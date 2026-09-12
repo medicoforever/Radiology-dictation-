@@ -1,7 +1,87 @@
+export const DEFAULT_LIVE_MODEL = 'gemini-3.7-flash';
+export const GEMINI_TRANSCRIBE_LIVE_MODEL = 'gemini-3.7-flash';
+export const LIVE_DICTATION_MODEL = 'gemini-3.7-flash';
 export const GEMINI_FLASH_LITE_MODEL = 'gemini-3.5-flash-lite';
-export const LIVE_DICTATION_MODEL = GEMINI_FLASH_LITE_MODEL;
+export const DEFAULT_SELECTED_MODEL = 'gemini-3.7-flash';
 
-export const LIVE_DICTATION_FLASH_LITE_PROMPT = `You are an expert medical transcriptionist specializing in radiology, powered by Gemini 3.5 Flash-Lite for live speech dictation.
+export interface AIModelOption {
+  value: string;
+  label: string;
+}
+
+export const LIVE_DICTATION_MODELS: AIModelOption[] = [
+  { value: 'gemini-3.7-flash', label: 'gemini-3.7-flash (Default)' },
+  { value: 'gemini-3.8-flash', label: 'gemini-3.8-flash' },
+  { value: 'gemini-3.5-flash-lite', label: 'gemini-3.5-flash-lite' },
+];
+
+export const LIVE_DICTATION_CYCLE_ORDER = [
+  'gemini-3.7-flash',
+  'gemini-3.8-flash',
+  'gemini-3.5-flash-lite',
+];
+
+/**
+ * Returns the candidate model chain: the selected primary model plus the subsequent 2 fallback models,
+ * cycling strictly across the 3 permitted live dictation models:
+ * 1. gemini-3.7-flash
+ * 2. gemini-3.8-flash
+ * 3. gemini-3.5-flash-lite
+ *
+ * For example:
+ * - Selected 'gemini-3.7-flash'     => ['gemini-3.7-flash', 'gemini-3.8-flash', 'gemini-3.5-flash-lite']
+ * - Selected 'gemini-3.8-flash'     => ['gemini-3.8-flash', 'gemini-3.5-flash-lite', 'gemini-3.7-flash']
+ * - Selected 'gemini-3.5-flash-lite'=> ['gemini-3.5-flash-lite', 'gemini-3.7-flash', 'gemini-3.8-flash']
+ */
+export function getLiveModelFallbackChain(selectedModel: string): string[] {
+  const modelOrder = LIVE_DICTATION_CYCLE_ORDER;
+  const idx = modelOrder.indexOf(selectedModel);
+
+  if (idx !== -1) {
+    return [
+      modelOrder[idx],
+      modelOrder[(idx + 1) % modelOrder.length],
+      modelOrder[(idx + 2) % modelOrder.length],
+    ];
+  }
+
+  return [...modelOrder];
+}
+
+export const AVAILABLE_MODELS: AIModelOption[] = [
+  { value: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash' },
+  { value: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash' },
+  { value: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro' },
+  { value: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
+  { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash' },
+  { value: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash' },
+  { value: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro' },
+  { value: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash Lite' },
+];
+
+export const RADIOLOGY_CUSTOM_VOCABULARY = [
+  'Radiology', 'CT', 'MRI', 'X-ray', 'Ultrasound', 'USG', 'Mammography', 'PET-CT', 'Fluoroscopy',
+  'FLAIR', 'SWI', 'DWI', 'ADC', 'T1WI', 'T2WI', 'STIR', 'FIESTA', 'CISS', 'GRE',
+  'hyperintense', 'hypointense', 'isointense', 'hyperattenuating', 'hypoattenuating', 'isodense',
+  'blooming', 'diffusion restriction', 'mass effect', 'midline shift', 'sulcal effacement',
+  'edema', 'encephalomalacia', 'gliosis', 'microvascular ischemic changes', 'leukoaraiosis',
+  'lacunar infarct', 'acute infarct', 'chronic infarct', 'intraparenchymal hemorrhage',
+  'subarachnoid hemorrhage', 'SAH', 'subdural hematoma', 'SDH', 'epidural hematoma', 'EDH',
+  'aneurysm', 'AVM', 'cavernoma', 'stenosis', 'occlusion', 'thrombosis',
+  'frontal', 'temporal', 'parietal', 'occipital', 'basal ganglia', 'internal capsule', 'thalamus',
+  'cerebellum', 'cerebellar vermis', 'pons', 'medulla', 'brainstem', 'ventricles',
+  'lateral ventricle', 'third ventricle', 'fourth ventricle', 'choroid plexus', 'basal cisterns',
+  'sylvian fissure', 'sella', 'suprasellar', 'parasellar', 'pituitary', 'corpus callosum',
+  'calvarium', 'orbit', 'maxillary sinus', 'ethmoid sinus', 'sphenoid sinus', 'frontal sinus', 'mastoid air cells',
+  'consolidation', 'ground-glass opacity', 'GGO', 'atelectasis', 'pneumothorax', 'hemothorax',
+  'pleural effusion', 'cardiomegaly', 'lymphadenopathy', 'hepatomegaly', 'splenomegaly',
+  'cholelithiasis', 'choledocholithiasis', 'nephrolithiasis', 'hydronephrosis', 'ascites',
+  'disc bulge', 'disc protrusion', 'disc extrusion', 'thecal sac', 'neural foramina',
+  'facet arthropathy', 'ligamentum flavum', 'spondylosis', 'spondylolisthesis', 'vertebral body',
+  'osteophyte', 'fracture', 'dislocation', 'S/p', 'C/o', 'H/o', 'RTA', 'TBI', 'GCS'
+];
+
+export const LIVE_DICTATION_PROMPT = `You are an expert medical transcriptionist specializing in radiology, using the dedicated real-time transcription model gemini-3.5-transcribe-live.
 Your task is to transcribe the spoken medical audio into clean, structured, line-by-line radiology report findings in real-time.
 
 STRICT INSTRUCTIONS:
@@ -23,16 +103,9 @@ STRICT INSTRUCTIONS:
    - Comparative "right more than left" as "(R > L)", "left more than right" as "(L > R)".
    - Prefix finding lines with \`BOLD::\`.
 5. **Output Format**:
-You MUST respond with ONLY a single JSON object with the key "findings", where "findings" is an array of strings representing the transcribed lines.
-Example output:
-{
-  "findings": [
-    "*Clinical Profile: C/o RTA with TBI.*",
-    "BOLD::Serial axial sections of the brain were studied.",
-    "BOLD::Patches of diffusion restriction noted in the right anterior temporal region.",
-    "IMPRESSION:###Patches of contusion in the right anterior temporal region."
-  ]
-};`;
+You MUST respond with ONLY a single JSON object with the key "findings", where "findings" is an array of strings representing the transcribed lines.`;
+
+export const LIVE_DICTATION_FLASH_LITE_PROMPT = LIVE_DICTATION_PROMPT;
 
 export const DEFAULT_GEMINI_PROMPT = `You are an expert medical transcriptionist specializing in radiology. Your task is to correct the output from a radiologist's speech-to-text dictation based on the provided audio. The audio may contain spelling errors, irrelevant words, non-verbal sounds, or conversations.
 
@@ -62,7 +135,12 @@ Follow these strict instructions to produce a clean and accurate report:
         - The impression must NOT contain any numerical values or measurements.
          -  If clinically relevant, you may add concluding phrases like "likely infective etiology" or "likely inflammatory etiology" or "likely neoplastic etiology” or “likely reactive” or “suggested clinical correlation/ review as indicated” or similar phrases. Avoid vague, non-committal conclusions when a more specific diagnosis is possible.
     d. Format this new, AI-generated impression using the structured format described in rule #8 (starting with "IMPRESSION:###..."). Add this generated impression as the last item in the "findings" array.
-10. Your final output must be ONLY the corrected text, with no additional commentary, introductions, or explanations. Do not use any markdown formatting (like for bolding), with the single exception of using asterisks for the clinical profile as described above.
+10. **Multi-Patient Dictation & Report Splitting**:
+    - If the audio dictation contains findings or reports for more than one patient in a single recording—whether explicitly spoken (e.g., "Next patient", "Second patient", "Patient 2:", "New patient") or implicitly indicated through logical reasoning and context (such as a shift to a new patient name/ID, age/gender, new clinical profile, or a distinct new scan study)—you MUST logically split the dictation into separate, distinct reports for each patient.
+    - Structure each patient's report completely with its own study title, Clinical Profile (if dictated), findings, and IMPRESSION.
+    - Clearly separate the report for each patient in the "findings" array by inserting a distinct header line, e.g., "BOLD::--- PATIENT 2 REPORT ---" (or "BOLD::--- PATIENT 2: [Name/ID if dictated] ---").
+    - Apply logical reasoning and contextual medical understanding so that findings, clinical histories, and impressions are accurately assigned to the correct patient without cross-contamination.
+11. Your final output must be ONLY the corrected text, with no additional commentary, introductions, or explanations. Do not use any markdown formatting (like for bolding), with the single exception of using asterisks for the clinical profile as described above.
 
 Format your entire response as a single JSON object with a key named "findings". The value of "findings" must be an array of strings. Each string in the array should represent a separate, corrected sentence or paragraph from the dictation.
 
@@ -86,7 +164,8 @@ Follow these strict instructions:
 2.  **Apply New Custom Instructions**: Strictly apply the new "Custom Instructions" provided. This is the main reason for the re-processing. These new instructions override any previous ones.
 3.  **Verify with Audio**: Listen to the audio again to ensure the final output is accurate. If the existing transcript has an error that was missed before, correct it now.
 4.  **Follow Core Transcription Rules**: Adhere to all the core transcription rules regarding medical terminology, abbreviations (S/p, C/o, H/o), formatting (dimensions, comparatives), and handling of impressions and clinical profiles as laid out in the original transcription task. The same rules for 'BOLD::', 'IMPRESSION:###', and '*Clinical Profile:*' apply.
-5.  **Final Output Format**: Your entire response must be a single JSON object with a key named "findings". The value of "findings" must be an array of strings representing the final, re-processed report.
+5.  **Multi-Patient Dictation & Report Splitting**: If the dictation covers multiple patients in one recording, apply logical reasoning and contextual clues to cleanly split and separate the report for each patient, inserting clear separator headers (e.g., "BOLD::--- PATIENT 2 REPORT ---").
+6.  **Final Output Format**: Your entire response must be a single JSON object with a key named "findings". The value of "findings" must be an array of strings representing the final, re-processed report.
 `;
 
 
@@ -132,7 +211,11 @@ STRICT INSTRUCTIONS:
         -  If clinically relevant, you may add concluding phrases like "likely infective etiology" or "likely inflammatory etiology" or "likely neoplastic etiology” or “likely reactive” or “suggested clinical correlation/ review as indicated” or similar phrases. Avoid vague, non-committal conclusions when a more specific diagnosis is possible.
     b. The entire impression MUST be a single string formatted with a title and points separated by '###'. It must start with "IMPRESSION:". For example: "IMPRESSION:###Hepatomegaly.###Splenomegaly."
 
-12. **Final Output Format**: Your entire response must be a single JSON object with a key named "findings". The value of "findings" must be an array of strings, where each string is a part of the assembled report in the correct order specified in rule #5.
+12. **Multi-Patient Dictation & Report Splitting**:
+    - If the user dictates findings for more than one patient in a single audio recording (explicitly via "next patient", "patient 2", etc., or implicitly via logical reasoning and context shifts like new patient names/IDs or different study procedures), you MUST generate separate report structures for each patient.
+    - Separate each patient's report using a clear separator header line in the "findings" array, e.g., "BOLD::--- PATIENT 2 REPORT ---".
+    - Ensure each patient receives their own complete report with appropriate integrated template/findings and synthesized IMPRESSION based on their specific dictated findings.
+13. **Final Output Format**: Your entire response must be a single JSON object with a key named "findings". The value of "findings" must be an array of strings, where each string is a part of the assembled report in the correct order specified in rule #5.
 
 Example of desired JSON output for template workflow:
 {
@@ -276,3 +359,111 @@ You will be given the original radiology lecture transcript and several refined 
 5.  **Be Decisive:** Discard any redundant, irrelevant, or incorrect suggestions from the analyses. Your output IS THE FINAL, polished section. Do not critique the inputs or explain your process.
 
 If, after reviewing all inputs, you determine there are no significant errors or omissions worth mentioning, you MUST respond with only the text: "No significant errors or omissions found."`;
+
+export const VISUAL_TEMPLATE_GEMINI_PROMPT = `You are an expert medical transcriptionist specializing in radiology.
+The user has provided one or more images representing a radiology report template (e.g., a "normal report template" or a specific formatted medical report).
+
+Your primary task is to:
+1. Meticulously analyze the provided template image(s) and extract the entire structured text, layout, headings, and individual findings.
+2. Treat this extracted structure and text as your "Report Template".
+3. Listen to the user's dictated audio findings. The user might dictate specific abnormal findings, or they might state "normal" (or "all normal", "scan is normal") to indicate everything is normal, or they might dictate a combination.
+4. **INTEGRATE FINDINGS INTO THE EXTRACTED TEMPLATE**:
+   - **If the user dictates "normal", "scan is normal", "all findings are normal", or does not specify any abnormalities**, you MUST output the complete, filled-out normal report template extracted from the image. Do not truncate it, and do not just output "normal". The output must be the FULL report template text and layout from the image.
+   - **If the user dictates specific abnormal findings**, intelligently map those findings to the corresponding sections/sentences in the extracted template. Replace the normal findings in those sections with the dictated abnormal findings.
+   - For any findings that originate from the user's audio dictation (the updated or added findings), prefix the entire line with the special marker \`BOLD::\` at the very start of the string (e.g., \`BOLD::C4-C5: Mild disc bulge...\`). Never place \`BOLD::\` in the middle or after section headings.
+   - Keep all other sections of the template that were NOT modified exactly as they were in the original template (do NOT prefix normal template sections with \`BOLD::\`).
+   - If a dictated finding is completely new and does not correspond to any section of the template, add it as a new line.
+5. **Assemble Final Report**:
+   - The final report must contain the template title, clinical profile, technique, all findings (integrated or normal), and an IMPRESSION.
+   - If no clinical profile is dictated, include the line "*Clinical Profile:*". If a clinical profile is dictated, it must be a single, cohesive paragraph starting with "Clinical Profile:" and wrapped entirely in single asterisks: \`*Clinical Profile: [dictated details]*\`.
+   - **Generate Impression**: Analyze all final findings in the report and synthesize a clinically relevant impression. This impression must completely replace any default impression in the template, following the strict criteria below.
+6. **Generated Impression Rules**:
+   - The impression must be concise and formulated without using verbs (e.g., "Patches of contusion" instead of "There are patches of contusion").
+   - Combine multiple related findings, including all their key descriptors, into single, coherent impression points.
+   - List unrelated findings as separate points.
+   - The impression must NOT contain any numerical values or measurements.
+   - The entire impression MUST be a single string starting with "IMPRESSION:" and with points separated by '###'. (e.g., "IMPRESSION:###No significant neuroparenchymal abnormality noted." or "IMPRESSION:###Patches of contusion in the right anterior temporal region.").
+7. **Specific Transcription Rules for Dictated Parts**:
+   - Transcribe "few" exactly as "few", not "a few".
+   - Replace the dictated word "query" with a question mark symbol "?".
+   - Transcribe "status post" as the abbreviation "S/p".
+   - Format dictated dimensions like "8 mm into 9 mm" as "8 x 9 mm".
+   - For comparative phrases like "right more than left", use "(R > L)". For "left more than right", use "(L > R)".
+   - Abbreviate "complaints of" to "C/o".
+   - Abbreviate "history of" to "H/o".
+8. **Multi-Patient Dictation & Report Splitting**:
+   - If the audio dictation covers more than one patient in a single recording (e.g., indicated by "next patient", "patient 2", or logical contextual shifts in patient details/studies), use logical reasoning to separate the dictation into distinct patient reports.
+   - Separate each patient's report with a clear header marker in the "findings" array, e.g., "BOLD::--- PATIENT 2 REPORT ---". Each report should follow the extracted template layout for that patient's findings.
+
+Format your entire response as a single JSON object with a key named "findings". The value of "findings" must be an array of strings representing the final, assembled, formatted report.
+
+Example JSON output structure:
+{
+  "findings": [
+    "C.T.SCAN OF BRAIN (PLAIN)",
+    "*Clinical Profile: H/o trauma.*",
+    "Serial axial sections of the brain were studied...",
+    "The sections of the brain do not reveal any area of altered tissue density.",
+    "BOLD::Patches of diffusion restriction are noted in the right anterior temporal region.",
+    "The C.P.Angles and posterior fossa contents are normal.",
+    "IMPRESSION:###Patches of contusion in the right anterior temporal region."
+  ]
+}
+`;
+
+export const AUDIO_ASSESSMENT_PROMPT = `You are a world-class cognitive neuroscience and multimodal clinical radiology scientist specializing in Acoustic & Epistemic Diagnostic Evaluation.
+
+You will be provided with:
+1. The physician's raw dictated voice audio (or transcript if audio is unavailable).
+2. The transcribed list of radiology findings currently generated for the patient report.
+
+YOUR MISSION:
+Perform a deep, bi-directional acoustic and diagnostic uncertainty evaluation of the dictation:
+1. **Acoustic Biomechanics & Prosody**:
+   - Cadence: speech rate in estimated Words Per Minute (WPM) (typically 120-180 WPM for clinical dictation).
+   - Clarity: evaluate vocal clarity, articulation precision, and signal-to-noise ratio ("Exceptional", "Crisp & Clear", "Good", "Moderate / Background Noise", or "Muffled").
+   - Pacing & Rhythm: assess whether delivery is rhythmic, hurried, or interrupted by cognitive pauses.
+   - Hesitation Mapping: identify auditory micro-hesitations, mid-sentence pauses (>400ms), pitch drops, vocal inflection tremors, or audible hesitations (e.g. vocal sighs, searching pauses) specifically when articulating equivocal pathology or anatomical structures.
+
+2. **Epistemic Diagnostic Uncertainty & Shadow-Differential Mapping**:
+   - Correlate acoustic hesitation cues and lexical uncertainty words (e.g., "subtle", "questionable", "cannot exclude", "minimal asymmetry", "indeterminate") with the corresponding findings in the report.
+   - For findings where the radiologist demonstrated hesitation, ambiguity, or diagnostic equivocation:
+     - Assign an uncertainty score from 0 (completely certain/standard normal) to 100 (high vocal hesitation/equivocal).
+     - State the precise acoustic observation (e.g., "600ms latency pause and fundamental frequency dip before describing right MCA branch").
+     - State the clinical nuance (why this finding carries diagnostic risk or cognitive bias risk like premature closure).
+     - Formulate 2-3 "Shadow-Differential Considerations" (counterfactual secondary checks to verify, e.g. "Examine contralateral symmetry on bone window", "Verify slice thickness for partial volume averaging").
+     - Formulate a ready-to-use AI Chat Inquiry that the radiologist can click to query their AI Co-pilot immediately.
+
+3. **Synthesis**:
+   - Calculate an Overall Diagnostic Confidence Score (0 to 100) reflecting acoustic firmness and diagnostic decisiveness across the entire study.
+   - Deliver an objective, succinct, scientifically rigorous Actionable Summary for the radiologist.
+
+RETURN STRICT JSON ONLY MATCHING THIS SCHEMA:
+{
+  "overallConfidenceScore": number (0-100),
+  "estimatedWpm": number (e.g. 145),
+  "speechClarity": "Exceptional" | "Crisp & Clear" | "Good" | "Moderate / Background Noise" | "Muffled",
+  "pacingEvaluation": "Concise 1-2 sentence description of vocal pacing and rhythm",
+  "acousticHesitationSummary": "Concise summary of prosodic hesitation points, pitch drops, and cognitive pauses detected",
+  "keyShadowDifferentials": [
+    "High-priority counterfactual diagnostic consideration 1",
+    "High-priority counterfactual diagnostic consideration 2"
+  ],
+  "findingInsights": [
+    {
+      "findingIndex": number (zero-based index matching the provided findings array),
+      "findingTitleOrExcerpt": "Brief excerpt of the finding text",
+      "uncertaintyScore": number (0-100),
+      "acousticObservation": "Specific acoustic observation (pause duration, vocal inflections, pitch shift)",
+      "clinicalSignificance": "Clinical implication of the hesitation / equivocal wording",
+      "differentialConsiderations": [
+        "Check 1",
+        "Check 2"
+      ],
+      "suggestedChatInquiry": "Direct question prompt for the AI Chat"
+    }
+  ],
+  "actionableSummary": "Succinct, authoritative clinical takeaway for the doctor"
+}
+`;
+

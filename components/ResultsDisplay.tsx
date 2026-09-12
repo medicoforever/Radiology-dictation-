@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import ChatInterface from './ChatInterface';
 import { useAudioRecorder } from '../hooks/useAudioRecorder';
-import { continueAudioDictation, modifyFindingWithAudio, modifyReportWithAudio, runComplexImpressionGeneration, transcribeAudioForPrompt } from '../services/geminiService';
+import { continueAudioDictation, modifyFindingWithAudio, modifyReportWithAudio, runComplexImpressionGeneration, transcribeAudioForPrompt, assessDictationAudio } from '../services/geminiService';
 import Spinner from './ui/Spinner';
 import PencilIcon from './icons/PencilIcon';
 import MicPlusIcon from './icons/MicPlusIcon';
@@ -13,11 +13,19 @@ import MicScribbleIcon from './icons/MicScribbleIcon';
 import ReorderIcon from './icons/ReorderIcon';
 import MergeIcon from './icons/MergeIcon';
 import CustomPromptInput from './ui/CustomPromptInput';
-import { IdentifiedError } from '../types';
+import { IdentifiedError, AudioAssessmentReport } from '../types';
+import { AVAILABLE_MODELS } from '../constants';
 import WarningIcon from './icons/WarningIcon';
 import BrainIcon from './icons/BrainIcon';
 import MicIcon from './icons/MicIcon';
 import DownloadIcon from './icons/DownloadIcon';
+import TrashIcon from './icons/TrashIcon';
+import PauseIcon from './icons/PauseIcon';
+import ResumeIcon from './icons/ResumeIcon';
+import { Activity, Globe } from 'lucide-react';
+import { AudioAssessmentPanel } from './AudioAssessmentPanel';
+import { openHtmlInBrowser } from '../services/googleDriveService';
+
 
 
 interface ChatMessage {
@@ -49,9 +57,13 @@ interface ResultsDisplayProps {
   liveError?: string | null;
   onPauseLive?: () => void;
   onResumeLive?: () => void;
+  audioLevel?: number;
+  isPausedLive?: boolean;
   identifiedErrors?: IdentifiedError[];
   errorCheckStatus?: 'idle' | 'checking' | 'complete';
 }
+
+
 
 const parseStructuredFinding = (finding: string) => {
   const parts = finding.split('###');
@@ -96,8 +108,10 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   liveError,
   onPauseLive,
   onResumeLive,
+  audioLevel = 0,
+  isPausedLive = false,
   identifiedErrors = [],
-  errorCheckStatus = 'idle'
+  errorCheckStatus = 'idle',
 }) => {
   const [isAllCopied, setIsAllCopied] = useState<boolean>(false);
   const [selectedIndices, setSelectedIndices] = useState<Set<number>>(new Set<number>());
@@ -107,6 +121,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   // State for Edit Mode
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
   const [editingText, setEditingText] = useState<string>('');
+
   const [dictatingIndex, setDictatingIndex] = useState<number | null>(null);
   const [dictateEditingIndex, setDictateEditingIndex] = useState<number | null>(null);
   const [processingIndex, setProcessingIndex] = useState<number | null>(null);
@@ -135,6 +150,27 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   const [expertNotes, setExpertNotes] = useState<string | null>(null);
   // FIX: Add state to handle transcription loading state for the complex impression mic.
   const [isTranscribingComplex, setIsTranscribingComplex] = useState(false);
+
+  // State for Audio & Diagnostic Assessment feature
+  const [isAudioAssessmentOpen, setIsAudioAssessmentOpen] = useState(false);
+  const [audioAssessmentReport, setAudioAssessmentReport] = useState<AudioAssessmentReport | null>(null);
+  const [isAssessingAudio, setIsAssessingAudio] = useState(false);
+  const [audioAssessmentError, setAudioAssessmentError] = useState<string | null>(null);
+
+  const handleRunAudioAssessment = async () => {
+    setIsAssessingAudio(true);
+    setAudioAssessmentError(null);
+    setIsAudioAssessmentOpen(true);
+    try {
+      const report = await assessDictationAudio(audioBlob, findings, selectedModel);
+      setAudioAssessmentReport(report);
+    } catch (err) {
+      console.error("Audio assessment error:", err);
+      setAudioAssessmentError(err instanceof Error ? err.message : 'Failed to complete audio assessment.');
+    } finally {
+      setIsAssessingAudio(false);
+    }
+  };
 
 
   // State for selection copier
@@ -308,8 +344,8 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         acc.html.push(`<strong>${snippet}</strong>`);
       } else {
         const finding = findings[i];
-        const isBold = finding.startsWith('BOLD::');
-        const cleanFinding = isBold ? finding.substring(6) : finding;
+        const isBold = finding.includes('BOLD::');
+        const cleanFinding = finding.replace(/BOLD::/g, '');
         const isTitle = cleanFinding.trim() === 'C.T.SCAN OF BRAIN (PLAIN)';
         const { isStructured, title, points } = parseStructuredFinding(cleanFinding);
         const isImpression = isStructured && title.trim().toUpperCase() === 'IMPRESSION:';
@@ -376,7 +412,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
       }
     }
 
-    const newSelectedIndices = new Set(selectedIndices);
+    const newSelectedIndices = new Set<number>(selectedIndices);
     if (newSelectedIndices.has(index)) {
       newSelectedIndices.delete(index);
       // Remove snippet if deselecting
@@ -405,8 +441,8 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     
     // Single-copy logic
     const findingToCopy = findings[index];
-    const isBold = findingToCopy.startsWith('BOLD::');
-    const cleanFinding = isBold ? findingToCopy.substring(6) : findingToCopy;
+    const isBold = findingToCopy.includes('BOLD::');
+    const cleanFinding = findingToCopy.replace(/BOLD::/g, '');
     const isTitle = cleanFinding.trim() === 'C.T.SCAN OF BRAIN (PLAIN)';
     const { isStructured, title, points } = parseStructuredFinding(cleanFinding);
     const isImpression = isStructured && title.trim().toUpperCase() === 'IMPRESSION:';
@@ -460,8 +496,8 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     if (!findings || findings.length === 0) return;
     
     const allTextPlain = findings.map(f => {
-      const isBold = f.startsWith('BOLD::');
-      const cleanFinding = isBold ? f.substring(6) : f;
+      const isBold = f.includes('BOLD::');
+      const cleanFinding = f.replace(/BOLD::/g, '');
       const { isStructured, title, points } = parseStructuredFinding(cleanFinding);
       const isImpression = isStructured && title.trim().toUpperCase() === 'IMPRESSION:';
 
@@ -478,8 +514,8 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     }).join('\n\n');
 
     const allTextHtml = findings.map(f => {
-      const isBold = f.startsWith('BOLD::');
-      const cleanFinding = isBold ? f.substring(6) : f;
+      const isBold = f.includes('BOLD::');
+      const cleanFinding = f.replace(/BOLD::/g, '');
       const isTitle = cleanFinding.trim() === 'C.T.SCAN OF BRAIN (PLAIN)';
       const { isStructured, title, points } = parseStructuredFinding(cleanFinding);
       const isImpression = isStructured && title.trim().toUpperCase() === 'IMPRESSION:';
@@ -554,14 +590,25 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     }
   };
 
+  const handleOpenInChrome = () => {
+    if (!findings || findings.length === 0) return;
+    try {
+      const htmlContent = generateSingleDictationHTML(findings);
+      openHtmlInBrowser(htmlContent);
+    } catch (err) {
+      console.error('Failed to open HTML in browser:', err);
+      showNotification('Failed to open HTML preview.');
+    }
+  };
+
   // --- Edit Mode Handlers ---
   const handleStartEdit = (index: number) => {
     setUndoState(null);
     setEditingIndex(index);
 
     const findingToEdit = findings[index];
-    const isBold = findingToEdit.startsWith('BOLD::');
-    const cleanFinding = isBold ? findingToEdit.substring(6) : findingToEdit;
+    const isBold = findingToEdit.includes('BOLD::');
+    const cleanFinding = findingToEdit.replace(/BOLD::/g, '');
     
     const { isStructured, title, points } = parseStructuredFinding(cleanFinding);
     const textForEditing = isStructured ? [title, ...points].join('\n') : cleanFinding;
@@ -571,14 +618,21 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     setDictateEditingIndex(null);
     setProcessingIndex(null);
     setContinuationError(null);
-    // Explicitly type the new Set to be Set<number> to match the state type.
-    // FIX: Explicitly type new Set() as Set<number> to match state type.
     setSelectedIndices(new Set<number>());
   };
 
   const handleCancelEdit = () => {
     setEditingIndex(null);
     setEditingText('');
+  };
+
+  const handleDeleteFinding = (indexToDelete: number) => {
+    setUndoState([...findings]);
+    onAllFindingsUpdate(findings.filter((_, i) => i !== indexToDelete));
+    if (editingIndex === indexToDelete) {
+      setEditingIndex(null);
+      setEditingText('');
+    }
   };
 
   const handleSaveEdit = () => {
@@ -593,7 +647,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         newText = editingText.split('\n').filter(line => line.trim() !== '').join('###');
       }
       
-      if(isBold) {
+      if(isBold && !newText.startsWith('BOLD::')) {
         newText = `BOLD::${newText}`;
       }
       
@@ -946,15 +1000,47 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
       )}
 
       {isLive && (
-        <div className="flex items-center gap-3 justify-center mb-6 p-3 bg-red-50 text-red-700 rounded-lg shadow-sm border border-red-200 dark:bg-red-900/20 dark:text-red-300 dark:border-red-500/30">
-            <div className="w-3 h-3 bg-red-500 rounded-full animate-ping flex-shrink-0"></div>
-            <p className="font-semibold text-center text-sm">
-                {liveError ? liveError : liveStatus || 'Live Dictation in Progress'}
-            </p>
+        <div className="mb-6 p-4 bg-slate-900 text-white rounded-xl shadow-lg border border-slate-700 flex flex-col sm:flex-row items-center justify-between gap-4">
+            <div className="flex items-center gap-3">
+                <div className="relative flex items-center justify-center">
+                    <div className={`w-3.5 h-3.5 rounded-full ${isPausedLive ? 'bg-amber-400' : 'bg-emerald-400 animate-ping'} absolute`}></div>
+                    <div className={`w-3.5 h-3.5 rounded-full ${isPausedLive ? 'bg-amber-500' : 'bg-emerald-500'} relative`}></div>
+                </div>
+                <div>
+                    <div className="flex items-center gap-2">
+                        <span className="text-xs uppercase tracking-wider font-semibold text-emerald-400">
+                            {isPausedLive ? 'Session Paused' : 'Live Dictation Active'}
+                        </span>
+                        <span className="text-xs bg-emerald-950/80 border border-emerald-700/60 px-2 py-0.5 rounded font-mono text-emerald-300">
+                            Real-Time Voice Stream
+                        </span>
+                    </div>
+                    <p className="font-medium text-sm text-slate-200 mt-0.5">
+                        {liveError ? liveError : liveStatus || 'Listening for speech & medical voice commands...'}
+                    </p>
+                </div>
+            </div>
+
+            {/* Real-time Audio Level Visualizer */}
+            <div className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800/80 rounded-lg border border-slate-700">
+                <span className="text-xs text-slate-400 font-mono mr-1">Mic</span>
+                {[0.4, 0.8, 1.2, 0.6, 1.0, 0.5, 0.9, 0.7].map((factor, idx) => {
+                    const barHeight = isPausedLive ? 4 : Math.max(4, Math.min(24, Math.round((audioLevel * factor * 0.28) + 4)));
+                    return (
+                        <div
+                            key={idx}
+                            style={{ height: `${barHeight}px` }}
+                            className={`w-1 rounded-full transition-all duration-75 ${
+                                audioLevel > 15 ? 'bg-emerald-400' : 'bg-slate-600'
+                            }`}
+                        />
+                    );
+                })}
+            </div>
         </div>
       )}
 
-      <div className="flex justify-between items-center mb-4">
+      <div className="flex flex-wrap justify-between items-center gap-3 mb-4">
         <div className="flex items-center gap-3">
             <h2 className="text-2xl font-bold text-slate-800 dark:text-slate-100">Corrected Findings</h2>
             {errorCheckStatus === 'checking' && (
@@ -964,7 +1050,44 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                 </div>
             )}
         </div>
+        {!isLive && (
+          <button
+            onClick={() => {
+              const nextOpen = !isAudioAssessmentOpen;
+              setIsAudioAssessmentOpen(nextOpen);
+              if (nextOpen && !audioAssessmentReport && !isAssessingAudio) {
+                handleRunAudioAssessment();
+              }
+            }}
+            className="inline-flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-bold bg-teal-50 hover:bg-teal-100 text-teal-800 dark:bg-teal-950/40 dark:text-teal-300 dark:hover:bg-teal-900/60 border border-teal-200/80 dark:border-teal-800/60 transition-all shadow-sm active:scale-95"
+            title="Perform Acoustic & Diagnostic Assessment on this dictation"
+          >
+            <Activity className="w-4 h-4 text-teal-600 dark:text-teal-400" />
+            <span>{audioAssessmentReport ? 'Acoustic Assessment' : 'Assess Dictation Audio'}</span>
+            {audioAssessmentReport && (
+              <span className="px-1.5 py-0.5 rounded-full bg-teal-200 dark:bg-teal-800/80 text-[10px] font-black text-teal-900 dark:text-teal-200">
+                {audioAssessmentReport.overallConfidenceScore}%
+              </span>
+            )}
+          </button>
+        )}
       </div>
+
+      {isAudioAssessmentOpen && (
+        <AudioAssessmentPanel
+          report={audioAssessmentReport}
+          isLoading={isAssessingAudio}
+          error={audioAssessmentError}
+          hasAudio={!!audioBlob}
+          onRunAssessment={handleRunAudioAssessment}
+          onClose={() => setIsAudioAssessmentOpen(false)}
+          onInquireInChat={(query) => {
+            onSendMessage(query);
+            const chatEl = document.getElementById('follow-up-chat');
+            chatEl?.scrollIntoView({ behavior: 'smooth' });
+          }}
+        />
+      )}
 
       {errorCheckStatus === 'complete' && identifiedErrors.length > 0 && <ErrorLegend />}
 
@@ -979,13 +1102,9 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                 className="bg-white border border-slate-300 text-slate-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block p-2 w-full dark:bg-slate-700 dark:border-slate-600 dark:text-white"
                 aria-label="Select AI model for reprocessing"
             >
-                <option value="gemini-3.1-pro-preview">Gemini 3.1 Pro</option>
-                <option value="gemini-3.6-flash">Gemini 3.6 Flash</option>
-                <option value="gemini-3.5-flash">Gemini 3.5 Flash</option>
-                <option value="gemini-3-flash-preview">Gemini 3 Flash</option>
-                <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
-                <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
-                <option value="gemini-3.5-flash-lite">Gemini 3.5 Flash Lite</option>
+                {AVAILABLE_MODELS.map((model) => (
+                    <option key={model.value} value={model.value}>{model.label}</option>
+                ))}
             </select>
           </div>
           <button
@@ -1022,44 +1141,50 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         </div>
       </div>
       {findings.length > 0 && (
-        <div className="flex justify-end items-center gap-2 mb-4">
-            {undoState && (
+        <div className="flex flex-wrap justify-between items-center gap-2 mb-4 p-2 bg-slate-100/70 dark:bg-slate-800/70 rounded-xl border border-slate-200/80 dark:border-slate-700/80">
+            <span className="text-xs sm:text-sm font-semibold text-slate-600 dark:text-slate-300 px-2">
+              {findings.filter(f => f && f.trim()).length} findings {selectedIndices.size > 0 && `• ${selectedIndices.size} selected`}
+            </span>
+            <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
+              {undoState && (
+                <button
+                  onClick={handleUndo}
+                  className="text-xs sm:text-sm font-semibold py-1.5 px-3 rounded-lg bg-yellow-400 text-yellow-900 hover:bg-yellow-500 transition-colors shadow-sm"
+                  aria-label="Undo last modification"
+                >
+                  Undo
+                </button>
+              )}
               <button
-                onClick={handleUndo}
-                className="text-sm font-semibold py-1 px-3 rounded-lg bg-yellow-400 text-yellow-900 hover:bg-yellow-500 transition-colors"
-                aria-label="Undo last modification"
-              >
-                Undo
+                  onClick={handleToggleMergeMode}
+                  className={`text-xs sm:text-sm font-semibold py-1.5 px-3 rounded-lg transition-colors flex items-center gap-1.5 shadow-sm ${mergeMode ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-white text-slate-700 hover:bg-slate-200 border border-slate-200 dark:border-slate-600 dark:bg-slate-700 dark:text-slate-200 dark:hover:bg-slate-600'}`}
+                >
+                <MergeIcon className={`w-4 h-4 ${mergeMode ? 'text-white' : 'text-slate-600 dark:text-slate-400'}`} />
+                {mergeMode ? 'Done' : 'Merge'}
               </button>
-            )}
-            <button
-                onClick={handleToggleMergeMode}
-                className={`text-sm font-semibold py-1 px-3 rounded-lg transition-colors flex items-center gap-1.5 ${mergeMode ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-slate-200 text-slate-700 hover:bg-slate-300 dark:bg-slate-700 dark:text-slate-300 dark:hover:bg-slate-600'}`}
+              <button
+                  onClick={handleToggleReorderMode}
+                  className={`text-xs sm:text-sm font-semibold py-1.5 px-3 rounded-lg transition-colors flex items-center gap-1.5 shadow-sm ${reorderMode ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-white text-slate-700 hover:bg-slate-200 border border-slate-200 dark:border-slate-600 dark:bg-slate-700 dark:text-slate-200 dark:hover:bg-slate-600'}`}
+                >
+                <ReorderIcon className={`w-4 h-4 ${reorderMode ? 'text-white' : 'text-slate-600 dark:text-slate-400'}`} />
+                {reorderMode ? 'Done' : 'Reorder'}
+              </button>
+              <button
+                onClick={handleCopyAll}
+                className={`text-xs sm:text-sm font-semibold py-1.5 px-3.5 rounded-lg transition-colors shadow-sm ${isAllCopied ? 'bg-green-600 text-white' : 'bg-blue-600 text-white hover:bg-blue-700'}`}
               >
-              <MergeIcon className={`w-4 h-4 ${mergeMode ? 'text-white' : 'text-slate-600 dark:text-slate-400'}`} />
-              {mergeMode ? 'Done' : 'Merge'}
-            </button>
-            <button
-                onClick={handleToggleReorderMode}
-                className={`text-sm font-semibold py-1 px-3 rounded-lg transition-colors flex items-center gap-1.5 ${reorderMode ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-slate-200 text-slate-700 hover:bg-slate-300 dark:bg-slate-700 dark:text-slate-300 dark:hover:bg-slate-600'}`}
-              >
-              <ReorderIcon className={`w-4 h-4 ${reorderMode ? 'text-white' : 'text-slate-600 dark:text-slate-400'}`} />
-              {reorderMode ? 'Done' : 'Reorder'}
-            </button>
-            <button
-              onClick={handleCopyAll}
-              className={`text-base font-semibold py-2 px-4 rounded-lg transition-colors ${isAllCopied ? 'bg-green-100 text-green-700 dark:bg-green-900/50 dark:text-green-300' : 'bg-slate-200 text-slate-700 hover:bg-slate-300 dark:bg-slate-700 dark:text-slate-300 dark:hover:bg-slate-600'}`}
-            >
-              {isAllCopied ? 'Copied!' : 'Copy All'}
-            </button>
+                {isAllCopied ? '✓ Copied All!' : 'Copy All'}
+              </button>
+            </div>
         </div>
       )}
+
       <div ref={findingsContainerRef} className="space-y-3 min-h-[150px]">
         {findings.map((finding, index) => {
           if (!finding && index === findings.length - 1) return null; // Don't render the trailing empty string from split
           
-          const isBold = finding.startsWith('BOLD::');
-          const cleanFinding = isBold ? finding.substring(6) : finding;
+          const isBold = finding.includes('BOLD::');
+          const cleanFinding = finding.replace(/BOLD::/g, '');
           const isTitle = cleanFinding.trim() === 'C.T.SCAN OF BRAIN (PLAIN)';
           const { isStructured, title, points } = parseStructuredFinding(cleanFinding);
           const isItalic = !isStructured && cleanFinding.startsWith('*') && cleanFinding.endsWith('*');
@@ -1132,7 +1257,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
               onDragOver={mergeMode || reorderMode ? (e) => e.preventDefault() : undefined}
               onDragEnterCapture={mergeMode ? (e) => { e.preventDefault(); setDragOverIndex(index); } : undefined}
               onDragLeaveCapture={mergeMode ? (e) => { e.preventDefault(); setDragOverIndex(null); } : undefined}
-              className={`finding-item relative group p-3 pl-10 border-l-4 rounded-r-lg transition-all duration-200 ${
+              className={`finding-item relative group p-3 pl-11 pr-28 sm:pr-24 border-l-4 rounded-r-lg transition-all duration-200 ${
                   isSelected && !isCurrentlyActive && !reorderMode && !mergeMode
                   ? 'bg-blue-100 border-blue-600 dark:bg-blue-900/30 dark:border-blue-500 shadow-md'
                   : isDragOverTarget
@@ -1148,20 +1273,22 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
               onKeyDown={(reorderMode || mergeMode || isCurrentlyActive) ? undefined : (e) => (e.key === ' ' || e.key === 'Enter') && handleFindingClick(index)}
             >
               {(reorderMode || mergeMode) ? (
-                  <div className="absolute left-0 top-0 bottom-0 w-8 flex items-center justify-center" aria-label="Drag to reorder or merge">
+                  <div className="absolute left-0 top-0 bottom-0 w-10 flex items-center justify-center" aria-label="Drag to reorder or merge">
                       {reorderMode && <ReorderIcon />}
                       {mergeMode && <MergeIcon className="w-5 h-5 text-slate-500 dark:text-slate-400" />}
                   </div>
               ) : (
                 <div
                     onClick={(e) => !isCurrentlyActive && handleSelectionHandleClick(e, index)}
-                    className={`absolute left-0 top-0 bottom-0 w-8 flex items-center justify-center ${isCurrentlyActive ? 'cursor-not-allowed' : 'cursor-pointer'}`}
+                    className={`absolute left-0 top-0 bottom-0 w-10 flex items-center justify-center touch-manipulation ${isCurrentlyActive ? 'cursor-not-allowed' : 'cursor-pointer'}`}
                     role="checkbox"
                     aria-checked={isSelected}
                     aria-disabled={isCurrentlyActive}
                     aria-label="Toggle selection for this finding"
                 >
-                    <div className={`w-4 h-4 rounded-full border-2 transition-colors ${isSelected && !isCurrentlyActive ? 'bg-blue-600 border-blue-600 dark:bg-blue-500 dark:border-blue-500' : 'border-slate-400 bg-white group-hover:border-blue-500 dark:border-slate-500 dark:bg-slate-600 dark:group-hover:border-blue-400'}`}></div>
+                    <div className={`w-5 h-5 rounded-full border-2 transition-colors flex items-center justify-center text-[10px] font-bold ${isSelected && !isCurrentlyActive ? 'bg-blue-600 border-blue-600 dark:bg-blue-500 dark:border-blue-500 text-white' : 'border-slate-400 bg-white group-hover:border-blue-500 dark:border-slate-500 dark:bg-slate-600 dark:group-hover:border-blue-400'}`}>
+                        {isSelected && !isCurrentlyActive && '✓'}
+                    </div>
                 </div>
               )}
 
@@ -1228,7 +1355,10 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                         </button>
                     </div>
                   ) : !reorderMode && !mergeMode && (
-                    <div className={`absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1 opacity-0 ${!isMakingSelection && 'group-hover:opacity-100'} transition-opacity bg-slate-100 dark:bg-slate-700 p-1 rounded-md shadow-sm`}>
+                    <div 
+                      onClick={(e) => e.stopPropagation()} 
+                      className={`absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1 opacity-100 sm:opacity-0 ${!isMakingSelection && 'sm:group-hover:opacity-100'} focus-within:opacity-100 transition-opacity bg-white/95 dark:bg-slate-800/95 border border-slate-200/80 dark:border-slate-700/80 p-1 rounded-lg shadow-sm z-10`}
+                    >
                        {hasError && (
                             <div className="group/tooltip relative flex items-center">
                               <WarningIcon className={`w-5 h-5 ${iconErrorClasses[highestSeverity!]}`} />
@@ -1242,14 +1372,25 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                               </div>
                             </div>
                           )}
-                      <button onClick={() => handleStartEdit(index)} aria-label="Edit text" className="p-1 text-slate-600 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400 rounded-full hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors">
+                      <button onClick={() => handleStartEdit(index)} aria-label="Edit text" className="p-1.5 sm:p-1 text-slate-600 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400 rounded-full hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors touch-manipulation" title="Edit row">
                         <PencilIcon />
                       </button>
-                      <button onClick={() => handleStartDictation(index)} aria-label="Append dictation" className="p-1 text-slate-600 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400 rounded-full hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors">
+                      <button onClick={() => handleStartDictation(index)} aria-label="Append dictation" className="p-1.5 sm:p-1 text-slate-600 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400 rounded-full hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors touch-manipulation" title="Append dictation to row">
                         <MicPlusIcon />
                       </button>
-                      <button onClick={() => handleStartDictateEdit(index)} aria-label="Dictate changes" className="p-1 text-slate-600 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400 rounded-full hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors">
+                      <button onClick={() => handleStartDictateEdit(index)} aria-label="Dictate changes" className="p-1.5 sm:p-1 text-slate-600 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400 rounded-full hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors touch-manipulation" title="Dictate changes to row">
                         <MicPencilIcon />
+                      </button>
+                      <button 
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleDeleteFinding(index);
+                        }} 
+                        aria-label="Delete this row" 
+                        title="Delete row"
+                        className="p-1.5 sm:p-1 text-slate-600 dark:text-slate-300 hover:text-red-600 dark:hover:text-red-400 rounded-full hover:bg-red-100 dark:hover:bg-red-900/40 transition-colors touch-manipulation"
+                      >
+                        <TrashIcon className="w-5 h-5" />
                       </button>
                     </div>
                   )}
@@ -1261,6 +1402,48 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         {findings.length === 0 && !isLive && (
             <div className="text-center py-8 text-slate-500 dark:text-slate-400">
                 <p>No findings have been transcribed yet.</p>
+            </div>
+        )}
+        {findings.length === 0 && isLive && (
+            <div className="border-2 border-dashed border-emerald-300 dark:border-emerald-700/60 bg-emerald-50/50 dark:bg-emerald-950/20 rounded-xl p-6 sm:p-8 text-center my-4">
+                <div className="w-12 h-12 mx-auto mb-3 rounded-full bg-emerald-100 dark:bg-emerald-900/40 flex items-center justify-center text-emerald-600 dark:text-emerald-300">
+                    <MicIcon className="w-6 h-6 animate-pulse" />
+                </div>
+                <h3 className="text-lg font-bold text-slate-800 dark:text-slate-100 mb-1">
+                    Listening to your dictation...
+                </h3>
+                <p className="text-sm text-slate-600 dark:text-slate-400 max-w-md mx-auto mb-4">
+                    Speak your findings clearly into the microphone. Voice commands like <em>"next line"</em> and <em>"new finding"</em> are formatted in real-time.
+                </p>
+                <div className="flex flex-wrap items-center justify-center gap-3">
+                    <button
+                        onClick={() => {
+                            const sampleFindings = [
+                                "BOLD::Serial axial CT sections of the brain were performed without contrast.",
+                                "BOLD::No acute intracranial hemorrhage, territorial infarction, or mass effect.",
+                                "BOLD::Ventricles, basal cisterns, and cortical sulci are normal for patient age.",
+                                "IMPRESSION:###NORMAL CT BRAIN STUDY WITHOUT ACUTE INTRACRANIAL ABNORMALITY."
+                            ];
+                            onAllFindingsUpdate(sampleFindings);
+                        }}
+                        className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-semibold shadow-sm transition-colors"
+                    >
+                        ⚡ Insert Sample Findings
+                    </button>
+                    {window.self !== window.top && (
+                        <a
+                            href={window.location.href}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-slate-700 hover:bg-slate-800 text-slate-100 rounded-lg text-xs font-semibold shadow-sm transition-colors"
+                        >
+                            ↗️ Open in New Tab (Full Mic Access)
+                        </a>
+                    )}
+                </div>
+                <div className="mt-4 inline-flex items-center gap-2 text-xs bg-white dark:bg-slate-800 border border-emerald-200 dark:border-emerald-800 px-3 py-1.5 rounded-full text-slate-700 dark:text-slate-300 shadow-sm">
+                    <span>💡 Tip: Say <strong>"new finding"</strong> or <strong>"move to next line"</strong> to separate points</span>
+                </div>
             </div>
         )}
       </div>
@@ -1370,66 +1553,115 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
 
       <div className="mt-8 pt-6 border-t dark:border-slate-700 flex flex-col sm:flex-row justify-center items-center gap-4 flex-wrap">
         {isLive ? (
-            <button
-                onClick={onStopLive}
-                className="flex items-center justify-center gap-2 bg-red-600 text-white font-bold py-3 px-8 rounded-full hover:bg-red-700 focus:outline-none focus:ring-4 focus:ring-red-300 transition-all duration-300 ease-in-out transform hover:scale-105 shadow-lg"
-                aria-label="Stop Live Session"
-            >
-                <StopIcon className="w-6 h-6" />
-                Stop Live Dictation
-            </button>
+            <div className="flex flex-col sm:flex-row items-center gap-3 w-full sm:w-auto justify-center">
+                {isPausedLive ? (
+                    <button
+                        onClick={onResumeLive}
+                        className="w-full sm:w-auto flex items-center justify-center gap-2 bg-emerald-600 text-white font-bold py-3 px-6 rounded-full hover:bg-emerald-700 focus:outline-none focus:ring-4 focus:ring-emerald-300 transition-all shadow-md min-h-[48px]"
+                        aria-label="Resume Live Session"
+                    >
+                        <ResumeIcon className="w-5 h-5" />
+                        Resume Dictation
+                    </button>
+                ) : (
+                    <button
+                        onClick={onPauseLive}
+                        className="w-full sm:w-auto flex items-center justify-center gap-2 bg-amber-500 text-white font-bold py-3 px-6 rounded-full hover:bg-amber-600 focus:outline-none focus:ring-4 focus:ring-amber-300 transition-all shadow-md min-h-[48px]"
+                        aria-label="Pause Live Session"
+                    >
+                        <PauseIcon className="w-5 h-5" />
+                        Pause Dictation
+                    </button>
+                )}
+                <button
+                    onClick={onStopLive}
+                    className="w-full sm:w-auto flex items-center justify-center gap-2 bg-red-600 text-white font-bold py-3 px-8 rounded-full hover:bg-red-700 focus:outline-none focus:ring-4 focus:ring-red-300 transition-all duration-300 ease-in-out transform hover:scale-105 shadow-lg min-h-[48px]"
+                    aria-label="Stop Live Session"
+                >
+                    <StopIcon className="w-6 h-6" />
+                    Stop Live Dictation
+                </button>
+            </div>
         ) : continuationState.status === 'idle' ? (
-          <>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:flex lg:flex-wrap justify-center items-center gap-2.5 sm:gap-3 w-full">
             <button
               onClick={handleRecordNew}
-              className="bg-blue-600 text-white font-bold py-2 px-6 rounded-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50 transition-colors w-full sm:w-auto"
+              className="bg-blue-600 text-white font-bold py-2.5 px-5 rounded-xl hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50 transition-all shadow-sm w-full lg:w-auto flex items-center justify-center gap-2 min-h-[44px]"
             >
+              <MicIcon className="w-4 h-4" />
               Record New Dictation
             </button>
             <button
                 onClick={() => setIsComplexGeneratorVisible(true)}
-                className="bg-purple-600 text-white font-bold py-2 px-6 rounded-lg hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-opacity-50 transition-colors w-full sm:w-auto flex items-center gap-2"
+                className="bg-purple-600 text-white font-bold py-2.5 px-5 rounded-xl hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-opacity-50 transition-all shadow-sm w-full lg:w-auto flex items-center justify-center gap-2 min-h-[44px]"
             >
-                <BrainIcon className="w-5 h-5" />
+                <BrainIcon className="w-4 h-4" />
                 Complex Impression
             </button>
+            {!isLive && (
+              <button
+                  onClick={() => {
+                    setIsAudioAssessmentOpen(true);
+                    if (!audioAssessmentReport && !isAssessingAudio) {
+                      handleRunAudioAssessment();
+                    }
+                    window.scrollTo({ top: 0, behavior: 'smooth' });
+                  }}
+                  className="bg-teal-600 text-white font-bold py-2.5 px-5 rounded-xl hover:bg-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-500 focus:ring-opacity-50 transition-all shadow-sm w-full lg:w-auto flex items-center justify-center gap-2 min-h-[44px]"
+              >
+                  <Activity className="w-4 h-4" />
+                  {audioAssessmentReport ? 'View Audio Assessment' : 'Assess Dictation Audio'}
+              </button>
+            )}
             {expertNotes && (
                 <button
                     onClick={handleDownloadExpertNotes}
-                    className="bg-teal-600 text-white font-bold py-2 px-6 rounded-lg hover:bg-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-500 focus:ring-opacity-50 transition-colors w-full sm:w-auto flex items-center gap-2"
+                    className="bg-teal-600 text-white font-bold py-2.5 px-5 rounded-xl hover:bg-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-500 focus:ring-opacity-50 transition-all shadow-sm w-full lg:w-auto flex items-center justify-center gap-2 min-h-[44px]"
                 >
-                    <DownloadIcon className="w-5 h-5" />
+                    <DownloadIcon className="w-4 h-4" />
                     Download Expert Notes
                 </button>
             )}
             <button
-              onClick={onSwitchToBatch}
-              className="bg-slate-600 text-white font-bold py-2 px-6 rounded-lg hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-500 focus:ring-opacity-50 transition-colors w-full sm:w-auto"
-            >
-              Batch Processing
-            </button>
-             <button
               onClick={handleStartContinue}
               disabled={!audioBlob}
-              className="bg-green-600 text-white font-bold py-2 px-6 rounded-lg hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-opacity-50 transition-colors w-full sm:w-auto disabled:bg-green-300 disabled:cursor-not-allowed"
+              className="bg-emerald-600 text-white font-bold py-2.5 px-5 rounded-xl hover:bg-emerald-700 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-opacity-50 transition-all shadow-sm w-full lg:w-auto disabled:bg-emerald-300 dark:disabled:bg-emerald-900/40 disabled:cursor-not-allowed flex items-center justify-center gap-2 min-h-[44px]"
             >
+              <MicPlusIcon className="w-4 h-4" />
               Continue Dictation
             </button>
             <button
-              onClick={handleDownload}
-              disabled={!audioBlob}
-              className="bg-slate-500 text-white font-bold py-2 px-6 rounded-lg hover:bg-slate-600 focus:outline-none focus:ring-2 focus:ring-slate-400 focus:ring-opacity-50 transition-colors disabled:bg-slate-300 disabled:cursor-not-allowed w-full sm:w-auto"
+              onClick={handleOpenInChrome}
+              disabled={!findings || findings.length === 0}
+              className="bg-blue-600 text-white font-bold py-2.5 px-5 rounded-xl hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50 transition-all shadow-sm disabled:bg-blue-300 dark:disabled:bg-blue-900/40 disabled:cursor-not-allowed w-full lg:w-auto flex items-center justify-center gap-2 min-h-[44px]"
+              title="Open full interactive HTML report directly in Google Chrome"
             >
-              Download Audio
+              <Globe className="w-4 h-4" />
+              Open in Chrome
             </button>
             <button
               onClick={handleDownloadHTML}
               disabled={!findings || findings.length === 0}
-              className="bg-green-600 text-white font-bold py-2 px-6 rounded-lg hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-opacity-50 transition-colors disabled:bg-green-300 disabled:cursor-not-allowed w-full sm:w-auto"
+              className="bg-emerald-700 text-white font-bold py-2.5 px-5 rounded-xl hover:bg-emerald-800 focus:outline-none focus:ring-2 focus:ring-emerald-600 focus:ring-opacity-50 transition-all shadow-sm disabled:bg-emerald-300 dark:disabled:bg-emerald-900/40 disabled:cursor-not-allowed w-full lg:w-auto flex items-center justify-center gap-2 min-h-[44px]"
             >
-              Download as HTML
+              <DownloadIcon className="w-4 h-4" />
+              Download HTML
             </button>
-          </>
+            <button
+              onClick={handleDownload}
+              disabled={!audioBlob}
+              className="bg-slate-600 text-white font-bold py-2.5 px-5 rounded-xl hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-500 focus:ring-opacity-50 transition-all shadow-sm disabled:bg-slate-300 dark:disabled:bg-slate-700 disabled:cursor-not-allowed w-full lg:w-auto flex items-center justify-center gap-2 min-h-[44px]"
+            >
+              <DownloadIcon className="w-4 h-4" />
+              Download Audio
+            </button>
+            <button
+              onClick={onSwitchToBatch}
+              className="bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 font-bold py-2.5 px-5 rounded-xl hover:bg-slate-200 dark:hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-400 focus:ring-opacity-50 transition-all shadow-sm w-full lg:w-auto flex items-center justify-center gap-2 min-h-[44px]"
+            >
+              Batch Processing
+            </button>
+          </div>
         ) : null}
         {continuationState.status === 'recording' && (
             <div className="w-full flex items-center justify-center gap-4 bg-red-100 dark:bg-red-900/20 p-2 rounded-lg">

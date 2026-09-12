@@ -60,8 +60,8 @@ document.addEventListener('DOMContentLoaded', () => {
     
     const getCopyContent = (findingEl) => {
         const rawFinding = decodeURIComponent(findingEl.dataset.findingRaw || '');
-        const isBold = rawFinding.startsWith('BOLD::');
-        const cleanFinding = isBold ? rawFinding.substring(6) : rawFinding;
+        const isBold = rawFinding.includes('BOLD::');
+        const cleanFinding = rawFinding.replace(/BOLD::/g, '');
         const isTitle = cleanFinding.trim() === 'C.T.SCAN OF BRAIN (PLAIN)';
         const parts = cleanFinding.split('###');
         const isStructured = parts.length > 1;
@@ -603,8 +603,8 @@ const renderFindingsList = (findings: string[], batchId: string): string => {
     return `
         <div class="space-y-3" data-batch-findings-container-id="${batchId}">
             ${findings.map((finding, index) => {
-                const isBold = finding.startsWith('BOLD::');
-                const cleanFinding = isBold ? finding.substring(6) : finding;
+                const isBold = finding.includes('BOLD::');
+                const cleanFinding = finding.replace(/BOLD::/g, '');
                 const isTitle = cleanFinding.trim() === 'C.T.SCAN OF BRAIN (PLAIN)';
 
                 const parts = cleanFinding.split('###');
@@ -673,10 +673,25 @@ const renderFindingsList = (findings: string[], batchId: string): string => {
     `;
 };
 
-export const generateSingleDictationHTML = (findings: string[]): string => {
+export const generateSingleDictationHTML = (findings: string[], timestamp?: number | Date): string => {
+    const formattedDate = timestamp 
+        ? new Date(timestamp).toLocaleString(undefined, { 
+            weekday: 'short', 
+            year: 'numeric', 
+            month: 'short', 
+            day: 'numeric', 
+            hour: '2-digit', 
+            minute: '2-digit', 
+            second: '2-digit' 
+          })
+        : null;
+
     const content = `
         <div class="flex justify-between items-center mb-4">
-            <h2 class="text-2xl font-bold text-slate-800">Corrected Findings</h2>
+            <div>
+                <h2 class="text-2xl font-bold text-slate-800">Corrected Findings</h2>
+                ${formattedDate ? `<p class="text-xs text-slate-500 font-medium mt-0.5">Dictated: ${formattedDate}</p>` : ''}
+            </div>
             ${findings.length > 0 ? `
             <div class="flex items-center gap-2">
                 <button class="undo-merge-btn hidden text-sm font-semibold py-1 px-3 rounded-lg bg-yellow-400 text-yellow-900 hover:bg-yellow-500 transition-colors" data-batch-id="single">Undo Merge</button>
@@ -694,11 +709,26 @@ export const generateSingleDictationHTML = (findings: string[]): string => {
     return getHTMLTemplate('Radiology Dictation Report', content);
 };
 
-export const generateBatchDictationHTML = (batches: ReportBatch[]): string => {
+export const generateBatchDictationHTML = (batches: ReportBatch[], timestamp?: number | Date): string => {
     const processedBatches = batches.filter(b => b.findings && b.findings.length > 0);
+    const formattedDate = timestamp 
+        ? new Date(timestamp).toLocaleString(undefined, { 
+            weekday: 'short', 
+            year: 'numeric', 
+            month: 'short', 
+            day: 'numeric', 
+            hour: '2-digit', 
+            minute: '2-digit', 
+            second: '2-digit' 
+          })
+        : null;
+
     const content = `
         <div class="flex justify-between items-center mb-4">
-            <h2 class="text-2xl font-bold text-slate-800">Processed Transcripts</h2>
+            <div>
+                <h2 class="text-2xl font-bold text-slate-800">Processed Transcripts</h2>
+                ${formattedDate ? `<p class="text-xs text-slate-500 font-medium mt-0.5">Batch Processed: ${formattedDate}</p>` : ''}
+            </div>
             ${processedBatches.length > 0 ? `
             <button
                 id="copy-all-transcripts"

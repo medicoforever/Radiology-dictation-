@@ -84,7 +84,7 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({ history, isChatting, onSe
   const isAwaitingResponse = isChatting && history.length > 0 && history[history.length - 1]?.author === 'You';
 
   return (
-    <div className="mt-8 border-t dark:border-slate-700 pt-6">
+    <div id="follow-up-chat" className="mt-8 border-t dark:border-slate-700 pt-6">
       <h3 className="text-xl font-bold text-slate-800 dark:text-slate-100 mb-4">Follow-up Chat</h3>
       {recorderError && <p className="text-red-500 mb-2 text-sm">{recorderError}</p>}
       <div className="bg-slate-50 dark:bg-slate-900/50 rounded-lg p-4 h-72 overflow-y-auto flex flex-col gap-4">
@@ -150,7 +150,7 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({ history, isChatting, onSe
                         type="button"
                         onClick={handleStartRecording}
                         disabled={isChatting} 
-                        className="bg-blue-600 text-white p-2 rounded-lg hover:bg-blue-700 disabled:bg-blue-300 disabled:cursor-not-allowed flex items-center justify-center w-12 h-12 flex-shrink-0 transition-colors"
+                        className="bg-blue-600 text-white p-2.5 rounded-xl hover:bg-blue-700 disabled:bg-blue-300 dark:disabled:bg-slate-700 disabled:cursor-not-allowed flex items-center justify-center w-12 h-12 min-h-[48px] min-w-[48px] flex-shrink-0 transition-colors shadow-sm touch-manipulation"
                         aria-label="Record audio message"
                     >
                         <MicIcon className="w-6 h-6" />
@@ -159,7 +159,7 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({ history, isChatting, onSe
                     <button 
                         type="submit" 
                         disabled={isChatting || !input.trim()} 
-                        className="bg-blue-600 text-white p-2 rounded-lg hover:bg-blue-700 disabled:bg-blue-300 disabled:cursor-not-allowed flex items-center justify-center w-12 h-12 flex-shrink-0 transition-colors"
+                        className="bg-blue-600 text-white p-2.5 rounded-xl hover:bg-blue-700 disabled:bg-blue-300 dark:disabled:bg-slate-700 disabled:cursor-not-allowed flex items-center justify-center w-12 h-12 min-h-[48px] min-w-[48px] flex-shrink-0 transition-colors shadow-sm touch-manipulation"
                         aria-label="Send chat message"
                     >
                         {isChatting ? <Spinner className="h-6 w-6 text-white" /> : <SendIcon />}

@@ -1,326 +1,719 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { GoogleGenAI, Type } from '@google/genai';
-import { GEMINI_FLASH_LITE_MODEL, LIVE_DICTATION_FLASH_LITE_PROMPT } from '../constants';
+import {
+  startRepeatingInterruptedAlert,
+  stopRepeatingInterruptedAlert,
+  unlockAudioContext,
+} from '../services/soundService';
+import { processLiveAudioChunk, synthesizeLiveReport, LiveHistoryContext } from '../services/geminiService';
 
-export function processLiveTranscript(rawTextOrFindings: string | string[]): string[] {
-  let inputLines: string[] = [];
-  if (Array.isArray(rawTextOrFindings)) {
-    inputLines = rawTextOrFindings;
-  } else if (typeof rawTextOrFindings === 'string') {
-    inputLines = [rawTextOrFindings];
-  }
-
-  const resultLines: string[] = [];
-
-  for (const rawText of inputLines) {
-    if (!rawText) continue;
-
-    let text = rawText;
-
-    // Natural Language Voice Commands handling
-    text = text
-      .replace(/\b(move to the next line|move to next line|go to the next line|go to next line|next line|new line|line break|new paragraph|next paragraph)\b/gi, '\n')
-      .replace(/\b(full stop|period)\b/gi, '. ')
-      .replace(/\b(comma)\b/gi, ', ')
-      .replace(/\b(colon)\b/gi, ': ')
-      .replace(/\b(semi-colon|semicolon)\b/gi, '; ')
-      .replace(/\b(question mark)\b/gi, '? ')
-      .replace(/\b(new finding|next finding|separate finding)\b/gi, '\nBOLD::')
-      .replace(/\b(mark as bold|make this bold)\b/gi, ' BOLD::')
-      .replace(/\b(impression section|start impression|new impression)\b/gi, '\nIMPRESSION:###');
-
-    // Split into sub-lines
-    const splitSubLines = text.split('\n').map(l => l.trim()).filter(Boolean);
-
-    for (const line of splitSubLines) {
-      // Smart finding boundary split on period followed by typical radiology starters
-      const findingBoundaryRegex = /(\.|\?|!)\s+(?=(In the\b|On the\b|There is\b|There are\b|No evidence of\b|Note is made of\b|No significant\b|Serial axial\b|The [a-z]+|Visualized [a-z]+|Impression:|Clinical Profile:|Finding \d|Point \d|First finding|Second finding|Third finding|Next finding|Also\b|Lungs\b|Heart\b|Brain\b|Liver\b|Spleen\b|Kidneys\b|Pancreas\b|Bones\b|Spine\b|Ventricles\b|C\.P\. Angles\b|Basal cisterns\b|Sella\b|Midline\b))/gi;
-
-      const subSegments = line.replace(findingBoundaryRegex, '$1\n').split('\n').map(s => s.trim()).filter(Boolean);
-
-      for (const segment of subSegments) {
-        if (!segment) continue;
-
-        let formatted = segment;
-        if (formatted.startsWith('BOLD::')) {
-          const rest = formatted.slice(6).trim();
-          formatted = `BOLD::${rest ? rest.charAt(0).toUpperCase() + rest.slice(1) : ''}`;
-        } else if (formatted.startsWith('*')) {
-          const rest = formatted.slice(1).trim();
-          formatted = `*${rest ? rest.charAt(0).toUpperCase() + rest.slice(1) : ''}`;
-        } else if (formatted.toUpperCase().startsWith('IMPRESSION:')) {
-          formatted = formatted.toUpperCase();
-        } else {
-          formatted = `BOLD::${formatted.charAt(0).toUpperCase() + formatted.slice(1)}`;
-        }
-        resultLines.push(formatted);
-      }
-    }
-  }
-
-  return resultLines;
+interface LiveHistorySnapshot {
+  findings: string[];
+  deletedItems: string[];
+  timestamp: number;
 }
 
-const responseSchema = {
-  type: Type.OBJECT,
-  properties: {
-    findings: {
-      type: Type.ARRAY,
-      items: { type: Type.STRING },
-      description: "Array of transcribed medical finding lines."
+/**
+ * Computes energy and Voice Activity Detection (VAD) metrics for a PCM sample range.
+ */
+export interface AudioEnergyAnalysis {
+  rms: number;
+  peak: number;
+  speechRatio: number;
+  hasSpeech: boolean;
+}
+
+export function analyzePcmEnergy(
+  pcmChunks: Int16Array[],
+  startSample: number,
+  endSample: number,
+  speechThreshold: number = 420,
+  minSpeechRatio: number = 0.035
+): AudioEnergyAnalysis {
+  let totalAvailable = 0;
+  for (const c of pcmChunks) totalAvailable += c.length;
+
+  const clampedStart = Math.max(0, Math.min(startSample, totalAvailable));
+  const clampedEnd = Math.max(clampedStart, Math.min(endSample, totalAvailable));
+  const totalSamples = clampedEnd - clampedStart;
+
+  if (totalSamples <= 0) {
+    return { rms: 0, peak: 0, speechRatio: 0, hasSpeech: false };
+  }
+
+  let sumSquares = 0;
+  let peak = 0;
+  let speechSamplesCount = 0;
+
+  let runningSampleIdx = 0;
+  for (const chunk of pcmChunks) {
+    const chunkLen = chunk.length;
+    const chunkStart = runningSampleIdx;
+    const chunkEnd = runningSampleIdx + chunkLen;
+
+    if (chunkEnd > clampedStart && chunkStart < clampedEnd) {
+      const takeStart = Math.max(0, clampedStart - chunkStart);
+      const takeEnd = Math.min(chunkLen, clampedEnd - chunkStart);
+      for (let i = takeStart; i < takeEnd; i++) {
+        const val = chunk[i];
+        const absVal = Math.abs(val);
+        if (absVal > peak) peak = absVal;
+        sumSquares += val * val;
+        if (absVal >= speechThreshold) {
+          speechSamplesCount++;
+        }
+      }
+    }
+    runningSampleIdx += chunkLen;
+    if (runningSampleIdx >= clampedEnd) break;
+  }
+
+  const rms = Math.sqrt(sumSquares / totalSamples);
+  const speechRatio = speechSamplesCount / totalSamples;
+  // Speech is present if speech frames ratio exceeds minimum threshold OR if RMS & peak indicate human vocalization
+  const hasSpeech = (speechRatio >= minSpeechRatio && peak >= 1200) || (rms >= 500 && peak >= 2200);
+
+  return { rms, peak, speechRatio, hasSpeech };
+}
+
+/**
+ * Convert recorded Int16Array PCM chunks into standard 16kHz 16-bit Mono WAV Blob
+ */
+export function pcmToWavBlob(pcmChunks: Int16Array[], sampleRate = 16000): Blob {
+  let totalSamples = 0;
+  for (const chunk of pcmChunks) {
+    totalSamples += chunk.length;
+  }
+  const buffer = new ArrayBuffer(44 + totalSamples * 2);
+  const view = new DataView(buffer);
+
+  const writeString = (offset: number, str: string) => {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  };
+
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + totalSamples * 2, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // Mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(36, 'data');
+  view.setUint32(40, totalSamples * 2, true);
+
+  let offset = 44;
+  for (const chunk of pcmChunks) {
+    for (let i = 0; i < chunk.length; i++, offset += 2) {
+      view.setInt16(offset, chunk[i], true);
     }
   }
-};
+
+  return new Blob([buffer], { type: 'audio/wav' });
+}
+
+/**
+ * Slice an exact sample range from the recorded 16kHz PCM chunks and output a valid Mono 16-bit WAV Blob
+ */
+export function pcmRangeToWavBlob(
+  pcmChunks: Int16Array[],
+  startSample: number,
+  endSample: number,
+  sampleRate = 16000
+): Blob {
+  let totalAvailable = 0;
+  for (const c of pcmChunks) totalAvailable += c.length;
+
+  const clampedStart = Math.max(0, Math.min(startSample, totalAvailable));
+  const clampedEnd = Math.max(clampedStart, Math.min(endSample, totalAvailable));
+  const numSamples = clampedEnd - clampedStart;
+
+  const buffer = new ArrayBuffer(44 + numSamples * 2);
+  const view = new DataView(buffer);
+
+  const writeString = (offset: number, str: string) => {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  };
+
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + numSamples * 2, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // Mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(36, 'data');
+  view.setUint32(40, numSamples * 2, true);
+
+  let outOffset = 44;
+  let runningSampleIdx = 0;
+
+  for (const chunk of pcmChunks) {
+    const chunkLen = chunk.length;
+    const chunkStart = runningSampleIdx;
+    const chunkEnd = runningSampleIdx + chunkLen;
+
+    if (chunkEnd > clampedStart && chunkStart < clampedEnd) {
+      const takeStart = Math.max(0, clampedStart - chunkStart);
+      const takeEnd = Math.min(chunkLen, clampedEnd - chunkStart);
+      for (let i = takeStart; i < takeEnd; i++) {
+        view.setInt16(outOffset, chunk[i], true);
+        outOffset += 2;
+      }
+    }
+    runningSampleIdx += chunkLen;
+    if (runningSampleIdx >= clampedEnd) break;
+  }
+
+  return new Blob([buffer], { type: 'audio/wav' });
+}
 
 export const useLiveSession = () => {
   const [status, setStatus] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
   const [isSessionActive, setIsSessionActive] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
+  const [audioLevel, setAudioLevel] = useState<number>(0);
 
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
-  const mimeTypeRef = useRef<string>('audio/webm');
-  const timerRef = useRef<NodeJS.Timeout | null>(null);
-  const recognitionRef = useRef<any>(null);
-  const activePromptRef = useRef<string>('');
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const recordedPcmChunksRef = useRef<Int16Array[]>([]);
   const onTranscriptUpdateRef = useRef<((lines: string[]) => void) | null>(null);
-  const isProcessingRef = useRef<boolean>(false);
-
+  const isSessionActiveRef = useRef<boolean>(false);
   const isPausedRef = useRef(isPaused);
+
+  // Progressive Low-Latency Flash Chunking Engine state
+  const sessionStartTimeRef = useRef<number>(0);
+  const accumulatedPauseDurationRef = useRef<number>(0);
+  const pauseStartTimeRef = useRef<number>(0);
+  const totalSamplesCountRef = useRef<number>(0);
+  const lastProcessedSampleRef = useRef<number>(0);
+  const currentChunkIndexRef = useRef<number>(0);
+  const isProcessingChunkRef = useRef<boolean>(false);
+  const schedulerIntervalRef = useRef<any>(null);
+  const selectedModelRef = useRef<string>('gemini-3.7-flash');
+  const customPromptRef = useRef<string>('');
+
+  // Voice Activity & Silence Gating state (VAD)
+  const lastSpeechTimestampRef = useRef<number>(0);
+  const speechDetectedInWindowRef = useRef<boolean>(false);
+
+  // Findings state: purely authoritative findings returned by Gemini model
+  const committedFindingsRef = useRef<string[]>([]);
+  // Last findings dispatched to Gemini in an active in-flight chunk
+  const lastDispatchedFindingsRef = useRef<string[]>([]);
+  // Version counter for manual edits by user (incremented on each manual edit/reorder/merge/delete)
+  const userEditVersionRef = useRef<number>(0);
+  // Version snapshot at the start of current in-flight chunk
+  const chunkStartVersionRef = useRef<number>(0);
+  // Deletion / edit history stack for voice undo / revert ("revert it back", "undo delete", etc.)
+  const historyStackRef = useRef<LiveHistorySnapshot[]>([]);
+  // Recently deleted items
+  const lastDeletedItemsRef = useRef<string[]>([]);
+
   useEffect(() => {
     isPausedRef.current = isPaused;
   }, [isPaused]);
 
-  const stopAudio = useCallback(() => {
-    if (timerRef.current) {
-      clearInterval(timerRef.current);
-      timerRef.current = null;
+  useEffect(() => {
+    isSessionActiveRef.current = isSessionActive;
+  }, [isSessionActive]);
+
+  // Synchronize state from UI manual edits, deletions, reorders, or merges
+  const syncFindings = useCallback((updatedFindings: string[]) => {
+    // Record history snapshot if findings were deleted or modified
+    if (committedFindingsRef.current.length > 0) {
+      const deleted = committedFindingsRef.current.filter(item => !updatedFindings.includes(item));
+      if (deleted.length > 0) {
+        lastDeletedItemsRef.current = deleted;
+      }
+      historyStackRef.current.push({
+        findings: [...committedFindingsRef.current],
+        deletedItems: deleted,
+        timestamp: Date.now(),
+      });
+      if (historyStackRef.current.length > 20) {
+        historyStackRef.current.shift();
+      }
     }
-    if (recognitionRef.current) {
-      try { recognitionRef.current.stop(); } catch (e) {}
-      recognitionRef.current = null;
-    }
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      try { mediaRecorderRef.current.stop(); } catch (e) {}
-      mediaRecorderRef.current = null;
-    }
-    streamRef.current?.getTracks().forEach(track => track.stop());
-    streamRef.current = null;
+    userEditVersionRef.current += 1;
+    committedFindingsRef.current = [...updatedFindings];
   }, []);
 
-  const processAudioWithGemini = useCallback(async (currentAudioBlob: Blob, customPrompt?: string) => {
-    if (isProcessingRef.current || currentAudioBlob.size < 500) return;
-    isProcessingRef.current = true;
+  // Synchronize custom instructions or template prompt from UI dynamically
+  const syncCustomPrompt = useCallback((prompt: string) => {
+    customPromptRef.current = prompt || '';
+  }, []);
+
+  const emitFindings = useCallback(() => {
+    if (!onTranscriptUpdateRef.current) return;
+    onTranscriptUpdateRef.current([...committedFindingsRef.current]);
+  }, []);
+
+  /**
+   * Dispatches a slice of recorded audio to Gemini Flash model (e.g. gemini-3.7-flash)
+   * with complete medical prompt and previous dictation text for seamless context continuation.
+   * Performs local VAD validation to ensure silence/noise is never sent to the model.
+   */
+  const dispatchLiveChunk = useCallback(async (startSample: number, endSample: number, chunkIdx: number) => {
+    if (isProcessingChunkRef.current) return;
+
+    // Acoustic Voice Activity Verification before dispatching API call
+    const vadMetrics = analyzePcmEnergy(recordedPcmChunksRef.current, startSample, endSample);
+    if (!vadMetrics.hasSpeech) {
+      // Pure silence or ambient room sound — advance without invoking Gemini to prevent hallucinations
+      lastProcessedSampleRef.current = endSample;
+      currentChunkIndexRef.current = chunkIdx + 1;
+      setStatus(`🎙️ Ambient room silence filtered. Listening for clinical speech...`);
+      return;
+    }
+
+    isProcessingChunkRef.current = true;
+
+    const modelName = selectedModelRef.current || 'gemini-3.7-flash';
+    const timeLabel = chunkIdx === 0 ? '0s-5s' : chunkIdx === 1 ? '0s-10s' : `${Math.round(startSample / 16000)}s-${Math.round(endSample / 16000)}s`;
+    setStatus(`⚡ Transcribing [${timeLabel}] with ${modelName}...`);
+
+    const chunkBlob = pcmRangeToWavBlob(recordedPcmChunksRef.current, startSample, endSample, 16000);
+
+    // Record baseline and version snapshot for in-flight conflict protection
+    chunkStartVersionRef.current = userEditVersionRef.current;
+    lastDispatchedFindingsRef.current = [...committedFindingsRef.current];
+
+    const historyContext: LiveHistoryContext = {
+      previousState: historyStackRef.current.length > 0
+        ? historyStackRef.current[historyStackRef.current.length - 1].findings
+        : [],
+      deletedItems: lastDeletedItemsRef.current || [],
+    };
 
     try {
-      const reader = new FileReader();
-      const base64Promise = new Promise<string>((resolve, reject) => {
-        reader.onloadend = () => {
-          const res = reader.result as string;
-          resolve(res.split(',')[1] || '');
-        };
-        reader.onerror = reject;
-        reader.readAsDataURL(currentAudioBlob);
-      });
+      const result = await processLiveAudioChunk(
+        chunkBlob,
+        modelName,
+        committedFindingsRef.current,
+        chunkIdx,
+        customPromptRef.current,
+        (failedModel, nextModel, reason) => {
+          setStatus(`⚡ Auto-failover: ${failedModel} failed (${reason}) — switching to subsequent model ${nextModel}...`);
+        },
+        historyContext
+      );
 
-      const base64Audio = await base64Promise;
-      if (!base64Audio) return;
+      const updatedFindings = Array.isArray(result) ? result : result.findings;
+      const activeModel = Array.isArray(result) ? modelName : (result.activeModel || modelName);
 
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-
-      let systemPrompt = LIVE_DICTATION_FLASH_LITE_PROMPT;
-      if (customPrompt) {
-        systemPrompt += `\n\nCustom Instructions:\n${customPrompt}`;
+      if (activeModel !== selectedModelRef.current) {
+        selectedModelRef.current = activeModel;
       }
 
-      const response = await ai.models.generateContent({
-        model: GEMINI_FLASH_LITE_MODEL,
-        contents: {
-          parts: [
-            { text: systemPrompt },
-            {
-              inlineData: {
-                mimeType: currentAudioBlob.type || 'audio/webm',
-                data: base64Audio,
+      if (Array.isArray(updatedFindings)) {
+        const userEditedDuringInFlight = userEditVersionRef.current > chunkStartVersionRef.current;
+
+        if (userEditedDuringInFlight) {
+          // Manual edit/reorder/merge occurred WHILE this chunk was being processed!
+          // Strictly protect user's manual modifications from being clobbered:
+          const baseline = lastDispatchedFindingsRef.current;
+          const baselineSet = new Set(baseline);
+          // Extract only genuinely newly spoken findings generated by the audio
+          const newlyAddedFindings = updatedFindings.filter(f => !baselineSet.has(f));
+
+          if (newlyAddedFindings.length > 0) {
+            committedFindingsRef.current = [...committedFindingsRef.current, ...newlyAddedFindings];
+          }
+          emitFindings();
+        } else {
+          // Normal flow: track deletion history if Gemini deleted or removed items
+          if (committedFindingsRef.current.length > 0) {
+            const deleted = committedFindingsRef.current.filter(item => !updatedFindings.includes(item));
+            if (deleted.length > 0) {
+              lastDeletedItemsRef.current = deleted;
+              historyStackRef.current.push({
+                findings: [...committedFindingsRef.current],
+                deletedItems: deleted,
+                timestamp: Date.now(),
+              });
+              if (historyStackRef.current.length > 20) {
+                historyStackRef.current.shift();
               }
             }
-          ]
-        },
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: responseSchema,
-        }
-      });
-
-      const jsonString = response.text;
-      if (jsonString) {
-        const cleaned = jsonString.replace(/^```json\s*|```\s*$/g, '').trim();
-        const parsed = JSON.parse(cleaned);
-        if (parsed && Array.isArray(parsed.findings)) {
-          const formatted = processLiveTranscript(parsed.findings);
-          if (onTranscriptUpdateRef.current && formatted.length > 0) {
-            onTranscriptUpdateRef.current(formatted);
           }
+          committedFindingsRef.current = updatedFindings;
+          emitFindings();
         }
       }
-    } catch (err) {
-      console.warn("Live dictation processing chunk error:", err);
+
+      lastProcessedSampleRef.current = endSample;
+      currentChunkIndexRef.current = chunkIdx + 1;
+      setStatus(`🎙️ Live Dictation active (${Math.round(endSample / 16000)}s elapsed with ${activeModel}). Listening...`);
+    } catch (err: any) {
+      console.warn(`Live chunk #${chunkIdx + 1} processing issue:`, err);
+      // Keep lastProcessedSampleRef untouched so subsequent interval recovers the audio
     } finally {
-      isProcessingRef.current = false;
+      isProcessingChunkRef.current = false;
     }
+  }, [emitFindings]);
+
+
+
+  const stopAudio = useCallback(() => {
+    isSessionActiveRef.current = false;
+
+    // Clear progressive chunk scheduler
+    if (schedulerIntervalRef.current) {
+      clearInterval(schedulerIntervalRef.current);
+      schedulerIntervalRef.current = null;
+    }
+
+    // Disconnect script processor
+    if (scriptProcessorRef.current) {
+      try {
+        scriptProcessorRef.current.disconnect();
+      } catch (e) {}
+      scriptProcessorRef.current = null;
+    }
+
+    // Close AudioContext
+    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+      try {
+        audioContextRef.current.close();
+      } catch (e) {}
+      audioContextRef.current = null;
+    }
+
+    // Stop MediaStream tracks
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach(t => {
+        try { t.stop(); } catch (e) {}
+      });
+      mediaStreamRef.current = null;
+    }
+
+    setAudioLevel(0);
   }, []);
 
   const startSession = useCallback(async (
     onTranscriptUpdate: (lines: string[]) => void,
-    customPrompt?: string
+    customPrompt?: string,
+    model: string = 'gemini-3.7-flash'
   ) => {
+    stopRepeatingInterruptedAlert();
     stopAudio();
     setError(null);
-    setStatus('Connecting live session with Gemini 3.5 Flash-Lite...');
-    audioChunksRef.current = [];
-    activePromptRef.current = customPrompt || '';
+    setStatus(`Initializing microphone stream for low-latency ${model}...`);
+    recordedPcmChunksRef.current = [];
+    committedFindingsRef.current = [];
+    lastDispatchedFindingsRef.current = [];
+    userEditVersionRef.current = 0;
+    chunkStartVersionRef.current = 0;
+    historyStackRef.current = [];
+    lastDeletedItemsRef.current = [];
+    totalSamplesCountRef.current = 0;
+    lastProcessedSampleRef.current = 0;
+    currentChunkIndexRef.current = 0;
+    isProcessingChunkRef.current = false;
+    lastSpeechTimestampRef.current = 0;
+    speechDetectedInWindowRef.current = false;
+    sessionStartTimeRef.current = Date.now();
+    accumulatedPauseDurationRef.current = 0;
+    pauseStartTimeRef.current = 0;
+    selectedModelRef.current = model || 'gemini-3.7-flash';
+    customPromptRef.current = customPrompt || '';
     onTranscriptUpdateRef.current = onTranscriptUpdate;
     onTranscriptUpdate([]);
     setIsPaused(false);
+    setIsSessionActive(true);
+    isSessionActiveRef.current = true;
 
+    // Unlock audio context for potential interruption alert
+    unlockAudioContext();
+
+    // 1. Setup AudioContext and Audio Analyzer for live volume visualizer and 16kHz WAV recording
+    let stream: MediaStream | null = null;
     try {
-      if (streamRef.current) {
-        try { streamRef.current.getTracks().forEach(t => t.stop()); } catch (e) {}
-        streamRef.current = null;
+      const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
+      const audioCtx = new AudioCtxClass({ sampleRate: 16000 });
+      audioContextRef.current = audioCtx;
+
+      if (audioCtx.state === 'suspended') {
+        await audioCtx.resume();
       }
 
-      let stream: MediaStream | null = null;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
           audio: {
+            channelCount: 1,
+            sampleRate: 16000,
             echoCancellation: true,
             noiseSuppression: true,
             autoGainControl: true,
           }
         });
-      } catch (firstErr) {
-        console.warn("Live dictation getUserMedia attempt 1 failed, retrying basic constraint:", firstErr);
-        await new Promise(r => setTimeout(r, 150));
+      } catch (err1) {
         stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       }
 
-      streamRef.current = stream;
+      mediaStreamRef.current = stream;
 
-      const supportedTypes = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg', 'audio/mp4'];
-      const supportedMime = supportedTypes.find(type => MediaRecorder.isTypeSupported(type)) || 'audio/webm';
-      mimeTypeRef.current = supportedMime;
+      // Monitor for unexpected microphone disconnection or hardware muting
+      stream.getAudioTracks().forEach(track => {
+        track.addEventListener('ended', () => {
+          if (isSessionActiveRef.current) {
+            startRepeatingInterruptedAlert(10000);
+            setError('Microphone was disconnected or turned off.');
+            setIsSessionActive(false);
+            isSessionActiveRef.current = false;
+            stopAudio();
+          }
+        });
+        track.addEventListener('mute', () => {
+          if (isSessionActiveRef.current) {
+            startRepeatingInterruptedAlert(10000);
+            setError('Microphone was muted by OS or hardware.');
+            setIsSessionActive(false);
+            isSessionActiveRef.current = false;
+            stopAudio();
+          }
+        });
+      });
 
-      const mediaRecorder = new MediaRecorder(stream, { mimeType: supportedMime });
-      mediaRecorderRef.current = mediaRecorder;
+      const source = audioCtx.createMediaStreamSource(stream);
+      const scriptProcessor = audioCtx.createScriptProcessor(2048, 1, 1);
+      scriptProcessorRef.current = scriptProcessor;
 
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data && event.data.size > 0) {
-          audioChunksRef.current.push(event.data);
+      scriptProcessor.onaudioprocess = (e) => {
+        if (isPausedRef.current) return;
+
+        const inputData = e.inputBuffer.getChannelData(0);
+        
+        // Calculate audio RMS volume level and detect human vocal presence
+        let sum = 0;
+        let peak = 0;
+        for (let i = 0; i < inputData.length; i++) {
+          const sample = inputData[i];
+          const absVal = Math.abs(sample);
+          if (absVal > peak) peak = absVal;
+          sum += sample * sample;
         }
+        const rms = Math.sqrt(sum / inputData.length);
+        const level = Math.min(100, Math.round(rms * 450));
+        setAudioLevel(level);
+
+        // Vocal presence detection: human speech typically has peak > 0.035 and rms > 0.012
+        if (peak > 0.035 || rms > 0.012) {
+          lastSpeechTimestampRef.current = Date.now();
+          speechDetectedInWindowRef.current = true;
+        }
+
+        // Convert Float32 to 16-bit linear PCM
+        const pcm16 = new Int16Array(inputData.length);
+        for (let i = 0; i < inputData.length; i++) {
+          const s = Math.max(-1, Math.min(1, inputData[i]));
+          pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+
+        // Save recorded PCM chunk for slice sending & final WAV generation
+        recordedPcmChunksRef.current.push(pcm16);
+        totalSamplesCountRef.current += pcm16.length;
       };
 
-      mediaRecorder.start(500);
-      setIsSessionActive(true);
-      setStatus('⚡ Live (Gemini 3.5 Flash-Lite). Listening...');
+      source.connect(scriptProcessor);
+      scriptProcessor.connect(audioCtx.destination);
+    } catch (audioErr: any) {
+      console.warn('Audio capture setup notice:', audioErr);
+      setError('Microphone permission required for Live Dictation. Please allow microphone access.');
+    }
 
-      // Setup periodic Gemini 3.5 Flash-Lite AI processing every 1.5s
-      timerRef.current = setInterval(() => {
-        if (!isPausedRef.current && audioChunksRef.current.length > 0) {
-          const currentBlob = new Blob(audioChunksRef.current, { type: mimeTypeRef.current });
-          processAudioWithGemini(currentBlob, activePromptRef.current);
-        }
-      }, 1500);
-
-      // Web Speech API fallback for instant character-by-character preview
-      const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-      if (SpeechRecognition) {
-        const recognition = new SpeechRecognition();
-        recognition.continuous = true;
-        recognition.interimResults = true;
-
-        recognition.onresult = (event: any) => {
-          if (isPausedRef.current) return;
-          let speechText = '';
-          for (let i = event.resultIndex; i < event.results.length; ++i) {
-            speechText += event.results[i][0].transcript;
-          }
-          if (speechText.trim() && !isProcessingRef.current) {
-            const formattedInterim = processLiveTranscript(speechText);
-            if (onTranscriptUpdateRef.current && formattedInterim.length > 0) {
-              onTranscriptUpdateRef.current(formattedInterim);
-            }
-          }
-        };
-
-        recognition.onerror = (event: any) => {
-          console.warn("Speech recognition warning:", event.error);
-        };
-
-        recognition.onend = () => {
-          if (streamRef.current && !isPausedRef.current) {
-            try { recognition.start(); } catch (e) {}
-          }
-        };
-
-        try { recognition.start(); } catch (e) {}
-        recognitionRef.current = recognition;
+    // 2. Start Progressive Semantic Chunking Scheduler
+    // Evaluates every 200ms for semantic thought boundaries (e.g. pauses)
+    // or duration thresholds to guarantee low latency without arbitrary mid-sentence cuts.
+    schedulerIntervalRef.current = setInterval(() => {
+      if (!isSessionActiveRef.current || isPausedRef.current || isProcessingChunkRef.current) {
+        return;
       }
 
-    } catch (err) {
-      console.error("Failed to start live session:", err);
-      const msg = err instanceof Error ? err.message : 'Microphone access denied or not supported.';
-      setError(`Error starting live dictation: ${msg}`);
-      setStatus('Session failed.');
-      stopAudio();
-      setIsSessionActive(false);
-    }
-  }, [stopAudio, processAudioWithGemini]);
+      const totalSamples = totalSamplesCountRef.current;
+      const unprocessedSamples = totalSamples - lastProcessedSampleRef.current;
+      const unprocessedSec = unprocessedSamples / 16000;
+
+      // Ensure at least 2.0s of audio has accumulated before attempting dispatch
+      if (unprocessedSec < 2.0) {
+        return;
+      }
+
+      const chunkIdx = currentChunkIndexRef.current;
+      const hasSpeechInWindow = speechDetectedInWindowRef.current;
+      const timeSinceSpeech = Date.now() - lastSpeechTimestampRef.current;
+
+      let shouldProcess = false;
+
+      if (hasSpeechInWindow) {
+        // Speech was detected in this segment.
+        // Trigger condition:
+        // 1. Natural clause/sentence boundary: doctor finished speaking and paused for >= 750ms, with >= 2.5s audio
+        // 2. OR sustained speech length reached >= 7.5s (to keep display updated progressively)
+        if ((timeSinceSpeech >= 750 && unprocessedSec >= 2.5) || unprocessedSec >= 7.5) {
+          shouldProcess = true;
+        }
+      } else {
+        // No speech detected in this window (pure silence or idle room hum)
+        // If 5.0 seconds of silence have elapsed, advance pointer without making API call
+        if (unprocessedSec >= 5.0) {
+          lastProcessedSampleRef.current = totalSamples;
+          setStatus(`🎙️ Ambient room silence filtered. Listening for radiology dictation...`);
+          return;
+        }
+      }
+
+      if (shouldProcess && unprocessedSamples > 0) {
+        speechDetectedInWindowRef.current = false;
+        // 0.25s (4000 samples) phonetic overlap buffer for natural word boundary continuity
+        const startSample = chunkIdx === 0 ? 0 : Math.max(0, lastProcessedSampleRef.current - 4000);
+        const endSample = totalSamples;
+
+        dispatchLiveChunk(startSample, endSample, chunkIdx);
+      }
+    }, 200);
+
+    setStatus(`🎙️ Live Dictation active (${model}). Speak clearly...`);
+  }, [stopAudio, dispatchLiveChunk]);
 
   const pauseSession = useCallback(() => {
     setIsPaused(true);
-    setStatus('Live session paused.');
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-      try { mediaRecorderRef.current.pause(); } catch (e) {}
+    pauseStartTimeRef.current = Date.now();
+    setStatus('Live dictation paused.');
+    if (audioContextRef.current && audioContextRef.current.state === 'running') {
+      try { audioContextRef.current.suspend(); } catch (e) {}
     }
-    if (recognitionRef.current) {
-      try { recognitionRef.current.stop(); } catch (e) {}
-    }
+    setAudioLevel(0);
   }, []);
 
   const resumeSession = useCallback(() => {
-    setIsPaused(false);
-    setStatus('⚡ Live (Gemini 3.5 Flash-Lite). Listening...');
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'paused') {
-      try { mediaRecorderRef.current.resume(); } catch (e) {}
+    if (pauseStartTimeRef.current > 0) {
+      accumulatedPauseDurationRef.current += Date.now() - pauseStartTimeRef.current;
+      pauseStartTimeRef.current = 0;
     }
-    if (recognitionRef.current) {
-      try { recognitionRef.current.start(); } catch (e) {}
+    setIsPaused(false);
+    setStatus(`🎙️ Live Dictation Active (${selectedModelRef.current}). Listening...`);
+    if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
+      try { audioContextRef.current.resume(); } catch (e) {}
     }
   }, []);
 
-  const stopSession = useCallback(() => {
-    setStatus('Finalizing live transcription...');
+  const stopSession = useCallback(async () => {
     setIsSessionActive(false);
+    isSessionActiveRef.current = false;
     setIsPaused(false);
 
+    if (schedulerIntervalRef.current) {
+      clearInterval(schedulerIntervalRef.current);
+      schedulerIntervalRef.current = null;
+    }
+
+    // Wait if a chunk is currently in flight
+    if (isProcessingChunkRef.current) {
+      setStatus('Finalizing active audio clause...');
+      let waitCount = 0;
+      while (isProcessingChunkRef.current && waitCount < 30) {
+        await new Promise(r => setTimeout(r, 100));
+        waitCount++;
+      }
+    }
+
+    // Process any remaining un-sent audio segment (> 0.8s) ONLY if speech is detected
+    const totalSamples = totalSamplesCountRef.current;
+    const unprocessedSamples = totalSamples - lastProcessedSampleRef.current;
+
+    if (unprocessedSamples > 12000 && recordedPcmChunksRef.current.length > 0) {
+      const startSample = Math.max(0, lastProcessedSampleRef.current - 4000);
+      const endSample = totalSamples;
+      const vadMetrics = analyzePcmEnergy(recordedPcmChunksRef.current, startSample, endSample);
+
+      if (vadMetrics.hasSpeech) {
+        setStatus(`Finalizing remaining clinical speech with ${selectedModelRef.current || 'gemini-3.7-flash'}...`);
+        const finalChunkBlob = pcmRangeToWavBlob(recordedPcmChunksRef.current, startSample, endSample, 16000);
+
+        const historyContext: LiveHistoryContext = {
+          previousState: historyStackRef.current.length > 0
+            ? historyStackRef.current[historyStackRef.current.length - 1].findings
+            : [],
+          deletedItems: lastDeletedItemsRef.current || [],
+        };
+
+        try {
+          const finalResult = await processLiveAudioChunk(
+            finalChunkBlob,
+            selectedModelRef.current || 'gemini-3.7-flash',
+            committedFindingsRef.current,
+            currentChunkIndexRef.current,
+            customPromptRef.current,
+            (failedModel, nextModel) => {
+              setStatus(`⚡ Finalizing: Switched to ${nextModel}...`);
+            },
+            historyContext
+          );
+          const finalFindings = Array.isArray(finalResult) ? finalResult : finalResult.findings;
+          if (Array.isArray(finalFindings) && finalFindings.length > 0) {
+            committedFindingsRef.current = finalFindings;
+          }
+        } catch (e) {
+          console.warn('Final audio chunk processing notice:', e);
+        }
+      }
+    }
+
+    // Comprehensive Holistic Synthesis Pass:
+    // Review entire report end-to-end to eliminate redundancies across chunk boundaries,
+    // standardize anatomical terminology, and construct a cohesive, authoritative IMPRESSION.
+    if (committedFindingsRef.current.length > 0) {
+      setStatus(`Harmonizing and reviewing comprehensive radiology report with ${selectedModelRef.current}...`);
+      try {
+        const synthesizedReport = await synthesizeLiveReport(
+          committedFindingsRef.current,
+          selectedModelRef.current || 'gemini-3.7-flash',
+          customPromptRef.current
+        );
+        if (Array.isArray(synthesizedReport) && synthesizedReport.length > 0) {
+          committedFindingsRef.current = synthesizedReport;
+        }
+      } catch (synthErr) {
+        console.warn('Final report synthesis notice:', synthErr);
+      }
+    }
+
+    emitFindings();
+
+    // Create high-fidelity 16kHz WAV Blob from all recorded PCM chunks
     let finalAudioBlob: Blob | null = null;
-    if (audioChunksRef.current.length > 0) {
-      finalAudioBlob = new Blob(audioChunksRef.current, { type: mimeTypeRef.current });
+    if (recordedPcmChunksRef.current.length > 0) {
+      finalAudioBlob = pcmToWavBlob(recordedPcmChunksRef.current, 16000);
     }
 
     stopAudio();
+    stopRepeatingInterruptedAlert();
+    setStatus('Live dictation complete.');
 
     return {
-      transcript: '',
+      transcript: committedFindingsRef.current.join('\n'),
       audioBlob: finalAudioBlob,
     };
-  }, [stopAudio]);
+  }, [stopAudio, emitFindings]);
 
   useEffect(() => {
     return () => {
       stopAudio();
+      stopRepeatingInterruptedAlert();
     };
   }, [stopAudio]);
 
@@ -329,10 +722,14 @@ export const useLiveSession = () => {
     error,
     isSessionActive,
     isPaused,
-    activeModel: GEMINI_FLASH_LITE_MODEL,
+    audioLevel,
     startSession,
     stopSession,
     pauseSession,
     resumeSession,
+    syncFindings,
+    syncCustomPrompt,
   };
 };
+
+
