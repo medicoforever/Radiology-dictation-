@@ -566,7 +566,7 @@ const getHTMLTemplate = (title: string, content: string): string => `
             ${content}
         </main>
         <footer class="text-center mt-8 text-sm text-slate-500">
-          <p>Generated from Radiology Dictation Corrector</p>
+          <p>Generated from ☯️RADDOC's Dictation app</p>
         </footer>
     </div>
     

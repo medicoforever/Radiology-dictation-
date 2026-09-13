@@ -1,9 +1,13 @@
 import React, { useState, useCallback, useEffect } from 'react';
 import { useLiveSession } from '../hooks/useLiveSession';
 import WaveformIcon from './icons/WaveformIcon';
+import WarningIcon from './icons/WarningIcon';
+import DownloadIcon from './icons/DownloadIcon';
 import ResultsDisplay from './ResultsDisplay';
 import CustomPromptInput from './ui/CustomPromptInput';
 import { DEFAULT_LIVE_MODEL, LIVE_DICTATION_MODELS, getLiveModelFallbackChain } from '../constants';
+import { getIncompleteLiveAudioSessions, recoverLiveSessionAudioAsBlob, clearSessionAudioCache } from '../services/audioCacheService';
+import { triggerAudioDownload } from '../services/audioMerger';
 
 interface LiveDictationProps {
     onComplete: (transcript: string, audioBlob: Blob | null) => void;
@@ -14,6 +18,17 @@ const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack }) => 
     const [findings, setFindings] = useState<string[]>([]);
     const [customPrompt, setCustomPrompt] = useState('');
     const [selectedModel, setSelectedModel] = useState<string>(DEFAULT_LIVE_MODEL || 'gemini-3.7-flash');
+    const [interruptedSession, setInterruptedSession] = useState<{ sessionId: string; createdAt: number; totalChunks: number } | null>(null);
+    const [isRecovering, setIsRecovering] = useState(false);
+
+    useEffect(() => {
+        getIncompleteLiveAudioSessions().then(sessions => {
+            if (sessions && sessions.length > 0) {
+                const sorted = sessions.sort((a, b) => b.updatedAt - a.updatedAt);
+                setInterruptedSession(sorted[0]);
+            }
+        }).catch(() => {});
+    }, []);
 
     const {
         status,
@@ -45,6 +60,51 @@ const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack }) => 
         onComplete(transcript, audioBlob);
     }, [stopSession, onComplete]);
 
+    const handleDownloadRecovered = async () => {
+        if (!interruptedSession) return;
+        setIsRecovering(true);
+        try {
+            const blob = await recoverLiveSessionAudioAsBlob(interruptedSession.sessionId);
+            if (blob) {
+                triggerAudioDownload(blob, `recovered-live-session-${new Date(interruptedSession.createdAt).toLocaleTimeString().replace(/:/g, '-')}`);
+            }
+        } finally {
+            setIsRecovering(false);
+        }
+    };
+
+    const handleRestoreAndProcess = async () => {
+        if (!interruptedSession) return;
+        setIsRecovering(true);
+        try {
+            const blob = await recoverLiveSessionAudioAsBlob(interruptedSession.sessionId);
+            await clearSessionAudioCache(interruptedSession.sessionId);
+            setInterruptedSession(null);
+            if (blob) {
+                onComplete('', blob);
+            }
+        } finally {
+            setIsRecovering(false);
+        }
+    };
+
+    const handleDiscardRecovered = async () => {
+        if (!interruptedSession) return;
+        await clearSessionAudioCache(interruptedSession.sessionId);
+        setInterruptedSession(null);
+    };
+
+    const handleSafeBack = useCallback(async () => {
+        if (isSessionActive) {
+            const { transcript, audioBlob } = await stopSession();
+            if (audioBlob || transcript) {
+                onComplete(transcript, audioBlob);
+                return;
+            }
+        }
+        onBack();
+    }, [isSessionActive, stopSession, onComplete, onBack]);
+
     const handleUpdateFinding = useCallback((index: number, newText: string) => {
         setFindings(prevFindings => {
             const newFindings = [...prevFindings];
@@ -64,6 +124,45 @@ const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack }) => 
     if (!isSessionActive) {
         return (
             <div className="flex flex-col items-center justify-center p-4">
+                {interruptedSession && (
+                    <div className="w-full max-w-xl mb-6 p-4 rounded-xl border border-amber-300 bg-amber-50 dark:bg-amber-900/30 dark:border-amber-700/60 shadow-sm flex flex-col gap-3 animate-in fade-in duration-200">
+                        <div className="flex items-center gap-3 text-amber-800 dark:text-amber-200">
+                            <WarningIcon className="w-6 h-6 shrink-0 text-amber-600 dark:text-amber-400" />
+                            <div>
+                                <p className="font-semibold text-sm sm:text-base">
+                                    Interrupted Live Dictation Detected
+                                </p>
+                                <p className="text-xs sm:text-sm text-amber-700 dark:text-amber-300">
+                                    Found unfinalized live session from {new Date(interruptedSession.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })} ({interruptedSession.totalChunks} audio chunks preserved in browser cache).
+                                </p>
+                            </div>
+                        </div>
+                        <div className="flex flex-wrap gap-2 pt-1 border-t border-amber-200 dark:border-amber-800/50 justify-end">
+                            <button
+                                onClick={handleDiscardRecovered}
+                                disabled={isRecovering}
+                                className="px-3 py-1.5 text-xs sm:text-sm font-medium text-slate-600 dark:text-slate-300 hover:bg-amber-100 dark:hover:bg-amber-800/40 rounded-lg transition-colors cursor-pointer"
+                            >
+                                Discard
+                            </button>
+                            <button
+                                onClick={handleDownloadRecovered}
+                                disabled={isRecovering}
+                                className="inline-flex items-center gap-1 px-3 py-1.5 text-xs sm:text-sm font-medium text-amber-800 dark:text-amber-200 bg-amber-200/60 dark:bg-amber-800/60 hover:bg-amber-200 rounded-lg transition-colors cursor-pointer"
+                            >
+                                <DownloadIcon className="w-4 h-4" />
+                                {isRecovering ? 'Saving...' : 'Save WAV Audio'}
+                            </button>
+                            <button
+                                onClick={handleRestoreAndProcess}
+                                disabled={isRecovering}
+                                className="px-4 py-1.5 text-xs sm:text-sm font-semibold text-white bg-amber-600 hover:bg-amber-700 dark:bg-amber-600 dark:hover:bg-amber-500 rounded-lg shadow transition-colors cursor-pointer"
+                            >
+                                {isRecovering ? 'Restoring...' : 'Restore & Generate Report'}
+                            </button>
+                        </div>
+                    </div>
+                )}
                 <div className="relative mb-6">
                     <div className="relative w-24 h-24 rounded-full bg-white dark:bg-slate-700 shadow-lg flex items-center justify-center">
                         <WaveformIcon className="w-10 h-10 text-emerald-600 dark:text-emerald-400 animate-pulse" />
@@ -131,14 +230,14 @@ const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack }) => 
 
                 <div className="flex flex-col sm:flex-row items-center justify-center gap-3 w-full max-w-md">
                     <button
-                        onClick={onBack}
-                        className="w-full sm:w-auto bg-slate-200 text-slate-700 font-bold py-3 px-6 rounded-xl hover:bg-slate-300 transition-colors dark:bg-slate-700 dark:text-slate-300 dark:hover:bg-slate-600 min-h-[48px] touch-manipulation"
+                        onClick={handleSafeBack}
+                        className="w-full sm:w-auto bg-slate-200 text-slate-700 font-bold py-3 px-6 rounded-xl hover:bg-slate-300 transition-colors dark:bg-slate-700 dark:text-slate-300 dark:hover:bg-slate-600 min-h-[48px] touch-manipulation cursor-pointer"
                     >
                         &larr; Back
                     </button>
                     <button
                         onClick={handleStart}
-                        className="w-full sm:w-auto flex-1 flex items-center justify-center gap-2 bg-emerald-600 text-white font-bold py-3 px-6 rounded-xl hover:bg-emerald-700 focus:outline-none focus:ring-4 focus:ring-emerald-300 transition-all shadow-md min-h-[48px] touch-manipulation"
+                        className="w-full sm:w-auto flex-1 flex items-center justify-center gap-2 bg-emerald-600 text-white font-bold py-3 px-6 rounded-xl hover:bg-emerald-700 focus:outline-none focus:ring-4 focus:ring-emerald-300 transition-all shadow-md min-h-[48px] touch-manipulation cursor-pointer"
                         aria-label="Start Live Session"
                     >
                         <WaveformIcon className="w-6 h-6" />
@@ -167,7 +266,7 @@ const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack }) => 
             onResumeLive={resumeSession}
             customPrompt={customPrompt}
             onCustomPromptChange={setCustomPrompt}
-            onReset={onBack}
+            onReset={handleSafeBack}
             audioBlob={null}
             chatHistory={[]}
             isChatting={false}

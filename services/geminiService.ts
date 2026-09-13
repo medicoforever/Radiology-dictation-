@@ -717,153 +717,259 @@ export const identifyPotentialErrors = async (findings: string[], model: string)
     }
 };
 
-export async function runAgenticAnalysis(content: string): Promise<{ finalResult: string; agenticSteps: string; enhancementText: string; }> {
-    let agenticSteps = "### Agentic Workflow Log\n\n";
-    let initialAnalyses: string[] = [];
-    let refinedAnalyses: string[] = [];
-    const DELAY_MS = 250; // Delay for sequential fallback
+// --- Complex Impression Generation Constants & Pipeline ---
+const COMPLEX_IMPRESSION_DEFAULT_MODEL = 'gemini-3.8-flash';
+const COMPLEX_IMPRESSION_FALLBACK_MODEL = 'gemini-3.7-flash';
 
-    try {
-        // --- PRIMARY PATH: PARALLEL EXECUTION ---
-        agenticSteps += "--- ATTEMPTING PARALLEL EXECUTION ---\n\n";
-        
-        // Step 1: Parallel Initial Analysis
-        agenticSteps += "--- STEP 1: Initial Analysis (Fact-Checker Agents) ---\n\n";
-        const initialPromises = Array.from({ length: 3 }, () => 
-            getAI().models.generateContent({
-                model: 'gemini-2.5-pro',
-                contents: `${INITIAL_AGENT_PROMPT}\n\n--- CONTENT TO ANALYZE ---\n\n${content}`,
-                config: { tools: [{ googleSearch: {} }] }
-            })
-        );
-        const initialResponses = await Promise.all(initialPromises);
-        initialAnalyses = initialResponses.map(res => res.text);
-        initialAnalyses.forEach((text, i) => {
-            agenticSteps += `**Agent 1.${i + 1} Output:**\n\`\`\`\n${text}\n\`\`\`\n\n`;
-        });
-
-        // Step 2: Parallel Refinement
-        agenticSteps += "--- STEP 2: Refinement (Peer Reviewer Agents) ---\n\n";
-        const refinementPromises = initialAnalyses.map(analysis => 
-            getAI().models.generateContent({
-                model: 'gemini-2.5-pro',
-                contents: `${REFINEMENT_AGENT_PROMPT}\n\n--- ORIGINAL CONTENT ---\n\n${content}\n\n--- INITIAL ANALYSIS TO REFINE ---\n\n${analysis}`,
-                config: { tools: [{ googleSearch: {} }] }
-            })
-        );
-        const refinedResponses = await Promise.all(refinementPromises);
-        refinedAnalyses = refinedResponses.map(res => res.text);
-        refinedAnalyses.forEach((text, i) => {
-            agenticSteps += `**Agent 2.${i + 1} Output:**\n\`\`\`\n${text}\n\`\`\`\n\n`;
-        });
-
-    } catch (err) {
-        // --- FALLBACK PATH: SEQUENTIAL EXECUTION ---
-        const isRateLimitError = err instanceof Error && (err.message.includes('429') || /rate limit/i.test(err.message));
-        
-        if (isRateLimitError) {
-            agenticSteps += "\n---!! PARALLEL EXECUTION FAILED DUE TO RATE LIMITING !! ---\n";
-            agenticSteps += `---!! SWITCHING TO SEQUENTIAL EXECUTION WITH DELAYS !! ---\n\n`;
-            
-            // Wait a moment before retrying
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            
-            // Clear previous results before retry
-            initialAnalyses = [];
-            refinedAnalyses = [];
-
-            // Step 1: Sequential Initial Analysis
-            agenticSteps += "--- STEP 1: Initial Analysis (Fact-Checker Agents) [SEQUENTIAL] ---\n\n";
-            for (let i = 0; i < 3; i++) {
-                const response = await getAI().models.generateContent({
-                    model: 'gemini-2.5-pro',
-                    contents: `${INITIAL_AGENT_PROMPT}\n\n--- CONTENT TO ANALYZE ---\n\n${content}`,
-                    config: { tools: [{ googleSearch: {} }] }
-                });
-                initialAnalyses.push(response.text);
-                agenticSteps += `**Agent 1.${i + 1} Output:**\n\`\`\`\n${response.text}\n\`\`\`\n\n`;
-                await new Promise(resolve => setTimeout(resolve, DELAY_MS));
-            }
-
-            // Step 2: Sequential Refinement
-            agenticSteps += "--- STEP 2: Refinement (Peer Reviewer Agents) [SEQUENTIAL] ---\n\n";
-            for (let i = 0; i < initialAnalyses.length; i++) {
-                const analysis = initialAnalyses[i];
-                const response = await getAI().models.generateContent({
-                    model: 'gemini-2.5-pro',
-                    contents: `${REFINEMENT_AGENT_PROMPT}\n\n--- ORIGINAL CONTENT ---\n\n${content}\n\n--- INITIAL ANALYSIS TO REFINE ---\n\n${analysis}`,
-                    config: { tools: [{ googleSearch: {} }] }
-                });
-                refinedAnalyses.push(response.text);
-                agenticSteps += `**Agent 2.${i + 1} Output:**\n\`\`\`\n${response.text}\n\`\`\`\n\n`;
-                await new Promise(resolve => setTimeout(resolve, DELAY_MS));
-            }
-        } else {
-            // It's not a rate limit error, so fail the workflow
-            console.error("Agentic analysis failed:", err);
-            const errorMessage = err instanceof Error ? err.message : "An unknown error occurred during agentic analysis.";
-            agenticSteps += `\n---!! WORKFLOW FAILED !! ---\n${errorMessage}`;
-            return {
-                finalResult: `${content}\n\n**Error:** The agentic analysis failed. Please try again.`,
-                agenticSteps,
-                enhancementText: `**Error:** The agentic analysis failed. ${errorMessage}`
-            };
-        }
-    }
-
-    // This part runs after either parallel success or sequential fallback success
-    try {
-        // Step 3: Final Synthesis
-        agenticSteps += "--- STEP 3: Final Synthesis (Master Editor Agent) ---\n\n";
-        const synthesizerResponse = await getAI().models.generateContent({
-            model: 'gemini-2.5-pro',
-            contents: `${SYNTHESIZER_AGENT_PROMPT}\n\n--- ORIGINAL CONTENT ---\n\n${content}\n\n--- REFINED ANALYSES ---\n\n${refinedAnalyses.join('\n\n---\n\n')}`,
-            config: {
-                tools: [{ googleSearch: {} }]
-            }
-        });
-        const enhancementText = synthesizerResponse.text;
-        agenticSteps += `**Agent 3.1 (Synthesizer) Output:**\n\`\`\`\n${enhancementText}\n\`\`\`\n\n`;
-
-        // Output Formatting
-        let finalResult = '';
-        if (enhancementText.toLowerCase().includes("no significant errors or omissions found")) {
-            finalResult = content;
-        } else {
-            let sourcesText = '';
-            const groundingChunks = synthesizerResponse.candidates?.[0]?.groundingMetadata?.groundingChunks;
-            if (groundingChunks && groundingChunks.length > 0) {
-                const urls = new Set<string>();
-                groundingChunks.forEach(chunk => {
-                    if (chunk.web?.uri) {
-                        urls.add(chunk.web.uri);
-                    }
-                });
-                if (urls.size > 0) {
-                    sourcesText = `\n\n## Sources\n${Array.from(urls).map(url => `- ${url}`).join('\n')}`;
-                }
-            }
-            finalResult = `${content}\n\n${enhancementText}${sourcesText}`;
-        }
-
-        return { finalResult, agenticSteps, enhancementText };
-    } catch (err) {
-        // This catch handles errors during the synthesis step or if the sequential fallback also fails
-        console.error("Agentic analysis failed (post-parallel/sequential):", err);
-        const errorMessage = err instanceof Error ? err.message : "An unknown error occurred during the final synthesis step.";
-        agenticSteps += `\n---!! WORKFLOW FAILED !! ---\n${errorMessage}`;
-        return {
-            finalResult: `${content}\n\n**Error:** The agentic analysis failed. Please try again.`,
-            agenticSteps,
-            enhancementText: `**Error:** The agentic analysis failed. ${errorMessage}`
-        };
-    }
+/**
+ * Detects if an API error is a rate-limit (429 / resource exhausted / quota) error.
+ */
+function isRateLimitError(err: unknown): boolean {
+    if (!err) return false;
+    const msg = err instanceof Error ? err.message : String(err);
+    const status = (err as any)?.status || (err as any)?.code || (err as any)?.error?.code || (err as any)?.statusText;
+    return (
+        status === 429 ||
+        status === 'RESOURCE_EXHAUSTED' ||
+        msg.includes('429') ||
+        /rate limit/i.test(msg) ||
+        /resource has been exhausted/i.test(msg) ||
+        /quota/i.test(msg) ||
+        /RESOURCE_EXHAUSTED/i.test(msg) ||
+        /too many requests/i.test(msg)
+    );
 }
 
-export async function runComplexImpressionGeneration(currentFindings: string[], additionalFindings: string): Promise<{ findings: string[]; expertNotes: string; }> {
+interface StepExecutionResult {
+    text: string;
+    groundingChunks?: any[];
+}
+
+/**
+ * Executes a single task in the complex impression workflow with:
+ * 1. gemini-3.8-flash with Google search grounding alone as default.
+ * 2. When rate limit error occurs, automatically falls back to gemini-3.7-flash with Google search grounding.
+ * 3. If both hit rate limit error, counts down live in the app ("retrying in x seconds...") and retries.
+ * 4. Only the errored item is retried; once an item succeeds, its result is preserved.
+ */
+async function executeAgentStepWithFallbackAndRetry(
+    taskName: string,
+    prompt: string,
+    onProgress?: (status: string) => void,
+    maxRetryCycles: number = 8
+): Promise<StepExecutionResult> {
+    let cycle = 0;
+    while (cycle < maxRetryCycles) {
+        cycle++;
+
+        // 1. Try default model: gemini-3.8-flash with Google search grounding alone
+        try {
+            onProgress?.(`${taskName}: Analyzing with ${COMPLEX_IMPRESSION_DEFAULT_MODEL} (Google Search grounded)...`);
+            const response = await getAI().models.generateContent({
+                model: COMPLEX_IMPRESSION_DEFAULT_MODEL,
+                contents: prompt,
+                config: {
+                    tools: [{ googleSearch: {} }]
+                }
+            });
+            const text = response.text || '';
+            const groundingChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks;
+            return { text, groundingChunks };
+        } catch (primaryErr: any) {
+            if (!isRateLimitError(primaryErr)) {
+                console.error(`${taskName}: Fatal error on ${COMPLEX_IMPRESSION_DEFAULT_MODEL}:`, primaryErr);
+                throw primaryErr;
+            }
+
+            console.warn(`${taskName}: Rate limit on ${COMPLEX_IMPRESSION_DEFAULT_MODEL}. Switching to ${COMPLEX_IMPRESSION_FALLBACK_MODEL}...`);
+            onProgress?.(`${taskName}: Rate limit on ${COMPLEX_IMPRESSION_DEFAULT_MODEL}. Switching to ${COMPLEX_IMPRESSION_FALLBACK_MODEL}...`);
+
+            // 2. Try fallback model: gemini-3.7-flash with Google search grounding alone
+            try {
+                const fallbackResponse = await getAI().models.generateContent({
+                    model: COMPLEX_IMPRESSION_FALLBACK_MODEL,
+                    contents: prompt,
+                    config: {
+                        tools: [{ googleSearch: {} }]
+                    }
+                });
+                const text = fallbackResponse.text || '';
+                const groundingChunks = fallbackResponse.candidates?.[0]?.groundingMetadata?.groundingChunks;
+                return { text, groundingChunks };
+            } catch (fallbackErr: any) {
+                if (!isRateLimitError(fallbackErr)) {
+                    console.error(`${taskName}: Fatal error on ${COMPLEX_IMPRESSION_FALLBACK_MODEL}:`, fallbackErr);
+                    throw fallbackErr;
+                }
+
+                // Both models hit rate limit! Wait with live countdown
+                const waitSeconds = Math.min(15, 5 + (cycle - 1) * 2); // 5s, 7s, 9s, 11s, 13s, 15s
+                console.warn(`${taskName}: Rate limit on both models. Retrying in ${waitSeconds}s...`);
+
+                for (let sec = waitSeconds; sec > 0; sec--) {
+                    onProgress?.(`${taskName}: Rate limit reached on both models. Retrying in ${sec} second${sec > 1 ? 's' : ''}...`);
+                    await new Promise(res => setTimeout(res, 1000));
+                }
+                onProgress?.(`${taskName}: Retrying with ${COMPLEX_IMPRESSION_DEFAULT_MODEL}...`);
+                // Loop continues to attempt gemini-3.8-flash again
+            }
+        }
+    }
+    throw new Error(`${taskName}: Rate limit persisted after ${maxRetryCycles} retry cycles.`);
+}
+
+/**
+ * Parses findings JSON array returned by Gemini, with multiple fallback extractors.
+ */
+function parseImpressionJsonResponse(rawText: string): string[] {
+    if (!rawText || !rawText.trim()) {
+        throw new Error("Complex impression generation returned an empty response.");
+    }
+
+    // 1. Direct code-fence strip & JSON parse
+    const cleaned = rawText.replace(/^```json\s*|```\s*$/g, '').trim();
+    try {
+        const parsed = JSON.parse(cleaned);
+        if (parsed && Array.isArray(parsed.findings)) {
+            return parsed.findings;
+        }
+    } catch (e) {}
+
+    // 2. Regex match for markdown json block
+    const fenceMatch = rawText.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+    if (fenceMatch && fenceMatch[1]) {
+        try {
+            const parsed = JSON.parse(fenceMatch[1].trim());
+            if (parsed && Array.isArray(parsed.findings)) {
+                return parsed.findings;
+            }
+        } catch (e) {}
+    }
+
+    // 3. Regex match for {"findings": [...]}
+    const objectMatch = rawText.match(/\{\s*"findings"\s*:\s*\[[\s\S]*?\]\s*\}/);
+    if (objectMatch) {
+        try {
+            const parsed = JSON.parse(objectMatch[0]);
+            if (parsed && Array.isArray(parsed.findings)) {
+                return parsed.findings;
+            }
+        } catch (e) {}
+    }
+
+    // 4. Regex match for raw array of strings [...]
+    const arrayMatch = rawText.match(/\[\s*"[\s\S]*?"\s*\]/);
+    if (arrayMatch) {
+        try {
+            const parsed = JSON.parse(arrayMatch[0]);
+            if (Array.isArray(parsed) && parsed.every(item => typeof item === 'string')) {
+                return parsed;
+            }
+        } catch (e) {}
+    }
+
+    throw new Error("Could not parse valid findings array from complex impression response.");
+}
+
+export async function runAgenticAnalysis(
+    content: string,
+    onProgress?: (status: string) => void
+): Promise<{ finalResult: string; agenticSteps: string; enhancementText: string; }> {
+    let agenticSteps = "### Agentic Workflow Log\n\n";
+    // Maintain state for each sub-task so finished items are NEVER re-executed
+    const initialAnalyses: string[] = new Array(3).fill('');
+    const refinedAnalyses: string[] = new Array(3).fill('');
+
+    // --- STEP 1: Initial Analysis (3 Fact-Checker Agents in parallel) ---
+    agenticSteps += "--- STEP 1: Initial Analysis (Fact-Checker Agents) ---\n\n";
+    onProgress?.("Step 1/4: Initial Fact-Checking Analysis (3 Agents)...");
+
+    const step1Promises = [0, 1, 2].map(async (i) => {
+        if (initialAnalyses[i]) {
+            return initialAnalyses[i]; // Already finished, do not retry!
+        }
+        const res = await executeAgentStepWithFallbackAndRetry(
+            `Agent 1.${i + 1} (Fact-Checker)`,
+            `${INITIAL_AGENT_PROMPT}\n\n--- CONTENT TO ANALYZE ---\n\n${content}`,
+            onProgress
+        );
+        initialAnalyses[i] = res.text;
+        return res.text;
+    });
+
+    await Promise.all(step1Promises);
+    initialAnalyses.forEach((text, i) => {
+        agenticSteps += `**Agent 1.${i + 1} Output:**\n\`\`\`\n${text}\n\`\`\`\n\n`;
+    });
+
+    // --- STEP 2: Refinement (3 Peer Reviewer Agents in parallel) ---
+    agenticSteps += "--- STEP 2: Refinement (Peer Reviewer Agents) ---\n\n";
+    onProgress?.("Step 2/4: Peer Review & Refinement (3 Agents)...");
+
+    const step2Promises = initialAnalyses.map(async (analysis, i) => {
+        if (refinedAnalyses[i]) {
+            return refinedAnalyses[i]; // Already finished, do not retry!
+        }
+        const res = await executeAgentStepWithFallbackAndRetry(
+            `Agent 2.${i + 1} (Peer Reviewer)`,
+            `${REFINEMENT_AGENT_PROMPT}\n\n--- ORIGINAL CONTENT ---\n\n${content}\n\n--- INITIAL ANALYSIS TO REFINE ---\n\n${analysis}`,
+            onProgress
+        );
+        refinedAnalyses[i] = res.text;
+        return res.text;
+    });
+
+    await Promise.all(step2Promises);
+    refinedAnalyses.forEach((text, i) => {
+        agenticSteps += `**Agent 2.${i + 1} Output:**\n\`\`\`\n${text}\n\`\`\`\n\n`;
+    });
+
+    // --- STEP 3: Final Synthesis (Master Editor Agent) ---
+    agenticSteps += "--- STEP 3: Final Synthesis (Master Editor Agent) ---\n\n";
+    onProgress?.("Step 3/4: Synthesizing expert notes (Master Editor Agent)...");
+
+    const synthesizerResponse = await executeAgentStepWithFallbackAndRetry(
+        "Agent 3.1 (Synthesizer)",
+        `${SYNTHESIZER_AGENT_PROMPT}\n\n--- ORIGINAL CONTENT ---\n\n${content}\n\n--- REFINED ANALYSES ---\n\n${refinedAnalyses.join('\n\n---\n\n')}`,
+        onProgress
+    );
+
+    const enhancementText = synthesizerResponse.text;
+    agenticSteps += `**Agent 3.1 (Synthesizer) Output:**\n\`\`\`\n${enhancementText}\n\`\`\`\n\n`;
+
+    // Output Formatting
+    let finalResult = '';
+    if (enhancementText.toLowerCase().includes("no significant errors or omissions found")) {
+        finalResult = content;
+    } else {
+        let sourcesText = '';
+        const groundingChunks = synthesizerResponse.groundingChunks;
+        if (groundingChunks && groundingChunks.length > 0) {
+            const urls = new Set<string>();
+            groundingChunks.forEach(chunk => {
+                if (chunk.web?.uri) {
+                    urls.add(chunk.web.uri);
+                }
+            });
+            if (urls.size > 0) {
+                sourcesText = `\n\n## Sources\n${Array.from(urls).map(url => `- ${url}`).join('\n')}`;
+            }
+        }
+        finalResult = `${content}\n\n${enhancementText}${sourcesText}`;
+    }
+
+    return { finalResult, agenticSteps, enhancementText };
+}
+
+export async function runComplexImpressionGeneration(
+    currentFindings: string[], 
+    additionalFindings: string,
+    onProgress?: (status: string) => void
+): Promise<{ findings: string[]; expertNotes: string; }> {
     const content = currentFindings.join('\n\n') + (additionalFindings ? `\n\n${additionalFindings}` : '');
 
-    const { finalResult: expertNotesContent, enhancementText } = await runAgenticAnalysis(content);
+    // Steps 1 to 3: Multi-agent analysis (Steps completed are preserved and never repeated)
+    const { finalResult: expertNotesContent, enhancementText } = await runAgenticAnalysis(content, onProgress);
 
     const findingsWithoutImpression = currentFindings.filter(f => !f.toUpperCase().startsWith('IMPRESSION:'));
 
@@ -878,9 +984,18 @@ export async function runComplexImpressionGeneration(currentFindings: string[], 
     - Combine multiple related findings, including all their key descriptors into single, coherent impression points to ensure the summary is both concise and complete.
     - List unrelated findings as separate points. For example, hepatomegaly and splenomegaly should be separate points if not related to a primary diagnosis.
     - The impression must NOT contain any numerical values or measurements.
-    -  If clinically relevant, you may add concluding phrases like "likely infective etiology" or "likely inflammatory etiology" or "likely neoplastic etiology” or “likely reactive” or “suggested clinical correlation/ review as indicated” or similar phrases. Avoid vague, non-committal conclusions when a more specific diagnosis is possible.
+    - If clinically relevant, you may add concluding phrases like "likely infective etiology" or "likely inflammatory etiology" or "likely neoplastic etiology” or “likely reactive” or “suggested clinical correlation/ review as indicated” or similar phrases. Avoid vague, non-committal conclusions when a more specific diagnosis is possible.
 5.  The entire impression MUST be formatted as a single string in the "findings" array. It must start with "IMPRESSION:" (all caps), followed by '###', then each point separated by '###'.
-6.  Your final output must be a JSON object with a single key "findings", containing the complete, updated list of findings (original findings + your new impression) as an array of strings.
+6.  Your final output must be a valid JSON object with a single key "findings", containing the complete, updated list of findings (original findings + your new impression) as an array of strings. Output ONLY the JSON block:
+\`\`\`json
+{
+  "findings": [
+    "Preserved original finding 1",
+    "Preserved original finding 2",
+    "IMPRESSION:###First point###Second point"
+  ]
+}
+\`\`\`
 
 **ORIGINAL FINDINGS (DO NOT CHANGE):**
 ${JSON.stringify(findingsWithoutImpression)}
@@ -888,30 +1003,31 @@ ${JSON.stringify(findingsWithoutImpression)}
 **EXPERT NOTES (USE FOR CONTEXT):**
 ${expertNotesContent}
 
-Now, generate the complete report including the new impression in the specified JSON format.`;
+Now, generate the complete report including the new impression in the specified JSON format. Return ONLY the JSON object.`;
 
-    const response = await getAI().models.generateContent({
-        model: 'gemini-2.5-pro',
-        contents: impressionPrompt,
-        config: {
-            responseMimeType: "application/json",
-            responseSchema: responseSchema,
+    onProgress?.("Step 4/4: Formulating final radiology impression...");
+
+    // Step 4: Final Impression Formulation using the same resilient runner
+    // If Step 4 encounters rate limits or retries, Steps 1-3 are NOT re-executed!
+    let lastError: Error | null = null;
+    for (let parseAttempt = 0; parseAttempt < 2; parseAttempt++) {
+        try {
+            const impressionResponse = await executeAgentStepWithFallbackAndRetry(
+                "Final Impression Formulation",
+                impressionPrompt,
+                onProgress
+            );
+            const findingsArray = parseImpressionJsonResponse(impressionResponse.text);
+            return { findings: findingsArray, expertNotes: enhancementText };
+        } catch (parseErr: any) {
+            lastError = parseErr;
+            if (parseAttempt === 0) {
+                onProgress?.("Re-formatting impression JSON output...");
+            }
         }
-    });
-
-    const jsonString = response.text;
-    if (!jsonString) {
-        throw new Error("Complex impression generation returned an empty response.");
     }
 
-    const cleanedJsonString = jsonString.replace(/^```json\s*|```\s*$/g, '').trim();
-    const result = JSON.parse(cleanedJsonString);
-
-    if (result && Array.isArray(result.findings)) {
-        return { findings: result.findings, expertNotes: enhancementText };
-    } else {
-        throw new Error("Invalid data structure in complex impression response.");
-    }
+    throw lastError || new Error("Failed to formulate complex impression.");
 }
 
 /**
@@ -1015,6 +1131,34 @@ export const processLiveAudioChunk = async (
 
   const { instructionsText, templateContext } = resolveCustomInstructionsAndTemplate(customPrompt);
 
+  // Feature E: Intelligent Boundary Stitching Anchor
+  // Extract trailing words from the last finding to provide explicit boundary awareness and eliminate word duplication
+  let trailingAnchor = '';
+  if (previousFindings && previousFindings.length > 0) {
+    const lastItem = previousFindings[previousFindings.length - 1];
+    const cleanLastItem = lastItem.replace(/^BOLD::\s*/i, '').replace(/^\*.*?\*\s*/, '').trim();
+    if (cleanLastItem) {
+      const words = cleanLastItem.split(/\s+/).filter(Boolean);
+      trailingAnchor = words.slice(-Math.min(words.length, 6)).join(' ');
+    }
+  }
+
+  const boundaryStitchingText = trailingAnchor
+    ? `
+================================================================================
+INTELLIGENT BOUNDARY STITCHING ANCHOR (FROM PRECEDING AUDIO SEGMENT):
+The immediate prior audio segment finished with the words:
+"...${trailingAnchor}"
+
+CRITICAL STITCHING DIRECTIVES (ELIMINATE BOUNDARY DUPLICATION & STUTTERING):
+1. Because consecutive audio segments have a slight overlap buffer, you may hear the tail-end of "...${trailingAnchor}" at the very beginning of this audio segment.
+2. DO NOT duplicate, re-transcribe, or stutter the words "...${trailingAnchor}"!
+3. If this audio segment continues that thought, smoothly finish that thought without repeating the anchor words.
+4. If this audio segment begins a brand new finding or clause, start the new finding cleanly.
+================================================================================
+`
+    : '';
+
   const historySectionText = historyContext && ((historyContext.previousState && historyContext.previousState.length > 0) || (historyContext.deletedItems && historyContext.deletedItems.length > 0))
     ? `
 ================================================================================
@@ -1036,6 +1180,7 @@ Your task is to transcribe this live audio segment into clean, structured radiol
 
 ${templateContext}
 ${instructionsText}
+${boundaryStitchingText}
 ${historySectionText}
 
 STRICT RADIOLOGY TRANSCRIPTION & MEDICAL FORMATTING RULES:

@@ -1,6 +1,6 @@
 {
-  "name": "Remix: Radiology Dictation Corrector 22.0",
-  "description": "An AI-powered tool for radiologists to record audio dictations and receive corrected, clean text transcripts. The app corrects speech-to-text errors, removes non-verbal sounds, and formats the output for easy copying.  NEW - IMPRESSION CREATION ALTERATION",
+  "name": "☯️RADDOC's Dictation app",
+  "description": "An AI-powered tool for radiologists to record audio dictations and receive corrected, clean text transcripts with smart voice commands and impression generation.",
   "requestFramePermissions": [
     "microphone"
   ],

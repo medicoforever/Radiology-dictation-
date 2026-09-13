@@ -22,11 +22,10 @@ import DownloadIcon from './icons/DownloadIcon';
 import TrashIcon from './icons/TrashIcon';
 import PauseIcon from './icons/PauseIcon';
 import ResumeIcon from './icons/ResumeIcon';
-import { Activity, Globe } from 'lucide-react';
+import { Activity } from 'lucide-react';
 import { AudioAssessmentPanel } from './AudioAssessmentPanel';
-import { openHtmlInBrowser } from '../services/googleDriveService';
-
-
+import { mergeAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
+import { stopRepeatingInterruptedAlert } from '../services/soundService';
 
 interface ChatMessage {
   author: 'You' | 'AI';
@@ -46,7 +45,8 @@ interface ResultsDisplayProps {
   onReprocess: () => void;
   onUpdateFinding: (index: number, newText: string) => void;
   onAllFindingsUpdate: (findings: string[]) => void;
-  onContinueDictation: (audioBlob: Blob) => Promise<void>;
+  onContinueDictation: (newAudioBlob: Blob, mergedBlob?: Blob) => Promise<void>;
+  onAudioBlobUpdate?: (newBlob: Blob) => void;
   customPrompt: string;
   onCustomPromptChange: (prompt: string) => void;
   customImages?: Array<{ data: string; mimeType: string }>;
@@ -98,6 +98,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   onUpdateFinding,
   onAllFindingsUpdate,
   onContinueDictation,
+  onAudioBlobUpdate,
   customPrompt,
   onCustomPromptChange,
   customImages,
@@ -133,19 +134,40 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
 
   // State for 'Continue Dictation' feature
   const continuationRecorder = useAudioRecorder();
-  const { startRecording: startContinuingRecording, stopRecording: stopContinuingRecording, error: continueRecorderError } = continuationRecorder;
+  const { 
+    startRecording: startContinuingRecording, 
+    stopRecording: stopContinuingRecording, 
+    error: continueRecorderError,
+    unsavedSession: continueUnsavedSession,
+    recoverUnsavedSession: recoverContinueSession,
+    discardUnsavedSession: discardContinueSession,
+    getUnsavedSessionBlob: getContinueRecoveredBlob,
+  } = continuationRecorder;
   const [continuationState, setContinuationState] = useState<{ status: 'idle' | 'recording' | 'processing'; error: string | null }>({ status: 'idle', error: null });
+  const [mergedContinuationBlob, setMergedContinuationBlob] = useState<Blob | null>(null);
+  const [isMergingAudio, setIsMergingAudio] = useState(false);
+  const [isRecoveringContinue, setIsRecoveringContinue] = useState(false);
 
   // State for 'Dictate Report Changes' feature
   const [modificationState, setModificationState] = useState<'idle' | 'recording' | 'processing'>('idle');
   const [modificationError, setModificationError] = useState<string | null>(null);
   const modificationRecorder = useAudioRecorder();
+  const {
+    startRecording: startGlobalModificationRecording,
+    stopRecording: stopGlobalModificationRecording,
+    unsavedSession: modifyUnsavedSession,
+    recoverUnsavedSession: recoverModifySession,
+    discardUnsavedSession: discardModifySession,
+    getUnsavedSessionBlob: getModifyRecoveredBlob,
+  } = modificationRecorder;
+  const [isRecoveringModify, setIsRecoveringModify] = useState(false);
 
   // State for 'Complex Impression Generation' feature
   const [isComplexGeneratorVisible, setIsComplexGeneratorVisible] = useState(false);
   const [complexInput, setComplexInput] = useState('');
   const [agenticStatus, setAgenticStatus] = useState<'idle' | 'processing' | 'error'>('idle');
   const [agenticError, setAgenticError] = useState<string | null>(null);
+  const [agenticProgressText, setAgenticProgressText] = useState<string>('');
   const complexInputRecorder = useAudioRecorder();
   const [expertNotes, setExpertNotes] = useState<string | null>(null);
   // FIX: Add state to handle transcription loading state for the complex impression mic.
@@ -546,23 +568,15 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   };
 
   const handleDownload = () => {
-    if (!audioBlob) return;
-    try {
-      const url = URL.createObjectURL(audioBlob);
-      const a = document.createElement('a');
-      document.body.appendChild(a);
-      a.style.display = 'none';
-      a.href = url;
-      
-      const extension = audioBlob.type === 'audio/mpeg' ? 'mp3' : (audioBlob.type.split('/')[1] || 'webm').split(';')[0];
-      a.download = `radiology-dictation.${extension}`;
-      
-      a.click();
-      window.URL.revokeObjectURL(url);
-      a.remove();
-    } catch (err) {
-        console.error('Failed to download audio:', err)
-    }
+    const targetBlob = mergedContinuationBlob || audioBlob;
+    if (!targetBlob) return;
+    triggerAudioDownload(targetBlob, mergedContinuationBlob ? 'radiology-dictation-merged' : 'radiology-dictation');
+  };
+
+  const handleDownloadMerged = (blobToDownload?: Blob | null) => {
+    const targetBlob = blobToDownload || mergedContinuationBlob || audioBlob;
+    if (!targetBlob) return;
+    triggerAudioDownload(targetBlob, 'radiology-dictation-merged');
   };
   
   const handleRecordNew = () => {
@@ -587,17 +601,6 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     } catch (err) {
       console.error('Failed to generate or download HTML:', err);
       showNotification('Failed to create HTML file.');
-    }
-  };
-
-  const handleOpenInChrome = () => {
-    if (!findings || findings.length === 0) return;
-    try {
-      const htmlContent = generateSingleDictationHTML(findings);
-      openHtmlInBrowser(htmlContent);
-    } catch (err) {
-      console.error('Failed to open HTML in browser:', err);
-      showNotification('Failed to open HTML preview.');
     }
   };
 
@@ -741,20 +744,34 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   };
 
   const handleStopContinue = async () => {
-      const audioBlob = await stopContinuingRecording();
-      if (audioBlob && audioBlob.size > 0) {
-          setContinuationState({ status: 'processing', error: null });
-          try {
-              setUndoState(findings);
-              await onContinueDictation(audioBlob);
-              setContinuationState({ status: 'idle', error: null });
-          } catch (err) {
-              const message = err instanceof Error ? err.message : 'An unknown error occurred.';
-              setContinuationState({ status: 'idle', error: message });
-          }
+    setContinuationState({ status: 'processing', error: null });
+    try {
+      const newRecordedBlob = await stopContinuingRecording();
+      if (newRecordedBlob && newRecordedBlob.size > 0) {
+        setIsMergingAudio(true);
+        // Immediately merge audio right at the moment Stop is clicked!
+        let merged: Blob;
+        if (audioBlob) {
+          merged = await mergeAudioBlobs(audioBlob, newRecordedBlob);
+        } else {
+          merged = newRecordedBlob;
+        }
+        setMergedContinuationBlob(merged);
+        onAudioBlobUpdate?.(merged);
+        setIsMergingAudio(false);
+
+        // Process with Gemini continuation in background
+        setUndoState(findings);
+        await onContinueDictation(newRecordedBlob, merged);
+        setContinuationState({ status: 'idle', error: null });
       } else {
-          setContinuationState({ status: 'idle', error: null });
+        setContinuationState({ status: 'idle', error: null });
       }
+    } catch (err) {
+      setIsMergingAudio(false);
+      const message = err instanceof Error ? err.message : 'An unknown error occurred.';
+      setContinuationState({ status: 'idle', error: message });
+    }
   };
   
   const handleCopyFromCopier = async (text: string) => {
@@ -796,6 +813,90 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
       if (isLive) onResumeLive?.();
   };
 
+  const handleDownloadRecoveredContinue = async () => {
+    setIsRecoveringContinue(true);
+    try {
+      const recoveredBlob = await getContinueRecoveredBlob();
+      if (recoveredBlob) {
+        triggerAudioDownload(recoveredBlob, 'recovered-continuation-audio');
+      }
+    } catch (err) {
+      console.error('Failed to download recovered continuation:', err);
+    } finally {
+      setIsRecoveringContinue(false);
+    }
+  };
+
+  const handleRestoreAndAppendContinue = async () => {
+    setIsRecoveringContinue(true);
+    try {
+      const newRecordedBlob = await recoverContinueSession();
+      if (newRecordedBlob && newRecordedBlob.size > 0) {
+        setIsMergingAudio(true);
+        let merged: Blob;
+        if (audioBlob) {
+          merged = await mergeAudioBlobs(audioBlob, newRecordedBlob);
+        } else {
+          merged = newRecordedBlob;
+        }
+        setMergedContinuationBlob(merged);
+        onAudioBlobUpdate?.(merged);
+        setIsMergingAudio(false);
+
+        setUndoState(findings);
+        await onContinueDictation(newRecordedBlob, merged);
+      }
+    } catch (err) {
+      setIsMergingAudio(false);
+      console.error('Failed to restore and append continuation:', err);
+    } finally {
+      setIsRecoveringContinue(false);
+    }
+  };
+
+  const handleDiscardContinue = async () => {
+    stopRepeatingInterruptedAlert();
+    await discardContinueSession();
+  };
+
+  const handleDownloadRecoveredModify = async () => {
+    setIsRecoveringModify(true);
+    try {
+      const recoveredBlob = await getModifyRecoveredBlob();
+      if (recoveredBlob) {
+        triggerAudioDownload(recoveredBlob, 'recovered-dictate-changes-audio');
+      }
+    } catch (err) {
+      console.error('Failed to download recovered modification audio:', err);
+    } finally {
+      setIsRecoveringModify(false);
+    }
+  };
+
+  const handleRestoreAndApplyModify = async () => {
+    setIsRecoveringModify(true);
+    try {
+      const recoveredBlob = await recoverModifySession();
+      if (recoveredBlob && recoveredBlob.size > 0) {
+        setModificationState('processing');
+        const modifiedFindings = await modifyReportWithAudio(findings, recoveredBlob, selectedModel, customPrompt, customImages);
+        onAllFindingsUpdate(modifiedFindings);
+        setModificationState('idle');
+      }
+    } catch (err) {
+      console.error('Failed to restore and apply modification:', err);
+      setModificationError(err instanceof Error ? err.message : 'Failed to apply changes.');
+      setModificationState('idle');
+    } finally {
+      setIsRecoveringModify(false);
+    }
+  };
+
+  const handleDiscardModify = async () => {
+    stopRepeatingInterruptedAlert();
+    await discardModifySession();
+  };
+
   // --- Complex Impression Handlers ---
     const handleComplexMicClick = async () => {
         setAgenticError(null);
@@ -826,19 +927,26 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     const handleGenerateComplexImpression = async () => {
         setAgenticStatus('processing');
         setAgenticError(null);
+        setAgenticProgressText('Starting complex impression workflow...');
         setExpertNotes(null); // Clear previous notes
         try {
             setUndoState(findings);
-            const result = await runComplexImpressionGeneration(findings, complexInput);
+            const result = await runComplexImpressionGeneration(
+                findings, 
+                complexInput,
+                (statusText) => setAgenticProgressText(statusText)
+            );
             onAllFindingsUpdate(result.findings);
             setExpertNotes(result.expertNotes); // Set new notes
             setIsComplexGeneratorVisible(false);
             setComplexInput('');
             setAgenticStatus('idle');
+            setAgenticProgressText('');
         } catch (err) {
             const message = err instanceof Error ? err.message : 'An unknown error occurred.';
             setAgenticError(`Failed to generate impression: ${message}`);
             setAgenticStatus('error');
+            setAgenticProgressText('');
         }
     };
 
@@ -1449,6 +1557,45 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
       </div>
       
       <div className="mt-6 p-4 border rounded-lg bg-slate-50 dark:bg-slate-700/50 dark:border-slate-700">
+        {modifyUnsavedSession && modificationState !== 'recording' && (
+          <div className="w-full mb-3 p-3 rounded-lg border border-amber-300 bg-amber-50 dark:bg-amber-900/30 dark:border-amber-700/60 shadow-sm flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 animate-in fade-in duration-200">
+            <div className="flex items-center gap-2.5 text-amber-800 dark:text-amber-200">
+              <WarningIcon className="w-5 h-5 shrink-0 text-amber-600 dark:text-amber-400" />
+              <div>
+                <p className="font-semibold text-xs sm:text-sm">
+                  Interrupted Report Changes Audio Detected
+                </p>
+                <p className="text-[11px] sm:text-xs text-amber-700 dark:text-amber-300">
+                  Found auto-saved audio from {new Date(modifyUnsavedSession.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}.
+                </p>
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-2 justify-end">
+              <button
+                onClick={handleDiscardModify}
+                disabled={isRecoveringModify}
+                className="px-2.5 py-1 text-xs font-medium text-slate-600 dark:text-slate-300 hover:bg-amber-100 dark:hover:bg-amber-800/40 rounded-md transition-colors cursor-pointer"
+              >
+                Discard
+              </button>
+              <button
+                onClick={handleDownloadRecoveredModify}
+                disabled={isRecoveringModify}
+                className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-amber-800 dark:text-amber-200 bg-amber-200/60 dark:bg-amber-800/60 hover:bg-amber-200 rounded-md transition-colors cursor-pointer"
+              >
+                <DownloadIcon className="w-3.5 h-3.5" />
+                {isRecoveringModify ? 'Saving...' : 'Save WAV'}
+              </button>
+              <button
+                onClick={handleRestoreAndApplyModify}
+                disabled={isRecoveringModify}
+                className="px-3 py-1 text-xs font-semibold text-white bg-amber-600 hover:bg-amber-700 rounded-md shadow transition-colors cursor-pointer"
+              >
+                {isRecoveringModify ? 'Applying...' : 'Restore & Apply Changes'}
+              </button>
+            </div>
+          </div>
+        )}
         <div className="flex items-start sm:items-center gap-3 flex-col sm:flex-row">
             <MicScribbleIcon className="w-8 h-8 text-slate-600 dark:text-slate-300 flex-shrink-0" />
             <div className="flex-grow">
@@ -1490,10 +1637,17 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     {!isLive && isComplexGeneratorVisible && (
         <div className="mt-6 p-4 border-2 border-dashed rounded-lg bg-slate-50 dark:bg-slate-700/50 dark:border-slate-600">
             {agenticStatus === 'processing' ? (
-                <div className="flex flex-col items-center justify-center p-4">
-                    <Spinner />
-                    <p className="font-semibold text-slate-700 dark:text-slate-200 mt-4">Running agentic analysis...</p>
-                    <p className="text-sm text-slate-500 dark:text-slate-400">This may take a minute.</p>
+                <div className="flex flex-col items-center justify-center p-6 text-center">
+                    <Spinner className="w-8 h-8 text-purple-600 mb-3" />
+                    <p className="font-semibold text-slate-800 dark:text-slate-200">
+                        Generating Complex Impression
+                    </p>
+                    <p className="text-sm font-medium text-purple-600 dark:text-purple-400 mt-2 px-3 py-1.5 rounded-lg bg-purple-50 dark:bg-purple-900/30 border border-purple-200 dark:border-purple-800/50 max-w-lg animate-pulse">
+                        {agenticProgressText || 'Running agentic analysis...'}
+                    </p>
+                    <p className="text-xs text-slate-500 dark:text-slate-400 mt-2">
+                        Default: gemini-3.8-flash (Search Grounded) • Automatic failover & retry
+                    </p>
                 </div>
             ) : (
                 <>
@@ -1582,8 +1736,49 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                     Stop Live Dictation
                 </button>
             </div>
-        ) : continuationState.status === 'idle' ? (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:flex lg:flex-wrap justify-center items-center gap-2.5 sm:gap-3 w-full">
+        ) : (
+          <div className="w-full flex flex-col items-center gap-3">
+            {continueUnsavedSession && continuationState.status !== 'recording' && (
+              <div className="w-full mb-3 p-4 rounded-xl border border-amber-300 bg-amber-50 dark:bg-amber-900/30 dark:border-amber-700/60 shadow-sm flex flex-col sm:flex-row sm:items-center justify-between gap-3 animate-in fade-in duration-200">
+                <div className="flex items-center gap-3 text-amber-800 dark:text-amber-200">
+                  <WarningIcon className="w-6 h-6 shrink-0 text-amber-600 dark:text-amber-400" />
+                  <div>
+                    <p className="font-semibold text-sm sm:text-base">
+                      Interrupted Continuation Audio Detected
+                    </p>
+                    <p className="text-xs sm:text-sm text-amber-700 dark:text-amber-300">
+                      Found continuation audio chunks auto-saved at {new Date(continueUnsavedSession.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })} ({Math.round(continueUnsavedSession.totalBytes / 1024)} KB).
+                    </p>
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-2 justify-end">
+                  <button
+                    onClick={handleDiscardContinue}
+                    disabled={isRecoveringContinue}
+                    className="px-3 py-1.5 text-xs sm:text-sm font-medium text-slate-600 dark:text-slate-300 hover:bg-amber-100 dark:hover:bg-amber-800/40 rounded-lg transition-colors cursor-pointer"
+                  >
+                    Discard
+                  </button>
+                  <button
+                    onClick={handleDownloadRecoveredContinue}
+                    disabled={isRecoveringContinue}
+                    className="inline-flex items-center gap-1 px-3 py-1.5 text-xs sm:text-sm font-medium text-amber-800 dark:text-amber-200 bg-amber-200/60 dark:bg-amber-800/60 hover:bg-amber-200 rounded-lg transition-colors cursor-pointer"
+                  >
+                    <DownloadIcon className="w-4 h-4" />
+                    Save WAV Audio
+                  </button>
+                  <button
+                    onClick={handleRestoreAndAppendContinue}
+                    disabled={isRecoveringContinue}
+                    className="px-4 py-1.5 text-xs sm:text-sm font-semibold text-white bg-amber-600 hover:bg-amber-700 dark:bg-amber-600 dark:hover:bg-amber-500 rounded-lg shadow transition-colors cursor-pointer"
+                  >
+                    {isRecoveringContinue ? 'Restoring...' : 'Restore & Append'}
+                  </button>
+                </div>
+              </div>
+            )}
+            {continuationState.status === 'idle' ? (
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:flex lg:flex-wrap justify-center items-center gap-2.5 sm:gap-3 w-full">
             <button
               onClick={handleRecordNew}
               className="bg-blue-600 text-white font-bold py-2.5 px-5 rounded-xl hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50 transition-all shadow-sm w-full lg:w-auto flex items-center justify-center gap-2 min-h-[44px]"
@@ -1592,11 +1787,12 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
               Record New Dictation
             </button>
             <button
-                onClick={() => setIsComplexGeneratorVisible(true)}
-                className="bg-purple-600 text-white font-bold py-2.5 px-5 rounded-xl hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-opacity-50 transition-all shadow-sm w-full lg:w-auto flex items-center justify-center gap-2 min-h-[44px]"
+              onClick={handleStartContinue}
+              disabled={!audioBlob && !mergedContinuationBlob}
+              className="bg-emerald-600 text-white font-bold py-2.5 px-5 rounded-xl hover:bg-emerald-700 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-opacity-50 transition-all shadow-sm w-full lg:w-auto disabled:bg-emerald-300 dark:disabled:bg-emerald-900/40 disabled:cursor-not-allowed flex items-center justify-center gap-2 min-h-[44px]"
             >
-                <BrainIcon className="w-4 h-4" />
-                Complex Impression
+              <MicPlusIcon className="w-4 h-4" />
+              Continue Dictation
             </button>
             {!isLive && (
               <button
@@ -1613,6 +1809,13 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                   {audioAssessmentReport ? 'View Audio Assessment' : 'Assess Dictation Audio'}
               </button>
             )}
+            <button
+                onClick={() => setIsComplexGeneratorVisible(true)}
+                className="bg-purple-600 text-white font-bold py-2.5 px-5 rounded-xl hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-opacity-50 transition-all shadow-sm w-full lg:w-auto flex items-center justify-center gap-2 min-h-[44px]"
+            >
+                <BrainIcon className="w-4 h-4" />
+                Complex Impression
+            </button>
             {expertNotes && (
                 <button
                     onClick={handleDownloadExpertNotes}
@@ -1623,21 +1826,12 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                 </button>
             )}
             <button
-              onClick={handleStartContinue}
-              disabled={!audioBlob}
-              className="bg-emerald-600 text-white font-bold py-2.5 px-5 rounded-xl hover:bg-emerald-700 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-opacity-50 transition-all shadow-sm w-full lg:w-auto disabled:bg-emerald-300 dark:disabled:bg-emerald-900/40 disabled:cursor-not-allowed flex items-center justify-center gap-2 min-h-[44px]"
+              onClick={handleDownload}
+              disabled={!audioBlob && !mergedContinuationBlob}
+              className="bg-slate-600 text-white font-bold py-2.5 px-5 rounded-xl hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-500 focus:ring-opacity-50 transition-all shadow-sm disabled:bg-slate-300 dark:disabled:bg-slate-700 disabled:cursor-not-allowed w-full lg:w-auto flex items-center justify-center gap-2 min-h-[44px]"
             >
-              <MicPlusIcon className="w-4 h-4" />
-              Continue Dictation
-            </button>
-            <button
-              onClick={handleOpenInChrome}
-              disabled={!findings || findings.length === 0}
-              className="bg-blue-600 text-white font-bold py-2.5 px-5 rounded-xl hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50 transition-all shadow-sm disabled:bg-blue-300 dark:disabled:bg-blue-900/40 disabled:cursor-not-allowed w-full lg:w-auto flex items-center justify-center gap-2 min-h-[44px]"
-              title="Open full interactive HTML report directly in Google Chrome"
-            >
-              <Globe className="w-4 h-4" />
-              Open in Chrome
+              <DownloadIcon className="w-4 h-4" />
+              Download Audio
             </button>
             <button
               onClick={handleDownloadHTML}
@@ -1648,30 +1842,22 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
               Download HTML
             </button>
             <button
-              onClick={handleDownload}
-              disabled={!audioBlob}
-              className="bg-slate-600 text-white font-bold py-2.5 px-5 rounded-xl hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-500 focus:ring-opacity-50 transition-all shadow-sm disabled:bg-slate-300 dark:disabled:bg-slate-700 disabled:cursor-not-allowed w-full lg:w-auto flex items-center justify-center gap-2 min-h-[44px]"
-            >
-              <DownloadIcon className="w-4 h-4" />
-              Download Audio
-            </button>
-            <button
               onClick={onSwitchToBatch}
-              className="bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 font-bold py-2.5 px-5 rounded-xl hover:bg-slate-200 dark:hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-400 focus:ring-opacity-50 transition-all shadow-sm w-full lg:w-auto flex items-center justify-center gap-2 min-h-[44px]"
+              className="bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 font-bold py-2.5 px-5 rounded-xl hover:bg-slate-200 dark:hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-400 focus:ring-opacity-50 transition-all shadow-sm w-full lg:w-auto sm:col-span-2 lg:col-span-1 flex items-center justify-center gap-2 min-h-[44px]"
             >
               Batch Processing
             </button>
           </div>
         ) : null}
         {continuationState.status === 'recording' && (
-            <div className="w-full flex items-center justify-center gap-4 bg-red-100 dark:bg-red-900/20 p-2 rounded-lg">
+            <div className="w-full flex items-center justify-center gap-4 bg-red-100 dark:bg-red-900/20 p-3 rounded-xl border border-red-200 dark:border-red-800/40">
               <div className="flex items-center gap-2">
                   <div className="w-3 h-3 bg-red-500 rounded-full animate-ping"></div>
-                  <span className="font-semibold text-red-700 dark:text-red-300">Recording...</span>
+                  <span className="font-semibold text-red-700 dark:text-red-300">Recording additional dictation...</span>
               </div>
               <button
                   onClick={handleStopContinue}
-                  className="flex items-center justify-center gap-2 bg-red-600 text-white font-bold py-1 px-4 rounded-lg hover:bg-red-700"
+                  className="flex items-center justify-center gap-2 bg-red-600 text-white font-bold py-2 px-5 rounded-lg hover:bg-red-700 active:bg-red-800 focus:outline-none focus:ring-2 focus:ring-red-500 shadow-sm transition-all"
                   aria-label="Stop continuing dictation"
               >
                   <StopIcon className="w-5 h-5"/>
@@ -1680,14 +1866,46 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
             </div>
         )}
         {continuationState.status === 'processing' && (
-            <div className="w-full flex items-center justify-center gap-2 bg-slate-100 dark:bg-slate-700 p-2 rounded-lg">
-                <Spinner className="w-6 h-6"/>
-                <span className="font-semibold text-slate-700 dark:text-slate-300">Processing...</span>
+            <div className="w-full flex flex-col sm:flex-row items-center justify-between gap-3 bg-slate-100 dark:bg-slate-800/90 p-3.5 sm:p-4 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm">
+                <div className="flex items-center gap-3">
+                    <Spinner className="w-5 h-5 text-emerald-600 dark:text-emerald-400 flex-shrink-0" />
+                    <div>
+                        <span className="font-semibold text-slate-800 dark:text-slate-200 text-sm block">
+                            Processing new dictation into report...
+                        </span>
+                        <span className="text-xs text-slate-500 dark:text-slate-400">
+                            {isMergingAudio ? 'Merging audio...' : 'Merged audio is ready and available to download.'}
+                        </span>
+                    </div>
+                </div>
+                {(mergedContinuationBlob || audioBlob) && (
+                    <button
+                        onClick={() => handleDownloadMerged(mergedContinuationBlob || audioBlob)}
+                        className="flex items-center justify-center gap-2 bg-slate-700 hover:bg-slate-800 active:bg-slate-900 text-white font-bold py-2.5 px-4 rounded-lg focus:outline-none focus:ring-2 focus:ring-slate-400 transition-all shadow-sm text-sm whitespace-nowrap min-h-[40px] w-full sm:w-auto"
+                        title="Download the full merged audio file recorded so far"
+                    >
+                        <DownloadIcon className="w-4 h-4"/>
+                        Download Audio (Merged)
+                    </button>
+                )}
             </div>
+        )}
+          </div>
         )}
       </div>
       {continuationState.error && (
-        <p className="text-center text-red-500 dark:text-red-400 mt-4" role="alert">{continuationState.error}</p>
+        <div className="mt-4 p-3.5 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800/60 rounded-xl flex flex-col sm:flex-row items-center justify-between gap-3">
+          <p className="text-sm text-red-600 dark:text-red-400 font-medium" role="alert">{continuationState.error}</p>
+          {(mergedContinuationBlob || audioBlob) && (
+            <button
+              onClick={() => handleDownloadMerged(mergedContinuationBlob || audioBlob)}
+              className="flex items-center gap-2 bg-slate-700 hover:bg-slate-800 text-white font-semibold py-1.5 px-3.5 rounded-lg text-xs transition-colors shadow-sm whitespace-nowrap"
+            >
+              <DownloadIcon className="w-3.5 h-3.5"/>
+              Download Audio (Merged)
+            </button>
+          )}
+        </div>
       )}
     </div>
   );

@@ -5,6 +5,11 @@ import {
   unlockAudioContext,
 } from '../services/soundService';
 import { processLiveAudioChunk, synthesizeLiveReport, LiveHistoryContext } from '../services/geminiService';
+import {
+  initLiveAudioSessionCache,
+  cacheAudioChunk,
+  clearSessionAudioCache,
+} from '../services/audioCacheService';
 
 interface LiveHistorySnapshot {
   findings: string[];
@@ -187,11 +192,14 @@ export const useLiveSession = () => {
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
+  const audioWorkletNodeRef = useRef<AudioWorkletNode | null>(null);
   const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const recordedPcmChunksRef = useRef<Int16Array[]>([]);
   const onTranscriptUpdateRef = useRef<((lines: string[]) => void) | null>(null);
   const isSessionActiveRef = useRef<boolean>(false);
   const isPausedRef = useRef(isPaused);
+  const wakeLockRef = useRef<any>(null);
+  const sessionIdRef = useRef<string>('');
 
   // Progressive Low-Latency Flash Chunking Engine state
   const sessionStartTimeRef = useRef<number>(0);
@@ -229,6 +237,49 @@ export const useLiveSession = () => {
   useEffect(() => {
     isSessionActiveRef.current = isSessionActive;
   }, [isSessionActive]);
+
+  // Feature B: Screen Wake Lock API management
+  // Prevents mobile and desktop devices from sleeping, dimming, or throttling background timers during active dictation
+  const requestScreenWakeLock = useCallback(async () => {
+    if (typeof navigator !== 'undefined' && 'wakeLock' in navigator) {
+      try {
+        if (!wakeLockRef.current) {
+          wakeLockRef.current = await (navigator as any).wakeLock.request('screen');
+          wakeLockRef.current.addEventListener('release', () => {
+            wakeLockRef.current = null;
+          });
+        }
+      } catch (err) {
+        console.debug('Screen WakeLock acquisition notice:', err);
+      }
+    }
+  }, []);
+
+  const releaseScreenWakeLock = useCallback(() => {
+    if (wakeLockRef.current) {
+      try {
+        wakeLockRef.current.release();
+      } catch (err) {}
+      wakeLockRef.current = null;
+    }
+  }, []);
+
+  // Re-request wake lock if user tabs back or unlocks screen while dictation is actively recording
+  useEffect(() => {
+    const handleVisibilityChange = async () => {
+      if (
+        document.visibilityState === 'visible' &&
+        isSessionActiveRef.current &&
+        !isPausedRef.current
+      ) {
+        await requestScreenWakeLock();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [requestScreenWakeLock]);
 
   // Synchronize state from UI manual edits, deletions, reorders, or merges
   const syncFindings = useCallback((updatedFindings: string[]) => {
@@ -376,13 +427,24 @@ export const useLiveSession = () => {
       schedulerIntervalRef.current = null;
     }
 
-    // Disconnect script processor
+    // Disconnect AudioWorkletNode (Feature A)
+    if (audioWorkletNodeRef.current) {
+      try {
+        audioWorkletNodeRef.current.disconnect();
+      } catch (e) {}
+      audioWorkletNodeRef.current = null;
+    }
+
+    // Disconnect script processor fallback
     if (scriptProcessorRef.current) {
       try {
         scriptProcessorRef.current.disconnect();
       } catch (e) {}
       scriptProcessorRef.current = null;
     }
+
+    // Release Screen Wake Lock (Feature B)
+    releaseScreenWakeLock();
 
     // Close AudioContext
     if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
@@ -436,10 +498,18 @@ export const useLiveSession = () => {
     setIsSessionActive(true);
     isSessionActiveRef.current = true;
 
+    // Feature F: Initialize persistent audio caching session
+    const sessionId = Date.now().toString();
+    sessionIdRef.current = sessionId;
+    initLiveAudioSessionCache(sessionId).catch(() => {});
+
+    // Feature B: Request Screen Wake Lock
+    requestScreenWakeLock().catch(() => {});
+
     // Unlock audio context for potential interruption alert
     unlockAudioContext();
 
-    // 1. Setup AudioContext and Audio Analyzer for live volume visualizer and 16kHz WAV recording
+    // 1. Setup AudioContext and Audio Pipeline for live volume visualizer and 16kHz WAV recording
     let stream: MediaStream | null = null;
     try {
       const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
@@ -489,24 +559,11 @@ export const useLiveSession = () => {
       });
 
       const source = audioCtx.createMediaStreamSource(stream);
-      const scriptProcessor = audioCtx.createScriptProcessor(2048, 1, 1);
-      scriptProcessorRef.current = scriptProcessor;
 
-      scriptProcessor.onaudioprocess = (e) => {
+      // Centralized PCM handler for both AudioWorklet (high performance) and ScriptProcessor fallback
+      const handleIncomingPcmData = (pcm16: Int16Array, rms: number, peak: number) => {
         if (isPausedRef.current) return;
 
-        const inputData = e.inputBuffer.getChannelData(0);
-        
-        // Calculate audio RMS volume level and detect human vocal presence
-        let sum = 0;
-        let peak = 0;
-        for (let i = 0; i < inputData.length; i++) {
-          const sample = inputData[i];
-          const absVal = Math.abs(sample);
-          if (absVal > peak) peak = absVal;
-          sum += sample * sample;
-        }
-        const rms = Math.sqrt(sum / inputData.length);
         const level = Math.min(100, Math.round(rms * 450));
         setAudioLevel(level);
 
@@ -516,20 +573,110 @@ export const useLiveSession = () => {
           speechDetectedInWindowRef.current = true;
         }
 
-        // Convert Float32 to 16-bit linear PCM
-        const pcm16 = new Int16Array(inputData.length);
-        for (let i = 0; i < inputData.length; i++) {
-          const s = Math.max(-1, Math.min(1, inputData[i]));
-          pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-        }
-
         // Save recorded PCM chunk for slice sending & final WAV generation
         recordedPcmChunksRef.current.push(pcm16);
         totalSamplesCountRef.current += pcm16.length;
+
+        // Feature F: Persist chunk to IndexedDB rolling cache for crash resilience
+        if (sessionIdRef.current) {
+          cacheAudioChunk(sessionIdRef.current, recordedPcmChunksRef.current.length - 1, pcm16);
+        }
       };
 
-      source.connect(scriptProcessor);
-      scriptProcessor.connect(audioCtx.destination);
+      // Feature A: Transition from ScriptProcessorNode to AudioWorkletNode
+      let workletInitialized = false;
+      if (audioCtx.audioWorklet && typeof AudioWorkletNode !== 'undefined') {
+        try {
+          const workletCode = `
+            class LiveAudioCaptureProcessor extends AudioWorkletProcessor {
+              constructor() {
+                super();
+                this.bufferSize = 2048;
+                this.buffer = new Float32Array(this.bufferSize);
+                this.bufferIndex = 0;
+              }
+              process(inputs, outputs, parameters) {
+                const input = inputs[0];
+                if (!input || !input[0]) return true;
+                const channel = input[0];
+                for (let i = 0; i < channel.length; i++) {
+                  this.buffer[this.bufferIndex++] = channel[i];
+                  if (this.bufferIndex >= this.bufferSize) {
+                    let sum = 0;
+                    let peak = 0;
+                    const pcm16 = new Int16Array(this.bufferSize);
+                    for (let j = 0; j < this.bufferSize; j++) {
+                      const s = this.buffer[j];
+                      const abs = Math.abs(s);
+                      if (abs > peak) peak = abs;
+                      sum += s * s;
+                      const clamped = Math.max(-1, Math.min(1, s));
+                      pcm16[j] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7FFF;
+                    }
+                    const rms = Math.sqrt(sum / this.bufferSize);
+                    this.port.postMessage({
+                      buffer: pcm16.buffer,
+                      rms: rms,
+                      peak: peak
+                    }, [pcm16.buffer]);
+                    this.bufferIndex = 0;
+                  }
+                }
+                return true;
+              }
+            }
+            registerProcessor('live-audio-capture-processor', LiveAudioCaptureProcessor);
+          `;
+          const blob = new Blob([workletCode], { type: 'application/javascript' });
+          const workletUrl = URL.createObjectURL(blob);
+          await audioCtx.audioWorklet.addModule(workletUrl);
+          URL.revokeObjectURL(workletUrl);
+
+          const workletNode = new AudioWorkletNode(audioCtx, 'live-audio-capture-processor');
+          audioWorkletNodeRef.current = workletNode;
+
+          workletNode.port.onmessage = (event) => {
+            const { buffer, rms, peak } = event.data;
+            const pcm16 = new Int16Array(buffer);
+            handleIncomingPcmData(pcm16, rms, peak);
+          };
+
+          source.connect(workletNode);
+          workletNode.connect(audioCtx.destination);
+          workletInitialized = true;
+        } catch (workletErr) {
+          console.warn('AudioWorklet initialization fallback to ScriptProcessor:', workletErr);
+          workletInitialized = false;
+        }
+      }
+
+      // Seamless fallback to ScriptProcessorNode if AudioWorklet is unavailable or fails
+      if (!workletInitialized) {
+        const scriptProcessor = audioCtx.createScriptProcessor(2048, 1, 1);
+        scriptProcessorRef.current = scriptProcessor;
+
+        scriptProcessor.onaudioprocess = (e) => {
+          if (isPausedRef.current) return;
+          const inputData = e.inputBuffer.getChannelData(0);
+
+          let sum = 0;
+          let peak = 0;
+          const pcm16 = new Int16Array(inputData.length);
+          for (let i = 0; i < inputData.length; i++) {
+            const sample = inputData[i];
+            const absVal = Math.abs(sample);
+            if (absVal > peak) peak = absVal;
+            sum += sample * sample;
+            const s = Math.max(-1, Math.min(1, sample));
+            pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+          }
+          const rms = Math.sqrt(sum / inputData.length);
+          handleIncomingPcmData(pcm16, rms, peak);
+        };
+
+        source.connect(scriptProcessor);
+        scriptProcessor.connect(audioCtx.destination);
+      }
     } catch (audioErr: any) {
       console.warn('Audio capture setup notice:', audioErr);
       setError('Microphone permission required for Live Dictation. Please allow microphone access.');
@@ -593,11 +740,12 @@ export const useLiveSession = () => {
     setIsPaused(true);
     pauseStartTimeRef.current = Date.now();
     setStatus('Live dictation paused.');
+    releaseScreenWakeLock();
     if (audioContextRef.current && audioContextRef.current.state === 'running') {
       try { audioContextRef.current.suspend(); } catch (e) {}
     }
     setAudioLevel(0);
-  }, []);
+  }, [releaseScreenWakeLock]);
 
   const resumeSession = useCallback(() => {
     if (pauseStartTimeRef.current > 0) {
@@ -605,16 +753,18 @@ export const useLiveSession = () => {
       pauseStartTimeRef.current = 0;
     }
     setIsPaused(false);
+    requestScreenWakeLock().catch(() => {});
     setStatus(`🎙️ Live Dictation Active (${selectedModelRef.current}). Listening...`);
     if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
       try { audioContextRef.current.resume(); } catch (e) {}
     }
-  }, []);
+  }, [requestScreenWakeLock]);
 
   const stopSession = useCallback(async () => {
     setIsSessionActive(false);
     isSessionActiveRef.current = false;
     setIsPaused(false);
+    releaseScreenWakeLock();
 
     if (schedulerIntervalRef.current) {
       clearInterval(schedulerIntervalRef.current);
@@ -698,6 +848,12 @@ export const useLiveSession = () => {
     let finalAudioBlob: Blob | null = null;
     if (recordedPcmChunksRef.current.length > 0) {
       finalAudioBlob = pcmToWavBlob(recordedPcmChunksRef.current, 16000);
+    }
+
+    // Feature F: Clear the active session cache from IndexedDB once final audio blob & transcript are produced
+    if (sessionIdRef.current) {
+      clearSessionAudioCache(sessionIdRef.current).catch(() => {});
+      sessionIdRef.current = '';
     }
 
     stopAudio();

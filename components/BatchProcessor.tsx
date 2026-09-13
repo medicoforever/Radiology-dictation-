@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useAudioRecorder } from '../hooks/useAudioRecorder';
 import { processAudio, createChat, blobToBase64, continueAudioDictation, base64ToBlob, modifyFindingWithAudio, modifyReportWithAudio, identifyPotentialErrors, runComplexImpressionGeneration, transcribeAudioForPrompt, assessDictationAudio } from '../services/geminiService';
 import { saveAudioBlob, getAudioBlob, clearUnusedAudioBlobs } from '../services/audioStorage';
+import { mergeMultipleAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
 import { downloadAssessmentPDF, downloadBatchAssessmentsPDF, BatchReportItem } from '../services/assessmentPdfGenerator';
 import { Activity } from 'lucide-react';
 
@@ -210,6 +211,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     const [complexInputs, setComplexInputs] = useState<Record<string, string>>({});
     const [agenticStates, setAgenticStates] = useState<Record<string, 'idle' | 'processing' | 'error'>>({});
     const [agenticErrors, setAgenticErrors] = useState<Record<string, string | null>>({});
+    const [agenticProgressTexts, setAgenticProgressTexts] = useState<Record<string, string>>({});
     const [expertNotesForBatches, setExpertNotesForBatches] = useState<Record<string, string | null>>({});
     const [isTranscribingComplex, setIsTranscribingComplex] = useState<Record<string, boolean>>({});
     const complexInputRecorder = useAudioRecorder();
@@ -295,7 +297,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                         // Recreate chat session for batches that have been processed
                         if (savedBatch.status === 'complete' && savedBatch.findings && audioBlobs.length > 0) {
                             try {
-                                const mergedBlob = new Blob(audioBlobs, { type: audioBlobs[0]?.type || 'audio/webm' });
+                                const mergedBlob = await mergeMultipleAudioBlobs(audioBlobs);
                                 chat = await createChat(mergedBlob, savedBatch.findings, savedBatch.customPrompt, savedBatch.customImages);
                             } catch (e) {
                                 console.error(`Failed to recreate chat for batch ${savedBatch.name}:`, e);
@@ -1005,8 +1007,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             if (batch.audioBlobs.length === 0) return;
             const currentReqId = batchProcessingIdRef.current[batch.id];
             try {
-                const mimeType = batch.audioBlobs[0].type;
-                const mergedBlob = new Blob(batch.audioBlobs, { type: mimeType });
+                const mergedBlob = await mergeMultipleAudioBlobs(batch.audioBlobs);
                 const findings = await processAudio(mergedBlob, batch.selectedModel, batch.customPrompt, batch.customImages);
                 
                 if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
@@ -1048,8 +1049,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         setBatches(prev => prev.map(b => b.id === batchId ? {...b, status: 'processing', error: undefined } : b));
 
         try {
-            const mimeType = batch.audioBlobs[0].type;
-            const mergedBlob = new Blob(batch.audioBlobs, { type: mimeType });
+            const mergedBlob = await mergeMultipleAudioBlobs(batch.audioBlobs);
             const findings = await processAudio(mergedBlob, batch.selectedModel, batch.customPrompt, batch.customImages);
             
             if (batchProcessingIdRef.current[batchId] !== currentReqId) return;
@@ -1482,23 +1482,13 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     };
 
 
-    const handleDownload = (batch: Batch) => {
+    const handleDownload = async (batch: Batch) => {
         if (!batch.audioBlobs.length) return;
         try {
-            const mimeType = batch.audioBlobs[0].type;
-            const mergedBlob = new Blob(batch.audioBlobs, { type: mimeType });
-            const url = URL.createObjectURL(mergedBlob);
-            const a = document.createElement('a');
-            a.style.display = 'none';
-            a.href = url;
-            const extension = mimeType === 'audio/mpeg' ? 'mp3' : (mimeType.split('/')[1] || 'webm').split(';')[0];
-            a.download = `${batch.name.replace(/\s+/g, '_')}.${extension}`;
-            document.body.appendChild(a);
-            a.click();
-            window.URL.revokeObjectURL(url);
-            a.remove();
+            const mergedBlob = await mergeMultipleAudioBlobs(batch.audioBlobs);
+            triggerAudioDownload(mergedBlob, batch.name.replace(/\s+/g, '_'));
         } catch (err) {
-            console.error('Failed to download audio:', err)
+            console.error('Failed to download audio:', err);
         }
     };
 
@@ -1703,8 +1693,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                 const updatedFindings = [...batch.findings, ...newFindings];
                 
                 const updatedAudioBlobs = [...batch.audioBlobs, newAudioBlob];
-                const mimeType = updatedAudioBlobs[0].type;
-                const mergedBlob = new Blob(updatedAudioBlobs, { type: mimeType });
+                const mergedBlob = await mergeMultipleAudioBlobs(updatedAudioBlobs);
 
                 const chatSession = await createChat(mergedBlob, updatedFindings, batch.customPrompt, batch.customImages);
                 const aiGreeting = "I have updated the transcript with your new dictation. How can I help you further?";
@@ -1766,8 +1755,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             try {
                 const newFindings = await modifyReportWithAudio(batchToModify.findings, audioBlob, batchToModify.selectedModel, batchToModify.customPrompt, batchToModify.customImages);
                 
-                const mimeType = batchToModify.audioBlobs[0]?.type || 'audio/webm';
-                const mergedBlob = new Blob(batchToModify.audioBlobs, { type: mimeType });
+                const mergedBlob = await mergeMultipleAudioBlobs(batchToModify.audioBlobs);
                 const chatSession = await createChat(mergedBlob, newFindings, batchToModify.customPrompt, batchToModify.customImages);
                 const aiGreeting = "I have updated the transcript with your new dictation. How can I help you further?";
                 const updatedChatHistory = [{ author: 'AI' as const, text: `${newFindings.join('\n\n')}\n\n${aiGreeting}` }];
@@ -1823,12 +1811,17 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
 
         setAgenticStates(prev => ({ ...prev, [batchId]: 'processing' }));
         setAgenticErrors(prev => ({ ...prev, [batchId]: null }));
+        setAgenticProgressTexts(prev => ({ ...prev, [batchId]: 'Starting complex impression workflow...' }));
         setExpertNotesForBatches(prev => ({ ...prev, [batchId]: null }));
 
         try {
             setUndoStates(prev => ({ ...prev, [batchId]: batch.findings! }));
             const complexInput = complexInputs[batchId] || '';
-            const result = await runComplexImpressionGeneration(batch.findings, complexInput);
+            const result = await runComplexImpressionGeneration(
+                batch.findings, 
+                complexInput,
+                (statusText) => setAgenticProgressTexts(prev => ({ ...prev, [batchId]: statusText }))
+            );
             
             setBatches(prevBatches => prevBatches.map(b => b.id === batchId ? { ...b, findings: result.findings } : b));
             setExpertNotesForBatches(prev => ({ ...prev, [batchId]: result.expertNotes }));
@@ -1836,10 +1829,12 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             setComplexGeneratorVisibleForBatchId(null);
             setComplexInputs(prev => ({ ...prev, [batchId]: '' }));
             setAgenticStates(prev => ({ ...prev, [batchId]: 'idle' }));
+            setAgenticProgressTexts(prev => ({ ...prev, [batchId]: '' }));
         } catch (err) {
             const message = err instanceof Error ? err.message : 'An unknown error occurred.';
             setAgenticErrors(prev => ({ ...prev, [batchId]: `Failed to generate impression: ${message}` }));
             setAgenticStates(prev => ({ ...prev, [batchId]: 'error' }));
+            setAgenticProgressTexts(prev => ({ ...prev, [batchId]: '' }));
         }
     };
 
@@ -2792,10 +2787,17 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                 {complexGeneratorVisibleForBatchId === batch.id ? (
                                                     <div className="mt-6 p-4 border-2 border-dashed rounded-lg bg-slate-50 dark:bg-slate-700/50 dark:border-slate-600">
                                                         {agenticStates[batch.id] === 'processing' ? (
-                                                            <div className="flex flex-col items-center justify-center p-4">
-                                                                <Spinner />
-                                                                <p className="font-semibold text-slate-700 dark:text-slate-200 mt-4">Running agentic analysis...</p>
-                                                                <p className="text-sm text-slate-500 dark:text-slate-400">This may take a minute.</p>
+                                                            <div className="flex flex-col items-center justify-center p-6 text-center">
+                                                                <Spinner className="w-8 h-8 text-purple-600 mb-3" />
+                                                                <p className="font-semibold text-slate-800 dark:text-slate-200">
+                                                                    Generating Complex Impression
+                                                                </p>
+                                                                <p className="text-sm font-medium text-purple-600 dark:text-purple-400 mt-2 px-3 py-1.5 rounded-lg bg-purple-50 dark:bg-purple-900/30 border border-purple-200 dark:border-purple-800/50 max-w-lg animate-pulse">
+                                                                    {agenticProgressTexts[batch.id] || 'Running agentic analysis...'}
+                                                                </p>
+                                                                <p className="text-xs text-slate-500 dark:text-slate-400 mt-2">
+                                                                    Default: gemini-3.8-flash (Search Grounded) • Automatic failover & retry
+                                                                </p>
                                                             </div>
                                                         ) : (
                                                             <>

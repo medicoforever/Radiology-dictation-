@@ -23,10 +23,12 @@ import StopIcon from './components/icons/StopIcon';
 import CloseIcon from './components/icons/CloseIcon';
 import CustomPromptInput from './components/ui/CustomPromptInput';
 import { AVAILABLE_MODELS, DEFAULT_SELECTED_MODEL } from './constants';
+import { mergeAudioBlobs } from './services/audioMerger';
 import { autoSaveSingleDictation, autoSaveLiveDictation, SaveResult, syncPendingLocalDictationsToDrive, isDriveConnected, subscribeToAuth } from './services/googleDriveService';
 import { DriveStatusBadge } from './components/DriveStatusBadge';
 import { DriveAutoSaveToast } from './components/DriveAutoSaveToast';
 import { DriveReportsModal } from './components/DriveReportsModal';
+import { RotateCcw, X, ExternalLink } from 'lucide-react';
 
 interface ChatMessage {
   author: 'You' | 'AI';
@@ -115,6 +117,26 @@ const App: React.FC = () => {
   const activeDictationTimestampRef = useRef<number | null>(null);
   const activeDictationIsLiveRef = useRef<boolean>(false);
   const driveSyncedHashRef = useRef<string | null>(null);
+
+  // Snapshot ref and snackbar state for "Undo Record New Dictation"
+  const previousSingleSessionRef = useRef<{
+    findings: string[];
+    audioBlob: Blob | null;
+    chatHistory: ChatMessage[];
+    customPrompt: string;
+    customImages: Array<{ data: string; mimeType: string }>;
+    selectedModel: string;
+    identifiedErrors: IdentifiedError[];
+    errorCheckStatus: 'idle' | 'checking' | 'complete';
+    timestamp: number | null;
+    isLive: boolean;
+    driveSyncedHash: string | null;
+  } | null>(null);
+  const [undoSnackbar, setUndoSnackbar] = useState<{
+    visible: boolean;
+    secondsRemaining: number;
+  } | null>(null);
+  const undoCountdownIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   useEffect(() => {
     if (theme === 'dark') {
@@ -296,6 +318,13 @@ const App: React.FC = () => {
   }, [findings]);
 
   const handleRecordingComplete = useCallback(async (audioInput: Blob | Blob[]) => {
+    if (undoCountdownIntervalRef.current) {
+      clearInterval(undoCountdownIntervalRef.current);
+      undoCountdownIntervalRef.current = null;
+    }
+    setUndoSnackbar(null);
+    previousSingleSessionRef.current = null;
+
     const audioBlobs = Array.isArray(audioInput) ? audioInput : [audioInput];
     if (audioBlobs.length === 0 || audioBlobs.every(b => !b || b.size === 0)) {
       setError('Recording or upload failed. The audio or input file is empty.');
@@ -461,18 +490,25 @@ const App: React.FC = () => {
     });
   };
 
-  const handleContinueDictation = useCallback(async (newAudioBlob: Blob) => {
-    if (!audioBlob) {
+  const handleAudioBlobUpdate = useCallback((newBlob: Blob) => {
+    setAudioBlob(newBlob);
+    saveAudioBlob('single_mode_audio', newBlob).catch(() => {});
+  }, []);
+
+  const handleContinueDictation = useCallback(async (newAudioBlob: Blob, premergedBlob?: Blob) => {
+    if (!audioBlob && !premergedBlob) {
       throw new Error('Original audio not found. Cannot continue dictation.');
     }
 
     try {
+      // Use premergedBlob if already merged on Stop click; otherwise merge now
+      const mergedBlob = premergedBlob || (audioBlob ? await mergeAudioBlobs(audioBlob, newAudioBlob) : newAudioBlob);
+      setAudioBlob(mergedBlob);
+      saveAudioBlob('single_mode_audio', mergedBlob).catch(() => {});
+
       const newFindings = await processAudio(newAudioBlob, selectedModel, customPrompt, customImages);
       const updatedFindings = [...findings, ...newFindings];
       setFindings(updatedFindings);
-
-      const mergedBlob = new Blob([audioBlob, newAudioBlob], { type: getCleanMimeType(audioBlob) });
-      setAudioBlob(mergedBlob);
       
       const chatSession = await createChat(mergedBlob, updatedFindings, customPrompt, customImages);
       setChat(chatSession);
@@ -530,6 +566,59 @@ const App: React.FC = () => {
   };
 
   const resetSingleMode = () => {
+    // If there was active session content, snapshot it for the Undo Snackbar
+    if (findings.length > 0 || audioBlob !== null) {
+      previousSingleSessionRef.current = {
+        findings: [...findings],
+        audioBlob,
+        chatHistory: [...chatHistory],
+        customPrompt,
+        customImages: [...customImages],
+        selectedModel,
+        identifiedErrors: [...identifiedErrors],
+        errorCheckStatus,
+        timestamp: activeDictationTimestampRef.current,
+        isLive: activeDictationIsLiveRef.current,
+        driveSyncedHash: driveSyncedHashRef.current,
+      };
+
+      if (undoCountdownIntervalRef.current) {
+        clearInterval(undoCountdownIntervalRef.current);
+      }
+
+      setUndoSnackbar({
+        visible: true,
+        secondsRemaining: 15,
+      });
+
+      undoCountdownIntervalRef.current = setInterval(() => {
+        setUndoSnackbar(prev => {
+          if (!prev) return null;
+          if (prev.secondsRemaining <= 1) {
+            clearInterval(undoCountdownIntervalRef.current!);
+            undoCountdownIntervalRef.current = null;
+            // Now finalize cleanup of persistent storage
+            try {
+              localStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
+              deleteAudioBlob('single_mode_audio').catch(() => {});
+            } catch (e) {}
+            previousSingleSessionRef.current = null;
+            return null;
+          }
+          return { ...prev, secondsRemaining: prev.secondsRemaining - 1 };
+        });
+      }, 1000);
+    } else {
+      // Nothing to undo, perform instant cleanup
+      try {
+        localStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
+        deleteAudioBlob('single_mode_audio').catch(() => {});
+      } catch (error) {
+        console.error("Failed to remove item from localStorage:", error);
+      }
+    }
+
+    // Reset workspace to idle immediately so user can record right away without confirmation friction
     setStatus(AppStatus.Idle);
     setFindings([]);
     setError(null);
@@ -545,13 +634,78 @@ const App: React.FC = () => {
     activeDictationTimestampRef.current = null;
     activeDictationIsLiveRef.current = false;
     driveSyncedHashRef.current = null;
-    // Clear saved state on reset
+  };
+
+  const handleUndoReset = async () => {
+    if (undoCountdownIntervalRef.current) {
+      clearInterval(undoCountdownIntervalRef.current);
+      undoCountdownIntervalRef.current = null;
+    }
+    setUndoSnackbar(null);
+
+    const prev = previousSingleSessionRef.current;
+    if (!prev) return;
+
+    setStatus(AppStatus.Success);
+    setFindings(prev.findings);
+    setAudioBlob(prev.audioBlob);
+    setChatHistory(prev.chatHistory);
+    setCustomPrompt(prev.customPrompt);
+    setCustomImages(prev.customImages);
+    setSelectedModel(prev.selectedModel);
+    setIdentifiedErrors(prev.identifiedErrors);
+    setErrorCheckStatus(prev.errorCheckStatus);
+    activeDictationTimestampRef.current = prev.timestamp;
+    activeDictationIsLiveRef.current = prev.isLive;
+    driveSyncedHashRef.current = prev.driveSyncedHash;
+
+    // Restore persistent storage
+    try {
+      const stateToSave = {
+        findings: prev.findings,
+        chatHistory: prev.chatHistory,
+        selectedModel: prev.selectedModel,
+        customPrompt: prev.customPrompt,
+        customImages: prev.customImages,
+        timestamp: prev.timestamp,
+        isLive: prev.isLive,
+        driveSyncedHash: prev.driveSyncedHash,
+      };
+      localStorage.setItem(SINGLE_MODE_STORAGE_KEY, JSON.stringify(stateToSave));
+      if (prev.audioBlob) {
+        await saveAudioBlob('single_mode_audio', prev.audioBlob);
+      }
+    } catch (e) {
+      console.warn("Failed to re-persist undone session:", e);
+    }
+
+    // Recreate chat session
+    try {
+      if (prev.audioBlob) {
+        const chatSession = await createChat(prev.audioBlob, prev.findings, prev.customPrompt, prev.customImages);
+        setChat(chatSession);
+      } else {
+        const chatSession = await createChatFromText(prev.findings, prev.customPrompt, prev.customImages);
+        setChat(chatSession);
+      }
+    } catch (err) {
+      console.warn("Chat recreate on undo notice:", err);
+    }
+
+    previousSingleSessionRef.current = null;
+  };
+
+  const handleDismissUndo = () => {
+    if (undoCountdownIntervalRef.current) {
+      clearInterval(undoCountdownIntervalRef.current);
+      undoCountdownIntervalRef.current = null;
+    }
+    setUndoSnackbar(null);
     try {
       localStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
       deleteAudioBlob('single_mode_audio').catch(() => {});
-    } catch (error) {
-      console.error("Failed to remove item from localStorage:", error);
-    }
+    } catch (e) {}
+    previousSingleSessionRef.current = null;
   };
 
   const errorFileInputRef = useRef<HTMLInputElement>(null);
@@ -668,6 +822,7 @@ const App: React.FC = () => {
             onUpdateFinding={handleUpdateFinding}
             onAllFindingsUpdate={setFindings}
             onContinueDictation={handleContinueDictation}
+            onAudioBlobUpdate={handleAudioBlobUpdate}
             customPrompt={customPrompt}
             onCustomPromptChange={setCustomPrompt}
             customImages={customImages}
@@ -824,7 +979,7 @@ const App: React.FC = () => {
             </div>
             <div className="flex-1 text-center">
               <h1 className="text-xl sm:text-2xl md:text-3xl font-extrabold text-slate-800 dark:text-slate-100 tracking-tight">
-                Radiology Dictation Corrector
+                ☯️RADDOC's Dictation app
               </h1>
             </div>
             <div className="shrink-0 flex items-center gap-2">
@@ -932,8 +1087,94 @@ const App: React.FC = () => {
           {renderContent()}
         </main>
         
-        <footer className="text-center mt-6 text-xs sm:text-sm text-slate-500 dark:text-slate-500">
-          <p>Powered by Gemini AI • Professional Radiology Corrector</p>
+        <footer id="app-footer" className="mt-8 mb-4 border-t border-slate-200/80 dark:border-slate-700/80 pt-6 pb-2">
+          <div className="max-w-2xl mx-auto bg-slate-50/80 dark:bg-slate-800/60 rounded-2xl p-4 sm:p-5 border border-slate-200/80 dark:border-slate-700/60 shadow-xs">
+            <h3 className="text-xs sm:text-sm font-bold text-slate-800 dark:text-slate-100 flex items-center justify-center gap-1.5 mb-3.5 text-center">
+              <span>☯️</span>
+              <span>Subscribe to our channels for updates &amp; tools:</span>
+            </h3>
+            <ul className="space-y-2 text-xs sm:text-sm">
+              <li className="flex flex-col sm:flex-row sm:items-center justify-between gap-1 sm:gap-3 py-1.5 px-3 rounded-xl bg-white dark:bg-slate-800/90 border border-slate-200/70 dark:border-slate-700/70 hover:border-slate-300 dark:hover:border-slate-600 transition-colors">
+                <span className="font-semibold text-slate-800 dark:text-slate-200 flex items-center gap-2">
+                  <span className="text-emerald-500 font-bold">•</span>
+                  <span>WhatsApp Channel:</span>
+                </span>
+                <a
+                  href="https://whatsapp.com/channel/0029Vb2S2bW0G0Xq94mR721T"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 hover:underline inline-flex items-center gap-1 font-mono text-[11px] sm:text-xs truncate"
+                >
+                  <span className="truncate">https://whatsapp.com/channel/0029Vb2S2bW0G0Xq94mR721T</span>
+                  <ExternalLink className="w-3.5 h-3.5 shrink-0" />
+                </a>
+              </li>
+
+              <li className="flex flex-col sm:flex-row sm:items-center justify-between gap-1 sm:gap-3 py-1.5 px-3 rounded-xl bg-white dark:bg-slate-800/90 border border-slate-200/70 dark:border-slate-700/70 hover:border-slate-300 dark:hover:border-slate-600 transition-colors">
+                <span className="font-semibold text-slate-800 dark:text-slate-200 flex items-center gap-2">
+                  <span className="text-sky-500 font-bold">•</span>
+                  <span>Telegram Group:</span>
+                </span>
+                <a
+                  href="https://t.me/raddocs"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 hover:underline inline-flex items-center gap-1 font-mono text-[11px] sm:text-xs truncate"
+                >
+                  <span className="truncate">https://t.me/raddocs</span>
+                  <ExternalLink className="w-3.5 h-3.5 shrink-0" />
+                </a>
+              </li>
+
+              <li className="flex flex-col sm:flex-row sm:items-center justify-between gap-1 sm:gap-3 py-1.5 px-3 rounded-xl bg-white dark:bg-slate-800/90 border border-slate-200/70 dark:border-slate-700/70 hover:border-slate-300 dark:hover:border-slate-600 transition-colors">
+                <span className="font-semibold text-slate-800 dark:text-slate-200 flex items-center gap-2">
+                  <span className="text-sky-500 font-bold">•</span>
+                  <span>Telegram Channel:</span>
+                </span>
+                <a
+                  href="https://t.me/radiology_chatgpt"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 hover:underline inline-flex items-center gap-1 font-mono text-[11px] sm:text-xs truncate"
+                >
+                  <span className="truncate">https://t.me/radiology_chatgpt</span>
+                  <ExternalLink className="w-3.5 h-3.5 shrink-0" />
+                </a>
+              </li>
+
+              <li className="flex flex-col sm:flex-row sm:items-center justify-between gap-1 sm:gap-3 py-1.5 px-3 rounded-xl bg-white dark:bg-slate-800/90 border border-slate-200/70 dark:border-slate-700/70 hover:border-slate-300 dark:hover:border-slate-600 transition-colors">
+                <span className="font-semibold text-slate-800 dark:text-slate-200 flex items-center gap-2">
+                  <span className="text-slate-500 dark:text-slate-400 font-bold">•</span>
+                  <span>Twitter:</span>
+                </span>
+                <a
+                  href="https://x.com/RadDoc96"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 hover:underline inline-flex items-center gap-1 font-mono text-[11px] sm:text-xs truncate"
+                >
+                  <span className="truncate">https://x.com/RadDoc96</span>
+                  <ExternalLink className="w-3.5 h-3.5 shrink-0" />
+                </a>
+              </li>
+
+              <li className="flex flex-col sm:flex-row sm:items-center justify-between gap-1 sm:gap-3 py-1.5 px-3 rounded-xl bg-white dark:bg-slate-800/90 border border-slate-200/70 dark:border-slate-700/70 hover:border-slate-300 dark:hover:border-slate-600 transition-colors">
+                <span className="font-semibold text-slate-800 dark:text-slate-200 flex items-center gap-2">
+                  <span className="text-red-500 font-bold">•</span>
+                  <span>YouTube:</span>
+                </span>
+                <a
+                  href="https://youtube.com/@raddoc96"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 hover:underline inline-flex items-center gap-1 font-mono text-[11px] sm:text-xs truncate"
+                >
+                  <span className="truncate">https://youtube.com/@raddoc96</span>
+                  <ExternalLink className="w-3.5 h-3.5 shrink-0" />
+                </a>
+              </li>
+            </ul>
+          </div>
         </footer>
 
         {/* Multiple Files Upload Modal */}
@@ -1044,6 +1285,48 @@ const App: React.FC = () => {
           onClose={() => setIsReportsModalOpen(false)}
           onLoadFindings={handleLoadReportFindings}
         />
+
+        {/* Undo "Record New Dictation" Floating Snackbar */}
+        {undoSnackbar && undoSnackbar.visible && (
+          <div
+            id="undo-record-new-snackbar"
+            className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 max-w-md w-[calc(100%-2rem)] bg-slate-900/95 dark:bg-slate-800/95 backdrop-blur-md text-white border border-slate-700/80 shadow-2xl rounded-2xl p-3.5 sm:p-4 flex items-center justify-between gap-3 animate-in fade-in slide-in-from-bottom-5 duration-200"
+            role="status"
+            aria-live="polite"
+          >
+            <div className="flex items-center gap-3 min-w-0">
+              <div className="w-8 h-8 rounded-full bg-blue-500/20 text-blue-400 flex items-center justify-center shrink-0">
+                <RotateCcw className="w-4 h-4" />
+              </div>
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-slate-100 truncate">
+                  Previous dictation cleared
+                </p>
+                <p className="text-xs text-slate-400">
+                  Undo available for <span className="font-semibold text-blue-400 font-mono">{undoSnackbar.secondsRemaining}s</span>
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                id="undo-restore-btn"
+                onClick={handleUndoReset}
+                className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-blue-600 hover:bg-blue-500 active:bg-blue-700 text-white text-xs sm:text-sm font-semibold rounded-lg shadow-sm transition-colors cursor-pointer"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                Undo
+              </button>
+              <button
+                id="undo-dismiss-btn"
+                onClick={handleDismissUndo}
+                className="p-1.5 text-slate-400 hover:text-slate-200 hover:bg-slate-800/60 rounded-md transition-colors cursor-pointer"
+                aria-label="Dismiss undo notification"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
