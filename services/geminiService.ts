@@ -106,39 +106,189 @@ const responseSchema = {
     }
 };
 
+export interface DetectedTemplateInfo {
+  isTemplateMode: boolean;
+  templateType: 'docx' | 'image' | 'builtin' | 'custom_text' | 'none';
+  templateName?: string;
+  templateContent?: string;
+  templateHtml?: string;
+  userInstructions?: string;
+  templateContextPrompt: string;
+}
+
+export function detectAndExtractTemplate(
+  customPrompt?: string,
+  customImages?: Array<{ data: string; mimeType: string }> | null,
+  customDocx?: { name: string; text: string; html?: string } | null
+): DetectedTemplateInfo {
+  // 1. DOCX Template
+  if (customDocx && customDocx.text && customDocx.text.trim().length > 0) {
+    const templateContent = customDocx.text.trim();
+    const templateName = customDocx.name || 'Uploaded DOCX Template';
+    const templateContextPrompt = `
+================================================================================
+ACTIVE DOCX REPORT TEMPLATE: "${templateName}"
+BASELINE TEMPLATE CONTENT:
+"""
+${templateContent}
+"""
+
+CRITICAL TEMPLATE MERGE DIRECTIVES:
+1. BASELINE STRUCTURE: Use the full structure, headings, normal findings, and layout from this template as the baseline skeleton.
+2. NORMAL FINDINGS PRESERVATION: If the doctor dictates "normal", "all normal", "scan is normal", "unremarkable", or does not mention changes for any section/organ, PRESERVE and output the complete normal findings for that section verbatim WITHOUT the 'BOLD::' prefix.
+3. ABNORMAL / DICTATED FINDINGS MERGING: When the doctor dictates specific abnormal findings or modifications, merge them into the corresponding template sections and prefix only those dictated/abnormal lines with 'BOLD::'.
+4. NEW FINDINGS: Dictated findings not covered in the template should be inserted in the appropriate anatomical section with 'BOLD::'.
+5. IMPRESSION: Synthesize an accurate, comprehensive IMPRESSION based on all findings (normal and abnormal) in the standard format 'IMPRESSION:###point 1###point 2...'.
+================================================================================
+`;
+    return {
+      isTemplateMode: true,
+      templateType: 'docx',
+      templateName,
+      templateContent,
+      templateHtml: customDocx.html,
+      userInstructions: customPrompt?.trim() || '',
+      templateContextPrompt,
+    };
+  }
+
+  // 2. Visual Template (Images)
+  if (customImages && customImages.length > 0) {
+    return {
+      isTemplateMode: true,
+      templateType: 'image',
+      templateName: 'Visual Image Template',
+      userInstructions: customPrompt?.trim() || '',
+      templateContextPrompt: `
+================================================================================
+ACTIVE VISUAL TEMPLATE: The user has provided ${customImages.length} image(s) of a report template.
+Use them as a strict visual guide for the layout, sections, and formatting of the final report.
+Populate the template with findings from the dictation. Normal sections without abnormal dictations should be populated with standard normal template findings without BOLD::.
+Prefix dictated/abnormal lines with 'BOLD::'.
+================================================================================
+`,
+    };
+  }
+
+  // 3. Text Prompt Analysis (Built-in template or Custom text template)
+  if (customPrompt && customPrompt.trim().length > 0) {
+    const trimmed = customPrompt.trim();
+    const lower = trimmed.toLowerCase();
+
+    // Check built-in template match from REPORT_TEMPLATES
+    const matchedBuiltin = REPORT_TEMPLATES.find(t =>
+      lower.includes(t.name.toLowerCase()) ||
+      lower.includes(t.name.toLowerCase().replace(/\s+/g, '')) ||
+      (t.name.toLowerCase().includes('chest') && lower.includes('chest') && lower.includes('x-ray')) ||
+      (t.name.toLowerCase().includes('ct brain') && lower.includes('ct') && lower.includes('brain')) ||
+      (t.name.toLowerCase().includes('mri brain') && lower.includes('mri') && lower.includes('brain')) ||
+      (t.name.toLowerCase().includes('usg abdomen') && (lower.includes('usg') || lower.includes('ultrasound')) && lower.includes('abdo'))
+    );
+
+    if (matchedBuiltin) {
+      const templateContent = matchedBuiltin.content;
+      const templateName = matchedBuiltin.name;
+      const templateContextPrompt = `
+================================================================================
+ACTIVE RADIOLOGY NORMAL REPORT TEMPLATE: "${templateName}"
+BASELINE TEMPLATE CONTENT:
+"""
+${templateContent}
+"""
+
+CRITICAL TEMPLATE MERGE DIRECTIVES:
+1. BASELINE STRUCTURE: Use the full structure, headings, normal findings, and layout from this "${templateName}" template as the baseline skeleton.
+2. NORMAL FINDINGS PRESERVATION: If the doctor's audio dictation states "normal", "all normal", "scan is normal", "unremarkable", or does not mention changes for any anatomical section, PRESERVE and output the complete normal findings for that section verbatim WITHOUT the 'BOLD::' prefix.
+3. ABNORMAL / DICTATED FINDINGS MERGING: When the doctor dictates specific abnormal findings, observations, or modifications, merge them into the corresponding template sections and prefix only those dictated/abnormal lines with 'BOLD::'.
+4. NEW FINDINGS: Any new findings dictated that are not covered in the template should be inserted in the appropriate clinical location with 'BOLD::'.
+5. IMPRESSION: Synthesize an accurate, comprehensive IMPRESSION based on all findings (normal and abnormal) in the format 'IMPRESSION:###point 1###point 2...'.
+================================================================================
+`;
+      return {
+        isTemplateMode: true,
+        templateType: 'builtin',
+        templateName,
+        templateContent,
+        userInstructions: trimmed,
+        templateContextPrompt,
+      };
+    }
+
+    // Check for custom text template indicators:
+    // a) Keywords indicating template merge mode
+    const hasTemplateKeyword = /(template|report template|normal report|standard report|merge with|integrate into template|normal template|use template|format as template|merge dictation)/i.test(trimmed);
+    
+    // b) Structural radiology template indicators
+    const lines = trimmed.split('\n').map(l => l.trim()).filter(Boolean);
+    const hasRadiologyHeaders = /(TECHNIQUE|FINDINGS|IMPRESSION|CLINICAL PROFILE|CLINICAL HISTORY|INDICATION|COMPARISON|PROTOCOL|OBSERVATIONS):/i.test(trimmed);
+    const hasMultipleOrganSections = (trimmed.match(/([A-Z][a-zA-Z\s]{2,25}):\s+[A-Z]/g) || []).length >= 2;
+    const isMultiLineTemplate = lines.length >= 3 && (hasRadiologyHeaders || hasMultipleOrganSections || hasTemplateKeyword || trimmed.length > 80);
+
+    if (hasTemplateKeyword || hasRadiologyHeaders || isMultiLineTemplate) {
+      const templateContent = trimmed;
+      const templateName = lines[0] && lines[0].length < 60 ? lines[0].replace(/^#+\s*/, '') : 'Custom Text Template';
+      const templateContextPrompt = `
+================================================================================
+ACTIVE CUSTOM TEXT REPORT TEMPLATE: "${templateName}"
+BASELINE TEMPLATE CONTENT:
+"""
+${templateContent}
+"""
+
+CRITICAL TEMPLATE MERGE DIRECTIVES:
+1. BASELINE STRUCTURE: Use the full structure, headings, normal findings, and layout from this custom text template as the baseline skeleton of the report.
+2. NORMAL FINDINGS PRESERVATION: If the doctor's audio dictation states "normal", "all normal", "scan is normal", "unremarkable", or does not mention changes for any anatomical section, PRESERVE and output the complete normal findings for that section verbatim WITHOUT the 'BOLD::' prefix.
+3. ABNORMAL / DICTATED FINDINGS MERGING: When the doctor dictates specific abnormal findings, observations, or modifications, merge them into the corresponding template sections and prefix only those dictated/abnormal lines with 'BOLD::'.
+4. NEW FINDINGS: Any new findings dictated that are not covered in the template should be inserted in the appropriate clinical location with 'BOLD::'.
+5. IMPRESSION: Synthesize an accurate, comprehensive IMPRESSION combining template baseline and all abnormal findings in the format 'IMPRESSION:###point 1###point 2...'.
+================================================================================
+`;
+      return {
+        isTemplateMode: true,
+        templateType: 'custom_text',
+        templateName,
+        templateContent,
+        userInstructions: trimmed,
+        templateContextPrompt,
+      };
+    }
+  }
+
+  return {
+    isTemplateMode: false,
+    templateType: 'none',
+    userInstructions: customPrompt?.trim() || '',
+    templateContextPrompt: '',
+  };
+}
+
 export const processAudio = async (
   audioBlob: Blob | Blob[], 
   model: string, 
   customPrompt?: string,
   customImages?: Array<{ data: string; mimeType: string }> | null,
-  existingFindings?: string[]
+  existingFindings?: string[],
+  customDocx?: { name: string; text: string; html?: string } | null
 ): Promise<string[]> => {
   const audioBlobs = Array.isArray(audioBlob) ? audioBlob : [audioBlob];
   if (audioBlobs.length === 0) {
     throw new Error("No audio or input files provided for processing.");
   }
 
-  const useTemplate = customPrompt?.toLowerCase().includes('report template');
-  let basePrompt: string;
   const isReprocessing = existingFindings && existingFindings.length > 0;
+  const templateInfo = detectAndExtractTemplate(customPrompt, customImages, customDocx);
 
+  let basePrompt: string;
   if (isReprocessing) {
-      basePrompt = REPROCESS_GEMINI_PROMPT;
-  } else if (useTemplate) {
-      const selectedTemplate = REPORT_TEMPLATES.find(t =>
-          customPrompt!.toLowerCase().includes(t.name.toLowerCase())
-      );
-
-      if (selectedTemplate) {
-          const templateContent = `## ${selectedTemplate.name} Normal Report Template\n${selectedTemplate.content}`;
-          basePrompt = TEMPLATE_GEMINI_PROMPT.replace('[INSERT_TEMPLATE_HERE]', templateContent);
-      } else {
-          basePrompt = TEMPLATE_GEMINI_PROMPT.replace('[INSERT_TEMPLATE_HERE]', '// Template mentioned in custom instructions was not found.');
-      }
-  } else if (customImages && customImages.length > 0) {
+    basePrompt = REPROCESS_GEMINI_PROMPT;
+  } else if (templateInfo.isTemplateMode) {
+    if (templateInfo.templateType === 'image') {
       basePrompt = VISUAL_TEMPLATE_GEMINI_PROMPT;
+    } else {
+      basePrompt = TEMPLATE_GEMINI_PROMPT.replace('[INSERT_TEMPLATE_HERE]', templateInfo.templateContent || customPrompt || '');
+    }
   } else {
-      basePrompt = DEFAULT_GEMINI_PROMPT;
+    basePrompt = DEFAULT_GEMINI_PROMPT;
   }
   
   const prompt = customPrompt 
@@ -146,6 +296,13 @@ export const processAudio = async (
     : basePrompt;
 
   const parts: any[] = [];
+
+  // If template is detected, inject the explicit template merge directives
+  if (templateInfo.isTemplateMode && templateInfo.templateContextPrompt) {
+    parts.push({
+      text: templateInfo.templateContextPrompt
+    });
+  }
 
   if (customImages && customImages.length > 0) {
     for (const customImage of customImages) {
@@ -203,9 +360,20 @@ export const processAudio = async (
     });
   }
   
-  const targetModel = (model === 'gemini-3.5-transcribe-live' || model === 'gemini-3.5-flash-lite')
-    ? 'gemini-3.5-transcribe'
-    : model;
+  // For merge mode alone: transcribe-only models do not support template reasoning or JSON mode.
+  // Route merge mode to multimodal reasoning models (defaulting to gemini-3.7-flash).
+  let targetModel: string;
+  if (templateInfo.isTemplateMode) {
+    if (model === 'gemini-3.5-transcribe-live' || model === 'gemini-3.5-flash-lite' || model === 'gemini-3.5-transcribe') {
+      targetModel = 'gemini-3.7-flash';
+    } else {
+      targetModel = model || 'gemini-3.7-flash';
+    }
+  } else {
+    targetModel = (model === 'gemini-3.5-transcribe-live' || model === 'gemini-3.5-flash-lite')
+      ? 'gemini-3.5-transcribe'
+      : model;
+  }
 
   try {
     const response: GenerateContentResponse = await getAI().models.generateContent({
@@ -230,11 +398,37 @@ export const processAudio = async (
     } else {
       throw new Error("Invalid data structure in API response. Expected a 'findings' array.");
     }
-  } catch (error) {
+  } catch (error: any) {
     console.warn("Gemini API call returned error, evaluating fallback:", error);
-    if (useTemplate) {
+
+    // In MERGE MODE ALONE: If error is JSON mode unsupported or schema failure, retry cleanly with Gemini 3.7 Flash & raw JSON prompt
+    if (templateInfo.isTemplateMode) {
+      try {
+        const fallbackModel = 'gemini-3.7-flash';
+        const retryResponse: GenerateContentResponse = await getAI().models.generateContent({
+          model: fallbackModel,
+          contents: {
+            parts: [
+              ...parts,
+              { text: "\n\nCRITICAL OUTPUT REQUIREMENT: Output ONLY a valid JSON object in the exact format: {\"findings\": [\"finding 1\", \"finding 2\", ...]}" }
+            ]
+          }
+        });
+
+        const retryText = retryResponse.text?.trim() || '';
+        const jsonMatch = retryText.match(/\{[\s\S]*"findings"[\s\S]*\}/);
+        if (jsonMatch) {
+          const parsed = JSON.parse(jsonMatch[0]);
+          if (parsed && Array.isArray(parsed.findings) && parsed.findings.length > 0) {
+            return parsed.findings;
+          }
+        }
+      } catch (retryErr) {
+        console.warn("Merge mode fallback attempt error:", retryErr);
+      }
+
       const selectedTemplate = REPORT_TEMPLATES.find(t =>
-        customPrompt!.toLowerCase().includes(t.name.toLowerCase())
+        customPrompt && customPrompt.toLowerCase().includes(t.name.toLowerCase())
       );
       if (selectedTemplate) {
         try {
@@ -383,7 +577,8 @@ export const modifyReportWithAudio = async (
   audioBlob: Blob, 
   model: string, 
   customPrompt?: string,
-  customImages?: Array<{ data: string; mimeType: string }> | null
+  customImages?: Array<{ data: string; mimeType: string }> | null,
+  customDocx?: { name: string; text: string; html?: string } | null
 ): Promise<string[]> => {
   const base64Audio = await blobToBase64(audioBlob);
 
@@ -462,7 +657,10 @@ export const modifyReportWithAudio = async (
 ${JSON.stringify({ findings: currentFindings })}
 `;
 
-  if (customPrompt) {
+  const templateInfo = detectAndExtractTemplate(customPrompt, customImages, customDocx);
+  if (templateInfo.isTemplateMode && templateInfo.templateContextPrompt) {
+    prompt += `\n\n${templateInfo.templateContextPrompt}`;
+  } else if (customPrompt) {
     prompt += `\n\nAdditionally, follow these custom instructions when processing the request:\n${customPrompt}`;
   }
 
@@ -488,9 +686,13 @@ ${JSON.stringify({ findings: currentFindings })}
     },
   });
   
+  const targetModel = (templateInfo.isTemplateMode && (model === 'gemini-3.5-transcribe-live' || model === 'gemini-3.5-flash-lite' || model === 'gemini-3.5-transcribe'))
+    ? 'gemini-3.7-flash'
+    : model;
+
   try {
     const response: GenerateContentResponse = await getAI().models.generateContent({
-      model: model,
+      model: targetModel,
       contents: { parts },
       config: {
           responseMimeType: "application/json",
@@ -1034,61 +1236,42 @@ Now, generate the complete report including the new impression in the specified 
  * Resolves user custom instructions and checks if a built-in or custom report template is active.
  * Formats custom instructions with HIGHEST PRIORITY so they take precedence over default rules.
  */
-export function resolveCustomInstructionsAndTemplate(customPrompt?: string): {
+export function resolveCustomInstructionsAndTemplate(
+  customPrompt?: string,
+  customImages?: Array<{ data: string; mimeType: string }> | null,
+  customDocx?: { name: string; text: string; html?: string } | null
+): {
   instructionsText: string;
   templateContext: string;
   hasTemplate: boolean;
   templateName?: string;
+  templateContent?: string;
+  templateType: 'docx' | 'image' | 'builtin' | 'custom_text' | 'none';
 } {
-  if (!customPrompt || !customPrompt.trim()) {
-    return { instructionsText: '', templateContext: '', hasTemplate: false };
-  }
+  const detected = detectAndExtractTemplate(customPrompt, customImages, customDocx);
 
-  const promptTrimmed = customPrompt.trim();
-  const lower = promptTrimmed.toLowerCase();
-
-  // Check for built-in template match from REPORT_TEMPLATES
-  const matchedTemplate = REPORT_TEMPLATES.find(t =>
-    lower.includes(t.name.toLowerCase()) ||
-    lower.includes(t.name.toLowerCase().replace(/\s+/g, ''))
-  );
-
-  let templateContext = '';
-  let hasTemplate = false;
-  let templateName: string | undefined = undefined;
-
-  if (matchedTemplate) {
-    hasTemplate = true;
-    templateName = matchedTemplate.name;
-    templateContext = `
-================================================================================
-ACTIVE RADIOLOGY REPORT TEMPLATE DETECTED: "${matchedTemplate.name}"
-TEMPLATE STRUCTURE & NORMAL FINDINGS:
-${matchedTemplate.content}
-
-TEMPLATE INTEGRATION MANDATE:
-1. The user explicitly requested to use the "${matchedTemplate.name}" report template.
-2. If the user dictates "normal", "all normal", "scan is normal", or does not mention abnormalities for a section, preserve and output the normal template findings for that section without "BOLD::".
-3. When the user dictates abnormal findings or specific observations, map them directly into the template: replace the corresponding normal findings with the dictated findings and prefix those updated or added lines with "BOLD::".
-4. Retain all unmentioned sections from the template intact.
-5. Generate or update the IMPRESSION based on the integrated findings.
-================================================================================
-`;
-  }
-
-  const instructionsText = `
+  const instructionsText = customPrompt && customPrompt.trim()
+    ? `
 ================================================================================
 CRITICAL USER CUSTOM INSTRUCTIONS (HIGHEST PRIORITY):
 """
-${promptTrimmed}
+${customPrompt.trim()}
 """
 MANDATORY PRECEDENCE:
 - You MUST strictly apply and obey all user custom instructions above!
 - If the user specified custom abbreviations (e.g. RT/LT), measurement formatting, specific terminology, section titles, language translations, omissions, additions, or stylistic rules, these user instructions MUST OVERRIDE default rules!
 ================================================================================
-`;
+`
+    : '';
 
-  return { instructionsText, templateContext, hasTemplate, templateName };
+  return {
+    instructionsText,
+    templateContext: detected.templateContextPrompt,
+    hasTemplate: detected.isTemplateMode,
+    templateName: detected.templateName,
+    templateContent: detected.templateContent,
+    templateType: detected.templateType,
+  };
 }
 
 export interface LiveHistoryContext {
@@ -1120,7 +1303,9 @@ export const processLiveAudioChunk = async (
   chunkIndex: number = 0,
   customPrompt?: string,
   onFailover?: (failedModel: string, nextModel: string, reason: string) => void,
-  historyContext?: LiveHistoryContext
+  historyContext?: LiveHistoryContext,
+  customImages?: Array<{ data: string; mimeType: string }> | null,
+  customDocx?: { name: string; text: string; html?: string } | null
 ): Promise<LiveChunkResult> => {
   const base64Audio = await blobToBase64(audioBlob);
   const cleanMime = getCleanMimeType(audioBlob) || 'audio/wav';
@@ -1129,7 +1314,7 @@ export const processLiveAudioChunk = async (
     ? previousFindings.join('\n')
     : '(None - starting session)';
 
-  const { instructionsText, templateContext } = resolveCustomInstructionsAndTemplate(customPrompt);
+  const { instructionsText, templateContext } = resolveCustomInstructionsAndTemplate(customPrompt, customImages, customDocx);
 
   // Feature E: Intelligent Boundary Stitching Anchor
   // Extract trailing words from the last finding to provide explicit boundary awareness and eliminate word duplication
@@ -1346,13 +1531,15 @@ INSTRUCTIONS FOR THIS AUDIO SEGMENT:
 export const synthesizeLiveReport = async (
   rawFindings: string[],
   model: string = 'gemini-3.7-flash',
-  customPrompt?: string
+  customPrompt?: string,
+  customImages?: Array<{ data: string; mimeType: string }> | null,
+  customDocx?: { name: string; text: string; html?: string } | null
 ): Promise<string[]> => {
   if (!rawFindings || rawFindings.length === 0) {
     return [];
   }
 
-  const { instructionsText, templateContext } = resolveCustomInstructionsAndTemplate(customPrompt);
+  const { instructionsText, templateContext } = resolveCustomInstructionsAndTemplate(customPrompt, customImages, customDocx);
 
   const prompt = `You are a Chief Clinical Radiologist and expert report synthesizer.
 Below is the accumulated raw draft from a live progressive radiology dictation session.

@@ -4,6 +4,13 @@ export interface UserTemplate {
   name: string;
   text: string;
   images: Array<{ data: string; mimeType: string }>;
+  docxFile?: {
+    name: string;
+    data?: string; // base64 of docx
+    size: number;
+    extractedText: string;
+    extractedHtml?: string;
+  };
   createdAt: number;
 }
 

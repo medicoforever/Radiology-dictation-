@@ -12,6 +12,15 @@ import ImageIcon from '../icons/ImageIcon';
 import CloseIcon from '../icons/CloseIcon';
 import TrashIcon from '../icons/TrashIcon';
 import { saveUserTemplate, getUserTemplates, deleteUserTemplate, UserTemplate } from '../../services/templateStorage';
+import { parseDocx } from '../../services/docxService';
+
+export interface DocxTemplateData {
+  name: string;
+  data?: string;
+  size: number;
+  extractedText: string;
+  extractedHtml?: string;
+}
 
 const CustomPromptInput: React.FC<{
   prompt: string;
@@ -19,8 +28,10 @@ const CustomPromptInput: React.FC<{
   className?: string;
   images?: Array<{ data: string; mimeType: string }>;
   onImagesChange?: (images: Array<{ data: string; mimeType: string }>) => void;
+  customDocx?: DocxTemplateData | null;
+  onCustomDocxChange?: (docx: DocxTemplateData | null) => void;
   isLiveMode?: boolean;
-}> = ({ prompt, onPromptChange, className, images = [], onImagesChange, isLiveMode = false }) => {
+}> = ({ prompt, onPromptChange, className, images = [], onImagesChange, customDocx, onCustomDocxChange, isLiveMode = false }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const { isRecording, startRecording, stopRecording, error: recorderError } = useAudioRecorder();
@@ -36,11 +47,15 @@ const CustomPromptInput: React.FC<{
   const [templateName, setTemplateName] = useState('');
   const [templateText, setTemplateText] = useState('');
   const [templateImages, setTemplateImages] = useState<Array<{ data: string; mimeType: string }>>([]);
+  const [templateDocx, setTemplateDocx] = useState<DocxTemplateData | null>(null);
+  const [isParsingDocx, setIsParsingDocx] = useState(false);
+  const [docxParseError, setDocxParseError] = useState<string | null>(null);
   const [templateSaveSuccess, setTemplateSaveSuccess] = useState(false);
   const [templateSaveError, setTemplateSaveError] = useState<string | null>(null);
   const [appliedTemplateName, setAppliedTemplateName] = useState<string | null>(null);
   const [deletingTemplateId, setDeletingTemplateId] = useState<string | null>(null);
   const templateFileInputRef = useRef<HTMLInputElement>(null);
+  const templateDocxInputRef = useRef<HTMLInputElement>(null);
 
   // Load saved templates from browser database
   const loadSavedTemplates = async () => {
@@ -86,38 +101,94 @@ const CustomPromptInput: React.FC<{
     setTimeout(() => setAppliedTemplateName(null), 4000);
   };
 
+  const handleProcessDocxFile = async (file: File, isTemplateCreation = false) => {
+    setIsParsingDocx(true);
+    setDocxParseError(null);
+    try {
+      const parsed = await parseDocx(file);
+      const docxData: DocxTemplateData = {
+        name: parsed.fileName,
+        size: parsed.fileSize,
+        extractedText: parsed.text,
+        extractedHtml: parsed.html,
+      };
+
+      if (isTemplateCreation) {
+        setTemplateDocx(docxData);
+        if (!templateName.trim()) {
+          setTemplateName(parsed.fileName.replace(/\.[^/.]+$/, ''));
+        }
+        if (!templateText.trim()) {
+          setTemplateText(parsed.text);
+        }
+      } else {
+        if (onCustomDocxChange) {
+          onCustomDocxChange(docxData);
+        }
+        onPromptChange(`Use the attached DOCX report template (${parsed.fileName}). Integrate my dictation findings into this template layout and synthesize a new impression.`);
+        setAppliedTemplateName(`DOCX ${parsed.fileName}`);
+        setTimeout(() => setAppliedTemplateName(null), 4000);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to parse DOCX file.';
+      setDocxParseError(msg);
+    } finally {
+      setIsParsingDocx(false);
+    }
+  };
+
   const processFiles = (files: FileList | null) => {
-    if (files && files.length > 0 && onImagesChange) {
-      const newImagesPromises = Array.from(files).map(file => {
-        return new Promise<{ data: string; mimeType: string } | null>(resolve => {
-          if (file.type.startsWith('image/')) {
-            const reader = new FileReader();
-            reader.onloadend = () => {
-              if (reader.result) {
-                const base64data = (reader.result as string).split(',')[1];
-                resolve({ data: base64data, mimeType: file.type });
-              } else {
-                resolve(null);
-              }
-            };
-            reader.readAsDataURL(file);
-          } else {
-            resolve(null);
+    if (files && files.length > 0) {
+      // Check for DOCX files
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        if (file.name.toLowerCase().endsWith('.docx') || file.type.includes('wordprocessingml')) {
+          handleProcessDocxFile(file, false);
+          return;
+        }
+      }
+
+      if (onImagesChange) {
+        const newImagesPromises = Array.from(files).map(file => {
+          return new Promise<{ data: string; mimeType: string } | null>(resolve => {
+            if (file.type.startsWith('image/')) {
+              const reader = new FileReader();
+              reader.onloadend = () => {
+                if (reader.result) {
+                  const base64data = (reader.result as string).split(',')[1];
+                  resolve({ data: base64data, mimeType: file.type });
+                } else {
+                  resolve(null);
+                }
+              };
+              reader.readAsDataURL(file);
+            } else {
+              resolve(null);
+            }
+          });
+        });
+
+        Promise.all(newImagesPromises).then(newImages => {
+          const validNewImages = newImages.filter((img): img is { data: string; mimeType: string } => img !== null);
+          if (onImagesChange) {
+            onImagesChange([...images, ...validNewImages]);
           }
         });
-      });
-
-      Promise.all(newImagesPromises).then(newImages => {
-        const validNewImages = newImages.filter((img): img is { data: string; mimeType: string } => img !== null);
-        if (onImagesChange) {
-          onImagesChange([...images, ...validNewImages]);
-        }
-      });
+      }
     }
   };
 
   const processTemplateFiles = (files: FileList | null) => {
     if (files && files.length > 0) {
+      // If docx file is uploaded, process it
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        if (file.name.toLowerCase().endsWith('.docx') || file.type.includes('wordprocessingml')) {
+          handleProcessDocxFile(file, true);
+          return;
+        }
+      }
+
       const newImagesPromises = Array.from(files).map(file => {
         return new Promise<{ data: string; mimeType: string } | null>(resolve => {
           if (file.type.startsWith('image/')) {
@@ -153,6 +224,15 @@ const CustomPromptInput: React.FC<{
 
   const handleTemplateImageSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
     processTemplateFiles(event.target.files);
+    if (event.target) {
+      event.target.value = "";
+    }
+  };
+
+  const handleTemplateDocxSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
+    if (event.target.files && event.target.files.length > 0) {
+      handleProcessDocxFile(event.target.files[0], true);
+    }
     if (event.target) {
       event.target.value = "";
     }
@@ -213,14 +293,16 @@ const CustomPromptInput: React.FC<{
       await saveUserTemplate({
         id: newId,
         name: templateName.trim(),
-        text: templateText.trim(),
+        text: templateText.trim() || (templateDocx?.extractedText || ''),
         images: templateImages,
+        docxFile: templateDocx || undefined,
       });
 
       setTemplateSaveSuccess(true);
       setTemplateName('');
       setTemplateText('');
       setTemplateImages([]);
+      setTemplateDocx(null);
       
       await loadSavedTemplates();
       setActiveTab('saved');
@@ -244,9 +326,12 @@ const CustomPromptInput: React.FC<{
   };
 
   const handleApplyCustomTemplate = (template: UserTemplate) => {
-    onPromptChange(template.text);
+    onPromptChange(template.text || `Use the custom ${template.name} report template. Integrate dictation into the layout and synthesize a new impression.`);
     if (onImagesChange) {
       onImagesChange(template.images);
+    }
+    if (onCustomDocxChange) {
+      onCustomDocxChange(template.docxFile || null);
     }
     setAppliedTemplateName(template.name);
     setTimeout(() => {
@@ -380,6 +465,33 @@ const CustomPromptInput: React.FC<{
               </div>
             </div>
           )}
+
+          {/* Active DOCX Template Badge */}
+          {customDocx && (
+            <div className="p-3 bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800/60 rounded-lg flex items-center justify-between gap-3 shadow-xs">
+              <div className="flex items-center gap-2.5 overflow-hidden">
+                <div className="w-8 h-8 rounded-lg bg-blue-600 text-white flex items-center justify-center font-bold text-xs flex-shrink-0 shadow-sm">
+                  DOCX
+                </div>
+                <div className="overflow-hidden">
+                  <p className="text-xs font-bold text-blue-950 dark:text-blue-200 truncate">
+                    {customDocx.name}
+                  </p>
+                  <p className="text-[10px] text-blue-700 dark:text-blue-400">
+                    {(customDocx.size / 1024).toFixed(1)} KB • Word template active for merging & RTF editor
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => onCustomDocxChange && onCustomDocxChange(null)}
+                className="text-xs font-bold text-red-600 dark:text-red-400 hover:text-red-700 px-2 py-1 rounded hover:bg-red-50 dark:hover:bg-red-950/30 transition-colors flex-shrink-0"
+                title="Remove attached DOCX template"
+              >
+                Remove
+              </button>
+            </div>
+          )}
           
           <div className="pt-4 border-t border-slate-200 dark:border-slate-800">
             <div className="flex justify-between items-center mb-3">
@@ -494,7 +606,12 @@ const CustomPromptInput: React.FC<{
                             </div>
 
                             <div className="flex flex-wrap items-center gap-1.5 mt-1">
-                              {tmpl.text && (
+                              {tmpl.docxFile && (
+                                <span className="text-[9px] bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 font-bold px-1.5 py-0.5 rounded border border-indigo-200 dark:border-indigo-900/50 flex items-center gap-1">
+                                  📄 DOCX: {tmpl.docxFile.name} ({(tmpl.docxFile.size / 1024).toFixed(1)} KB)
+                                </span>
+                              )}
+                              {tmpl.text && !tmpl.docxFile && (
                                 <span className="text-[9px] bg-slate-100 dark:bg-slate-800 font-semibold px-1.5 py-0.5 rounded text-slate-600 dark:text-slate-400">
                                   📝 Text content
                                 </span>
@@ -545,6 +662,73 @@ const CustomPromptInput: React.FC<{
                     placeholder="e.g., Chest CT - Double screenshot reference"
                     className="w-full p-2 border border-slate-200 dark:border-slate-700 rounded-lg text-sm bg-white dark:bg-slate-900 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:outline-none"
                   />
+                </div>
+
+                {/* DOCX Template Upload Section */}
+                <div>
+                  <label className="block text-[11px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-1">
+                    Template Word Document (.docx) (Optional)
+                  </label>
+
+                  {templateDocx ? (
+                    <div className="p-3 bg-blue-50/70 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800/70 rounded-lg flex items-center justify-between gap-2 shadow-xs">
+                      <div className="flex items-center gap-2.5 overflow-hidden">
+                        <div className="w-8 h-8 rounded-lg bg-blue-600 text-white flex items-center justify-center font-bold text-xs flex-shrink-0">
+                          DOCX
+                        </div>
+                        <div className="overflow-hidden">
+                          <p className="text-xs font-bold text-blue-950 dark:text-blue-200 truncate">
+                            {templateDocx.name}
+                          </p>
+                          <p className="text-[10px] text-blue-700 dark:text-blue-400">
+                            {(templateDocx.size / 1024).toFixed(1)} KB • Extracted {templateDocx.extractedText.split(/\s+/).filter(Boolean).length} words
+                          </p>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setTemplateDocx(null)}
+                        className="text-xs font-bold text-red-600 dark:text-red-400 hover:text-red-700 px-2 py-1 rounded hover:bg-red-50 dark:hover:bg-red-950/30 transition-colors"
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  ) : (
+                    <div>
+                      <input
+                        type="file"
+                        ref={templateDocxInputRef}
+                        onChange={handleTemplateDocxSelect}
+                        className="hidden"
+                        accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => templateDocxInputRef.current?.click()}
+                        disabled={isParsingDocx}
+                        className="w-full text-xs font-bold py-2.5 px-3 border border-dashed border-slate-300 dark:border-slate-700 hover:border-blue-500 dark:hover:border-blue-500 rounded-lg text-slate-600 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400 bg-white dark:bg-slate-900 flex items-center justify-center gap-2 transition-colors shadow-xs"
+                      >
+                        {isParsingDocx ? (
+                          <>
+                            <Spinner className="w-4 h-4 text-blue-600" />
+                            <span>Extracting text & formatting from Word document...</span>
+                          </>
+                        ) : (
+                          <>
+                            <span className="text-base">📄</span>
+                            <span>Upload .docx Template (Word Document)</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  )}
+
+                  {docxParseError && (
+                    <p className="text-xs text-red-500 mt-1">{docxParseError}</p>
+                  )}
+                  <p className="mt-1 text-[10px] text-slate-400 dark:text-slate-500">
+                    Upload your institution's Word template. All sections and normal wording will be parsed and stored locally.
+                  </p>
                 </div>
 
                 <div>
@@ -616,7 +800,7 @@ const CustomPromptInput: React.FC<{
                   </div>
 
                   <p className="mt-2 text-[10px] text-slate-500 dark:text-slate-400 leading-relaxed bg-blue-50/40 dark:bg-blue-950/15 p-2.5 rounded-lg border border-blue-100/20 dark:border-blue-900/20">
-                    ℹ️ <strong>How to replicate your template:</strong> Take screenshots of your report template layout and upload them here. If the template is large, take multiple sequential screenshots and add them together. You can also upload screenshots combined with custom text guidelines!
+                    ℹ️ <strong>How to replicate your template:</strong> Upload your Word .docx template or take screenshots of your report layout. You can combine .docx files, screenshots, and custom text guidelines for seamless merging.
                   </p>
                 </div>
 
@@ -631,6 +815,7 @@ const CustomPromptInput: React.FC<{
                       setTemplateName('');
                       setTemplateText('');
                       setTemplateImages([]);
+                      setTemplateDocx(null);
                       setTemplateSaveError(null);
                       setActiveTab('saved');
                     }}
@@ -669,11 +854,11 @@ const CustomPromptInput: React.FC<{
 
           <div className="text-[11px] text-slate-400 dark:text-slate-500 leading-relaxed bg-slate-50 dark:bg-slate-950 p-2.5 rounded-lg border border-slate-100 dark:border-slate-800 flex flex-col sm:flex-row gap-2 justify-between">
             <span>
-              ℹ️ Custom instructions and reference images fine-tune the AI's transcription style, report format, and structure.
+              ℹ️ Custom instructions, DOCX documents, and reference images fine-tune the AI's transcription style, report format, and structure.
             </span>
             {!isLiveMode && (
               <span className="font-semibold text-blue-600 dark:text-blue-400 flex-shrink-0 cursor-pointer hover:underline" onClick={() => fileInputRef.current?.click()}>
-                + Click here to add quick screenshots to active session
+                + Click here to attach screenshots or .docx report template to active session
               </span>
             )}
           </div>
@@ -683,7 +868,7 @@ const CustomPromptInput: React.FC<{
               ref={fileInputRef}
               onChange={handleImageFileSelect}
               className="hidden"
-              accept="image/*"
+              accept="image/*,.docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
               multiple
           />
         </div>

@@ -21,7 +21,7 @@ import UploadIcon from './components/icons/UploadIcon';
 import WarningIcon from './components/icons/WarningIcon';
 import StopIcon from './components/icons/StopIcon';
 import CloseIcon from './components/icons/CloseIcon';
-import CustomPromptInput from './components/ui/CustomPromptInput';
+import CustomPromptInput, { DocxTemplateData } from './components/ui/CustomPromptInput';
 import { AVAILABLE_MODELS, DEFAULT_SELECTED_MODEL } from './constants';
 import { mergeAudioBlobs } from './services/audioMerger';
 import { autoSaveSingleDictation, autoSaveLiveDictation, SaveResult, syncPendingLocalDictationsToDrive, isDriveConnected, subscribeToAuth } from './services/googleDriveService';
@@ -96,6 +96,7 @@ const App: React.FC = () => {
   const [selectedModel, setSelectedModel] = useState<string>(DEFAULT_SELECTED_MODEL);
   const [customPrompt, setCustomPrompt] = useState<string>('');
   const [customImages, setCustomImages] = useState<Array<{ data: string; mimeType: string }>>([]);
+  const [customDocx, setCustomDocx] = useState<DocxTemplateData | null>(null);
   const [identifiedErrors, setIdentifiedErrors] = useState<IdentifiedError[]>([]);
   const [errorCheckStatus, setErrorCheckStatus] = useState<'idle' | 'checking' | 'complete'>('idle');
   const [theme, setTheme] = useState(() => {
@@ -125,6 +126,7 @@ const App: React.FC = () => {
     chatHistory: ChatMessage[];
     customPrompt: string;
     customImages: Array<{ data: string; mimeType: string }>;
+    customDocx?: DocxTemplateData | null;
     selectedModel: string;
     identifiedErrors: IdentifiedError[];
     errorCheckStatus: 'idle' | 'checking' | 'complete';
@@ -187,6 +189,9 @@ const App: React.FC = () => {
           setSelectedModel(savedState.selectedModel || DEFAULT_SELECTED_MODEL);
           setCustomPrompt(savedState.customPrompt || '');
           setCustomImages(savedState.customImages || []);
+          if (savedState.customDocx) {
+            setCustomDocx(savedState.customDocx);
+          }
 
           if (savedState.timestamp) {
             activeDictationTimestampRef.current = savedState.timestamp;
@@ -232,6 +237,7 @@ const App: React.FC = () => {
             selectedModel,
             customPrompt,
             customImages,
+            customDocx,
             hasAudio: !!audioBlob,
             timestamp: activeDictationTimestampRef.current || Date.now(),
             isLive: activeDictationIsLiveRef.current,
@@ -338,7 +344,7 @@ const App: React.FC = () => {
     setAudioBlob(audioBlobs[0]); // Primary audio/file blob
 
     try {
-      const processedText = await processAudio(audioBlobs, selectedModel, customPrompt, customImages);
+      const processedText = await processAudio(audioBlobs, selectedModel, customPrompt, customImages, undefined, customDocx);
       if (processingRequestIdRef.current !== reqId) return; // cancelled
       setFindings(processedText);
 
@@ -354,6 +360,7 @@ const App: React.FC = () => {
       driveSyncedHashRef.current = processedText.join('|||');
 
       setStatus(AppStatus.Success);
+      window.scrollTo({ top: 0, behavior: 'instant' });
 
       // Auto-save single dictation HTML to Google Drive in hidden background
       autoSaveSingleDictation(processedText, undefined, timestamp).then(result => {
@@ -421,6 +428,7 @@ const App: React.FC = () => {
 
         setMode('single'); // Switch back to single mode to show ResultsDisplay
         setStatus(AppStatus.Success);
+        window.scrollTo({ top: 0, behavior: 'instant' });
 
         // Auto-save live dictation HTML to Google Drive in hidden background
         autoSaveLiveDictation(processedText, timestamp).then(result => {
@@ -451,7 +459,7 @@ const App: React.FC = () => {
     
     try {
       // Pass the current findings as the base for reprocessing
-      const processedText = await processAudio(audioBlob, selectedModel, customPrompt, customImages, findings);
+      const processedText = await processAudio(audioBlob, selectedModel, customPrompt, customImages, findings, customDocx);
       if (processingRequestIdRef.current !== reqId) return; // cancelled
       setFindings(processedText);
 
@@ -478,7 +486,7 @@ const App: React.FC = () => {
       setError(err instanceof Error ? err.message : 'An unknown error occurred during re-processing.');
       setStatus(AppStatus.Error);
     }
-  }, [audioBlob, selectedModel, customPrompt, customImages, findings]);
+  }, [audioBlob, selectedModel, customPrompt, customImages, customDocx, findings]);
 
   const handleUpdateFinding = (index: number, newText: string) => {
     setFindings(prevFindings => {
@@ -506,7 +514,7 @@ const App: React.FC = () => {
       setAudioBlob(mergedBlob);
       saveAudioBlob('single_mode_audio', mergedBlob).catch(() => {});
 
-      const newFindings = await processAudio(newAudioBlob, selectedModel, customPrompt, customImages);
+      const newFindings = await processAudio(newAudioBlob, selectedModel, customPrompt, customImages, undefined, customDocx);
       const updatedFindings = [...findings, ...newFindings];
       setFindings(updatedFindings);
       
@@ -574,6 +582,7 @@ const App: React.FC = () => {
         chatHistory: [...chatHistory],
         customPrompt,
         customImages: [...customImages],
+        customDocx,
         selectedModel,
         identifiedErrors: [...identifiedErrors],
         errorCheckStatus,
@@ -629,6 +638,7 @@ const App: React.FC = () => {
     setMode('single');
     setCustomPrompt(''); // Reset custom prompt as well
     setCustomImages([]);
+    setCustomDocx(null);
     setIdentifiedErrors([]);
     setErrorCheckStatus('idle');
     activeDictationTimestampRef.current = null;
@@ -652,6 +662,7 @@ const App: React.FC = () => {
     setChatHistory(prev.chatHistory);
     setCustomPrompt(prev.customPrompt);
     setCustomImages(prev.customImages);
+    setCustomDocx(prev.customDocx || null);
     setSelectedModel(prev.selectedModel);
     setIdentifiedErrors(prev.identifiedErrors);
     setErrorCheckStatus(prev.errorCheckStatus);
@@ -667,6 +678,7 @@ const App: React.FC = () => {
         selectedModel: prev.selectedModel,
         customPrompt: prev.customPrompt,
         customImages: prev.customImages,
+        customDocx: prev.customDocx || null,
         timestamp: prev.timestamp,
         isLive: prev.isLive,
         driveSyncedHash: prev.driveSyncedHash,
@@ -746,26 +758,13 @@ const App: React.FC = () => {
       case AppStatus.Recording:
         return (
           <>
-            <div className="flex flex-wrap justify-end items-center gap-3 mb-4 -mt-2">
-                 <button 
-                    onClick={() => setMode('live')} 
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs sm:text-sm font-semibold text-emerald-600 hover:text-emerald-800 bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/40 dark:text-emerald-300 dark:hover:bg-emerald-900/60 border border-emerald-200/60 dark:border-emerald-800/40 transition-colors"
-                >
-                    <WaveformIcon className="w-4 h-4" />
-                    Live Dictation
-                </button>
-                 <button 
-                    onClick={() => setMode('batch')} 
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs sm:text-sm font-semibold text-blue-600 hover:text-blue-800 bg-blue-50 hover:bg-blue-100 dark:bg-blue-950/40 dark:text-blue-300 dark:hover:bg-blue-900/60 border border-blue-200/60 dark:border-blue-800/40 transition-colors"
-                >
-                    Batch Processing &rarr;
-                </button>
-            </div>
              <CustomPromptInput
                 prompt={customPrompt}
                 onPromptChange={setCustomPrompt}
                 images={customImages}
                 onImagesChange={setCustomImages}
+                customDocx={customDocx}
+                onCustomDocxChange={setCustomDocx}
                 className="mb-6"
             />
             <AudioRecorder
@@ -827,6 +826,8 @@ const App: React.FC = () => {
             onCustomPromptChange={setCustomPrompt}
             customImages={customImages}
             onCustomImagesChange={setCustomImages}
+            customDocx={customDocx}
+            onCustomDocxChange={setCustomDocx}
             identifiedErrors={identifiedErrors}
             errorCheckStatus={errorCheckStatus}
           />
@@ -961,31 +962,23 @@ const App: React.FC = () => {
         
         {/* Top Header */}
         <header className="mb-6 relative">
-          <div className="flex items-center justify-between gap-3 mb-2">
-            <div className="shrink-0 flex items-center gap-1.5 sm:gap-2">
+          <div className="grid grid-cols-[auto_1fr_auto] items-center gap-2 sm:gap-4 mb-2 w-full">
+            <div className="justify-self-start flex items-center">
               <DriveStatusBadge 
                 lastSaveResult={driveSaveResult} 
                 onClearLastSave={() => setDriveSaveResult(null)} 
                 onOpenReportsModal={() => setIsReportsModalOpen(true)}
               />
-              <button
-                onClick={() => setIsReportsModalOpen(true)}
-                className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-xl text-xs sm:text-sm font-semibold text-slate-700 dark:text-slate-200 bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 border border-slate-200/80 dark:border-slate-700/80 shadow-xs transition-all cursor-pointer min-h-[36px]"
-                title="View and open dictation reports from Google Drive"
-              >
-                <span>☁️</span>
-                <span className="hidden sm:inline">Drive Reports</span>
-              </button>
             </div>
-            <div className="flex-1 text-center">
-              <h1 className="text-xl sm:text-2xl md:text-3xl font-extrabold text-slate-800 dark:text-slate-100 tracking-tight">
-                ☯️RADDOC's Dictation app
+            <div className="justify-self-center text-center px-1 sm:px-4">
+              <h1 className="text-xl sm:text-2xl md:text-3xl font-extrabold text-slate-800 dark:text-slate-100 tracking-tight whitespace-nowrap">
+                ☯️ RADDOC's Dictation app
               </h1>
             </div>
-            <div className="shrink-0 flex items-center gap-2">
+            <div className="justify-self-end flex items-center">
               <button
                 onClick={toggleTheme}
-                className="p-2.5 rounded-xl text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors shrink-0 shadow-sm border border-slate-200/60 dark:border-slate-700/60 cursor-pointer"
+                className="p-2 sm:p-2.5 rounded-xl text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors shrink-0 shadow-sm border border-slate-200/60 dark:border-slate-700/60 cursor-pointer min-h-[36px] min-w-[36px] flex items-center justify-center"
                 aria-label="Toggle theme"
                 title={theme === 'light' ? 'Switch to Dark Mode' : 'Switch to Light Mode'}
               >

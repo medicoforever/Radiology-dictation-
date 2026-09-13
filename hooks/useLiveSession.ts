@@ -212,6 +212,8 @@ export const useLiveSession = () => {
   const schedulerIntervalRef = useRef<any>(null);
   const selectedModelRef = useRef<string>('gemini-3.7-flash');
   const customPromptRef = useRef<string>('');
+  const customImagesRef = useRef<Array<{ data: string; mimeType: string }> | null>(null);
+  const customDocxRef = useRef<{ name: string; text: string; html?: string } | null>(null);
 
   // Voice Activity & Silence Gating state (VAD)
   const lastSpeechTimestampRef = useRef<number>(0);
@@ -307,6 +309,14 @@ export const useLiveSession = () => {
     customPromptRef.current = prompt || '';
   }, []);
 
+  const syncCustomImages = useCallback((images?: Array<{ data: string; mimeType: string }> | null) => {
+    customImagesRef.current = images || null;
+  }, []);
+
+  const syncCustomDocx = useCallback((docx?: { name: string; text: string; html?: string } | null) => {
+    customDocxRef.current = docx || null;
+  }, []);
+
   const emitFindings = useCallback(() => {
     if (!onTranscriptUpdateRef.current) return;
     onTranscriptUpdateRef.current([...committedFindingsRef.current]);
@@ -359,7 +369,9 @@ export const useLiveSession = () => {
         (failedModel, nextModel, reason) => {
           setStatus(`⚡ Auto-failover: ${failedModel} failed (${reason}) — switching to subsequent model ${nextModel}...`);
         },
-        historyContext
+        historyContext,
+        customImagesRef.current,
+        customDocxRef.current
       );
 
       const updatedFindings = Array.isArray(result) ? result : result.findings;
@@ -468,7 +480,9 @@ export const useLiveSession = () => {
   const startSession = useCallback(async (
     onTranscriptUpdate: (lines: string[]) => void,
     customPrompt?: string,
-    model: string = 'gemini-3.7-flash'
+    model: string = 'gemini-3.7-flash',
+    customImages?: Array<{ data: string; mimeType: string }> | null,
+    customDocx?: { name: string; text: string; html?: string } | null
   ) => {
     stopRepeatingInterruptedAlert();
     stopAudio();
@@ -492,6 +506,8 @@ export const useLiveSession = () => {
     pauseStartTimeRef.current = 0;
     selectedModelRef.current = model || 'gemini-3.7-flash';
     customPromptRef.current = customPrompt || '';
+    customImagesRef.current = customImages || null;
+    customDocxRef.current = customDocx || null;
     onTranscriptUpdateRef.current = onTranscriptUpdate;
     onTranscriptUpdate([]);
     setIsPaused(false);
@@ -811,7 +827,9 @@ export const useLiveSession = () => {
             (failedModel, nextModel) => {
               setStatus(`⚡ Finalizing: Switched to ${nextModel}...`);
             },
-            historyContext
+            historyContext,
+            customImagesRef.current,
+            customDocxRef.current
           );
           const finalFindings = Array.isArray(finalResult) ? finalResult : finalResult.findings;
           if (Array.isArray(finalFindings) && finalFindings.length > 0) {
@@ -832,7 +850,9 @@ export const useLiveSession = () => {
         const synthesizedReport = await synthesizeLiveReport(
           committedFindingsRef.current,
           selectedModelRef.current || 'gemini-3.7-flash',
-          customPromptRef.current
+          customPromptRef.current,
+          customImagesRef.current,
+          customDocxRef.current
         );
         if (Array.isArray(synthesizedReport) && synthesizedReport.length > 0) {
           committedFindingsRef.current = synthesizedReport;
@@ -885,6 +905,8 @@ export const useLiveSession = () => {
     resumeSession,
     syncFindings,
     syncCustomPrompt,
+    syncCustomImages,
+    syncCustomDocx,
   };
 };
 

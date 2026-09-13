@@ -17,6 +17,8 @@ interface LiveDictationProps {
 const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack }) => {
     const [findings, setFindings] = useState<string[]>([]);
     const [customPrompt, setCustomPrompt] = useState('');
+    const [customImages, setCustomImages] = useState<Array<{ data: string; mimeType: string }>>([]);
+    const [customDocx, setCustomDocx] = useState<{ name: string; text: string; html?: string } | null>(null);
     const [selectedModel, setSelectedModel] = useState<string>(DEFAULT_LIVE_MODEL || 'gemini-3.7-flash');
     const [interruptedSession, setInterruptedSession] = useState<{ sessionId: string; createdAt: number; totalChunks: number } | null>(null);
     const [isRecovering, setIsRecovering] = useState(false);
@@ -42,18 +44,32 @@ const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack }) => 
         resumeSession,
         syncFindings,
         syncCustomPrompt,
+        syncCustomImages,
+        syncCustomDocx,
     } = useLiveSession();
 
-    // Keep active custom instructions and template prompt dynamically synchronized with live session
+    // Keep active custom instructions, images, and docx template dynamically synchronized with live session
     useEffect(() => {
         if (syncCustomPrompt) {
             syncCustomPrompt(customPrompt);
         }
     }, [customPrompt, syncCustomPrompt]);
 
+    useEffect(() => {
+        if (syncCustomImages) {
+            syncCustomImages(customImages);
+        }
+    }, [customImages, syncCustomImages]);
+
+    useEffect(() => {
+        if (syncCustomDocx) {
+            syncCustomDocx(customDocx);
+        }
+    }, [customDocx, syncCustomDocx]);
+
     const handleStart = useCallback(() => {
-        startSession(setFindings, customPrompt, selectedModel);
-    }, [startSession, customPrompt, selectedModel]);
+        startSession(setFindings, customPrompt, selectedModel, customImages, customDocx);
+    }, [startSession, customPrompt, selectedModel, customImages, customDocx]);
 
     const handleStop = useCallback(async () => {
         const { transcript, audioBlob } = await stopSession();
@@ -224,6 +240,10 @@ const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack }) => 
                    <CustomPromptInput 
                         prompt={customPrompt} 
                         onPromptChange={setCustomPrompt}
+                        images={customImages}
+                        onImagesChange={setCustomImages}
+                        customDocx={customDocx}
+                        onCustomDocxChange={setCustomDocx}
                         isLiveMode={true}
                     />
                 </div>
@@ -266,6 +286,10 @@ const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack }) => 
             onResumeLive={resumeSession}
             customPrompt={customPrompt}
             onCustomPromptChange={setCustomPrompt}
+            customImages={customImages}
+            onCustomImagesChange={setCustomImages}
+            customDocx={customDocx}
+            onCustomDocxChange={setCustomDocx}
             onReset={handleSafeBack}
             audioBlob={null}
             chatHistory={[]}
@@ -276,8 +300,6 @@ const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack }) => 
             onModelChange={setSelectedModel}
             onReprocess={() => {}}
             onContinueDictation={async () => {}}
-            customImages={[]}
-            onCustomImagesChange={() => {}}
             identifiedErrors={[]}
             errorCheckStatus={'idle'}
         />

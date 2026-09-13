@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import ChatInterface from './ChatInterface';
 import { useAudioRecorder } from '../hooks/useAudioRecorder';
-import { continueAudioDictation, modifyFindingWithAudio, modifyReportWithAudio, runComplexImpressionGeneration, transcribeAudioForPrompt, assessDictationAudio } from '../services/geminiService';
+import { continueAudioDictation, modifyFindingWithAudio, modifyReportWithAudio, runComplexImpressionGeneration, transcribeAudioForPrompt, assessDictationAudio, detectAndExtractTemplate } from '../services/geminiService';
 import Spinner from './ui/Spinner';
 import PencilIcon from './icons/PencilIcon';
 import MicPlusIcon from './icons/MicPlusIcon';
@@ -26,6 +26,8 @@ import { Activity } from 'lucide-react';
 import { AudioAssessmentPanel } from './AudioAssessmentPanel';
 import { mergeAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
 import { stopRepeatingInterruptedAlert } from '../services/soundService';
+import RichTextReportEditor from './RichTextReportEditor';
+import type { DocxTemplateData } from './ui/CustomPromptInput';
 
 interface ChatMessage {
   author: 'You' | 'AI';
@@ -51,6 +53,8 @@ interface ResultsDisplayProps {
   onCustomPromptChange: (prompt: string) => void;
   customImages?: Array<{ data: string; mimeType: string }>;
   onCustomImagesChange: (images: Array<{ data: string; mimeType: string }>) => void;
+  customDocx?: DocxTemplateData | null;
+  onCustomDocxChange?: (docx: DocxTemplateData | null) => void;
   isLive?: boolean;
   onStopLive?: () => void;
   liveStatus?: string;
@@ -103,6 +107,8 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   onCustomPromptChange,
   customImages,
   onCustomImagesChange,
+  customDocx,
+  onCustomDocxChange,
   isLive = false,
   onStopLive,
   liveStatus,
@@ -118,6 +124,29 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   const [selectedIndices, setSelectedIndices] = useState<Set<number>>(new Set<number>());
   const [copyNotification, setCopyNotification] = useState<{ text: string; visible: boolean }>({ text: '', visible: false });
   const [multiSelectMode, setMultiSelectMode] = useState<boolean>(false);
+
+  // Detect if user is in "Merging with template" mode using comprehensive detector
+  const detectedTemplate = detectAndExtractTemplate(customPrompt, customImages, customDocx);
+  const isTemplateMergeMode = Boolean(
+    detectedTemplate.isTemplateMode ||
+    customDocx ||
+    (customImages && customImages.length > 0) ||
+    (customPrompt && (
+      customPrompt.toLowerCase().includes('template') ||
+      customPrompt.toLowerCase().includes('docx') ||
+      customPrompt.toLowerCase().includes('merge') ||
+      customPrompt.toLowerCase().includes('normal')
+    ))
+  );
+
+  const activeTemplateName = customDocx?.name
+    ? customDocx.name.replace(/\.[^/.]+$/, '')
+    : (detectedTemplate.templateName || (customImages && customImages.length > 0
+      ? 'Reference Image Template'
+      : (customPrompt?.match(/normal (.*?) report template/i)?.[1] || 'Radiology Template')));
+
+  // State to toggle RTF editor view (defaults to open in template merge mode, or user toggleable)
+  const [showRtfEditor, setShowRtfEditor] = useState<boolean>(true);
 
   // State for Edit Mode
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
@@ -210,6 +239,10 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   const [undoState, setUndoState] = useState<string[] | null>(null);
   const [isMakingSelection, setIsMakingSelection] = useState<boolean>(false);
 
+  useEffect(() => {
+    // Keep viewport positioned at the top of the report findings when results display loads
+    window.scrollTo({ top: 0, behavior: 'instant' });
+  }, []);
 
   useEffect(() => {
     const container = findingsContainerRef.current;
@@ -1233,9 +1266,92 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
           onPromptChange={onCustomPromptChange}
           images={customImages}
           onImagesChange={onCustomImagesChange}
+          customDocx={customDocx}
+          onCustomDocxChange={onCustomDocxChange}
           isLiveMode={isLive}
           className="mb-6"
         />
+
+      {/* Embedded / Inline Rich Text Format (RTF) Editor - ONLY active when Template Merge Mode is selected */}
+      {isTemplateMergeMode && (
+        <>
+          {/* Quick Toggle Bar for RTF in Template Merge Mode */}
+          <div className="flex flex-wrap items-center justify-between gap-3 mb-4 p-2 bg-slate-100 dark:bg-slate-800/80 rounded-xl border border-slate-200 dark:border-slate-700">
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setShowRtfEditor(prev => !prev)}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${
+                  showRtfEditor
+                    ? 'bg-blue-600 text-white shadow-sm'
+                    : 'bg-white dark:bg-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-50'
+                }`}
+              >
+                <span>📄</span>
+                <span>{showRtfEditor ? 'Hide Rich Text (RTF) Editor' : 'Show Rich Text (RTF) Editor'}</span>
+                <span className="ml-1 text-[10px] bg-white/20 text-white px-1.5 py-0.2 rounded-full">Template Mode</span>
+              </button>
+            </div>
+            <div className="text-xs text-slate-500 dark:text-slate-400 flex items-center gap-2">
+              <span>{findings.length} findings loaded</span>
+              <span className="font-semibold text-blue-600 dark:text-blue-400">• Template: {activeTemplateName}</span>
+            </div>
+          </div>
+
+          {showRtfEditor && (
+            <div className="mb-8 p-4 sm:p-5 bg-gradient-to-br from-blue-50/70 to-indigo-50/50 dark:from-slate-800/80 dark:to-blue-950/40 border border-blue-200/80 dark:border-blue-800/60 rounded-2xl shadow-sm animate-fade-in">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-4 pb-3 border-b border-blue-200/60 dark:border-blue-900/50">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xl">📄</span>
+                    <h3 className="text-base sm:text-lg font-bold text-slate-800 dark:text-slate-100">
+                      Rich Text Format (RTF) Editor & Template Output
+                    </h3>
+                    <span className="text-[11px] bg-blue-600 text-white font-bold px-2 py-0.5 rounded-full shadow-xs">
+                      Template Mode
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                    {customDocx?.name 
+                      ? `Merged into institution Word document: "${customDocx.name}". Edit formatting directly with live RTF tools or export to Word (.doc) / RTF.` 
+                      : `Merged with "${activeTemplateName}" template structure. Edit formatting and headings directly in rich text format.`}
+                  </p>
+                </div>
+                <a
+                  href="#usual-html-report-section"
+                  className="text-xs font-bold text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300 underline flex-shrink-0"
+                >
+                  Usual HTML Findings Below ↓
+                </a>
+              </div>
+
+              <RichTextReportEditor
+                findings={findings}
+                templateName={activeTemplateName}
+                onUpdateFindings={onAllFindingsUpdate}
+              />
+            </div>
+          )}
+        </>
+      )}
+
+      {/* USUAL HTML REPORT AND FINDINGS */}
+      <div id="usual-html-report-section">
+        {isTemplateMergeMode && showRtfEditor && (
+          <div className="pt-4 pb-2 border-t-2 border-slate-200 dark:border-slate-800 mb-4 flex items-center justify-between gap-3">
+            <div>
+              <h4 className="text-sm sm:text-base font-bold text-slate-800 dark:text-slate-200 flex items-center gap-2">
+                <span>Standard HTML Report & Findings Cards</span>
+                <span className="text-xs font-medium px-2 py-0.5 rounded bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300">
+                  Usual Output
+                </span>
+              </h4>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Card-by-card findings with voice editing, continuation, reordering, and HTML report export.
+              </p>
+            </div>
+          </div>
+        )}
 
       {!isLive && <p className="text-slate-600 dark:text-slate-400 mb-6">Click any finding to copy it. To select multiple findings, click the circle on the left of each item. Use the 'Continue Dictation' button at the bottom to add more findings to this report.</p>}
       <div className="text-sm text-slate-500 dark:text-slate-400 mb-6 p-3 bg-slate-100 dark:bg-slate-700/50 rounded-lg flex flex-col sm:flex-row gap-4 items-center">
@@ -1841,12 +1957,6 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
               <DownloadIcon className="w-4 h-4" />
               Download HTML
             </button>
-            <button
-              onClick={onSwitchToBatch}
-              className="bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 font-bold py-2.5 px-5 rounded-xl hover:bg-slate-200 dark:hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-400 focus:ring-opacity-50 transition-all shadow-sm w-full lg:w-auto sm:col-span-2 lg:col-span-1 flex items-center justify-center gap-2 min-h-[44px]"
-            >
-              Batch Processing
-            </button>
           </div>
         ) : null}
         {continuationState.status === 'recording' && (
@@ -1907,6 +2017,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
           )}
         </div>
       )}
+      </div>
     </div>
   );
 };

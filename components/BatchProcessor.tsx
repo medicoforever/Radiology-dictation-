@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useAudioRecorder } from '../hooks/useAudioRecorder';
-import { processAudio, createChat, blobToBase64, continueAudioDictation, base64ToBlob, modifyFindingWithAudio, modifyReportWithAudio, identifyPotentialErrors, runComplexImpressionGeneration, transcribeAudioForPrompt, assessDictationAudio } from '../services/geminiService';
+import { processAudio, createChat, blobToBase64, continueAudioDictation, base64ToBlob, modifyFindingWithAudio, modifyReportWithAudio, identifyPotentialErrors, runComplexImpressionGeneration, transcribeAudioForPrompt, assessDictationAudio, detectAndExtractTemplate } from '../services/geminiService';
 import { saveAudioBlob, getAudioBlob, clearUnusedAudioBlobs } from '../services/audioStorage';
 import { mergeMultipleAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
 import { downloadAssessmentPDF, downloadBatchAssessmentsPDF, BatchReportItem } from '../services/assessmentPdfGenerator';
 import { Activity } from 'lucide-react';
+import RichTextReportEditor from './RichTextReportEditor';
 
 import Spinner from './ui/Spinner';
 import MicIcon from './icons/MicIcon';
@@ -181,6 +182,11 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     const dragItem = useRef<{ batchId: string; index: number } | null>(null);
     const dragOverItem = useRef<{ batchId: string; index: number } | null>(null);
     const [undoStates, setUndoStates] = useState<Record<string, string[]>>({});
+    const [batchRtfViewIds, setBatchRtfViewIds] = useState<Record<string, boolean>>({});
+
+    const handleUpdateBatchFindings = (batchId: string, newFindings: string[]) => {
+        setBatches(prev => prev.map(b => b.id === batchId ? { ...b, findings: newFindings } : b));
+    };
 
     // State for 'Dictate Report Changes' feature
     const [modificationState, setModificationState] = useState<{ batchId: string | null; status: 'idle' | 'recording' | 'processing' }>({ batchId: null, status: 'idle' });
@@ -2045,7 +2051,6 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                 {copyNotification.text}
                 </div>
             )}
-            <button onClick={onBack} className="text-sm text-blue-600 hover:underline dark:text-blue-400 dark:hover:text-blue-300 mb-4 inline-block">&larr; Back to Single Dictation</button>
             <input type="file" ref={fileInputRef} onChange={handleFileSelect} className="hidden" accept="audio/*,video/*,image/*,.pdf,.doc,.docx,.txt,.csv,.rtf,.webm,.mp4,.mp3,.wav,.m4a,.png,.jpg,.jpeg" multiple aria-hidden="true" />
 
             {/* General Drag and Drop Dropzone for New Batches */}
@@ -2474,55 +2479,101 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                         <span>Use this to <strong>dictate changes</strong>.</span>
                                                     </div>
                                                 </div>
-                                                <div className="flex justify-end items-center gap-2 mb-4">
-                                                    {undoStates[batch.id] && (
-                                                        <button
-                                                            onClick={() => handleUndo(batch.id)}
-                                                            className="text-sm font-semibold py-1 px-3 rounded-lg bg-yellow-400 text-yellow-900 hover:bg-yellow-500 transition-colors"
-                                                            aria-label="Undo last modification for this batch"
-                                                        >
-                                                            Undo
-                                                        </button>
-                                                    )}
-                                                    <button
-                                                        onClick={() => handleToggleMergeMode(batch.id)}
-                                                        className={`text-sm font-semibold py-1 px-3 rounded-lg transition-colors flex items-center gap-1.5 ${mergeBatchId === batch.id ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-slate-200 text-slate-700 hover:bg-slate-300 dark:bg-slate-700 dark:text-slate-300 dark:hover:bg-slate-600'}`}
-                                                    >
-                                                        <MergeIcon className={`w-4 h-4 ${mergeBatchId === batch.id ? 'text-white' : 'text-slate-600 dark:text-slate-400'}`} />
-                                                        {mergeBatchId === batch.id ? 'Done' : 'Merge'}
-                                                    </button>
-                                                    <button
-                                                      onClick={() => handleToggleReorderMode(batch.id)}
-                                                      className={`text-sm font-semibold py-1 px-3 rounded-lg transition-colors flex items-center gap-1.5 ${reorderBatchId === batch.id ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-slate-200 text-slate-700 hover:bg-slate-300 dark:bg-slate-700 dark:text-slate-300 dark:hover:bg-slate-600'}`}
-                                                    >
-                                                      <ReorderIcon className={`w-4 h-4 ${reorderBatchId === batch.id ? 'text-white' : 'text-slate-600 dark:text-slate-400'}`} />
-                                                      {reorderBatchId === batch.id ? 'Done' : 'Reorder'}
-                                                    </button>
-                                                    <button
-                                                        onClick={() => handleCopyAllForBatch(batch)}
-                                                        className={`text-base font-semibold py-2 px-4 rounded-lg transition-colors ${allCopiedId === batch.id ? 'bg-green-100 text-green-700 dark:bg-green-900/50 dark:text-green-300' : 'bg-slate-200 text-slate-700 hover:bg-slate-300 dark:bg-slate-700 dark:text-slate-300 dark:hover:bg-slate-600'}`}
-                                                    >
-                                                        {allCopiedId === batch.id ? 'Copied!' : 'Copy All'}
-                                                    </button>
-                                                    <button
-                                                        onClick={() => handleDownloadBatchAssessmentPDF(batch.id)}
-                                                        disabled={assessingBatchId === batch.id || isAssessingAllBatches}
-                                                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold bg-teal-50 hover:bg-teal-100 text-teal-800 dark:bg-teal-950/40 dark:text-teal-300 dark:hover:bg-teal-900/60 border border-teal-200/80 dark:border-teal-800/60 transition-all shadow-sm active:scale-95 disabled:opacity-60 disabled:cursor-not-allowed"
-                                                        title="Assess prosody & diagnostic certainty for this batch and download PDF"
-                                                    >
-                                                        {assessingBatchId === batch.id ? (
-                                                            <>
-                                                                <Spinner className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400" />
-                                                                <span>Assessing & Downloading PDF...</span>
-                                                            </>
-                                                        ) : (
-                                                            <>
-                                                                <Activity className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400" />
-                                                                <span>Download Assessment (PDF)</span>
-                                                            </>
-                                                        )}
-                                                    </button>
-                                                </div>
+                                                {(() => {
+                                                    const effectivePrompt = batch.customPrompt || globalCustomPrompt;
+                                                    const effectiveImages = (batch.customImages && batch.customImages.length > 0) ? batch.customImages : globalCustomImages;
+                                                    const batchTemplate = detectAndExtractTemplate(effectivePrompt, effectiveImages, null);
+                                                    const isBatchTemplateMode = batchTemplate.isTemplateMode;
+                                                    const isRtfOpen = batchRtfViewIds[batch.id] !== undefined ? batchRtfViewIds[batch.id] : isBatchTemplateMode;
+
+                                                    return (
+                                                        <>
+                                                            <div className="flex flex-wrap justify-end items-center gap-2 mb-4">
+                                                                <button
+                                                                    onClick={() => setBatchRtfViewIds(prev => ({ ...prev, [batch.id]: !isRtfOpen }))}
+                                                                    className={`text-sm font-semibold py-1 px-3 rounded-lg transition-colors flex items-center gap-1.5 ${isRtfOpen ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-slate-200 text-slate-700 hover:bg-slate-300 dark:bg-slate-700 dark:text-slate-300 dark:hover:bg-slate-600'}`}
+                                                                    title="Toggle Rich Text Format (RTF) & Word editor for this batch"
+                                                                >
+                                                                    <span>📄</span>
+                                                                    <span>{isRtfOpen ? 'Hide RTF' : 'RTF Editor'}</span>
+                                                                    {isBatchTemplateMode && (
+                                                                        <span className="text-[10px] bg-white/20 text-white px-1.5 py-0.2 rounded-full">Template</span>
+                                                                    )}
+                                                                </button>
+                                                                {undoStates[batch.id] && (
+                                                                    <button
+                                                                        onClick={() => handleUndo(batch.id)}
+                                                                        className="text-sm font-semibold py-1 px-3 rounded-lg bg-yellow-400 text-yellow-900 hover:bg-yellow-500 transition-colors"
+                                                                        aria-label="Undo last modification for this batch"
+                                                                    >
+                                                                        Undo
+                                                                    </button>
+                                                                )}
+                                                                <button
+                                                                    onClick={() => handleToggleMergeMode(batch.id)}
+                                                                    className={`text-sm font-semibold py-1 px-3 rounded-lg transition-colors flex items-center gap-1.5 ${mergeBatchId === batch.id ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-slate-200 text-slate-700 hover:bg-slate-300 dark:bg-slate-700 dark:text-slate-300 dark:hover:bg-slate-600'}`}
+                                                                >
+                                                                    <MergeIcon className={`w-4 h-4 ${mergeBatchId === batch.id ? 'text-white' : 'text-slate-600 dark:text-slate-400'}`} />
+                                                                    {mergeBatchId === batch.id ? 'Done' : 'Merge'}
+                                                                </button>
+                                                                <button
+                                                                  onClick={() => handleToggleReorderMode(batch.id)}
+                                                                  className={`text-sm font-semibold py-1 px-3 rounded-lg transition-colors flex items-center gap-1.5 ${reorderBatchId === batch.id ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-slate-200 text-slate-700 hover:bg-slate-300 dark:bg-slate-700 dark:text-slate-300 dark:hover:bg-slate-600'}`}
+                                                                >
+                                                                  <ReorderIcon className={`w-4 h-4 ${reorderBatchId === batch.id ? 'text-white' : 'text-slate-600 dark:text-slate-400'}`} />
+                                                                  {reorderBatchId === batch.id ? 'Done' : 'Reorder'}
+                                                                </button>
+                                                                <button
+                                                                    onClick={() => handleCopyAllForBatch(batch)}
+                                                                    className={`text-base font-semibold py-2 px-4 rounded-lg transition-colors ${allCopiedId === batch.id ? 'bg-green-100 text-green-700 dark:bg-green-900/50 dark:text-green-300' : 'bg-slate-200 text-slate-700 hover:bg-slate-300 dark:bg-slate-700 dark:text-slate-300 dark:hover:bg-slate-600'}`}
+                                                                >
+                                                                    {allCopiedId === batch.id ? 'Copied!' : 'Copy All'}
+                                                                </button>
+                                                                <button
+                                                                    onClick={() => handleDownloadBatchAssessmentPDF(batch.id)}
+                                                                    disabled={assessingBatchId === batch.id || isAssessingAllBatches}
+                                                                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold bg-teal-50 hover:bg-teal-100 text-teal-800 dark:bg-teal-950/40 dark:text-teal-300 dark:hover:bg-teal-900/60 border border-teal-200/80 dark:border-teal-800/60 transition-all shadow-sm active:scale-95 disabled:opacity-60 disabled:cursor-not-allowed"
+                                                                    title="Assess prosody & diagnostic certainty for this batch and download PDF"
+                                                                >
+                                                                    {assessingBatchId === batch.id ? (
+                                                                        <>
+                                                                            <Spinner className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400" />
+                                                                            <span>Assessing & Downloading PDF...</span>
+                                                                        </>
+                                                                    ) : (
+                                                                        <>
+                                                                            <Activity className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400" />
+                                                                            <span>Download Assessment (PDF)</span>
+                                                                        </>
+                                                                    )}
+                                                                </button>
+                                                            </div>
+
+                                                            {isRtfOpen && (
+                                                                <div className="mb-6 p-4 bg-gradient-to-br from-blue-50/70 to-indigo-50/50 dark:from-slate-800/80 dark:to-blue-950/40 border border-blue-200/80 dark:border-blue-800/60 rounded-xl shadow-xs animate-fade-in">
+                                                                    <div className="flex items-center justify-between gap-2 mb-3 pb-2 border-b border-blue-200/60 dark:border-blue-900/50">
+                                                                        <div className="flex items-center gap-2">
+                                                                            <span className="text-base">📄</span>
+                                                                            <h4 className="text-xs sm:text-sm font-bold text-slate-800 dark:text-slate-100">
+                                                                                Rich Text Format (RTF) Editor & Template Output: {batch.name}
+                                                                            </h4>
+                                                                            {isBatchTemplateMode && (
+                                                                                <span className="text-[10px] bg-blue-600 text-white font-bold px-2 py-0.5 rounded-full">
+                                                                                    {batchTemplate.templateName || 'Template Active'}
+                                                                                </span>
+                                                                            )}
+                                                                        </div>
+                                                                    </div>
+                                                                    <RichTextReportEditor
+                                                                        findings={batch.findings}
+                                                                        templateName={batchTemplate.templateName || batch.name}
+                                                                        onUpdateFindings={(updatedFindings) => handleUpdateBatchFindings(batch.id, updatedFindings)}
+                                                                    />
+                                                                </div>
+                                                            )}
+                                                        </>
+                                                    );
+                                                })()}
                                                 <div className="space-y-3">
                                                     {batch.findings.map((finding, index) => {
                                                         const isBold = finding.includes('BOLD::');

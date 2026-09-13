@@ -19,16 +19,21 @@ interface ChatInterfaceProps {
 
 const ChatInterface: React.FC<ChatInterfaceProps> = ({ history, isChatting, onSendMessage }) => {
   const [input, setInput] = useState('');
-  const messagesEndRef = useRef<null | HTMLDivElement>(null);
+  const messagesContainerRef = useRef<null | HTMLDivElement>(null);
   const { isRecording, startRecording, stopRecording, error: recorderError } = useAudioRecorder();
   const [recordingTime, setRecordingTime] = useState(0);
   const timerRef = useRef<number | null>(null);
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }
-
-  useEffect(scrollToBottom, [history]);
+  // Only scroll the internal chat container when the user actively interacts in chat (more than 1 message).
+  // Using container.scrollTo() prevents the entire browser window/page from scrolling down to the bottom.
+  useEffect(() => {
+    if (history.length > 1 && messagesContainerRef.current) {
+      messagesContainerRef.current.scrollTo({
+        top: messagesContainerRef.current.scrollHeight,
+        behavior: 'smooth',
+      });
+    }
+  }, [history]);
   
   useEffect(() => {
     if (isRecording) {
@@ -87,7 +92,7 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({ history, isChatting, onSe
     <div id="follow-up-chat" className="mt-8 border-t dark:border-slate-700 pt-6">
       <h3 className="text-xl font-bold text-slate-800 dark:text-slate-100 mb-4">Follow-up Chat</h3>
       {recorderError && <p className="text-red-500 mb-2 text-sm">{recorderError}</p>}
-      <div className="bg-slate-50 dark:bg-slate-900/50 rounded-lg p-4 h-72 overflow-y-auto flex flex-col gap-4">
+      <div ref={messagesContainerRef} className="bg-slate-50 dark:bg-slate-900/50 rounded-lg p-4 h-72 overflow-y-auto flex flex-col gap-4">
         {history.map((msg, index) => (
           <div key={index} className={`flex w-full ${msg.author === 'You' ? 'justify-end' : 'justify-start'}`}>
             <div className={`max-w-[85%] p-3 rounded-lg shadow-sm ${msg.author === 'You' ? 'bg-blue-600 text-white' : 'bg-slate-200 text-slate-800 dark:bg-slate-700 dark:text-slate-200'}`}>
@@ -106,7 +111,6 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({ history, isChatting, onSe
              </div>
            </div>
         )}
-        <div ref={messagesEndRef} />
       </div>
       <form onSubmit={handleSubmit} className="mt-4 flex gap-2 items-center">
         {isRecording ? (
