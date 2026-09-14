@@ -1,10 +1,10 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useAudioRecorder } from '../hooks/useAudioRecorder';
-import { processAudio, createChat, blobToBase64, continueAudioDictation, base64ToBlob, modifyFindingWithAudio, modifyReportWithAudio, identifyPotentialErrors, runComplexImpressionGeneration, transcribeAudioForPrompt, assessDictationAudio, detectAndExtractTemplate } from '../services/geminiService';
+import { processAudio, createChat, blobToBase64, continueAudioDictation, base64ToBlob, modifyFindingWithAudio, modifyReportWithAudio, identifyPotentialErrors, runComplexImpressionGeneration, transcribeAudioForPrompt, detectAndExtractTemplate } from '../services/geminiService';
 import { saveAudioBlob, getAudioBlob, clearUnusedAudioBlobs } from '../services/audioStorage';
 import { mergeMultipleAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
-import { downloadAssessmentPDF, downloadBatchAssessmentsPDF, BatchReportItem } from '../services/assessmentPdfGenerator';
-import { Activity } from 'lucide-react';
+import { ClipboardPaste } from 'lucide-react';
+import PasteTextModal from './PasteTextModal';
 import RichTextReportEditor from './RichTextReportEditor';
 
 import Spinner from './ui/Spinner';
@@ -28,7 +28,7 @@ import MergeIcon from './icons/MergeIcon';
 import MicScribbleIcon from './icons/MicScribbleIcon';
 import CustomPromptInput from './ui/CustomPromptInput';
 import SparklesIcon from './icons/SparklesIcon';
-import { IdentifiedError, AudioAssessmentReport } from '../types';
+import { IdentifiedError } from '../types';
 import { AVAILABLE_MODELS } from '../constants';
 import WarningIcon from './icons/WarningIcon';
 import BrainIcon from './icons/BrainIcon';
@@ -151,12 +151,6 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     const [copyNotification, setCopyNotification] = useState<{ text: string; visible: boolean }>({ text: '', visible: false });
     const [multiSelectMode, setMultiSelectMode] = useState<boolean>(false);
 
-    // Audio Assessment PDF Download States
-    const [batchAssessmentReports, setBatchAssessmentReports] = useState<Record<string, AudioAssessmentReport>>({});
-    const [assessingBatchId, setAssessingBatchId] = useState<string | null>(null);
-    const [isAssessingAllBatches, setIsAssessingAllBatches] = useState<boolean>(false);
-    const [batchAssessmentProgress, setBatchAssessmentProgress] = useState<string | null>(null);
-
     const fileInputRef = useRef<HTMLInputElement>(null);
     const [uploadTargetBatchId, setUploadTargetBatchId] = useState<string | null>(null);
 
@@ -257,7 +251,60 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     };
     
     const [isRestored, setIsRestored] = useState(false);
+    const [isPasteModalOpen, setIsPasteModalOpen] = useState(false);
+    const [pasteModalTargetBatchId, setPasteModalTargetBatchId] = useState<string | null>(null);
+    const [clipboardPastedText, setClipboardPastedText] = useState('');
     const [driveBatchFolder, setDriveBatchFolder] = useState<BatchFolderInfo | null>(null);
+
+    // Global Ctrl+V listener to directly capture text pastes when not actively recording or typing
+    useEffect(() => {
+        const handleGlobalPaste = (e: ClipboardEvent) => {
+            if (activeBatchId) return;
+            const target = e.target as HTMLElement;
+            if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) {
+                return;
+            }
+            const text = e.clipboardData?.getData('text');
+            if (text && text.trim().length > 0) {
+                e.preventDefault();
+                setClipboardPastedText(text);
+                setPasteModalTargetBatchId(null);
+                setIsPasteModalOpen(true);
+            }
+        };
+        window.addEventListener('paste', handleGlobalPaste);
+        return () => window.removeEventListener('paste', handleGlobalPaste);
+    }, [activeBatchId]);
+
+    const handlePasteBatches = (files: File[]) => {
+        if (pasteModalTargetBatchId) {
+            // Append files to the target batch
+            setBatches(prev => prev.map(b => {
+                if (b.id === pasteModalTargetBatchId) {
+                    return {
+                        ...b,
+                        audioBlobs: [...b.audioBlobs, ...files],
+                        status: 'complete'
+                    };
+                }
+                return b;
+            }));
+            setPasteModalTargetBatchId(null);
+        } else {
+            // Create a new batch for each file
+            const newBatches: Batch[] = files.map((file, idx) => ({
+                id: `batch-${Date.now()}-${idx}-${Math.random().toString(36).substring(2, 6)}`,
+                name: file.name.replace(/\.[^/.]+$/, "").replace(/_/g, " ") || `Batch ${batches.length + idx + 1}`,
+                audioBlobs: [file],
+                findings: null,
+                status: 'complete',
+                selectedModel: selectedModel,
+                customPrompt: globalCustomPrompt,
+                customImages: [...globalCustomImages],
+            }));
+            setBatches(prev => [...prev, ...newBatches]);
+        }
+    };
     const [driveSyncedBatchHash, setDriveSyncedBatchHash] = useState<string | null>(null);
     const driveBatchFolderRef = useRef<BatchFolderInfo | null>(null);
     const driveSyncedBatchHashRef = useRef<string | null>(null);
@@ -1129,77 +1176,6 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
       setTimeout(() => setCopyNotification({ text: '', visible: false }), 2000);
     };
 
-    const handleDownloadBatchAssessmentPDF = async (batchId: string) => {
-        if (assessingBatchId || isAssessingAllBatches) return;
-        const batch = batches.find(b => b.id === batchId);
-        if (!batch || !batch.findings || batch.findings.length === 0) {
-            showNotification("No findings available to assess for this batch.");
-            return;
-        }
-
-        let report = batchAssessmentReports[batchId];
-        if (!report) {
-            setAssessingBatchId(batchId);
-            try {
-                const audioInput = batch.audioBlobs && batch.audioBlobs.length > 0 ? batch.audioBlobs : null;
-                report = await assessDictationAudio(audioInput, batch.findings, batch.selectedModel);
-                setBatchAssessmentReports(prev => ({ ...prev, [batchId]: report! }));
-            } catch (err) {
-                console.error("Batch assessment error:", err);
-                showNotification(err instanceof Error ? err.message : 'Failed to assess batch audio.');
-                setAssessingBatchId(null);
-                return;
-            } finally {
-                setAssessingBatchId(null);
-            }
-        }
-
-        try {
-            downloadAssessmentPDF(report, batch.name);
-            showNotification(`Assessment PDF downloaded for ${batch.name}!`);
-        } catch (pdfErr) {
-            console.error("Failed to generate PDF:", pdfErr);
-            showNotification('Failed to generate assessment PDF.');
-        }
-    };
-
-    const handleDownloadAllBatchesAssessmentPDF = async () => {
-        if (isAssessingAllBatches || assessingBatchId) return;
-        const completedBatches = batches.filter(b => b.findings && b.findings.length > 0);
-        if (completedBatches.length === 0) {
-            showNotification("No completed batches with findings to assess.");
-            return;
-        }
-
-        setIsAssessingAllBatches(true);
-        const reportItems: BatchReportItem[] = [];
-
-        try {
-            for (let i = 0; i < completedBatches.length; i++) {
-                const batch = completedBatches[i];
-                setBatchAssessmentProgress(`Assessing batch ${i + 1} of ${completedBatches.length}...`);
-
-                let report = batchAssessmentReports[batch.id];
-                if (!report) {
-                    const audioInput = batch.audioBlobs && batch.audioBlobs.length > 0 ? batch.audioBlobs : null;
-                    report = await assessDictationAudio(audioInput, batch.findings, batch.selectedModel);
-                    setBatchAssessmentReports(prev => ({ ...prev, [batch.id]: report }));
-                }
-                reportItems.push({ batchName: batch.name, report });
-            }
-
-            setBatchAssessmentProgress('Generating PDF...');
-            downloadBatchAssessmentsPDF(reportItems, 'all-batches-audio-assessment.pdf');
-            showNotification('All batch assessments downloaded as PDF!');
-        } catch (err) {
-            console.error("Batch all assessment error:", err);
-            showNotification(err instanceof Error ? err.message : 'Failed to generate all batch assessments.');
-        } finally {
-            setIsAssessingAllBatches(false);
-            setBatchAssessmentProgress(null);
-        }
-    };
-
     const copyToClipboard = async (plainText: string, htmlText: string) => {
         try {
           const htmlBlob = new Blob([htmlText], { type: 'text/html' });
@@ -1271,12 +1247,12 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         return acc;
       }, { plain: [] as string[], html: [] as string[] });
 
-      const plainText = plain.join('\n');
+      const plainText = plain.join('\n\n');
       const htmlText = html.join('');
       
       const success = await copyToClipboard(plainText, htmlText);
       const notificationText = success
-        ? `Copied ${plain.length} finding${plain.length > 1 ? 's' : ''}!`
+        ? `Copied ${selection.size} finding${selection.size > 1 ? 's' : ''} for ${batch.name}!`
         : 'Copy failed!';
       showNotification(notificationText);
     };
@@ -1393,6 +1369,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
 
     const handleCopyAllForBatch = async (batch: Batch) => {
         if (!batch.findings || batch.findings.length === 0) return;
+
         const allTextPlain = batch.findings.map(f => {
             const isBold = f.includes('BOLD::');
             const cleanFinding = f.replace(/BOLD::/g, '');
@@ -1437,6 +1414,9 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         if (success) {
           setAllCopiedId(batch.id);
           setTimeout(() => setAllCopiedId(null), 2000);
+          showNotification('Copied all!');
+        } else {
+          showNotification('Copy failed!');
         }
     };
 
@@ -1558,6 +1538,19 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         if (editingState && editingState.batchId === batchId && editingState.index === indexToDelete) {
             handleCancelEdit();
         }
+        setSelections(prev => {
+            const current = prev[batchId];
+            if (!current) return prev;
+            const next = new Set<number>();
+            for (const idx of current) {
+                if (idx < indexToDelete) next.add(idx);
+                else if (idx > indexToDelete) next.add(idx - 1);
+            }
+            if (next.size > 0 && multiSelectMode) {
+                copyBatchSelection(batchId, next);
+            }
+            return { ...prev, [batchId]: next };
+        });
     };
 
     const handleSaveEdit = () => {
@@ -1609,7 +1602,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             setProcessingState({ batchId, index });
             try {
                 const existingText = batch.findings[index];
-                const newText = await continueAudioDictation(existingText, audioBlob, batch.customPrompt);
+                const newText = await continueAudioDictation(existingText, audioBlob, batch.customPrompt, batch.selectedModel);
                 const separator = existingText.trim().length > 0 && !existingText.endsWith(' ') ? ' ' : '';
                 const updatedText = existingText + separator + newText.trim();
                 handleUpdateFindingForBatch(batchId, index, updatedText);
@@ -1650,7 +1643,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             setProcessingState({ batchId, index });
             try {
                 const existingText = batch.findings[index];
-                const newText = await modifyFindingWithAudio(existingText, audioBlob, batch.customPrompt);
+                const newText = await modifyFindingWithAudio(existingText, audioBlob, batch.customPrompt, batch.selectedModel);
                 handleUpdateFindingForBatch(batchId, index, newText);
             } catch (err) {
                 const message = err instanceof Error ? err.message : 'An unknown error occurred.';
@@ -2013,30 +2006,6 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
 
     return (
         <div>
-            {multiSelectMode && (
-                <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-40 bg-slate-800 text-white rounded-full shadow-lg flex items-center gap-4 px-5 py-2 transition-all duration-300 ease-in-out">
-                  <p className="text-sm font-semibold">Multi-select Mode</p>
-                  <label htmlFor="multi-select-toggle-batch" className="flex items-center cursor-pointer">
-                    <span className="mr-2 text-sm font-medium text-slate-300">OFF</span>
-                    <div className="relative">
-                      <input 
-                        type="checkbox" 
-                        id="multi-select-toggle-batch" 
-                        className="sr-only peer" 
-                        checked={multiSelectMode}
-                        onChange={() => {
-                          setMultiSelectMode(false);
-                          setSelections({});
-                          setSelectionSnippets({});
-                        }}
-                      />
-                      <div className="w-12 h-6 bg-slate-600 rounded-full peer-checked:bg-blue-600"></div>
-                      <div className="absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform peer-checked:translate-x-6"></div>
-                    </div>
-                    <span className="ml-2 text-sm font-medium">ON</span>
-                  </label>
-                </div>
-            )}
             {copier && copier.visible && (
                 <SelectionCopier
                 x={copier.x}
@@ -2088,6 +2057,23 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                             <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
                                 Or <span className="text-blue-600 dark:text-blue-400 underline font-medium">browse files</span> from your device
                             </p>
+                        </div>
+                        <div className="flex flex-wrap items-center justify-center gap-2 mt-1">
+                            <span className="text-xs text-slate-400 dark:text-slate-500">or</span>
+                            <button
+                                type="button"
+                                onClick={(e) => {
+                                    e.stopPropagation();
+                                    setPasteModalTargetBatchId(null);
+                                    setClipboardPastedText('');
+                                    setIsPasteModalOpen(true);
+                                }}
+                                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-100 hover:bg-blue-200 text-blue-700 dark:bg-blue-900/50 dark:text-blue-300 dark:hover:bg-blue-900/80 font-bold text-xs transition-colors shadow-2xs"
+                                title="Paste any number of texts to generate batches (or press Ctrl+V)"
+                            >
+                                <ClipboardPaste className="w-3.5 h-3.5" />
+                                <span>Paste Text(s) as Batches</span>
+                            </button>
                         </div>
                     </div>
                 )}
@@ -2247,19 +2233,24 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                             <button onClick={() => triggerUpload(batch.id)} className="flex items-center gap-2 bg-slate-200 text-slate-700 p-2 rounded-lg hover:bg-slate-300 transition-colors text-sm px-3 disabled:bg-slate-100 disabled:cursor-wait dark:bg-slate-700 dark:text-slate-300 dark:hover:bg-slate-600">
                                                                 <UploadIcon className="w-4 h-4" /> Upload
                                                             </button>
+                                                            <button 
+                                                                onClick={() => {
+                                                                    setPasteModalTargetBatchId(batch.id);
+                                                                    setClipboardPastedText('');
+                                                                    setIsPasteModalOpen(true);
+                                                                }} 
+                                                                className="flex items-center gap-1.5 bg-blue-50 text-blue-700 border border-blue-200 p-2 rounded-lg hover:bg-blue-100 dark:bg-blue-950/40 dark:text-blue-300 dark:border-blue-800 transition-colors text-sm px-3"
+                                                                title="Paste text dictation directly into this batch"
+                                                            >
+                                                                <ClipboardPaste className="w-4 h-4" /> Paste Text
+                                                            </button>
                                                         </>
                                                     )}
                                                     {batch.audioBlobs.length > 0 && (
                                                         <>
                                                             <span className="text-xs font-semibold px-2.5 py-1 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-full border border-slate-300 dark:border-slate-600">
-                                                                {batch.audioBlobs.length} {batch.audioBlobs.length === 1 ? 'audio clip' : 'audio clips'}
+                                                                {batch.audioBlobs.length} {batch.audioBlobs.length === 1 ? 'item' : 'items'}
                                                             </span>
-                                                            <button onClick={() => handleRecordOrResume(batch)} className="flex items-center gap-2 bg-blue-600 text-white p-2 rounded-lg hover:bg-blue-700 transition-colors text-sm px-3 disabled:bg-blue-300 disabled:cursor-wait" disabled={isBusy && activeBatchId !== batch.id} title="Record and append another audio clip to this batch">
-                                                                <MicPlusIcon className="w-4 h-4"/> Append Audio
-                                                            </button>
-                                                            <button onClick={() => triggerUpload(batch.id)} className="flex items-center gap-2 bg-slate-200 text-slate-700 p-2 rounded-lg hover:bg-slate-300 transition-colors text-sm px-3 disabled:bg-slate-100 disabled:cursor-wait dark:bg-slate-700 dark:text-slate-300 dark:hover:bg-slate-600" title="Upload another audio file to this batch">
-                                                                <UploadIcon className="w-4 h-4" /> Upload
-                                                            </button>
                                                             <button onClick={() => handleDownload(batch)} className="flex items-center gap-2 bg-slate-500 text-white p-2 rounded-lg hover:bg-slate-600 transition-colors text-sm px-3" aria-label={`Download audio for ${batch.name}`}>
                                                                 <DownloadIcon className="w-4 h-4" /> Download
                                                             </button>
@@ -2301,7 +2292,16 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                     </button>
                                                 </div>
                                             )}
-                                            {batch.findings && <span className="text-blue-600 dark:text-blue-400 font-semibold text-sm">Processed</span>}
+                                            {batch.findings && (
+                                                <div className="flex items-center gap-2">
+                                                    <span className="text-blue-600 dark:text-blue-400 font-semibold text-sm">Processed</span>
+                                                    {batch.audioBlobs.length > 0 && (
+                                                        <button onClick={() => handleDownload(batch)} className="flex items-center gap-1.5 bg-slate-500 text-white p-1.5 rounded-lg hover:bg-slate-600 transition-colors text-xs px-2.5" aria-label={`Download audio for ${batch.name}`} title="Download audio for this batch">
+                                                            <DownloadIcon className="w-3.5 h-3.5" /> Download Audio
+                                                        </button>
+                                                    )}
+                                                </div>
+                                            )}
                                         </div>
                                     </div>
                                     {expandedBatchPromptIds[batch.id] && (
@@ -2333,8 +2333,19 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                     ))}
             </div>
 
-            <div className="mt-6 flex flex-col sm:flex-row gap-4 flex-wrap">
+            <div className="mt-6 flex flex-col sm:flex-row gap-3 flex-wrap">
                 <button onClick={addBatch} className="bg-slate-200 text-slate-800 font-bold py-2 px-4 rounded-lg hover:bg-slate-300 w-full sm:w-auto dark:bg-slate-700 dark:text-slate-200 dark:hover:bg-slate-600">Add Dictation Batch</button>
+                <button
+                    onClick={() => {
+                        setPasteModalTargetBatchId(null);
+                        setClipboardPastedText('');
+                        setIsPasteModalOpen(true);
+                    }}
+                    className="bg-blue-50 text-blue-700 border border-blue-200 dark:bg-blue-900/40 dark:text-blue-300 dark:border-blue-800 font-bold py-2 px-4 rounded-lg hover:bg-blue-100 dark:hover:bg-blue-900/60 w-full sm:w-auto flex items-center justify-center gap-2"
+                    title="Paste text snippets as new batches"
+                >
+                    <ClipboardPaste className="w-4 h-4" /> Paste Text(s) as Batches
+                </button>
                 <button
                     onClick={() => setIsBatchReorderMode(prev => !prev)}
                     className={`bg-slate-200 text-slate-800 font-bold py-2 px-4 rounded-lg hover:bg-slate-300 w-full sm:w-auto flex items-center justify-center gap-2 transition-colors dark:bg-slate-700 dark:text-slate-200 dark:hover:bg-slate-600 ${isBatchReorderMode ? 'bg-blue-100 text-blue-800 ring-2 ring-blue-300 dark:bg-blue-900/50 dark:text-blue-300 dark:ring-blue-500/50' : ''}`}
@@ -2355,24 +2366,6 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                     className="bg-blue-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-blue-700 disabled:bg-blue-300 disabled:cursor-not-allowed w-full sm:w-auto"
                 >
                     Download Report as HTML
-                </button>
-                <button
-                    onClick={handleDownloadAllBatchesAssessmentPDF}
-                    disabled={!hasAnyResults || isAssessingAllBatches}
-                    className="bg-teal-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-teal-700 disabled:bg-teal-300 dark:disabled:bg-teal-900/40 disabled:cursor-not-allowed w-full sm:w-auto flex items-center justify-center gap-2 transition-all shadow-sm active:scale-95"
-                    title="Assess prosody & uncertainty across all batches and download consolidated PDF"
-                >
-                    {isAssessingAllBatches ? (
-                        <>
-                            <Spinner className="w-4 h-4 text-white" />
-                            <span>{batchAssessmentProgress || 'Assessing Batches...'}</span>
-                        </>
-                    ) : (
-                        <>
-                            <Activity className="w-4 h-4 text-white" />
-                            <span>Download All Assessments (PDF)</span>
-                        </>
-                    )}
                 </button>
                 <button
                     onClick={clearAllBatches}
@@ -2471,12 +2464,12 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                 <p className="text-slate-600 dark:text-slate-400 mb-6 text-sm">Click any finding to copy it. To select multiple, click the circle on the left. The 'Continue Dictation' button below adds new findings to this batch.</p>
                                                 <div className="text-sm text-slate-500 dark:text-slate-400 mb-6 p-3 bg-slate-100 dark:bg-slate-700/50 rounded-lg flex flex-col sm:flex-row gap-4 items-center">
                                                     <div className="flex items-center gap-2">
-                                                        <MicPlusIcon className="w-5 h-5 flex-shrink-0" />
-                                                        <span>Use this to <strong>append</strong> dictation.</span>
+                                                        <MicIcon className="w-5 h-5 flex-shrink-0" />
+                                                        <span>Use this to <strong>continue dictation</strong>.</span>
                                                     </div>
                                                     <div className="flex items-center gap-2">
                                                         <MicPencilIcon className="w-5 h-5 flex-shrink-0" />
-                                                        <span>Use this to <strong>dictate changes</strong>.</span>
+                                                        <span>Use this to <strong>dictate changes</strong> or corrections to an existing finding.</span>
                                                     </div>
                                                 </div>
                                                 {(() => {
@@ -2529,24 +2522,16 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                                 >
                                                                     {allCopiedId === batch.id ? 'Copied!' : 'Copy All'}
                                                                 </button>
-                                                                <button
-                                                                    onClick={() => handleDownloadBatchAssessmentPDF(batch.id)}
-                                                                    disabled={assessingBatchId === batch.id || isAssessingAllBatches}
-                                                                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold bg-teal-50 hover:bg-teal-100 text-teal-800 dark:bg-teal-950/40 dark:text-teal-300 dark:hover:bg-teal-900/60 border border-teal-200/80 dark:border-teal-800/60 transition-all shadow-sm active:scale-95 disabled:opacity-60 disabled:cursor-not-allowed"
-                                                                    title="Assess prosody & diagnostic certainty for this batch and download PDF"
-                                                                >
-                                                                    {assessingBatchId === batch.id ? (
-                                                                        <>
-                                                                            <Spinner className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400" />
-                                                                            <span>Assessing & Downloading PDF...</span>
-                                                                        </>
-                                                                    ) : (
-                                                                        <>
-                                                                            <Activity className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400" />
-                                                                            <span>Download Assessment (PDF)</span>
-                                                                        </>
-                                                                    )}
-                                                                </button>
+                                                                {batch.audioBlobs.length > 0 && (
+                                                                    <button
+                                                                        onClick={() => handleDownload(batch)}
+                                                                        className="text-sm font-semibold py-1.5 px-3 rounded-lg bg-slate-600 hover:bg-slate-700 text-white transition-colors flex items-center gap-1.5 shadow-xs"
+                                                                        title="Download original audio for this batch"
+                                                                    >
+                                                                        <DownloadIcon className="w-4 h-4" />
+                                                                        <span>Download Audio</span>
+                                                                    </button>
+                                                                )}
                                                             </div>
 
                                                             {isRtfOpen && (
@@ -2769,13 +2754,13 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                                                     </div>
                                                                                     </div>
                                                                                 )}
-                                                                                <button onClick={() => handleStartEdit(batch.id, index)} aria-label="Edit text" className="p-1.5 sm:p-1 text-slate-600 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400 rounded-full hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors touch-manipulation" title="Edit row">
+                                                                                 <button onClick={() => handleStartEdit(batch.id, index)} aria-label="Edit text" className="p-1.5 sm:p-1 text-slate-600 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400 rounded-full hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors touch-manipulation" title="Edit row">
                                                                                     <PencilIcon />
                                                                                 </button>
-                                                                                <button onClick={() => handleStartDictation(batch.id, index)} aria-label="Append dictation" className="p-1.5 sm:p-1 text-slate-600 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400 rounded-full hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors touch-manipulation" title="Append dictation to row">
-                                                                                    <MicPlusIcon />
+                                                                                <button onClick={() => handleStartDictation(batch.id, index)} aria-label="Continue dictation" className="p-1.5 sm:p-1 text-slate-600 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400 rounded-full hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors touch-manipulation" title="Continue dictation for this row">
+                                                                                    <MicIcon className="w-5 h-5" />
                                                                                 </button>
-                                                                                 <button onClick={() => handleStartDictateEditForBatch(batch.id, index)} aria-label="Dictate changes" className="p-1.5 sm:p-1 text-slate-600 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400 rounded-full hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors touch-manipulation" title="Dictate changes to row">
+                                                                                <button onClick={() => handleStartDictateEditForBatch(batch.id, index)} aria-label="Dictate changes" className="p-1.5 sm:p-1 text-slate-600 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400 rounded-full hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors touch-manipulation" title="Dictate changes to row">
                                                                                     <MicPencilIcon />
                                                                                 </button>
                                                                                 <button 
@@ -2933,24 +2918,6 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                                 </button>
                                                             )}
                                                             <button
-                                                                onClick={() => handleDownloadBatchAssessmentPDF(batch.id)}
-                                                                disabled={assessingBatchId === batch.id || isAssessingAllBatches}
-                                                                className="bg-teal-600 text-white font-bold py-2.5 px-5 rounded-xl hover:bg-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-500 focus:ring-opacity-50 transition-all shadow-sm w-full lg:w-auto flex items-center justify-center gap-2 min-h-[44px] disabled:bg-teal-400 disabled:cursor-not-allowed"
-                                                                title="Assess prosody & uncertainty for this batch and download PDF"
-                                                            >
-                                                                {assessingBatchId === batch.id ? (
-                                                                    <>
-                                                                        <Spinner className="w-4 h-4 text-white" />
-                                                                        <span>Assessing & Downloading PDF...</span>
-                                                                    </>
-                                                                ) : (
-                                                                    <>
-                                                                        <Activity className="w-4 h-4 text-white" />
-                                                                        <span>Download Assessment (PDF)</span>
-                                                                    </>
-                                                                )}
-                                                            </button>
-                                                            <button
                                                                 onClick={() => handleDownload(batch)}
                                                                 disabled={!batch.audioBlobs.length}
                                                                 className="bg-slate-600 text-white font-bold py-2.5 px-5 rounded-xl hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-400 focus:ring-opacity-50 transition-all shadow-sm disabled:bg-slate-300 dark:disabled:bg-slate-700 disabled:cursor-not-allowed w-full lg:w-auto flex items-center justify-center gap-2 min-h-[44px]"
@@ -3053,6 +3020,47 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                              </div>
                         ))}
                      </div>
+                </div>
+            )}
+            <PasteTextModal
+                isOpen={isPasteModalOpen}
+                onClose={() => {
+                    setIsPasteModalOpen(false);
+                    setPasteModalTargetBatchId(null);
+                }}
+                targetBatchName={batches.find(b => b.id === pasteModalTargetBatchId)?.name}
+                mode={pasteModalTargetBatchId ? 'append' : 'batch'}
+                initialText={clipboardPastedText}
+                onAppendToBatch={(files) => {
+                    handlePasteBatches(files);
+                }}
+                onProcessBatch={(files) => {
+                    handlePasteBatches(files);
+                }}
+            />
+
+            {multiSelectMode && (
+                <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-40 bg-slate-800 text-white rounded-full shadow-lg flex items-center gap-4 px-5 py-2 transition-all duration-300 ease-in-out">
+                  <p className="text-sm font-semibold">Multi-select Mode</p>
+                  <label htmlFor="multi-select-toggle-batch" className="flex items-center cursor-pointer">
+                    <span className="mr-2 text-sm font-medium text-slate-300">OFF</span>
+                    <div className="relative">
+                      <input 
+                        type="checkbox" 
+                        id="multi-select-toggle-batch" 
+                        className="sr-only peer" 
+                        checked={multiSelectMode}
+                        onChange={() => {
+                          setMultiSelectMode(false);
+                          setSelections({});
+                          setSelectionSnippets({});
+                        }}
+                      />
+                      <div className="w-12 h-6 bg-slate-600 rounded-full peer-checked:bg-blue-600"></div>
+                      <div className="absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform peer-checked:translate-x-6"></div>
+                    </div>
+                    <span className="ml-2 text-sm font-medium">ON</span>
+                  </label>
                 </div>
             )}
         </div>

@@ -1,6 +1,7 @@
 import React, { useState, useCallback, useEffect } from 'react';
 import { useLiveSession } from '../hooks/useLiveSession';
 import WaveformIcon from './icons/WaveformIcon';
+import YinYangMicIcon from './icons/YinYangMicIcon';
 import WarningIcon from './icons/WarningIcon';
 import DownloadIcon from './icons/DownloadIcon';
 import ResultsDisplay from './ResultsDisplay';
@@ -179,10 +180,17 @@ const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack }) => 
                         </div>
                     </div>
                 )}
-                <div className="relative mb-6">
-                    <div className="relative w-24 h-24 rounded-full bg-white dark:bg-slate-700 shadow-lg flex items-center justify-center">
-                        <WaveformIcon className="w-10 h-10 text-emerald-600 dark:text-emerald-400 animate-pulse" />
-                    </div>
+                <div className="relative mb-6 flex flex-col items-center">
+                    <button
+                        onClick={handleStart}
+                        className="relative w-28 h-28 rounded-full transition-all duration-300 transform hover:scale-105 active:scale-95 hover:shadow-2xl hover:shadow-emerald-500/25 cursor-pointer focus:outline-none focus:ring-4 focus:ring-emerald-400/40 group"
+                        aria-label="Start Live Dictation"
+                        title="Click logo to start live dictation"
+                    >
+                        <div className="w-full h-full rounded-full overflow-hidden flex items-center justify-center bg-[#0A0B0E] p-1 border-2 border-slate-700/50 dark:border-slate-600 shadow-inner">
+                            <YinYangMicIcon className="w-full h-full transform transition-transform duration-300 group-hover:rotate-6" />
+                        </div>
+                    </button>
                 </div>
                 <h2 className="text-2xl font-semibold text-slate-700 dark:text-slate-200 mb-2 text-center">
                     Live Dictation Mode
@@ -219,8 +227,32 @@ const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack }) => 
                     </span>
                 </div>
 
-                {/* Voice Commands Guide */}
-                <div className="w-full max-w-md bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800/40 p-4 rounded-xl mb-6 text-xs text-blue-900 dark:text-blue-200 space-y-2 shadow-sm">
+                <div className="w-full max-w-md mb-6">
+                   <CustomPromptInput 
+                        prompt={customPrompt} 
+                        onPromptChange={setCustomPrompt}
+                        images={customImages}
+                        onImagesChange={setCustomImages}
+                        customDocx={customDocx}
+                        onCustomDocxChange={setCustomDocx}
+                        isLiveMode={true}
+                    />
+                </div>
+
+                {/* Centered Start Live Dictation Button */}
+                <div className="flex items-center justify-center w-full max-w-md mb-6">
+                    <button
+                        onClick={handleStart}
+                        className="w-full sm:w-auto px-8 flex items-center justify-center gap-2.5 bg-emerald-600 text-white font-bold py-3.5 rounded-xl hover:bg-emerald-700 focus:outline-none focus:ring-4 focus:ring-emerald-300 transition-all shadow-md min-h-[48px] touch-manipulation cursor-pointer text-base"
+                        aria-label="Start Live Session"
+                    >
+                        <WaveformIcon className="w-6 h-6" />
+                        <span>Start Live Dictation</span>
+                    </button>
+                </div>
+
+                {/* Voice Commands Guide placed below the start live dictation button */}
+                <div className="w-full max-w-md bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800/40 p-4 rounded-xl mb-4 text-xs text-blue-900 dark:text-blue-200 space-y-2 shadow-sm">
                     <div className="flex items-center gap-1.5 font-bold text-sm text-blue-950 dark:text-blue-100">
                         <span>🎙️</span>
                         <span>Smart Voice Commands (Obeys & Strips Commands):</span>
@@ -236,35 +268,7 @@ const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack }) => 
                     </ul>
                 </div>
 
-                <div className="w-full max-w-md mb-6">
-                   <CustomPromptInput 
-                        prompt={customPrompt} 
-                        onPromptChange={setCustomPrompt}
-                        images={customImages}
-                        onImagesChange={setCustomImages}
-                        customDocx={customDocx}
-                        onCustomDocxChange={setCustomDocx}
-                        isLiveMode={true}
-                    />
-                </div>
-
-                <div className="flex flex-col sm:flex-row items-center justify-center gap-3 w-full max-w-md">
-                    <button
-                        onClick={handleSafeBack}
-                        className="w-full sm:w-auto bg-slate-200 text-slate-700 font-bold py-3 px-6 rounded-xl hover:bg-slate-300 transition-colors dark:bg-slate-700 dark:text-slate-300 dark:hover:bg-slate-600 min-h-[48px] touch-manipulation cursor-pointer"
-                    >
-                        &larr; Back
-                    </button>
-                    <button
-                        onClick={handleStart}
-                        className="w-full sm:w-auto flex-1 flex items-center justify-center gap-2 bg-emerald-600 text-white font-bold py-3 px-6 rounded-xl hover:bg-emerald-700 focus:outline-none focus:ring-4 focus:ring-emerald-300 transition-all shadow-md min-h-[48px] touch-manipulation cursor-pointer"
-                        aria-label="Start Live Session"
-                    >
-                        <WaveformIcon className="w-6 h-6" />
-                        Start Live Dictation
-                    </button>
-                </div>
-                <div className="mt-6 text-center text-sm min-h-[20px]">
+                <div className="mt-2 text-center text-sm min-h-[20px]">
                     {error ? <span className="text-red-500 font-medium">{error}</span> : <span className="text-slate-500 dark:text-slate-400">{status}</span>}
                 </div>
             </div>

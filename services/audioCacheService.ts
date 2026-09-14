@@ -96,7 +96,7 @@ export async function cacheAudioChunk(
     const metaStore = tx.objectStore(STORE_META);
 
     // Make a copy of the buffer to store safely
-    const bufferCopy = pcmData.buffer.slice(pcmData.byteOffset, pcmData.byteOffset + pcmData.byteLength);
+    const bufferCopy = pcmData.buffer.slice(pcmData.byteOffset, pcmData.byteOffset + pcmData.byteLength) as ArrayBuffer;
 
     const record: AudioChunkRecord = {
       sessionId,

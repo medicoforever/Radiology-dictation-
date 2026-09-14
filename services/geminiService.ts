@@ -1,6 +1,6 @@
 import { GoogleGenAI, Type, GenerateContentResponse, Chat } from "@google/genai";
-import { DEFAULT_GEMINI_PROMPT, REPROCESS_GEMINI_PROMPT, TEMPLATE_GEMINI_PROMPT, REPORT_TEMPLATES, ERROR_IDENTIFIER_PROMPT, INITIAL_AGENT_PROMPT, REFINEMENT_AGENT_PROMPT, SYNTHESIZER_AGENT_PROMPT, VISUAL_TEMPLATE_GEMINI_PROMPT, AUDIO_ASSESSMENT_PROMPT, getLiveModelFallbackChain } from '../constants';
-import { IdentifiedError, AudioAssessmentReport } from "../types";
+import { DEFAULT_GEMINI_PROMPT, REPROCESS_GEMINI_PROMPT, TEMPLATE_GEMINI_PROMPT, REPORT_TEMPLATES, ERROR_IDENTIFIER_PROMPT, INITIAL_AGENT_PROMPT, REFINEMENT_AGENT_PROMPT, SYNTHESIZER_AGENT_PROMPT, VISUAL_TEMPLATE_GEMINI_PROMPT, getLiveModelFallbackChain } from '../constants';
+import { IdentifiedError } from "../types";
 
 let aiClient: GoogleGenAI | null = null;
 export const getAI = (): GoogleGenAI => {
@@ -105,6 +105,203 @@ const responseSchema = {
         }
     }
 };
+
+/**
+ * Resolves user/system model aliases to valid, robust Gemini API endpoints.
+ * Prevents routing audio/template structured JSON requests to raw-transcribe models which lack JSON mode.
+ */
+export function resolveApiTargetModel(model?: string): string {
+  if (!model) return 'gemini-3.7-flash';
+  // Map gemini-3.5-flash-lite / flash-lite aliases
+  if (model === 'gemini-3.5-flash-lite') {
+    return 'gemini-3.1-flash-lite';
+  }
+  // Audio-only transcription models do not support JSON mode / structured schema reasoning
+  if (model === 'gemini-3.5-transcribe' || model === 'gemini-3.5-transcribe-live') {
+    return 'gemini-3.7-flash';
+  }
+  return model;
+}
+
+/**
+ * Determines if an error thrown by the Gemini API is caused by lack of JSON mode support or schema rejection.
+ */
+export function isJsonModeUnsupportedError(err: any): boolean {
+  if (!err) return false;
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return (
+    msg.includes('json mode is not enabled') ||
+    msg.includes('json mode') ||
+    msg.includes('responsemimetype') ||
+    msg.includes('responseschema') ||
+    msg.includes('schema') ||
+    msg.includes('not supported for this model') ||
+    msg.includes('unsupported modality') ||
+    msg.includes('invalid argument')
+  );
+}
+
+/**
+ * Robustly parses and extracts an array of finding strings from any model response.
+ * Handles direct JSON, Markdown code blocks, nested JSON objects, regex array matches,
+ * or raw newline-delimited transcription output.
+ */
+export function extractFindingsFromResponse(rawText?: string | null): string[] {
+  if (!rawText || !rawText.trim()) {
+    return [];
+  }
+  const text = rawText.trim();
+
+  // 1. Direct JSON or code-fence stripped parse
+  const cleaned = text.replace(/^```(?:json)?\s*|```\s*$/g, '').trim();
+  try {
+    const parsed = JSON.parse(cleaned);
+    if (parsed && Array.isArray(parsed.findings) && parsed.findings.length > 0) {
+      return parsed.findings.filter((f: any) => typeof f === 'string' && f.trim().length > 0);
+    }
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      return parsed.filter((f: any) => typeof f === 'string' && f.trim().length > 0);
+    }
+  } catch {}
+
+  // 2. Regex match for {"findings": [...]}
+  const objMatch = text.match(/\{[\s\S]*?"findings"\s*:\s*(\[[\s\S]*?\])[\s\S]*?\}/);
+  if (objMatch && objMatch[1]) {
+    try {
+      const arr = JSON.parse(objMatch[1]);
+      if (Array.isArray(arr) && arr.length > 0) {
+        return arr.filter((f: any) => typeof f === 'string' && f.trim().length > 0);
+      }
+    } catch {}
+  }
+
+  // 3. Regex match for [...] array of strings
+  const arrMatch = text.match(/\[\s*"[\s\S]*?"\s*\]/);
+  if (arrMatch) {
+    try {
+      const arr = JSON.parse(arrMatch[0]);
+      if (Array.isArray(arr) && arr.length > 0) {
+        return arr.filter((f: any) => typeof f === 'string' && f.trim().length > 0);
+      }
+    } catch {}
+  }
+
+  // 4. Fallback line-by-line parsing if the model returned plain formatted text
+  const lines = text
+    .split(/\r?\n/)
+    .map(l => l.trim())
+    .filter(l => l.length > 0 && !l.startsWith('```') && l !== '{' && l !== '}' && !l.startsWith('"findings":'));
+
+  if (lines.length > 0) {
+    return lines;
+  }
+
+  return [];
+}
+
+/**
+ * Robustly parses and extracts identified errors from model output even without strict JSON mode.
+ */
+export function extractErrorsFromResponse(rawText?: string | null): IdentifiedError[] {
+  if (!rawText || !rawText.trim()) {
+    return [];
+  }
+  const text = rawText.trim();
+  const cleaned = text.replace(/^```(?:json)?\s*|```\s*$/g, '').trim();
+  try {
+    const parsed = JSON.parse(cleaned);
+    if (parsed && Array.isArray(parsed.errors)) {
+      return parsed.errors as IdentifiedError[];
+    }
+  } catch {}
+
+  const objMatch = text.match(/\{[\s\S]*?"errors"\s*:\s*(\[[\s\S]*?\])[\s\S]*?\}/);
+  if (objMatch && objMatch[1]) {
+    try {
+      const arr = JSON.parse(objMatch[1]);
+      if (Array.isArray(arr)) {
+        return arr as IdentifiedError[];
+      }
+    } catch {}
+  }
+
+  return [];
+}
+
+/**
+ * Universal safe caller for Gemini models that gracefully handles JSON mode incompatibilities across all models.
+ */
+export async function generateContentWithJsonFallback(
+  model: string,
+  parts: any[],
+  schema: any = responseSchema,
+  temperature: number = 0.1
+): Promise<string> {
+  const resolvedModel = resolveApiTargetModel(model);
+
+  // Strategy 1: Primary attempt with structured JSON schema
+  try {
+    const response: GenerateContentResponse = await getAI().models.generateContent({
+      model: resolvedModel,
+      contents: { parts },
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: schema,
+        temperature,
+      }
+    });
+
+    const text = response.text?.trim() || '';
+    if (text) return text;
+  } catch (err: any) {
+    console.warn(`[Gemini API] Primary JSON mode call failed on model ${resolvedModel} (${err?.message || err}). Attempting fallback without schema config...`);
+
+    // Strategy 2: If JSON mode unsupported or schema error, retry the model without responseMimeType/responseSchema and explicit JSON instructions
+    try {
+      const partsWithJsonInstruction = [
+        ...parts,
+        { text: '\n\nCRITICAL OUTPUT REQUIREMENT: Output ONLY a valid JSON object in the exact format: {"findings": ["finding 1", "finding 2", ...]}. Do NOT output any markdown wrappers or conversational text.' }
+      ];
+
+      const retryResponse: GenerateContentResponse = await getAI().models.generateContent({
+        model: resolvedModel,
+        contents: { parts: partsWithJsonInstruction },
+        config: {
+          temperature,
+        }
+      });
+
+      const retryText = retryResponse.text?.trim() || '';
+      if (retryText) return retryText;
+    } catch (retryErr: any) {
+      console.warn(`[Gemini API] Prompt-only retry on ${resolvedModel} failed:`, retryErr);
+    }
+
+    // Strategy 3: Failover to gemini-3.7-flash
+    if (resolvedModel !== 'gemini-3.7-flash') {
+      try {
+        console.info(`[Gemini API] Failing over to gemini-3.7-flash with JSON mode...`);
+        const flashResponse: GenerateContentResponse = await getAI().models.generateContent({
+          model: 'gemini-3.7-flash',
+          contents: { parts },
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: schema,
+            temperature,
+          }
+        });
+        const flashText = flashResponse.text?.trim() || '';
+        if (flashText) return flashText;
+      } catch (flashErr) {
+        console.warn(`[Gemini API] gemini-3.7-flash failover notice:`, flashErr);
+      }
+    }
+
+    throw err;
+  }
+
+  return '';
+}
 
 export interface DetectedTemplateInfo {
   isTemplateMode: boolean;
@@ -352,6 +549,17 @@ export const processAudio = async (
       });
     }
 
+    if (isText) {
+      try {
+        const textContent = await blob.text();
+        parts.push({
+          text: `[Dictated / Pasted Clinical Text Content for ${fileName}]:\n"""\n${textContent}\n"""\nInstruction: This is dictated / clinical text provided by the clinician. Transcribe, analyze, correct, format, and structure this text into formal radiology findings according to all radiology report and transcription rules.`
+        });
+      } catch (e) {
+        console.warn('Could not read blob as text:', e);
+      }
+    }
+
     parts.push({
       inlineData: {
         mimeType: cleanMime,
@@ -360,41 +568,21 @@ export const processAudio = async (
     });
   }
   
-  // For merge mode alone: transcribe-only models do not support template reasoning or JSON mode.
-  // Route merge mode to multimodal reasoning models (defaulting to gemini-3.7-flash).
-  let targetModel: string;
-  if (templateInfo.isTemplateMode) {
-    if (model === 'gemini-3.5-transcribe-live' || model === 'gemini-3.5-flash-lite' || model === 'gemini-3.5-transcribe') {
-      targetModel = 'gemini-3.7-flash';
-    } else {
-      targetModel = model || 'gemini-3.7-flash';
-    }
-  } else {
-    targetModel = (model === 'gemini-3.5-transcribe-live' || model === 'gemini-3.5-flash-lite')
-      ? 'gemini-3.5-transcribe'
-      : model;
-  }
+  // For merge mode alone or non-audio inputs: transcribe-only models do not support non-audio formats or template reasoning.
+  // Route to multimodal reasoning models (defaulting to gemini-3.7-flash).
+  const hasNonAudio = audioBlobs.some(b => {
+    const mime = getCleanMimeType(b);
+    return !mime.startsWith('audio/');
+  });
+
+  const targetModel = resolveApiTargetModel(model);
 
   try {
-    const response: GenerateContentResponse = await getAI().models.generateContent({
-      model: targetModel,
-      contents: { parts },
-      config: {
-          responseMimeType: "application/json",
-          responseSchema: responseSchema
-      }
-    });
+    const rawResponseText = await generateContentWithJsonFallback(targetModel, parts, responseSchema, 0.1);
+    const findings = extractFindingsFromResponse(rawResponseText);
 
-    const jsonString = response.text;
-    if (!jsonString) {
-      throw new Error("API returned an empty response.");
-    }
-
-    const cleanedJsonString = jsonString.replace(/^```json\s*|```\s*$/g, '').trim();
-    const result = JSON.parse(cleanedJsonString);
-
-    if (result && Array.isArray(result.findings)) {
-      return result.findings;
+    if (findings && findings.length > 0) {
+      return findings;
     } else {
       throw new Error("Invalid data structure in API response. Expected a 'findings' array.");
     }
@@ -416,12 +604,9 @@ export const processAudio = async (
         });
 
         const retryText = retryResponse.text?.trim() || '';
-        const jsonMatch = retryText.match(/\{[\s\S]*"findings"[\s\S]*\}/);
-        if (jsonMatch) {
-          const parsed = JSON.parse(jsonMatch[0]);
-          if (parsed && Array.isArray(parsed.findings) && parsed.findings.length > 0) {
-            return parsed.findings;
-          }
+        const parsedFindings = extractFindingsFromResponse(retryText);
+        if (parsedFindings && parsedFindings.length > 0) {
+          return parsedFindings;
         }
       } catch (retryErr) {
         console.warn("Merge mode fallback attempt error:", retryErr);
@@ -462,16 +647,28 @@ export const processAudio = async (
   }
 };
 
-export const continueAudioDictation = async (existingText: string, audioBlob: Blob, customPrompt?: string): Promise<string> => {
-  const base64Audio = await blobToBase64(audioBlob);
+export const continueAudioDictation = async (existingText: string, audioBlob: Blob, customPrompt?: string, model?: string): Promise<string> => {
+  let audioPart: any;
+  if (audioBlob.type && (audioBlob.type.startsWith('text/') || audioBlob.type === 'application/json')) {
+    const textContent = await audioBlob.text();
+    audioPart = { text: `New dictated/pasted text to append:\n"""\n${textContent}\n"""` };
+  } else {
+    const base64Audio = await blobToBase64(audioBlob);
+    audioPart = {
+      inlineData: {
+        mimeType: getCleanMimeType(audioBlob),
+        data: base64Audio,
+      },
+    };
+  }
 
   let prompt = `You are an expert medical transcriptionist specializing in radiology. A user is adding to their dictation.
 The existing text is: "${existingText}".
 
-Your task is to transcribe and correct ONLY the new audio provided. Your transcription should be a direct continuation of the existing text.
+Your task is to transcribe and correct ONLY the new audio/text provided. Your transcription should be a direct continuation of the existing text.
 
 Follow these strict instructions to produce a clean and accurate continuation:
-1. Analyze each word from the new audio for its contextual meaning within radiology and replace any incorrect words with the proper medical terminology. For example, a speech-to-text tool might misinterpret 'radiology findings' as something unrelated.
+1. Analyze each word from the new audio/text for its contextual meaning within radiology and replace any incorrect words with the proper medical terminology. For example, a speech-to-text tool might misinterpret 'radiology findings' as something unrelated.
 2. **Specific Transcription Rules**:
     - Transcribe "few" exactly as "few", not "a few".
     - Replace the dictated word "query" with a question mark symbol "?".
@@ -490,16 +687,11 @@ Follow these strict instructions to produce a clean and accurate continuation:
   }
 
   const textPart = { text: prompt };
-  const audioPart = {
-    inlineData: {
-      mimeType: getCleanMimeType(audioBlob),
-      data: base64Audio,
-    },
-  };
 
   try {
+    const targetModel = resolveApiTargetModel(model || 'gemini-2.5-flash');
     const response: GenerateContentResponse = await getAI().models.generateContent({
-      model: 'gemini-flash-lite-latest',
+      model: targetModel,
       contents: { parts: [textPart, audioPart] },
     });
 
@@ -517,8 +709,20 @@ Follow these strict instructions to produce a clean and accurate continuation:
   }
 };
 
-export const modifyFindingWithAudio = async (originalText: string, audioBlob: Blob, customPrompt?: string): Promise<string> => {
-  const base64Audio = await blobToBase64(audioBlob);
+export const modifyFindingWithAudio = async (originalText: string, audioBlob: Blob, customPrompt?: string, model?: string): Promise<string> => {
+  let audioPart: any;
+  if (audioBlob.type && (audioBlob.type.startsWith('text/') || audioBlob.type === 'application/json')) {
+    const textContent = await audioBlob.text();
+    audioPart = { text: `New modification instructions/text:\n"""\n${textContent}\n"""` };
+  } else {
+    const base64Audio = await blobToBase64(audioBlob);
+    audioPart = {
+      inlineData: {
+        mimeType: getCleanMimeType(audioBlob),
+        data: base64Audio,
+      },
+    };
+  }
 
   let prompt = `You are an expert medical transcriptionist assistant. You will be given an existing medical finding text and an audio recording. The audio contains instructions and/or additional dictation to modify the original finding.
 
@@ -545,16 +749,11 @@ Now, listen to the audio and provide the single, updated finding text.`;
   }
 
   const textPart = { text: prompt };
-  const audioPart = {
-    inlineData: {
-      mimeType: getCleanMimeType(audioBlob),
-      data: base64Audio,
-    },
-  };
 
   try {
+    const targetModel = resolveApiTargetModel(model || 'gemini-2.5-flash');
     const response: GenerateContentResponse = await getAI().models.generateContent({
-      model: 'gemini-2.5-flash',
+      model: targetModel,
       contents: { parts: [textPart, audioPart] },
     });
 
@@ -580,7 +779,19 @@ export const modifyReportWithAudio = async (
   customImages?: Array<{ data: string; mimeType: string }> | null,
   customDocx?: { name: string; text: string; html?: string } | null
 ): Promise<string[]> => {
-  const base64Audio = await blobToBase64(audioBlob);
+  let audioPart: any;
+  if (audioBlob.type && (audioBlob.type.startsWith('text/') || audioBlob.type === 'application/json')) {
+    const textContent = await audioBlob.text();
+    audioPart = { text: `New instructions or clinical text to modify/append to the report:\n"""\n${textContent}\n"""` };
+  } else {
+    const base64Audio = await blobToBase64(audioBlob);
+    audioPart = {
+      inlineData: {
+        mimeType: getCleanMimeType(audioBlob),
+        data: base64Audio,
+      },
+    };
+  }
 
   let prompt = `You are an expert medical transcriptionist assistant. You are given an existing medical report in JSON format and an audio recording containing instructions to modify it. Your task is to intelligently interpret the audio instructions and return a single, updated report in the exact same JSON format.
 
@@ -679,37 +890,16 @@ ${JSON.stringify({ findings: currentFindings })}
   }
 
   parts.push({ text: prompt });
-  parts.push({
-    inlineData: {
-      mimeType: getCleanMimeType(audioBlob),
-      data: base64Audio,
-    },
-  });
+  parts.push(audioPart);
   
-  const targetModel = (templateInfo.isTemplateMode && (model === 'gemini-3.5-transcribe-live' || model === 'gemini-3.5-flash-lite' || model === 'gemini-3.5-transcribe'))
-    ? 'gemini-3.7-flash'
-    : model;
+  const targetModel = resolveApiTargetModel(model);
 
   try {
-    const response: GenerateContentResponse = await getAI().models.generateContent({
-      model: targetModel,
-      contents: { parts },
-      config: {
-          responseMimeType: "application/json",
-          responseSchema: responseSchema
-      }
-    });
+    const rawResponseText = await generateContentWithJsonFallback(targetModel, parts, responseSchema, 0.1);
+    const findings = extractFindingsFromResponse(rawResponseText);
 
-    const jsonString = response.text;
-    if (!jsonString) {
-      throw new Error("API returned an empty response for report modification.");
-    }
-
-    const cleanedJsonString = jsonString.replace(/^```json\s*|```\s*$/g, '').trim();
-    const result = JSON.parse(cleanedJsonString);
-
-    if (result && Array.isArray(result.findings)) {
-      return result.findings;
+    if (findings && findings.length > 0) {
+      return findings;
     } else {
       throw new Error("Invalid data structure in API response. Expected a 'findings' array.");
     }
@@ -781,17 +971,35 @@ export const createChat = async (
   for (let i = 0; i < audioBlobs.length; i++) {
     const blob = audioBlobs[i];
     const base64Audio = await blobToBase64(blob);
-    userMessageParts.push({
-      inlineData: {
-        mimeType: getCleanMimeType(blob),
-        data: base64Audio,
-      },
-    });
-    userMessageParts.push({ 
-      text: audioBlobs.length > 1 
-        ? `This is dictation / input file #${i + 1}${ (blob as any).name ? ` (${(blob as any).name})` : '' }.` 
-        : `This is the audio / file I dictated.` 
-    });
+    const cleanMime = getCleanMimeType(blob);
+
+    if (cleanMime.startsWith('text/')) {
+      try {
+        const textContent = await blob.text();
+        userMessageParts.push({
+          text: `This is dictation / input text document #${i + 1}${ (blob as any).name ? ` (${(blob as any).name})` : '' }:\n"""\n${textContent}\n"""`
+        });
+      } catch {
+        userMessageParts.push({
+          inlineData: {
+            mimeType: cleanMime,
+            data: base64Audio,
+          },
+        });
+      }
+    } else {
+      userMessageParts.push({
+        inlineData: {
+          mimeType: cleanMime,
+          data: base64Audio,
+        },
+      });
+      userMessageParts.push({ 
+        text: audioBlobs.length > 1 
+          ? `This is dictation / input file #${i + 1}${ (blob as any).name ? ` (${(blob as any).name})` : '' }.` 
+          : `This is the audio / file I dictated.` 
+      });
+    }
   }
   
 
@@ -889,29 +1097,9 @@ export const identifyPotentialErrors = async (findings: string[], model: string)
     };
 
     try {
-        const response: GenerateContentResponse = await getAI().models.generateContent({
-            model: model, // use the same model as the main transcription for consistency
-            contents: { parts: [textPart] },
-            config: {
-                responseMimeType: "application/json",
-                responseSchema: errorSchema
-            }
-        });
-
-        const jsonString = response.text;
-        if (!jsonString) {
-            return [];
-        }
-
-        const cleanedJsonString = jsonString.replace(/^```json\s*|```\s*$/g, '').trim();
-        const result = JSON.parse(cleanedJsonString);
-
-        if (result && Array.isArray(result.errors)) {
-            return result.errors as IdentifiedError[];
-        } else {
-            console.warn("Invalid data structure in error identification response.");
-            return [];
-        }
+        const targetModel = resolveApiTargetModel(model);
+        const rawResponseText = await generateContentWithJsonFallback(targetModel, [textPart], errorSchema, 0.1);
+        return extractErrorsFromResponse(rawResponseText);
     } catch (error) {
         console.error("Error calling Gemini API for error identification:", error);
         // Don't throw, just return empty array as this is a background task.
@@ -1446,33 +1634,12 @@ INSTRUCTIONS FOR THIS AUDIO SEGMENT:
         }
       ];
 
-      const response: GenerateContentResponse = await getAI().models.generateContent({
-        model: currentModel,
-        contents: { parts },
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: responseSchema,
-          temperature: 0.1,
-        }
-      });
+      const rawResponseText = await generateContentWithJsonFallback(currentModel, parts, responseSchema, 0.1);
+      const parsedFindings = extractFindingsFromResponse(rawResponseText);
 
-      const jsonString = response.text;
-      if (!jsonString) {
+      if (parsedFindings && parsedFindings.length > 0) {
         return {
-          findings: previousFindings,
-          activeModel: currentModel,
-          attempts: attempt + 1,
-          failoverOccurred: attempt > 0,
-          failedModels,
-        };
-      }
-
-      const cleanedJsonString = jsonString.replace(/^```json\s*|```\s*$/g, '').trim();
-      const result = JSON.parse(cleanedJsonString);
-
-      if (result && Array.isArray(result.findings)) {
-        return {
-          findings: result.findings,
+          findings: parsedFindings,
           activeModel: currentModel,
           attempts: attempt + 1,
           failoverOccurred: attempt > 0,
@@ -1576,22 +1743,10 @@ Output MUST be a JSON object with a single "findings" array of strings.`;
   for (let attempt = 0; attempt < fallbackChain.length; attempt++) {
     const currentModel = fallbackChain[attempt];
     try {
-      const response: GenerateContentResponse = await getAI().models.generateContent({
-        model: currentModel,
-        contents: prompt,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: responseSchema,
-          temperature: 0.1,
-        }
-      });
-
-      const jsonString = response.text;
-      if (!jsonString) return rawFindings;
-      const cleanedJsonString = jsonString.replace(/^```json\s*|```\s*$/g, '').trim();
-      const result = JSON.parse(cleanedJsonString);
-      if (result && Array.isArray(result.findings) && result.findings.length > 0) {
-        return result.findings;
+      const rawResponseText = await generateContentWithJsonFallback(currentModel, [{ text: prompt }], responseSchema, 0.1);
+      const parsedFindings = extractFindingsFromResponse(rawResponseText);
+      if (parsedFindings && parsedFindings.length > 0) {
+        return parsedFindings;
       }
       return rawFindings;
     } catch (err) {
@@ -1603,130 +1758,6 @@ Output MUST be a JSON object with a single "findings" array of strings.`;
   }
 
   return rawFindings;
-};
-
-const audioAssessmentSchema = {
-  type: Type.OBJECT,
-  properties: {
-    overallConfidenceScore: {
-      type: Type.NUMBER,
-      description: "Overall diagnostic confidence and acoustic certainty score from 0 to 100"
-    },
-    estimatedWpm: {
-      type: Type.NUMBER,
-      description: "Estimated speaking cadence in words per minute"
-    },
-    speechClarity: {
-      type: Type.STRING,
-      description: "Speech clarity rating: Exceptional, Crisp & Clear, Good, Moderate / Background Noise, or Muffled"
-    },
-    pacingEvaluation: {
-      type: Type.STRING,
-      description: "Summary of vocal pacing, rhythmic cadence, and sentence flow"
-    },
-    acousticHesitationSummary: {
-      type: Type.STRING,
-      description: "Summary of prosodic hesitation points, pitch drops, and cognitive pauses"
-    },
-    keyShadowDifferentials: {
-      type: Type.ARRAY,
-      items: { type: Type.STRING },
-      description: "Key counterfactual shadow-differential considerations to prevent diagnostic fixation"
-    },
-    findingInsights: {
-      type: Type.ARRAY,
-      items: {
-        type: Type.OBJECT,
-        properties: {
-          findingIndex: { type: Type.NUMBER, description: "Zero-based index corresponding to the finding in the report" },
-          findingTitleOrExcerpt: { type: Type.STRING, description: "Brief excerpt of the finding text" },
-          uncertaintyScore: { type: Type.NUMBER, description: "Uncertainty score from 0 (firm) to 100 (high doubt/hesitation)" },
-          acousticObservation: { type: Type.STRING, description: "Specific acoustic observation regarding pause duration, pitch drops, or tone inflection" },
-          clinicalSignificance: { type: Type.STRING, description: "Clinical implication of the hesitation / ambiguity" },
-          differentialConsiderations: {
-            type: Type.ARRAY,
-            items: { type: Type.STRING },
-            description: "Counter-factual secondary checks and shadow differentials"
-          },
-          suggestedChatInquiry: { type: Type.STRING, description: "One-click prompt to explore this finding further in AI Chat" }
-        },
-        required: ["findingIndex", "findingTitleOrExcerpt", "uncertaintyScore", "acousticObservation", "clinicalSignificance", "differentialConsiderations", "suggestedChatInquiry"]
-      },
-      description: "Specific findings with acoustic hesitation or equivocal phrasing"
-    },
-    actionableSummary: {
-      type: Type.STRING,
-      description: "Authoritative clinical takeaway and advice for finalizing the report"
-    }
-  },
-  required: [
-    "overallConfidenceScore",
-    "estimatedWpm",
-    "speechClarity",
-    "pacingEvaluation",
-    "acousticHesitationSummary",
-    "keyShadowDifferentials",
-    "findingInsights",
-    "actionableSummary"
-  ]
-};
-
-export const assessDictationAudio = async (
-  audioBlob: Blob | null,
-  findings: string[],
-  model: string = 'gemini-3.8-flash'
-): Promise<AudioAssessmentReport> => {
-  if (!findings || findings.length === 0) {
-    throw new Error("No findings available to assess.");
-  }
-
-  // Format findings list for prompt
-  const findingsList = findings
-    .map((f, i) => `[Finding #${i}]: ${f}`)
-    .join('\n');
-
-  const promptText = `${AUDIO_ASSESSMENT_PROMPT}\n\n--- TRANSCRIBED REPORT FINDINGS ---\n${findingsList}\n\n--- INSTRUCTIONS ---\nCarefully evaluate the spoken audio and acoustic telemetry alongside these findings. Return your assessment in the exact JSON schema provided.`;
-
-  const parts: any[] = [];
-
-  if (audioBlob && audioBlob.size > 0) {
-    try {
-      const base64Audio = await blobToBase64(audioBlob);
-      parts.push({
-        inlineData: {
-          mimeType: getCleanMimeType(audioBlob),
-          data: base64Audio,
-        },
-      });
-    } catch (blobErr) {
-      console.warn("Could not encode audioBlob for assessment, proceeding with text-based analysis:", blobErr);
-    }
-  }
-
-  parts.push({ text: promptText });
-
-  const targetModel = model || 'gemini-3.8-flash';
-
-  const response = await getAI().models.generateContent({
-    model: targetModel,
-    contents: { parts },
-    config: {
-      responseMimeType: "application/json",
-      responseSchema: audioAssessmentSchema,
-      temperature: 0.2,
-    },
-  });
-
-  const jsonString = response.text;
-  if (!jsonString) {
-    throw new Error("The AI model did not return an assessment response.");
-  }
-
-  const cleanedJson = jsonString.replace(/^```json\s*|```\s*$/g, '').trim();
-  const parsed = JSON.parse(cleanedJson) as AudioAssessmentReport;
-
-  parsed.assessedAt = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  return parsed;
 };
 
 

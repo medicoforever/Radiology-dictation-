@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import ChatInterface from './ChatInterface';
 import { useAudioRecorder } from '../hooks/useAudioRecorder';
-import { continueAudioDictation, modifyFindingWithAudio, modifyReportWithAudio, runComplexImpressionGeneration, transcribeAudioForPrompt, assessDictationAudio, detectAndExtractTemplate } from '../services/geminiService';
+import { continueAudioDictation, modifyFindingWithAudio, modifyReportWithAudio, runComplexImpressionGeneration, transcribeAudioForPrompt, detectAndExtractTemplate } from '../services/geminiService';
 import Spinner from './ui/Spinner';
 import PencilIcon from './icons/PencilIcon';
 import MicPlusIcon from './icons/MicPlusIcon';
@@ -13,7 +13,7 @@ import MicScribbleIcon from './icons/MicScribbleIcon';
 import ReorderIcon from './icons/ReorderIcon';
 import MergeIcon from './icons/MergeIcon';
 import CustomPromptInput from './ui/CustomPromptInput';
-import { IdentifiedError, AudioAssessmentReport } from '../types';
+import { IdentifiedError } from '../types';
 import { AVAILABLE_MODELS } from '../constants';
 import WarningIcon from './icons/WarningIcon';
 import BrainIcon from './icons/BrainIcon';
@@ -22,8 +22,6 @@ import DownloadIcon from './icons/DownloadIcon';
 import TrashIcon from './icons/TrashIcon';
 import PauseIcon from './icons/PauseIcon';
 import ResumeIcon from './icons/ResumeIcon';
-import { Activity } from 'lucide-react';
-import { AudioAssessmentPanel } from './AudioAssessmentPanel';
 import { mergeAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
 import { stopRepeatingInterruptedAlert } from '../services/soundService';
 import RichTextReportEditor from './RichTextReportEditor';
@@ -37,7 +35,7 @@ interface ChatMessage {
 interface ResultsDisplayProps {
   findings: string[];
   onReset: () => void;
-  audioBlob: Blob | null;
+  audioBlob: Blob | Blob[] | null;
   chatHistory: ChatMessage[];
   isChatting: boolean;
   onSendMessage: (message: string | Blob) => void;
@@ -152,14 +150,14 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
   const [editingText, setEditingText] = useState<string>('');
 
-  const [dictatingIndex, setDictatingIndex] = useState<number | null>(null);
   const [dictateEditingIndex, setDictateEditingIndex] = useState<number | null>(null);
+  const [dictatingIndex, setDictatingIndex] = useState<number | null>(null);
   const [processingIndex, setProcessingIndex] = useState<number | null>(null);
   const [continuationError, setContinuationError] = useState<{ index: number; message: string } | null>(null);
-  const appendRecorder = useAudioRecorder();
   const modifyRecorder = useAudioRecorder();
-  const { startRecording: startAppendingRecording, stopRecording: stopAppendingRecording, error: appendRecorderError } = appendRecorder;
   const { startRecording: startModifyRecording, stopRecording: stopModifyRecording, error: modifyRecorderError } = modifyRecorder;
+  const rowDictationRecorder = useAudioRecorder();
+  const { startRecording: startRowDictationRecording, stopRecording: stopRowDictationRecording, error: rowDictationRecorderError } = rowDictationRecorder;
 
   // State for 'Continue Dictation' feature
   const continuationRecorder = useAudioRecorder();
@@ -201,27 +199,6 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   const [expertNotes, setExpertNotes] = useState<string | null>(null);
   // FIX: Add state to handle transcription loading state for the complex impression mic.
   const [isTranscribingComplex, setIsTranscribingComplex] = useState(false);
-
-  // State for Audio & Diagnostic Assessment feature
-  const [isAudioAssessmentOpen, setIsAudioAssessmentOpen] = useState(false);
-  const [audioAssessmentReport, setAudioAssessmentReport] = useState<AudioAssessmentReport | null>(null);
-  const [isAssessingAudio, setIsAssessingAudio] = useState(false);
-  const [audioAssessmentError, setAudioAssessmentError] = useState<string | null>(null);
-
-  const handleRunAudioAssessment = async () => {
-    setIsAssessingAudio(true);
-    setAudioAssessmentError(null);
-    setIsAudioAssessmentOpen(true);
-    try {
-      const report = await assessDictationAudio(audioBlob, findings, selectedModel);
-      setAudioAssessmentReport(report);
-    } catch (err) {
-      console.error("Audio assessment error:", err);
-      setAudioAssessmentError(err instanceof Error ? err.message : 'Failed to complete audio assessment.');
-    } finally {
-      setIsAssessingAudio(false);
-    }
-  };
 
 
   // State for selection copier
@@ -268,18 +245,18 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   }, []);
 
   useEffect(() => {
-    if (appendRecorderError && dictatingIndex !== null) {
-      setContinuationError({ index: dictatingIndex, message: appendRecorderError });
-      setDictatingIndex(null);
-    }
-  }, [appendRecorderError, dictatingIndex]);
-
-  useEffect(() => {
     if (modifyRecorderError && dictateEditingIndex !== null) {
       setContinuationError({ index: dictateEditingIndex, message: modifyRecorderError });
       setDictateEditingIndex(null);
     }
   }, [modifyRecorderError, dictateEditingIndex]);
+
+  useEffect(() => {
+    if (rowDictationRecorderError && dictatingIndex !== null) {
+      setContinuationError({ index: dictatingIndex, message: rowDictationRecorderError });
+      setDictatingIndex(null);
+    }
+  }, [rowDictationRecorderError, dictatingIndex]);
 
   useEffect(() => {
     if (continueRecorderError) {
@@ -430,12 +407,12 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
       return acc;
     }, { plain: [] as string[], html: [] as string[] });
 
-    const plainText = plain.join('\n');
+    const plainText = plain.join('\n\n');
     const htmlText = html.join('');
 
     const success = await copyToClipboard(plainText, htmlText);
     const notificationText = success
-      ? `Copied ${plain.length} finding${plain.length > 1 ? 's' : ''}!`
+      ? `Copied ${indices.size} finding${indices.size > 1 ? 's' : ''}!`
       : 'Copy failed!';
     showNotification(notificationText);
   };
@@ -549,7 +526,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
 
   const handleCopyAll = async () => {
     if (!findings || findings.length === 0) return;
-    
+
     const allTextPlain = findings.map(f => {
       const isBold = f.includes('BOLD::');
       const cleanFinding = f.replace(/BOLD::/g, '');
@@ -592,22 +569,28 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
       return isBold ? `<p><strong>${cleanFinding}</strong></p>` : `<p>${cleanFinding}</p>`;
     }).join('');
 
-
     const success = await copyToClipboard(allTextPlain, allTextHtml);
     if (success) {
         setIsAllCopied(true);
         setTimeout(() => setIsAllCopied(false), 2000);
+        showNotification('Copied all!');
+    } else {
+        showNotification('Copy failed!');
     }
   };
 
   const handleDownload = () => {
-    const targetBlob = mergedContinuationBlob || audioBlob;
+    const rawTarget = mergedContinuationBlob || audioBlob;
+    if (!rawTarget) return;
+    const targetBlob = Array.isArray(rawTarget) ? rawTarget.find(b => b.type?.startsWith('audio/')) || rawTarget[0] : rawTarget;
     if (!targetBlob) return;
     triggerAudioDownload(targetBlob, mergedContinuationBlob ? 'radiology-dictation-merged' : 'radiology-dictation');
   };
 
   const handleDownloadMerged = (blobToDownload?: Blob | null) => {
-    const targetBlob = blobToDownload || mergedContinuationBlob || audioBlob;
+    const rawTarget = blobToDownload || mergedContinuationBlob || audioBlob;
+    if (!rawTarget) return;
+    const targetBlob = Array.isArray(rawTarget) ? rawTarget.find(b => b.type?.startsWith('audio/')) || rawTarget[0] : rawTarget;
     if (!targetBlob) return;
     triggerAudioDownload(targetBlob, 'radiology-dictation-merged');
   };
@@ -650,8 +633,8 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     const textForEditing = isStructured ? [title, ...points].join('\n') : cleanFinding;
     
     setEditingText(textForEditing);
-    setDictatingIndex(null);
     setDictateEditingIndex(null);
+    setDictatingIndex(null);
     setProcessingIndex(null);
     setContinuationError(null);
     setSelectedIndices(new Set<number>());
@@ -664,11 +647,40 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
 
   const handleDeleteFinding = (indexToDelete: number) => {
     setUndoState([...findings]);
-    onAllFindingsUpdate(findings.filter((_, i) => i !== indexToDelete));
+    const updatedFindings = findings.filter((_, i) => i !== indexToDelete);
+    onAllFindingsUpdate(updatedFindings);
     if (editingIndex === indexToDelete) {
       setEditingIndex(null);
       setEditingText('');
     }
+    // Update selectedIndices so that indices shift properly
+    setSelectedIndices(prev => {
+      const next = new Set<number>();
+      for (const idx of prev) {
+        if (idx < indexToDelete) {
+          next.add(idx);
+        } else if (idx > indexToDelete) {
+          next.add(idx - 1);
+        }
+      }
+      if (next.size > 0 && multiSelectMode) {
+        copySelection(next);
+      }
+      return next;
+    });
+    setSelectionSnippets(prev => {
+      const next: Record<number, string> = {};
+      const snippets = prev as Record<string, string>;
+      for (const [keyStr, val] of Object.entries(snippets)) {
+        const key = Number(keyStr);
+        if (key < indexToDelete) {
+          next[key] = String(val);
+        } else if (key > indexToDelete) {
+          next[key - 1] = String(val);
+        }
+      }
+      return next;
+    });
   };
 
   const handleSaveEdit = () => {
@@ -692,24 +704,22 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     handleCancelEdit();
   };
 
-  const handleStartDictation = async (index: number) => {
+  const handleStartRowDictation = async (index: number) => {
     setUndoState(null);
     if (isLive) onPauseLive?.();
     setEditingIndex(null);
-    setDictateEditingIndex(null);
     setProcessingIndex(null);
     setContinuationError(null);
-    // Explicitly type the new Set to be Set<number> to match the state type.
-    // FIX: Explicitly type new Set() as Set<number> to match state type.
     setSelectedIndices(new Set<number>());
+    setDictateEditingIndex(null);
     setDictatingIndex(index);
-    await startAppendingRecording();
+    await startRowDictationRecording();
   };
 
-  const handleStopDictation = async () => {
+  const handleStopRowDictation = async () => {
     if (dictatingIndex === null) return;
 
-    const audioBlob = await stopAppendingRecording();
+    const audioBlob = await stopRowDictationRecording();
     const currentIndex = dictatingIndex;
     setDictatingIndex(null);
 
@@ -718,7 +728,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
       setUndoState(findings);
       try {
         const existingText = findings[currentIndex];
-        const newText = await continueAudioDictation(existingText, audioBlob, customPrompt);
+        const newText = await continueAudioDictation(existingText, audioBlob, customPrompt, selectedModel);
         const separator = existingText.trim().length > 0 && !existingText.endsWith(' ') ? ' ' : '';
         const updatedText = existingText + separator + newText.trim();
         onUpdateFinding(currentIndex, updatedText);
@@ -736,12 +746,12 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     setUndoState(null);
     if (isLive) onPauseLive?.();
     setEditingIndex(null);
-    setDictatingIndex(null);
     setProcessingIndex(null);
     setContinuationError(null);
     // Explicitly type the new Set to be Set<number> to match the state type.
     // FIX: Explicitly type new Set() as Set<number> to match state type.
     setSelectedIndices(new Set<number>());
+    setDictatingIndex(null);
     setDictateEditingIndex(index);
     await startModifyRecording();
   };
@@ -758,7 +768,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         setUndoState(findings);
         try {
             const existingText = findings[currentIndex];
-            const modifiedText = await modifyFindingWithAudio(existingText, audioBlob, customPrompt);
+            const modifiedText = await modifyFindingWithAudio(existingText, audioBlob, customPrompt, selectedModel);
             onUpdateFinding(currentIndex, modifiedText);
         } catch (err) {
             const message = err instanceof Error ? err.message : 'An unknown error occurred.';
@@ -785,7 +795,8 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         // Immediately merge audio right at the moment Stop is clicked!
         let merged: Blob;
         if (audioBlob) {
-          merged = await mergeAudioBlobs(audioBlob, newRecordedBlob);
+          const baseBlob = Array.isArray(audioBlob) ? (audioBlob.find(b => b.type?.startsWith('audio/')) || audioBlob[0]) : audioBlob;
+          merged = await mergeAudioBlobs(baseBlob, newRecordedBlob);
         } else {
           merged = newRecordedBlob;
         }
@@ -868,7 +879,8 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         setIsMergingAudio(true);
         let merged: Blob;
         if (audioBlob) {
-          merged = await mergeAudioBlobs(audioBlob, newRecordedBlob);
+          const baseBlob = Array.isArray(audioBlob) ? (audioBlob.find(b => b.type?.startsWith('audio/')) || audioBlob[0]) : audioBlob;
+          merged = await mergeAudioBlobs(baseBlob, newRecordedBlob);
         } else {
           merged = newRecordedBlob;
         }
@@ -1099,32 +1111,6 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
 
   return (
     <div className="p-4">
-      {multiSelectMode && (
-          <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-40 bg-slate-800 text-white rounded-full shadow-lg flex items-center gap-4 px-5 py-2 transition-all duration-300 ease-in-out">
-            <p className="text-sm font-semibold">Multi-select Mode</p>
-            <label htmlFor="multi-select-toggle-single" className="flex items-center cursor-pointer">
-              <span className="mr-2 text-sm font-medium text-slate-300">OFF</span>
-              <div className="relative">
-                <input 
-                  type="checkbox" 
-                  id="multi-select-toggle-single" 
-                  className="sr-only peer" 
-                  checked={multiSelectMode}
-                  onChange={() => {
-                    setMultiSelectMode(false);
-                    // Explicitly type the new Set to be Set<number> to match the state type.
-                    // FIX: Explicitly type new Set() as Set<number> to match state type.
-                    setSelectedIndices(new Set<number>());
-                    setSelectionSnippets({});
-                  }}
-                />
-                <div className="w-12 h-6 bg-slate-600 rounded-full peer-checked:bg-blue-600"></div>
-                <div className="absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform peer-checked:translate-x-6"></div>
-              </div>
-              <span className="ml-2 text-sm font-medium">ON</span>
-            </label>
-          </div>
-        )}
       {copier && copier.visible && (
         <SelectionCopier 
           x={copier.x}
@@ -1191,44 +1177,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                 </div>
             )}
         </div>
-        {!isLive && (
-          <button
-            onClick={() => {
-              const nextOpen = !isAudioAssessmentOpen;
-              setIsAudioAssessmentOpen(nextOpen);
-              if (nextOpen && !audioAssessmentReport && !isAssessingAudio) {
-                handleRunAudioAssessment();
-              }
-            }}
-            className="inline-flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-bold bg-teal-50 hover:bg-teal-100 text-teal-800 dark:bg-teal-950/40 dark:text-teal-300 dark:hover:bg-teal-900/60 border border-teal-200/80 dark:border-teal-800/60 transition-all shadow-sm active:scale-95"
-            title="Perform Acoustic & Diagnostic Assessment on this dictation"
-          >
-            <Activity className="w-4 h-4 text-teal-600 dark:text-teal-400" />
-            <span>{audioAssessmentReport ? 'Acoustic Assessment' : 'Assess Dictation Audio'}</span>
-            {audioAssessmentReport && (
-              <span className="px-1.5 py-0.5 rounded-full bg-teal-200 dark:bg-teal-800/80 text-[10px] font-black text-teal-900 dark:text-teal-200">
-                {audioAssessmentReport.overallConfidenceScore}%
-              </span>
-            )}
-          </button>
-        )}
       </div>
-
-      {isAudioAssessmentOpen && (
-        <AudioAssessmentPanel
-          report={audioAssessmentReport}
-          isLoading={isAssessingAudio}
-          error={audioAssessmentError}
-          hasAudio={!!audioBlob}
-          onRunAssessment={handleRunAudioAssessment}
-          onClose={() => setIsAudioAssessmentOpen(false)}
-          onInquireInChat={(query) => {
-            onSendMessage(query);
-            const chatEl = document.getElementById('follow-up-chat');
-            chatEl?.scrollIntoView({ behavior: 'smooth' });
-          }}
-        />
-      )}
 
       {errorCheckStatus === 'complete' && identifiedErrors.length > 0 && <ErrorLegend />}
 
@@ -1356,8 +1305,8 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
       {!isLive && <p className="text-slate-600 dark:text-slate-400 mb-6">Click any finding to copy it. To select multiple findings, click the circle on the left of each item. Use the 'Continue Dictation' button at the bottom to add more findings to this report.</p>}
       <div className="text-sm text-slate-500 dark:text-slate-400 mb-6 p-3 bg-slate-100 dark:bg-slate-700/50 rounded-lg flex flex-col sm:flex-row gap-4 items-center">
         <div className="flex items-center gap-2">
-            <MicPlusIcon className="w-5 h-5 flex-shrink-0" />
-            <span>Use this to <strong>append</strong> new dictation to the end of a finding.</span>
+            <MicIcon className="w-5 h-5 flex-shrink-0" />
+            <span>Use this to <strong>continue dictation</strong>.</span>
         </div>
         <div className="flex items-center gap-2">
             <MicPencilIcon className="w-5 h-5 flex-shrink-0" />
@@ -1366,9 +1315,11 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
       </div>
       {findings.length > 0 && (
         <div className="flex flex-wrap justify-between items-center gap-2 mb-4 p-2 bg-slate-100/70 dark:bg-slate-800/70 rounded-xl border border-slate-200/80 dark:border-slate-700/80">
-            <span className="text-xs sm:text-sm font-semibold text-slate-600 dark:text-slate-300 px-2">
-              {findings.filter(f => f && f.trim()).length} findings {selectedIndices.size > 0 && `• ${selectedIndices.size} selected`}
-            </span>
+            <div className="flex items-center gap-2">
+              <span className="text-xs sm:text-sm font-semibold text-slate-600 dark:text-slate-300">
+                {findings.filter(f => f && f.trim()).length} findings
+              </span>
+            </div>
             <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
               {undoState && (
                 <button
@@ -1395,9 +1346,9 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
               </button>
               <button
                 onClick={handleCopyAll}
-                className={`text-xs sm:text-sm font-semibold py-1.5 px-3.5 rounded-lg transition-colors shadow-sm ${isAllCopied ? 'bg-green-600 text-white' : 'bg-blue-600 text-white hover:bg-blue-700'}`}
+                className={`text-xs sm:text-sm font-semibold py-1.5 px-3.5 rounded-lg transition-colors shadow-sm flex items-center gap-1.5 ${isAllCopied ? 'bg-green-600 text-white' : 'bg-blue-600 text-white hover:bg-blue-700'}`}
               >
-                {isAllCopied ? '✓ Copied All!' : 'Copy All'}
+                {isAllCopied ? 'Copied!' : 'Copy All'}
               </button>
             </div>
         </div>
@@ -1428,7 +1379,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
           const isDictateEditingThis = dictateEditingIndex === index;
           const isProcessingThis = processingIndex === index;
           const hasErrorThis = continuationError?.index === index;
-          const isCurrentlyActive = isEditingThis || isDictatingThis || isProcessingThis || hasErrorThis || isDictateEditingThis;
+          const isCurrentlyActive = isEditingThis || isProcessingThis || hasErrorThis || isDictateEditingThis || isDictatingThis;
           const isDraggingThis = draggedIndex === index;
           const isDragOverTarget = mergeMode && dragOverIndex === index && draggedIndex !== index;
           
@@ -1567,7 +1518,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                   {isDictatingThis ? (
                      <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-2 bg-white dark:bg-slate-800 p-1 rounded-full shadow-lg border border-slate-200 dark:border-slate-700">
                         <div className="w-3 h-3 bg-red-500 rounded-full animate-ping ml-1"></div>
-                        <button onClick={handleStopDictation} aria-label="Stop dictation" className="p-1 text-slate-600 dark:text-slate-300 hover:text-red-600 rounded-full hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors">
+                        <button onClick={handleStopRowDictation} aria-label="Stop dictation" className="p-1 text-slate-600 dark:text-slate-300 hover:text-red-600 rounded-full hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors">
                             <StopIcon className="w-5 h-5" />
                         </button>
                     </div>
@@ -1599,8 +1550,8 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                       <button onClick={() => handleStartEdit(index)} aria-label="Edit text" className="p-1.5 sm:p-1 text-slate-600 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400 rounded-full hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors touch-manipulation" title="Edit row">
                         <PencilIcon />
                       </button>
-                      <button onClick={() => handleStartDictation(index)} aria-label="Append dictation" className="p-1.5 sm:p-1 text-slate-600 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400 rounded-full hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors touch-manipulation" title="Append dictation to row">
-                        <MicPlusIcon />
+                      <button onClick={() => handleStartRowDictation(index)} aria-label="Continue dictation" className="p-1.5 sm:p-1 text-slate-600 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400 rounded-full hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors touch-manipulation" title="Continue dictation for this row">
+                        <MicIcon className="w-5 h-5" />
                       </button>
                       <button onClick={() => handleStartDictateEdit(index)} aria-label="Dictate changes" className="p-1.5 sm:p-1 text-slate-600 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400 rounded-full hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors touch-manipulation" title="Dictate changes to row">
                         <MicPencilIcon />
@@ -1888,7 +1839,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                     disabled={isRecoveringContinue}
                     className="px-4 py-1.5 text-xs sm:text-sm font-semibold text-white bg-amber-600 hover:bg-amber-700 dark:bg-amber-600 dark:hover:bg-amber-500 rounded-lg shadow transition-colors cursor-pointer"
                   >
-                    {isRecoveringContinue ? 'Restoring...' : 'Restore & Append'}
+                    {isRecoveringContinue ? 'Restoring...' : 'Restore & Transcribe'}
                   </button>
                 </div>
               </div>
@@ -1910,21 +1861,6 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
               <MicPlusIcon className="w-4 h-4" />
               Continue Dictation
             </button>
-            {!isLive && (
-              <button
-                  onClick={() => {
-                    setIsAudioAssessmentOpen(true);
-                    if (!audioAssessmentReport && !isAssessingAudio) {
-                      handleRunAudioAssessment();
-                    }
-                    window.scrollTo({ top: 0, behavior: 'smooth' });
-                  }}
-                  className="bg-teal-600 text-white font-bold py-2.5 px-5 rounded-xl hover:bg-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-500 focus:ring-opacity-50 transition-all shadow-sm w-full lg:w-auto flex items-center justify-center gap-2 min-h-[44px]"
-              >
-                  <Activity className="w-4 h-4" />
-                  {audioAssessmentReport ? 'View Audio Assessment' : 'Assess Dictation Audio'}
-              </button>
-            )}
             <button
                 onClick={() => setIsComplexGeneratorVisible(true)}
                 className="bg-purple-600 text-white font-bold py-2.5 px-5 rounded-xl hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-opacity-50 transition-all shadow-sm w-full lg:w-auto flex items-center justify-center gap-2 min-h-[44px]"
@@ -2018,6 +1954,31 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         </div>
       )}
       </div>
+
+      {multiSelectMode && (
+          <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-40 bg-slate-800 text-white rounded-full shadow-lg flex items-center gap-4 px-5 py-2 transition-all duration-300 ease-in-out">
+            <p className="text-sm font-semibold">Multi-select Mode</p>
+            <label htmlFor="multi-select-toggle-single" className="flex items-center cursor-pointer">
+              <span className="mr-2 text-sm font-medium text-slate-300">OFF</span>
+              <div className="relative">
+                <input 
+                  type="checkbox" 
+                  id="multi-select-toggle-single" 
+                  className="sr-only peer" 
+                  checked={multiSelectMode}
+                  onChange={() => {
+                    setMultiSelectMode(false);
+                    setSelectedIndices(new Set<number>());
+                    setSelectionSnippets({});
+                  }}
+                />
+                <div className="w-12 h-6 bg-slate-600 rounded-full peer-checked:bg-blue-600"></div>
+                <div className="absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform peer-checked:translate-x-6"></div>
+              </div>
+              <span className="ml-2 text-sm font-medium">ON</span>
+            </label>
+          </div>
+      )}
     </div>
   );
 };

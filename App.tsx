@@ -13,6 +13,7 @@ import { saveAudioBlob, getAudioBlob, deleteAudioBlob } from './services/audioSt
 import { BatchProcessor } from './components/BatchProcessor';
 import LiveDictation from './components/LiveDictation';
 import MicIcon from './components/icons/MicIcon';
+import YinYangMicIcon from './components/icons/YinYangMicIcon';
 import WaveformIcon from './components/icons/WaveformIcon';
 import SunIcon from './components/icons/SunIcon';
 import MoonIcon from './components/icons/MoonIcon';
@@ -28,7 +29,7 @@ import { autoSaveSingleDictation, autoSaveLiveDictation, SaveResult, syncPending
 import { DriveStatusBadge } from './components/DriveStatusBadge';
 import { DriveAutoSaveToast } from './components/DriveAutoSaveToast';
 import { DriveReportsModal } from './components/DriveReportsModal';
-import { RotateCcw, X, ExternalLink } from 'lucide-react';
+import { RotateCcw, X, ExternalLink, Power, Sparkles, Trash2 } from 'lucide-react';
 
 interface ChatMessage {
   author: 'You' | 'AI';
@@ -43,6 +44,7 @@ const formatFileSize = (bytes: number): string => {
 
 const SINGLE_MODE_STORAGE_KEY = 'radiologyDictationSingleMode';
 const ERROR_CHECK_ENABLED_KEY = 'radiologyErrorCheckEnabled';
+const POWER_MODE_KEY = 'radiologyPowerMode';
 
 const getCleanMimeType = (blob: Blob): string => {
     let mimeType = blob.type;
@@ -89,7 +91,7 @@ const App: React.FC = () => {
   const [status, setStatus] = useState<AppStatus>(AppStatus.Idle);
   const [findings, setFindings] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [audioBlob, setAudioBlob] = useState<Blob | null>(null);
+  const [audioBlob, setAudioBlob] = useState<Blob | Blob[] | null>(null);
   const [chat, setChat] = useState<Chat | null>(null);
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
   const [isChatting, setIsChatting] = useState<boolean>(false);
@@ -110,6 +112,10 @@ const App: React.FC = () => {
     const saved = localStorage.getItem(ERROR_CHECK_ENABLED_KEY);
     return saved ? JSON.parse(saved) : false; // Default is OFF
   });
+  const [isPowerMode, setIsPowerMode] = useState<boolean>(() => {
+    const saved = localStorage.getItem(POWER_MODE_KEY);
+    return saved !== null ? saved === 'true' : true; // Default is ON
+  });
   const [multipleFilesModal, setMultipleFilesModal] = useState<File[] | null>(null);
   const [pendingBatchFiles, setPendingBatchFiles] = useState<File[] | null>(null);
   const [isReportsModalOpen, setIsReportsModalOpen] = useState<boolean>(false);
@@ -122,7 +128,7 @@ const App: React.FC = () => {
   // Snapshot ref and snackbar state for "Undo Record New Dictation"
   const previousSingleSessionRef = useRef<{
     findings: string[];
-    audioBlob: Blob | null;
+    audioBlob: Blob | Blob[] | null;
     chatHistory: ChatMessage[];
     customPrompt: string;
     customImages: Array<{ data: string; mimeType: string }>;
@@ -139,6 +145,11 @@ const App: React.FC = () => {
     secondsRemaining: number;
   } | null>(null);
   const undoCountdownIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const [recoveredInFlightAudio, setRecoveredInFlightAudio] = useState<{
+    blob: Blob;
+    timestamp: number;
+    size: number;
+  } | null>(null);
 
   useEffect(() => {
     if (theme === 'dark') {
@@ -150,6 +161,15 @@ const App: React.FC = () => {
     }
   }, [theme]);
   
+  useEffect(() => {
+    localStorage.setItem(POWER_MODE_KEY, String(isPowerMode));
+    if (!isPowerMode) {
+      document.documentElement.classList.add('low-power-mode');
+    } else {
+      document.documentElement.classList.remove('low-power-mode');
+    }
+  }, [isPowerMode]);
+
   useEffect(() => {
     localStorage.setItem(ERROR_CHECK_ENABLED_KEY, JSON.stringify(isErrorCheckEnabled));
   }, [isErrorCheckEnabled]);
@@ -211,6 +231,26 @@ const App: React.FC = () => {
           chatPromise
             .then(setChat)
             .catch(err => console.error("Failed to recreate chat session from saved state:", err));
+        }
+
+        // Check for any in-flight recording that was interrupted during processing, network disruption, or page reload
+        try {
+          const inFlightBlob = await getAudioBlob('in_flight_recording');
+          if (inFlightBlob && inFlightBlob.size > 0) {
+            let meta: { timestamp: number; type: string; size: number } | null = null;
+            try {
+              const rawMeta = localStorage.getItem('in_flight_recording_meta');
+              if (rawMeta) meta = JSON.parse(rawMeta);
+            } catch (_) {}
+
+            setRecoveredInFlightAudio({
+              blob: inFlightBlob,
+              timestamp: meta?.timestamp || Date.now(),
+              size: inFlightBlob.size,
+            });
+          }
+        } catch (inFlightErr) {
+          console.warn("Notice: could not check in-flight recording recovery:", inFlightErr);
         }
       } catch (err) {
         console.error("Failed to load state from localStorage:", err);
@@ -323,6 +363,43 @@ const App: React.FC = () => {
     }
   }, [findings]);
 
+  const handleProcessRecoveredAudio = useCallback((blobToProcess?: Blob) => {
+    const audio = blobToProcess || recoveredInFlightAudio?.blob;
+    if (!audio) return;
+    setRecoveredInFlightAudio(null);
+    setMode('single');
+    handleRecordingComplete(audio);
+  }, [recoveredInFlightAudio]);
+
+  const handleDownloadRecoveredAudio = useCallback(() => {
+    if (!recoveredInFlightAudio) return;
+    const blob = recoveredInFlightAudio.blob;
+    try {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      document.body.appendChild(a);
+      a.style.display = 'none';
+      a.href = url;
+      const extension = blob.type === 'audio/mpeg' ? 'mp3' : blob.type === 'audio/wav' ? 'wav' : (blob.type.split('/')[1] || 'webm').split(';')[0];
+      a.download = `recovered-interrupted-dictation.${extension}`;
+      a.click();
+      window.URL.revokeObjectURL(url);
+      a.remove();
+    } catch (e) {
+      console.error("Failed to download recovered audio:", e);
+    }
+  }, [recoveredInFlightAudio]);
+
+  const handleDiscardRecoveredAudio = useCallback(async () => {
+    setRecoveredInFlightAudio(null);
+    try {
+      localStorage.removeItem('in_flight_recording_meta');
+      await deleteAudioBlob('in_flight_recording');
+    } catch (e) {
+      console.warn("Could not discard in-flight recording:", e);
+    }
+  }, []);
+
   const handleRecordingComplete = useCallback(async (audioInput: Blob | Blob[]) => {
     if (undoCountdownIntervalRef.current) {
       clearInterval(undoCountdownIntervalRef.current);
@@ -341,7 +418,24 @@ const App: React.FC = () => {
     setStatus(AppStatus.Processing);
     setError(null);
     setFindings([]);
-    setAudioBlob(audioBlobs[0]); // Primary audio/file blob
+    const primaryBlob = audioBlobs[0];
+    setAudioBlob(audioBlobs.length > 1 ? audioBlobs : primaryBlob); // Preserve all input blobs (audio, text files, docx, etc.)
+
+    // Immediate Zero-Loss Pre-Save:
+    // Persist audio into IndexedDB BEFORE dispatching network requests to Gemini.
+    // If the server, browser tab, or network gets disrupted during processing,
+    // the audio is 100% safely persisted and can be recovered on reload.
+    saveAudioBlob('in_flight_recording', primaryBlob).catch(err => {
+      console.warn("Could not pre-save in-flight audio:", err);
+    });
+    try {
+      localStorage.setItem('in_flight_recording_meta', JSON.stringify({
+        timestamp: Date.now(),
+        type: primaryBlob.type || 'audio/webm',
+        size: primaryBlob.size,
+      }));
+    } catch (_) {}
+    setRecoveredInFlightAudio(null);
 
     try {
       const processedText = await processAudio(audioBlobs, selectedModel, customPrompt, customImages, undefined, customDocx);
@@ -362,6 +456,12 @@ const App: React.FC = () => {
       setStatus(AppStatus.Success);
       window.scrollTo({ top: 0, behavior: 'instant' });
 
+      // Processing succeeded! Safely clear the temporary in-flight backup
+      deleteAudioBlob('in_flight_recording').catch(() => {});
+      try {
+        localStorage.removeItem('in_flight_recording_meta');
+      } catch (_) {}
+
       // Auto-save single dictation HTML to Google Drive in hidden background
       autoSaveSingleDictation(processedText, undefined, timestamp).then(result => {
         if (result.success) {
@@ -373,8 +473,10 @@ const App: React.FC = () => {
       console.error(err);
       setError(err instanceof Error ? err.message : 'An unknown error occurred during processing.');
       setStatus(AppStatus.Error);
+      // NOTE: We intentionally keep 'in_flight_recording' in IndexedDB so that even if the user
+      // accidentally refreshes or closes the page on this Error screen, the audio is STILL preserved!
     }
-  }, [selectedModel, customPrompt, customImages]);
+  }, [selectedModel, customPrompt, customImages, customDocx]);
   
   const handleLiveDictationComplete = useCallback(async (transcript: string, audioBlob: Blob | null) => {
     const reqId = ++processingRequestIdRef.current;
@@ -382,6 +484,20 @@ const App: React.FC = () => {
     setError(null);
     setFindings([]);
     setAudioBlob(audioBlob); // Set the captured audio blob from the live session
+
+    if (audioBlob) {
+      saveAudioBlob('in_flight_recording', audioBlob).catch(err => {
+        console.warn("Could not pre-save live in-flight audio:", err);
+      });
+      try {
+        localStorage.setItem('in_flight_recording_meta', JSON.stringify({
+          timestamp: Date.now(),
+          type: audioBlob.type || 'audio/webm',
+          size: audioBlob.size,
+        }));
+      } catch (_) {}
+      setRecoveredInFlightAudio(null);
+    }
 
     try {
         let processedText = transcript.split('\n').map(l => l.trim()).filter(line => line !== '');
@@ -430,6 +546,12 @@ const App: React.FC = () => {
         setStatus(AppStatus.Success);
         window.scrollTo({ top: 0, behavior: 'instant' });
 
+        // Processing succeeded! Safely clear temporary in-flight backup
+        deleteAudioBlob('in_flight_recording').catch(() => {});
+        try {
+          localStorage.removeItem('in_flight_recording_meta');
+        } catch (_) {}
+
         // Auto-save live dictation HTML to Google Drive in hidden background
         autoSaveLiveDictation(processedText, timestamp).then(result => {
           if (result.success) {
@@ -458,8 +580,8 @@ const App: React.FC = () => {
     setError(null);
     
     try {
-      // Pass the current findings as the base for reprocessing
-      const processedText = await processAudio(audioBlob, selectedModel, customPrompt, customImages, findings, customDocx);
+      // Reprocess clean from the original input audio/template/prompt without feeding in previous model output
+      const processedText = await processAudio(audioBlob, selectedModel, customPrompt, customImages, undefined, customDocx);
       if (processingRequestIdRef.current !== reqId) return; // cancelled
       setFindings(processedText);
 
@@ -513,6 +635,14 @@ const App: React.FC = () => {
       const mergedBlob = premergedBlob || (audioBlob ? await mergeAudioBlobs(audioBlob, newAudioBlob) : newAudioBlob);
       setAudioBlob(mergedBlob);
       saveAudioBlob('single_mode_audio', mergedBlob).catch(() => {});
+      saveAudioBlob('in_flight_recording', mergedBlob).catch(() => {});
+      try {
+        localStorage.setItem('in_flight_recording_meta', JSON.stringify({
+          timestamp: Date.now(),
+          type: mergedBlob.type || 'audio/webm',
+          size: mergedBlob.size,
+        }));
+      } catch (_) {}
 
       const newFindings = await processAudio(newAudioBlob, selectedModel, customPrompt, customImages, undefined, customDocx);
       const updatedFindings = [...findings, ...newFindings];
@@ -526,6 +656,12 @@ const App: React.FC = () => {
 
       const timestamp = activeDictationTimestampRef.current || Date.now();
       driveSyncedHashRef.current = updatedFindings.join('|||');
+
+      deleteAudioBlob('in_flight_recording').catch(() => {});
+      try {
+        localStorage.removeItem('in_flight_recording_meta');
+      } catch (_) {}
+
       autoSaveSingleDictation(updatedFindings, undefined, timestamp).then(result => {
         if (result.success) {
           setDriveSaveResult(result);
@@ -957,7 +1093,19 @@ const App: React.FC = () => {
   };
 
   return (
-    <div className="min-h-screen bg-gray-50 dark:bg-slate-900 flex flex-col items-center justify-start sm:justify-center p-2 sm:p-4 md:p-6 font-sans transition-colors duration-300">
+    <div className={`min-h-screen bg-gray-50 dark:bg-slate-900 flex flex-col items-center justify-start sm:justify-center p-2 sm:p-4 md:p-6 font-sans transition-colors duration-300 ${!isPowerMode ? 'low-power-active' : ''}`}>
+      {!isPowerMode && (
+        <style>{`
+          .low-power-mode *, .low-power-mode *::before, .low-power-mode *::after {
+            animation-duration: 0.001ms !important;
+            animation-iteration-count: 1 !important;
+            transition-duration: 0.001ms !important;
+            backdrop-filter: none !important;
+            box-shadow: none !important;
+            text-shadow: none !important;
+          }
+        `}</style>
+      )}
       <div className={`w-full mx-auto transition-all duration-200 ${isWideView ? 'max-w-4xl lg:max-w-5xl xl:max-w-6xl' : 'max-w-3xl'}`}>
         
         {/* Top Header */}
@@ -971,11 +1119,24 @@ const App: React.FC = () => {
               />
             </div>
             <div className="justify-self-center text-center px-1 sm:px-4">
-              <h1 className="text-xl sm:text-2xl md:text-3xl font-extrabold text-slate-800 dark:text-slate-100 tracking-tight whitespace-nowrap">
-                ☯️ RADDOC's Dictation app
+              <h1 className="text-xl sm:text-2xl md:text-3xl font-extrabold text-slate-800 dark:text-slate-100 tracking-tight whitespace-nowrap flex items-center justify-center gap-2">
+                <YinYangMicIcon className="w-7 h-7 sm:w-8 sm:h-8 shrink-0 rounded-full shadow-xs inline-block" />
+                <span>RADDOC's Dictation app</span>
               </h1>
             </div>
-            <div className="justify-self-end flex items-center">
+            <div className="justify-self-end flex items-center gap-1.5 sm:gap-2">
+              <button
+                onClick={() => setIsPowerMode(prev => !prev)}
+                className={`p-2 sm:p-2.5 rounded-xl transition-all shrink-0 shadow-sm border cursor-pointer min-h-[36px] min-w-[36px] flex items-center justify-center ${
+                  isPowerMode
+                    ? 'text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/40 border-emerald-300 dark:border-emerald-700/60 hover:bg-emerald-100 dark:hover:bg-emerald-900/60'
+                    : 'text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/40 border-amber-300 dark:border-amber-700/60 hover:bg-amber-100 dark:hover:bg-amber-900/60'
+                }`}
+                aria-label={isPowerMode ? "Power Mode ON (Standard). Click for Low Power / Simple Mode." : "Power Mode OFF (Low Power / Simple Mode Active). Click for Standard Power."}
+                title={isPowerMode ? "Power: ON (Standard Mode) — Click to switch to Low Power / Simple Mode to minimize CPU/data usage and run lag-free on any device" : "Power: OFF (Low Power / Simple Mode Active) — Animations and background effects minimized for smooth, lag-free performance on all devices. Click to turn ON."}
+              >
+                <Power className={`w-5 h-5 ${isPowerMode ? '' : 'opacity-80'}`} />
+              </button>
               <button
                 onClick={toggleTheme}
                 className="p-2 sm:p-2.5 rounded-xl text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors shrink-0 shadow-sm border border-slate-200/60 dark:border-slate-700/60 cursor-pointer min-h-[36px] min-w-[36px] flex items-center justify-center"
@@ -1074,6 +1235,57 @@ const App: React.FC = () => {
               </div>
           </div>
         </header>
+
+        {/* Zero-Loss Interrupted Dictation Recovery Banner */}
+        {recoveredInFlightAudio && (
+          <div className="mb-5 bg-amber-50 dark:bg-amber-950/50 border-2 border-amber-400/80 dark:border-amber-600/70 rounded-2xl p-4 sm:p-5 shadow-md transition-all animate-fadeIn">
+            <div className="flex items-start gap-3.5">
+              <div className="p-2.5 rounded-xl bg-amber-100 dark:bg-amber-900/60 text-amber-700 dark:text-amber-300 shrink-0">
+                <WarningIcon className="w-5 h-5" />
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <h3 className="text-sm sm:text-base font-bold text-amber-950 dark:text-amber-100">
+                    Interrupted Audio Recovered
+                  </h3>
+                  <span className="text-[11px] font-semibold px-2.5 py-0.5 rounded-full bg-amber-200/90 dark:bg-amber-800 text-amber-900 dark:text-amber-200 shrink-0">
+                    Zero-Loss Protection
+                  </span>
+                </div>
+                <p className="text-xs sm:text-sm text-amber-900/90 dark:text-amber-200/90 mt-1">
+                  An audio dictation was automatically pre-saved to browser storage before an unexpected disruption or reload occurred during processing. Your complete recording ({formatFileSize(recoveredInFlightAudio.size)}) is safe.
+                </p>
+                <div className="mt-3.5 flex flex-wrap items-center gap-2 sm:gap-3">
+                  <button
+                    type="button"
+                    onClick={() => handleProcessRecoveredAudio()}
+                    className="inline-flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs sm:text-sm py-2 px-4 rounded-xl shadow-xs transition-colors cursor-pointer"
+                  >
+                    <Sparkles className="w-4 h-4" />
+                    Process Audio Now
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleDownloadRecoveredAudio}
+                    className="inline-flex items-center gap-1.5 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-600 font-semibold text-xs sm:text-sm py-2 px-3.5 rounded-xl shadow-2xs transition-colors cursor-pointer"
+                  >
+                    <DownloadIcon className="w-4 h-4" />
+                    Download Audio File
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleDiscardRecoveredAudio}
+                    className="inline-flex items-center gap-1 text-slate-500 hover:text-red-600 dark:text-slate-400 dark:hover:text-red-400 font-medium text-xs sm:text-sm py-2 px-3 transition-colors cursor-pointer ml-auto"
+                    title="Discard this recovered audio"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    Discard
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Main Content Card */}
         <main className="bg-white dark:bg-slate-800 rounded-2xl shadow-xl p-3.5 sm:p-6 md:p-8 min-h-[300px] border border-slate-100 dark:border-slate-700/50 transition-all">
