@@ -29,7 +29,7 @@ import { autoSaveSingleDictation, autoSaveLiveDictation, SaveResult, syncPending
 import { DriveStatusBadge } from './components/DriveStatusBadge';
 import { DriveAutoSaveToast } from './components/DriveAutoSaveToast';
 import { DriveReportsModal } from './components/DriveReportsModal';
-import { RotateCcw, X, ExternalLink, Power, Sparkles, Trash2 } from 'lucide-react';
+import { RotateCcw, X, ExternalLink, Power, Sparkles, Trash2, Download } from 'lucide-react';
 
 interface ChatMessage {
   author: 'You' | 'AI';
@@ -1376,6 +1376,30 @@ const App: React.FC = () => {
                 >
                   <span className="truncate">https://youtube.com/@raddoc96</span>
                   <ExternalLink className="w-3.5 h-3.5 shrink-0" />
+                </a>
+              </li>
+
+              <li className="flex flex-col sm:flex-row sm:items-start sm:items-center justify-between gap-1.5 sm:gap-3 py-2 px-3 rounded-xl bg-white dark:bg-slate-800/90 border border-slate-200/70 dark:border-slate-700/70 hover:border-slate-300 dark:hover:border-slate-600 transition-colors">
+                <div className="flex flex-col gap-0.5 min-w-0">
+                  <span className="font-semibold text-slate-800 dark:text-slate-200 flex items-center gap-2">
+                    <span className="text-emerald-500 font-bold">•</span>
+                    <span>Android APK:</span>
+                  </span>
+                  <p className="text-[11px] sm:text-xs text-slate-500 dark:text-slate-400 pl-4">
+                    Download it as APK so that you can dictate in Android mobile after minimising the app also
+                  </p>
+                </div>
+                <a
+                  href="https://github.com/medicoforever/ai-studio-applet-apk/releases/download/v1.0.8/RADDOC-Dictation-Release.apk"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  download="RADDOC-Dictation-Release.apk"
+                  className="text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 hover:underline inline-flex items-center gap-1.5 font-mono text-[11px] sm:text-xs truncate max-w-full sm:max-w-xs shrink-0 self-start sm:self-center font-medium"
+                  title="https://github.com/medicoforever/ai-studio-applet-apk/releases/download/v1.0.8/RADDOC-Dictation-Release.apk"
+                >
+                  <Download className="w-3.5 h-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                  <span className="truncate">Download APK (v1.0.8)</span>
+                  <ExternalLink className="w-3.5 h-3.5 shrink-0 opacity-70" />
                 </a>
               </li>
             </ul>
