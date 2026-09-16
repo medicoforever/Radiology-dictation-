@@ -1,5 +1,5 @@
 import { GoogleGenAI, Type, GenerateContentResponse, Chat } from "@google/genai";
-import { DEFAULT_GEMINI_PROMPT, REPROCESS_GEMINI_PROMPT, TEMPLATE_GEMINI_PROMPT, REPORT_TEMPLATES, ERROR_IDENTIFIER_PROMPT, INITIAL_AGENT_PROMPT, REFINEMENT_AGENT_PROMPT, SYNTHESIZER_AGENT_PROMPT, VISUAL_TEMPLATE_GEMINI_PROMPT, getLiveModelFallbackChain } from '../constants';
+import { DEFAULT_GEMINI_PROMPT, REPROCESS_GEMINI_PROMPT, TEMPLATE_GEMINI_PROMPT, REPORT_TEMPLATES, ERROR_IDENTIFIER_PROMPT, INITIAL_AGENT_PROMPT, REFINEMENT_AGENT_PROMPT, SYNTHESIZER_AGENT_PROMPT, VISUAL_TEMPLATE_GEMINI_PROMPT, getLiveModelFallbackChain, DEFAULT_SELECTED_MODEL } from '../constants';
 import { IdentifiedError } from "../types";
 
 let aiClient: GoogleGenAI | null = null;
@@ -112,6 +112,10 @@ const responseSchema = {
  */
 export function resolveApiTargetModel(model?: string): string {
   if (!model) return 'gemini-3.7-flash';
+  // If legacy gemini-2.5-flash is passed, map to gemini-3.7-flash to prevent 403 permission errors
+  if (model === 'gemini-2.5-flash') {
+    return 'gemini-3.7-flash';
+  }
   // Map gemini-3.5-flash-lite / flash-lite aliases
   if (model === 'gemini-3.5-flash-lite') {
     return 'gemini-3.1-flash-lite';
@@ -689,7 +693,7 @@ Follow these strict instructions to produce a clean and accurate continuation:
   const textPart = { text: prompt };
 
   try {
-    const targetModel = resolveApiTargetModel(model || 'gemini-2.5-flash');
+    const targetModel = resolveApiTargetModel(model || DEFAULT_SELECTED_MODEL);
     const response: GenerateContentResponse = await getAI().models.generateContent({
       model: targetModel,
       contents: { parts: [textPart, audioPart] },
@@ -751,7 +755,7 @@ Now, listen to the audio and provide the single, updated finding text.`;
   const textPart = { text: prompt };
 
   try {
-    const targetModel = resolveApiTargetModel(model || 'gemini-2.5-flash');
+    const targetModel = resolveApiTargetModel(model || DEFAULT_SELECTED_MODEL);
     const response: GenerateContentResponse = await getAI().models.generateContent({
       model: targetModel,
       contents: { parts: [textPart, audioPart] },
@@ -912,7 +916,10 @@ ${JSON.stringify({ findings: currentFindings })}
   }
 };
 
-export const transcribeAudioForPrompt = async (audioBlob: Blob): Promise<string> => {
+export const transcribeAudioForPrompt = async (
+  audioBlob: Blob,
+  model?: string
+): Promise<string> => {
   const base64Audio = await blobToBase64(audioBlob);
 
   const prompt = "Transcribe the following audio accurately. Provide only the transcribed text without any additional commentary or introduction.";
@@ -924,25 +931,43 @@ export const transcribeAudioForPrompt = async (audioBlob: Blob): Promise<string>
       data: base64Audio,
     },
   };
-  
-  try {
-    const response: GenerateContentResponse = await getAI().models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: { parts: [textPart, audioPart] },
-    });
 
-    const resultText = response.text?.trim();
-    if (!resultText) {
-      return ""; // Return empty string if no transcription
+  // Primary model respects the user's selected model from main interface
+  const primaryModel = resolveApiTargetModel(model || DEFAULT_SELECTED_MODEL);
+
+  // Dynamic failover chain: starts with user's selected model, followed by fast, authorized Gemini models
+  const candidateModels = [
+    primaryModel,
+    'gemini-3.7-flash',
+    'gemini-3.8-flash',
+    'gemini-3.5-flash-lite'
+  ].filter((m, i, arr) => arr.indexOf(m) === i);
+
+  let lastError: any = null;
+
+  for (const candidateModel of candidateModels) {
+    try {
+      const response: GenerateContentResponse = await getAI().models.generateContent({
+        model: candidateModel,
+        contents: { parts: [textPart, audioPart] },
+      });
+
+      const resultText = response.text?.trim();
+      if (!resultText) {
+        return ""; // Return empty string if no transcription
+      }
+      return resultText;
+    } catch (error: any) {
+      console.warn(`Transcription attempt with model "${candidateModel}" failed, checking failover:`, error);
+      lastError = error;
     }
-    return resultText;
-  } catch (error) {
-    console.error("Error calling Gemini API for transcription:", error);
-    if (error instanceof Error) {
-        throw new Error(`Failed to transcribe audio: ${error.message}`);
-    }
-    throw new Error("An unknown error occurred while communicating with the API for transcription.");
   }
+
+  console.error("All candidate Gemini models failed for transcription:", lastError);
+  if (lastError instanceof Error) {
+    throw new Error(`Failed to transcribe audio: ${lastError.message}`);
+  }
+  throw new Error("An unknown error occurred while communicating with the API for transcription.");
 };
 
 
@@ -950,7 +975,8 @@ export const createChat = async (
   audioBlob: Blob | Blob[], 
   initialFindings: string[], 
   customPrompt?: string,
-  customImages?: Array<{ data: string; mimeType: string }> | null
+  customImages?: Array<{ data: string; mimeType: string }> | null,
+  model: string = DEFAULT_SELECTED_MODEL
 ): Promise<Chat> => {
   const audioBlobs = Array.isArray(audioBlob) ? audioBlob : [audioBlob];
   
@@ -1011,7 +1037,7 @@ export const createChat = async (
   }
 
   const chat = getAI().chats.create({
-    model: 'gemini-2.5-pro',
+    model: model || DEFAULT_SELECTED_MODEL,
     config: {
       systemInstruction: systemInstruction,
     },
@@ -1026,7 +1052,8 @@ export const createChat = async (
 export const createChatFromText = async (
   initialFindings: string[], 
   customPrompt?: string,
-  customImages?: Array<{ data: string; mimeType: string }> | null
+  customImages?: Array<{ data: string; mimeType: string }> | null,
+  model: string = DEFAULT_SELECTED_MODEL
 ): Promise<Chat> => {
   const userMessageParts: any[] = [];
   
@@ -1052,7 +1079,7 @@ export const createChatFromText = async (
   }
 
   const chat = getAI().chats.create({
-    model: 'gemini-2.5-pro',
+    model: model || DEFAULT_SELECTED_MODEL,
     config: {
       systemInstruction: systemInstruction,
     },

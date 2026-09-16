@@ -1,5 +1,13 @@
 // @ts-ignore
 import mammoth from 'mammoth';
+import {
+  Document,
+  Paragraph,
+  TextRun,
+  HeadingLevel,
+  AlignmentType,
+  Packer,
+} from 'docx';
 
 export interface ParsedDocxResult {
   fileName: string;
@@ -195,7 +203,8 @@ ${bodyHtml}
 }
 
 /**
- * Triggers download of a string or blob as a file
+ * Triggers download of a string or blob as a file.
+ * Handles Android mobile browsers, Android APK WebViews, and desktop browsers safely.
  */
 export function downloadFile(content: string | Blob, fileName: string, mimeType: string) {
   const blob = typeof content === 'string' ? new Blob([content], { type: mimeType }) : content;
@@ -205,8 +214,604 @@ export function downloadFile(content: string | Blob, fileName: string, mimeType:
   a.download = fileName;
   document.body.appendChild(a);
   a.click();
+
+  // On Android devices and APK WebViews, revoking the object URL after only 100ms
+  // causes Android Download Manager to fail or download a 0-byte corrupted file
+  // because the download occurs asynchronously outside the browser UI thread.
+  // Using a 60-second delay guarantees the OS has finished streaming the file.
   setTimeout(() => {
-    document.body.removeChild(a);
-    window.URL.revokeObjectURL(url);
-  }, 100);
+    try {
+      if (document.body.contains(a)) {
+        document.body.removeChild(a);
+      }
+      window.URL.revokeObjectURL(url);
+    } catch {
+      // Ignore cleanup error
+    }
+  }, 60000);
+}
+
+/**
+ * Tokenizes markdown inline styles (**bold**, *italics*) into docx TextRuns
+ */
+function parseMarkdownRuns(text: string): TextRun[] {
+  const runs: TextRun[] = [];
+  const parts = text.split(/(\*\*.*?\*\*|\*.*?\*)/g);
+  for (const part of parts) {
+    if (!part) continue;
+    if (part.startsWith('**') && part.endsWith('**') && part.length >= 4) {
+      runs.push(
+        new TextRun({
+          text: part.slice(2, -2),
+          bold: true,
+          font: 'Calibri',
+          size: 22,
+          color: '0F172A',
+        })
+      );
+    } else if (part.startsWith('*') && part.endsWith('*') && part.length >= 2) {
+      runs.push(
+        new TextRun({
+          text: part.slice(1, -1),
+          italics: true,
+          font: 'Calibri',
+          size: 22,
+          color: '334155',
+        })
+      );
+    } else {
+      runs.push(
+        new TextRun({
+          text: part,
+          font: 'Calibri',
+          size: 22,
+          color: '334155',
+        })
+      );
+    }
+  }
+  return runs.length > 0 ? runs : [new TextRun({ text, font: 'Calibri', size: 22 })];
+}
+
+/**
+ * Generates an authentic binary Microsoft Word (.docx) file from Markdown text (e.g. Expert Notes).
+ * Fully compatible with Microsoft Word for Android, Google Docs app, WPS Office, and desktop Word.
+ */
+export async function generateDocxFromMarkdown(markdown: string, title = 'Expert Notes'): Promise<Blob> {
+  const lines = markdown.split('\n');
+  const paragraphs: Paragraph[] = [];
+
+  if (title) {
+    paragraphs.push(
+      new Paragraph({
+        heading: HeadingLevel.HEADING_1,
+        alignment: AlignmentType.CENTER,
+        spacing: { before: 200, after: 160 },
+        children: [
+          new TextRun({
+            text: title,
+            bold: true,
+            size: 32,
+            font: 'Calibri',
+            color: '0F172A',
+          }),
+        ],
+      })
+    );
+  }
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    if (trimmed.startsWith('# ')) {
+      paragraphs.push(
+        new Paragraph({
+          heading: HeadingLevel.HEADING_1,
+          spacing: { before: 240, after: 120 },
+          children: parseMarkdownRuns(trimmed.slice(2)),
+        })
+      );
+    } else if (trimmed.startsWith('## ')) {
+      paragraphs.push(
+        new Paragraph({
+          heading: HeadingLevel.HEADING_2,
+          spacing: { before: 200, after: 100 },
+          children: parseMarkdownRuns(trimmed.slice(3)),
+        })
+      );
+    } else if (trimmed.startsWith('### ')) {
+      paragraphs.push(
+        new Paragraph({
+          heading: HeadingLevel.HEADING_3,
+          spacing: { before: 160, after: 80 },
+          children: parseMarkdownRuns(trimmed.slice(4)),
+        })
+      );
+    } else if (trimmed.startsWith('- ') || trimmed.startsWith('* ')) {
+      paragraphs.push(
+        new Paragraph({
+          bullet: { level: 0 },
+          spacing: { after: 80, line: 276 },
+          children: parseMarkdownRuns(trimmed.slice(2)),
+        })
+      );
+    } else if (/^\d+\.\s/.test(trimmed)) {
+      const textWithoutNum = trimmed.replace(/^\d+\.\s/, '');
+      paragraphs.push(
+        new Paragraph({
+          bullet: { level: 0 },
+          spacing: { after: 80, line: 276 },
+          children: parseMarkdownRuns(textWithoutNum),
+        })
+      );
+    } else {
+      paragraphs.push(
+        new Paragraph({
+          spacing: { after: 120, line: 276 },
+          children: parseMarkdownRuns(trimmed),
+        })
+      );
+    }
+  }
+
+  const documentDoc = new Document({
+    sections: [
+      {
+        properties: {
+          page: {
+            margin: {
+              top: 1440,
+              right: 1440,
+              bottom: 1440,
+              left: 1440,
+            },
+          },
+        },
+        children: paragraphs,
+      },
+    ],
+  });
+
+  return await Packer.toBlob(documentDoc);
+}
+
+/**
+ * Generates an authentic binary Microsoft Word (.docx) file from HTML content (e.g. RichTextReportEditor).
+ * Opens natively on Android Word, Google Docs, WPS Office, iOS, Mac, and Windows Word without corruption.
+ */
+export async function generateDocxFromHtml(html: string, title = 'Radiology Report'): Promise<Blob> {
+  const paragraphs: Paragraph[] = [];
+
+  if (typeof document === 'undefined') {
+    // Fallback if document is undefined (SSR)
+    return generateDocxFromMarkdown(html.replace(/<[^>]+>/g, '\n'), title);
+  }
+
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, 'text/html');
+  const body = doc.body;
+
+  // Insert title header if not already present in HTML
+  const hasH1 = !!body.querySelector('h1');
+  if (title && !hasH1) {
+    paragraphs.push(
+      new Paragraph({
+        heading: HeadingLevel.HEADING_1,
+        alignment: AlignmentType.CENTER,
+        spacing: { before: 200, after: 140 },
+        children: [
+          new TextRun({
+            text: title,
+            bold: true,
+            size: 32,
+            font: 'Calibri',
+            color: '0F172A',
+          }),
+        ],
+      })
+    );
+  }
+
+  function parseInlineRuns(
+    node: Node,
+    inheritedStyles: { bold?: boolean; italics?: boolean; underline?: boolean; color?: string } = {}
+  ): TextRun[] {
+    const runs: TextRun[] = [];
+
+    if (node.nodeType === Node.TEXT_NODE) {
+      const text = node.textContent || '';
+      if (!text) return runs;
+
+      if (text.includes('BOLD::')) {
+        const parts = text.split(/(BOLD::[^\n]*)/g);
+        for (const part of parts) {
+          if (part.startsWith('BOLD::')) {
+            runs.push(
+              new TextRun({
+                text: part.replace(/^BOLD::/, ''),
+                bold: true,
+                italics: inheritedStyles.italics,
+                underline: inheritedStyles.underline ? {} : undefined,
+                font: 'Calibri',
+                size: 22,
+                color: inheritedStyles.color || '0F172A',
+              })
+            );
+          } else if (part) {
+            runs.push(
+              new TextRun({
+                text: part,
+                bold: inheritedStyles.bold,
+                italics: inheritedStyles.italics,
+                underline: inheritedStyles.underline ? {} : undefined,
+                font: 'Calibri',
+                size: 22,
+                color: inheritedStyles.color || '334155',
+              })
+            );
+          }
+        }
+      } else {
+        runs.push(
+          new TextRun({
+            text,
+            bold: inheritedStyles.bold,
+            italics: inheritedStyles.italics,
+            underline: inheritedStyles.underline ? {} : undefined,
+            font: 'Calibri',
+            size: 22,
+            color: inheritedStyles.color || '334155',
+          })
+        );
+      }
+      return runs;
+    }
+
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      const el = node as HTMLElement;
+      const tag = el.tagName.toLowerCase();
+
+      const newStyles = { ...inheritedStyles };
+      if (tag === 'strong' || tag === 'b') newStyles.bold = true;
+      if (tag === 'em' || tag === 'i') newStyles.italics = true;
+      if (tag === 'u') newStyles.underline = true;
+
+      if (tag === 'br') {
+        runs.push(new TextRun({ break: 1 }));
+        return runs;
+      }
+
+      for (let i = 0; i < el.childNodes.length; i++) {
+        runs.push(...parseInlineRuns(el.childNodes[i], newStyles));
+      }
+    }
+
+    return runs;
+  }
+
+  function processBlockNode(node: Node) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const text = (node.textContent || '').trim();
+      if (text) {
+        paragraphs.push(
+          new Paragraph({
+            spacing: { after: 120, line: 276 },
+            children: [new TextRun({ text, font: 'Calibri', size: 22, color: '334155' })],
+          })
+        );
+      }
+      return;
+    }
+
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const el = node as HTMLElement;
+    const tag = el.tagName.toLowerCase();
+
+    // Headings
+    if (tag === 'h1') {
+      const runs = parseInlineRuns(el, { bold: true, color: '0F172A' });
+      paragraphs.push(
+        new Paragraph({
+          heading: HeadingLevel.HEADING_1,
+          alignment: AlignmentType.CENTER,
+          spacing: { before: 240, after: 120 },
+          children: runs,
+        })
+      );
+      return;
+    }
+
+    if (tag === 'h2') {
+      const runs = parseInlineRuns(el, { bold: true, color: '1D4ED8' });
+      paragraphs.push(
+        new Paragraph({
+          heading: HeadingLevel.HEADING_2,
+          spacing: { before: 220, after: 100 },
+          children: runs,
+        })
+      );
+      return;
+    }
+
+    if (tag === 'h3') {
+      const runs = parseInlineRuns(el, { bold: true, color: '1E3A8A' });
+      paragraphs.push(
+        new Paragraph({
+          heading: HeadingLevel.HEADING_3,
+          spacing: { before: 180, after: 80 },
+          children: runs,
+        })
+      );
+      return;
+    }
+
+    // Lists
+    if (tag === 'ul' || tag === 'ol') {
+      const lis = el.querySelectorAll('li');
+      lis.forEach((li) => {
+        const runs = parseInlineRuns(li);
+        paragraphs.push(
+          new Paragraph({
+            bullet: { level: 0 },
+            spacing: { after: 80, line: 276 },
+            children: runs,
+          })
+        );
+      });
+      return;
+    }
+
+    // Clinical profile box
+    if (el.classList.contains('clinical-profile')) {
+      const runs = parseInlineRuns(el, { italics: true, bold: true, color: '0284C7' });
+      paragraphs.push(
+        new Paragraph({
+          spacing: { before: 140, after: 140 },
+          children: runs,
+        })
+      );
+      return;
+    }
+
+    // Impression section container
+    if (el.classList.contains('impression-section')) {
+      paragraphs.push(
+        new Paragraph({
+          heading: HeadingLevel.HEADING_3,
+          spacing: { before: 200, after: 100 },
+          children: [
+            new TextRun({
+              text: 'IMPRESSION:',
+              bold: true,
+              color: '1E3A8A',
+              font: 'Calibri',
+              size: 24,
+            }),
+          ],
+        })
+      );
+      for (let i = 0; i < el.childNodes.length; i++) {
+        processBlockNode(el.childNodes[i]);
+      }
+      return;
+    }
+
+    // If element contains block children, recurse
+    const hasBlockChildren = Array.from(el.children).some((c) =>
+      ['p', 'div', 'h1', 'h2', 'h3', 'h4', 'ul', 'ol', 'section', 'article'].includes(c.tagName.toLowerCase())
+    );
+
+    if (hasBlockChildren) {
+      for (let i = 0; i < el.childNodes.length; i++) {
+        processBlockNode(el.childNodes[i]);
+      }
+    } else {
+      const runs = parseInlineRuns(el);
+      if (runs.length > 0) {
+        paragraphs.push(
+          new Paragraph({
+            spacing: { after: 120, line: 276 },
+            children: runs,
+          })
+        );
+      }
+    }
+  }
+
+  for (let i = 0; i < body.childNodes.length; i++) {
+    processBlockNode(body.childNodes[i]);
+  }
+
+  if (paragraphs.length === 0) {
+    paragraphs.push(
+      new Paragraph({
+        children: [new TextRun({ text: 'No report content', font: 'Calibri' })],
+      })
+    );
+  }
+
+  const documentDoc = new Document({
+    sections: [
+      {
+        properties: {
+          page: {
+            margin: {
+              top: 1440,
+              right: 1440,
+              bottom: 1440,
+              left: 1440,
+            },
+          },
+        },
+        children: paragraphs,
+      },
+    ],
+  });
+
+  return await Packer.toBlob(documentDoc);
+}
+
+/**
+ * Generates an authentic binary Microsoft Word (.docx) file from an array of findings.
+ */
+export async function generateDocxFromFindings(findings: string[], title = 'Radiology Report'): Promise<Blob> {
+  const paragraphs: Paragraph[] = [];
+
+  if (title) {
+    paragraphs.push(
+      new Paragraph({
+        heading: HeadingLevel.HEADING_1,
+        alignment: AlignmentType.CENTER,
+        spacing: { before: 200, after: 160 },
+        children: [
+          new TextRun({
+            text: title,
+            bold: true,
+            size: 32,
+            font: 'Calibri',
+            color: '0F172A',
+          }),
+        ],
+      })
+    );
+  }
+
+  for (const finding of findings) {
+    const trimmed = finding.trim();
+    if (!trimmed) continue;
+
+    // Clinical profile
+    if (trimmed.startsWith('*Clinical Profile:') && trimmed.endsWith('*')) {
+      const inner = trimmed.slice(1, -1);
+      paragraphs.push(
+        new Paragraph({
+          spacing: { before: 140, after: 140 },
+          children: [
+            new TextRun({
+              text: inner,
+              bold: true,
+              italics: true,
+              font: 'Calibri',
+              size: 22,
+              color: '0284C7',
+            }),
+          ],
+        })
+      );
+      continue;
+    }
+
+    // Impression
+    if (trimmed.startsWith('IMPRESSION:')) {
+      paragraphs.push(
+        new Paragraph({
+          heading: HeadingLevel.HEADING_3,
+          spacing: { before: 200, after: 100 },
+          children: [
+            new TextRun({
+              text: 'IMPRESSION',
+              bold: true,
+              font: 'Calibri',
+              size: 24,
+              color: '1E3A8A',
+            }),
+          ],
+        })
+      );
+      const parts = trimmed.replace('IMPRESSION:', '').split('###').map((p) => p.trim()).filter(Boolean);
+      for (const pt of parts) {
+        paragraphs.push(
+          new Paragraph({
+            bullet: { level: 0 },
+            spacing: { after: 80, line: 276 },
+            children: [
+              new TextRun({
+                text: pt,
+                bold: true,
+                font: 'Calibri',
+                size: 22,
+                color: '1E293B',
+              }),
+            ],
+          })
+        );
+      }
+      continue;
+    }
+
+    // Patient separator
+    if (trimmed.startsWith('BOLD::--- PATIENT') || trimmed.startsWith('--- PATIENT')) {
+      const cleanTitle = trimmed.replace('BOLD::', '');
+      paragraphs.push(
+        new Paragraph({
+          heading: HeadingLevel.HEADING_2,
+          spacing: { before: 240, after: 120 },
+          children: [
+            new TextRun({
+              text: cleanTitle,
+              bold: true,
+              font: 'Calibri',
+              size: 26,
+              color: '1D4ED8',
+            }),
+          ],
+        })
+      );
+      continue;
+    }
+
+    // Findings with BOLD:: (dictated abnormality modifications)
+    if (trimmed.startsWith('BOLD::')) {
+      const content = trimmed.replace(/^BOLD::/, '');
+      paragraphs.push(
+        new Paragraph({
+          spacing: { after: 120, line: 276 },
+          children: [
+            new TextRun({
+              text: content,
+              bold: true,
+              font: 'Calibri',
+              size: 22,
+              color: '0F172A',
+            }),
+          ],
+        })
+      );
+    } else {
+      paragraphs.push(
+        new Paragraph({
+          spacing: { after: 120, line: 276 },
+          children: [
+            new TextRun({
+              text: trimmed,
+              font: 'Calibri',
+              size: 22,
+              color: '334155',
+            }),
+          ],
+        })
+      );
+    }
+  }
+
+  const documentDoc = new Document({
+    sections: [
+      {
+        properties: {
+          page: {
+            margin: {
+              top: 1440,
+              right: 1440,
+              bottom: 1440,
+              left: 1440,
+            },
+          },
+        },
+        children: paragraphs,
+      },
+    ],
+  });
+
+  return await Packer.toBlob(documentDoc);
 }

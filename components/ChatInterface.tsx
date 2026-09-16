@@ -15,9 +15,10 @@ interface ChatInterfaceProps {
   history: ChatMessage[];
   isChatting: boolean;
   onSendMessage: (message: string | Blob) => void;
+  selectedModel?: string;
 }
 
-const ChatInterface: React.FC<ChatInterfaceProps> = ({ history, isChatting, onSendMessage }) => {
+const ChatInterface: React.FC<ChatInterfaceProps> = ({ history, isChatting, onSendMessage, selectedModel }) => {
   const [input, setInput] = useState('');
   const messagesContainerRef = useRef<null | HTMLDivElement>(null);
   const { isRecording, startRecording, stopRecording, error: recorderError } = useAudioRecorder();
@@ -90,7 +91,14 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({ history, isChatting, onSe
 
   return (
     <div id="follow-up-chat" className="mt-8 border-t dark:border-slate-700 pt-6">
-      <h3 className="text-xl font-bold text-slate-800 dark:text-slate-100 mb-4">Follow-up Chat</h3>
+      <div className="flex items-center justify-between gap-2 mb-4">
+        <h3 className="text-xl font-bold text-slate-800 dark:text-slate-100">Follow-up Chat</h3>
+        {selectedModel && (
+          <span className="text-xs font-medium px-2.5 py-1 rounded-full bg-blue-50 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300 border border-blue-200 dark:border-blue-800">
+            Model: {selectedModel}
+          </span>
+        )}
+      </div>
       {recorderError && <p className="text-red-500 mb-2 text-sm">{recorderError}</p>}
       <div ref={messagesContainerRef} className="bg-slate-50 dark:bg-slate-900/50 rounded-lg p-4 h-72 overflow-y-auto flex flex-col gap-4">
         {history.map((msg, index) => (

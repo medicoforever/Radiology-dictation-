@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { findingsToRichHtml, generateRtfDocument, generateWordHtmlDoc, downloadFile } from '../services/docxService';
+import { findingsToRichHtml, generateRtfDocument, generateWordHtmlDoc, generateDocxFromHtml, downloadFile } from '../services/docxService';
 import CopyIcon from './icons/CopyIcon';
 import DownloadIcon from './icons/DownloadIcon';
 import SparklesIcon from './icons/SparklesIcon';
@@ -137,12 +137,25 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
     downloadFile(fullHtml, fileName, 'text/html');
   };
 
-  const handleDownloadWordDoc = () => {
+  const [isExportingDocx, setIsExportingDocx] = useState<boolean>(false);
+
+  const handleDownloadWordDoc = async () => {
     if (!editorRef.current) return;
     const title = templateName ? `${templateName} Report` : 'Radiology Merged Report';
-    const htmlDoc = generateWordHtmlDoc(editorRef.current.innerHTML, title);
-    const fileName = `${title.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${new Date().toISOString().slice(0, 10)}.doc`;
-    downloadFile(htmlDoc, fileName, 'application/msword');
+    setIsExportingDocx(true);
+    try {
+      // Generate genuine binary .docx file using OpenXML Packer
+      const docxBlob = await generateDocxFromHtml(editorRef.current.innerHTML, title);
+      const fileName = `${title.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${new Date().toISOString().slice(0, 10)}.docx`;
+      downloadFile(docxBlob, fileName, 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+    } catch (err) {
+      console.error('Failed to export genuine docx, falling back to legacy doc format:', err);
+      const htmlDoc = generateWordHtmlDoc(editorRef.current.innerHTML, title);
+      const fileName = `${title.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${new Date().toISOString().slice(0, 10)}.doc`;
+      downloadFile(htmlDoc, fileName, 'application/msword');
+    } finally {
+      setIsExportingDocx(false);
+    }
   };
 
   const handleDownloadRtf = () => {
@@ -259,11 +272,12 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
           <button
             type="button"
             onClick={handleDownloadWordDoc}
-            className="flex items-center gap-1 px-2.5 py-1.5 bg-blue-800/80 hover:bg-blue-900 text-white font-bold text-xs rounded-lg shadow-sm transition-all cursor-pointer"
-            title="Download formatted report as a Microsoft Word-compatible .doc file"
+            disabled={isExportingDocx}
+            className="flex items-center gap-1 px-2.5 py-1.5 bg-blue-800/80 hover:bg-blue-900 text-white font-bold text-xs rounded-lg shadow-sm transition-all cursor-pointer disabled:opacity-50"
+            title="Download authentic Microsoft Word document (.docx) - opens cleanly without corruption on Android, iOS, Windows, and Mac"
           >
             <DownloadIcon className="w-3.5 h-3.5" />
-            Word (.doc)
+            {isExportingDocx ? 'Generating...' : 'Word (.docx)'}
           </button>
           <button
             type="button"

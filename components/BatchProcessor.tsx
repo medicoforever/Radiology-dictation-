@@ -33,6 +33,7 @@ import { AVAILABLE_MODELS } from '../constants';
 import WarningIcon from './icons/WarningIcon';
 import BrainIcon from './icons/BrainIcon';
 import { autoSaveBatchDictations, SaveResult, BatchFolderInfo, isDriveConnected, subscribeToAuth } from '../services/googleDriveService';
+import { generateDocxFromMarkdown, downloadFile } from '../services/docxService';
 
 const BATCH_DRIVE_FOLDER_KEY = 'radiologyDictationBatchDriveFolder';
 const BATCH_SESSION_TIMESTAMP_KEY = 'radiologyDictationBatchSessionTimestamp';
@@ -171,6 +172,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     // State for Drag and Drop
     const [reorderBatchId, setReorderBatchId] = useState<string | null>(null);
     const [mergeBatchId, setMergeBatchId] = useState<string | null>(null);
+    const [clickMergeBatchState, setClickMergeBatchState] = useState<{ batchId: string; index: number } | null>(null);
     const [draggedState, setDraggedState] = useState<{ batchId: string; index: number } | null>(null);
     const [dragOverState, setDragOverState] = useState<{ batchId: string; index: number } | null>(null);
     const dragItem = useRef<{ batchId: string; index: number } | null>(null);
@@ -351,7 +353,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                         if (savedBatch.status === 'complete' && savedBatch.findings && audioBlobs.length > 0) {
                             try {
                                 const mergedBlob = await mergeMultipleAudioBlobs(audioBlobs);
-                                chat = await createChat(mergedBlob, savedBatch.findings, savedBatch.customPrompt, savedBatch.customImages);
+                                chat = await createChat(mergedBlob, savedBatch.findings, savedBatch.customPrompt, savedBatch.customImages, savedBatch.selectedModel || selectedModel);
                             } catch (e) {
                                 console.error(`Failed to recreate chat for batch ${savedBatch.name}:`, e);
                             }
@@ -1065,7 +1067,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                 
                 if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
 
-                const chatSession = await createChat(mergedBlob, findings, batch.customPrompt, batch.customImages);
+                const chatSession = await createChat(mergedBlob, findings, batch.customPrompt, batch.customImages, batch.selectedModel);
                 const aiGreeting = "I have reviewed the audio and transcript for this dictation. How can I help you further?";
                 const initialChatHistory = [{ author: 'AI' as const, text: `${findings.join('\n\n')}\n\n${aiGreeting}` }];
 
@@ -1107,7 +1109,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             
             if (batchProcessingIdRef.current[batchId] !== currentReqId) return;
 
-            const chatSession = await createChat(mergedBlob, findings, batch.customPrompt, batch.customImages);
+            const chatSession = await createChat(mergedBlob, findings, batch.customPrompt, batch.customImages, batch.selectedModel);
             const aiGreeting = "I have reviewed the audio and transcript for this dictation. How can I help you further?";
             const initialChatHistory = [{ author: 'AI' as const, text: `${findings.join('\n\n')}\n\n${aiGreeting}` }];
 
@@ -1487,16 +1489,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
 
         try {
             const htmlContent = generateBatchDictationHTML(batchesWithFindings);
-            const blob = new Blob([htmlContent], { type: 'text/html' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.style.display = 'none';
-            a.href = url;
-            a.download = 'batch-radiology-report.html';
-            document.body.appendChild(a);
-            a.click();
-            window.URL.revokeObjectURL(url);
-            a.remove();
+            downloadFile(htmlContent, 'batch-radiology-report.html', 'text/html;charset=utf-8');
         } catch (err) {
             console.error('Failed to generate or download batch HTML:', err);
             showNotification("Failed to create HTML file.");
@@ -1755,7 +1748,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                 const newFindings = await modifyReportWithAudio(batchToModify.findings, audioBlob, batchToModify.selectedModel, batchToModify.customPrompt, batchToModify.customImages);
                 
                 const mergedBlob = await mergeMultipleAudioBlobs(batchToModify.audioBlobs);
-                const chatSession = await createChat(mergedBlob, newFindings, batchToModify.customPrompt, batchToModify.customImages);
+                const chatSession = await createChat(mergedBlob, newFindings, batchToModify.customPrompt, batchToModify.customImages, batchToModify.selectedModel);
                 const aiGreeting = "I have updated the transcript with your new dictation. How can I help you further?";
                 const updatedChatHistory = [{ author: 'AI' as const, text: `${newFindings.join('\n\n')}\n\n${aiGreeting}` }];
     
@@ -1785,7 +1778,9 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             try {
                 const audioBlob = await complexInputRecorder.stopRecording();
                 if (audioBlob && audioBlob.size > 0) {
-                    const transcript = await transcribeAudioForPrompt(audioBlob);
+                    const currentBatch = batches.find(b => b.id === batchId);
+                    const modelToUse = currentBatch?.selectedModel || selectedModel;
+                    const transcript = await transcribeAudioForPrompt(audioBlob, modelToUse);
                     setComplexInputs(prev => ({ ...prev, [batchId]: prev[batchId] ? `${prev[batchId]} ${transcript}` : transcript }));
                 }
             } catch (err) {
@@ -1837,31 +1832,20 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         }
     };
 
-    const handleDownloadExpertNotes = (batchId: string) => {
+    const handleDownloadExpertNotes = async (batchId: string) => {
         const expertNotes = expertNotesForBatches[batchId];
         if (!expertNotes) return;
-        
-        let htmlContent = expertNotes
-          .replace(/^## (.*$)/gim, '<h2>$1</h2>')
-          .replace(/^### (.*$)/gim, '<h3>$1</h3>')
-          .replace(/\n/g, '<br />');
-    
-        const header = "<html xmlns:o='urn:schemas-microsoft-com:office:office' "+
-                   "xmlns:w='urn:schemas-microsoft-com:office:word' "+
-                   "xmlns='http://www.w3.org/TR/REC-html40'>"+
-                   "<head><meta charset='utf-8'><title>Expert Notes</title></head><body>";
-        const footer = "</body></html>";
-        const source = header + htmlContent + footer;
-    
-        const fileBlob = new Blob([source], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
-        const url = URL.createObjectURL(fileBlob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = 'expert-notes.docx';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
+        try {
+            const docxBlob = await generateDocxFromMarkdown(expertNotes, `Expert Notes - Batch ${batchId}`);
+            downloadFile(
+                docxBlob,
+                `expert-notes-${batchId}.docx`,
+                'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            );
+        } catch (err) {
+            console.error('Failed to generate authentic docx notes:', err);
+            showNotification("Failed to create Word document.");
+        }
     };
 
     // --- Drag and Drop Handlers for Findings ---
@@ -1872,6 +1856,10 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     };
     const handleToggleMergeMode = (batchId: string) => {
         clearUndoStateForBatch(batchId);
+        setClickMergeBatchState(null);
+        setDragOverState(null);
+        setDraggedState(null);
+        dragItem.current = null;
         setMergeBatchId(prev => (prev === batchId ? null : batchId));
         setReorderBatchId(null);
     };
@@ -1909,44 +1897,124 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         setDraggedState(null);
     };
 
-    // Merge
-    const handleMergeDragStart = (e: React.DragEvent, batchId: string, index: number) => {
-        e.dataTransfer.setData("sourceInfo", JSON.stringify({ batchId, index }));
-        setDraggedState({ batchId, index });
-    };
-    const handleMergeDrop = (e: React.DragEvent, targetBatchId: string, targetIndex: number) => {
-        e.preventDefault();
-        const sourceInfoStr = e.dataTransfer.getData("sourceInfo");
-        if (!sourceInfoStr) return;
-
-        const { batchId: sourceBatchId, index: sourceIndex } = JSON.parse(sourceInfoStr);
-
-        if (sourceBatchId !== targetBatchId || sourceIndex === targetIndex) {
+    // Safely execute batch merge
+    const executeBatchMerge = (batchId: string, sourceIndex: number, targetIndex: number) => {
+        if (
+            typeof sourceIndex !== 'number' ||
+            typeof targetIndex !== 'number' ||
+            isNaN(sourceIndex) ||
+            isNaN(targetIndex) ||
+            sourceIndex === targetIndex
+        ) {
             setDragOverState(null);
             setDraggedState(null);
+            setClickMergeBatchState(null);
             return;
         }
 
-        const batch = batches.find(b => b.id === sourceBatchId);
-        if (!batch || !batch.findings) return;
+        const batch = batches.find(b => b.id === batchId);
+        if (!batch || !batch.findings) {
+            setDragOverState(null);
+            setDraggedState(null);
+            setClickMergeBatchState(null);
+            return;
+        }
 
-        // Store pre-merge state for undo
-        setUndoStates(prev => ({ ...prev, [sourceBatchId]: [...batch.findings!] }));
+        if (sourceIndex < 0 || sourceIndex >= batch.findings.length || targetIndex < 0 || targetIndex >= batch.findings.length) {
+            setDragOverState(null);
+            setDraggedState(null);
+            setClickMergeBatchState(null);
+            return;
+        }
 
         const sourceFinding = batch.findings[sourceIndex];
         const targetFinding = batch.findings[targetIndex];
-        const mergedText = targetFinding + ' ' + sourceFinding;
+
+        if (sourceFinding === undefined || targetFinding === undefined || typeof sourceFinding !== 'string' || typeof targetFinding !== 'string') {
+            setDragOverState(null);
+            setDraggedState(null);
+            setClickMergeBatchState(null);
+            return;
+        }
+
+        // Store pre-merge state for undo
+        setUndoStates(prev => ({ ...prev, [batchId]: [...batch.findings!] }));
+
+        const mergedText = `${targetFinding.trim()} ${sourceFinding.trim()}`.trim();
 
         const newFindings = batch.findings
             .map((finding, index) => index === targetIndex ? mergedText : finding)
             .filter((_, index) => index !== sourceIndex);
 
         setBatches(prev => prev.map(b => 
-            b.id === sourceBatchId ? { ...b, findings: newFindings } : b
+            b.id === batchId ? { ...b, findings: newFindings } : b
         ));
 
         setDragOverState(null);
         setDraggedState(null);
+        setClickMergeBatchState(null);
+    };
+
+    // Merge Drag Handlers
+    const handleMergeDragStart = (e: React.DragEvent, batchId: string, index: number) => {
+        dragItem.current = { batchId, index };
+        setDraggedState({ batchId, index });
+        try {
+            e.dataTransfer.setData("text/plain", JSON.stringify({ batchId, index }));
+            e.dataTransfer.setData("sourceInfo", JSON.stringify({ batchId, index }));
+            e.dataTransfer.effectAllowed = "copyMove";
+        } catch {
+            // Ignore dataTransfer errors in sandboxed environments
+        }
+    };
+
+    const handleMergeDrop = (e: React.DragEvent, targetBatchId: string, targetIndex: number) => {
+        e.preventDefault();
+        let sourceBatchId: string | null = null;
+        let sourceIndex: number | null = null;
+
+        // In-memory ref first (immune to iframe / browser dataTransfer stripping)
+        if (dragItem.current && dragItem.current.batchId === targetBatchId && typeof dragItem.current.index === 'number') {
+            sourceBatchId = dragItem.current.batchId;
+            sourceIndex = dragItem.current.index;
+        } else if (draggedState && draggedState.batchId === targetBatchId && typeof draggedState.index === 'number') {
+            sourceBatchId = draggedState.batchId;
+            sourceIndex = draggedState.index;
+        } else {
+            try {
+                const sourceInfoStr = e.dataTransfer.getData("text/plain") || e.dataTransfer.getData("sourceInfo");
+                if (sourceInfoStr) {
+                    const parsed = JSON.parse(sourceInfoStr);
+                    if (parsed && parsed.batchId === targetBatchId && typeof parsed.index === 'number') {
+                        sourceBatchId = parsed.batchId;
+                        sourceIndex = parsed.index;
+                    }
+                }
+            } catch {
+                // Ignore parse errors
+            }
+        }
+
+        if (sourceBatchId && typeof sourceIndex === 'number' && !isNaN(sourceIndex)) {
+            executeBatchMerge(targetBatchId, sourceIndex, targetIndex);
+        }
+
+        dragItem.current = null;
+        setDragOverState(null);
+        setDraggedState(null);
+        setClickMergeBatchState(null);
+    };
+
+    const handleMergeItemClickForBatch = (batchId: string, index: number) => {
+        if (!clickMergeBatchState || clickMergeBatchState.batchId !== batchId) {
+            setClickMergeBatchState({ batchId, index });
+        } else if (clickMergeBatchState.index === index) {
+            // Clicking same item deselects
+            setClickMergeBatchState(null);
+        } else {
+            // Merge selected item into target item
+            executeBatchMerge(batchId, clickMergeBatchState.index, index);
+        }
     };
 
     const handleUndo = (batchId: string) => {
@@ -2126,6 +2194,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                     onPromptChange={setGlobalCustomPrompt}
                     images={globalCustomImages}
                     onImagesChange={setGlobalCustomImages}
+                    selectedModel={selectedModel}
                 />
             </div>
 
@@ -2225,7 +2294,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                         <div className="flex items-center justify-start sm:justify-end gap-2 flex-wrap w-full sm:w-auto">
                                             {(batch.status === 'idle' || batch.status === 'paused' || batch.status === 'complete' || batch.status === 'error') && batch.findings === null && (
                                                 <>
-                                                    {batch.audioBlobs.length === 0 && (
+                                                    {batch.audioBlobs.length === 0 ? (
                                                         <>
                                                             <button onClick={() => handleRecordOrResume(batch)} className="flex items-center gap-2 bg-blue-600 text-white p-2 rounded-lg hover:bg-blue-700 transition-colors text-sm px-3 disabled:bg-blue-300 disabled:cursor-wait" disabled={isBusy && activeBatchId !== batch.id}>
                                                                 <MicIcon className="w-4 h-4"/> Record
@@ -2245,12 +2314,37 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                                 <ClipboardPaste className="w-4 h-4" /> Paste Text
                                                             </button>
                                                         </>
-                                                    )}
-                                                    {batch.audioBlobs.length > 0 && (
+                                                    ) : (
                                                         <>
                                                             <span className="text-xs font-semibold px-2.5 py-1 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-full border border-slate-300 dark:border-slate-600">
                                                                 {batch.audioBlobs.length} {batch.audioBlobs.length === 1 ? 'item' : 'items'}
                                                             </span>
+                                                            <button 
+                                                                onClick={() => handleRecordOrResume(batch)} 
+                                                                className="flex items-center gap-1.5 bg-emerald-600 text-white p-2 rounded-lg hover:bg-emerald-700 transition-colors text-sm px-3 disabled:bg-emerald-300 disabled:cursor-wait font-semibold shadow-2xs" 
+                                                                disabled={isBusy && activeBatchId !== batch.id}
+                                                                title="Append extra audio by dictating directly here"
+                                                            >
+                                                                <MicPlusIcon className="w-4 h-4"/> Append Dictation
+                                                            </button>
+                                                            <button 
+                                                                onClick={() => triggerUpload(batch.id)} 
+                                                                className="flex items-center gap-1.5 bg-slate-200 text-slate-700 p-2 rounded-lg hover:bg-slate-300 transition-colors text-sm px-3 disabled:bg-slate-100 disabled:cursor-wait dark:bg-slate-700 dark:text-slate-300 dark:hover:bg-slate-600"
+                                                                title="Upload and append extra audio file to this batch"
+                                                            >
+                                                                <UploadIcon className="w-4 h-4" /> + Audio
+                                                            </button>
+                                                            <button 
+                                                                onClick={() => {
+                                                                    setPasteModalTargetBatchId(batch.id);
+                                                                    setClipboardPastedText('');
+                                                                    setIsPasteModalOpen(true);
+                                                                }} 
+                                                                className="flex items-center gap-1.5 bg-blue-50 text-blue-700 border border-blue-200 p-2 rounded-lg hover:bg-blue-100 dark:bg-blue-950/40 dark:text-blue-300 dark:border-blue-800 transition-colors text-sm px-3"
+                                                                title="Paste text dictation to append to this batch"
+                                                            >
+                                                                <ClipboardPaste className="w-4 h-4" /> + Text
+                                                            </button>
                                                             <button onClick={() => handleDownload(batch)} className="flex items-center gap-2 bg-slate-500 text-white p-2 rounded-lg hover:bg-slate-600 transition-colors text-sm px-3" aria-label={`Download audio for ${batch.name}`}>
                                                                 <DownloadIcon className="w-4 h-4" /> Download
                                                             </button>
@@ -2293,8 +2387,33 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                 </div>
                                             )}
                                             {batch.findings && (
-                                                <div className="flex items-center gap-2">
+                                                <div className="flex items-center gap-2 flex-wrap">
                                                     <span className="text-blue-600 dark:text-blue-400 font-semibold text-sm">Processed</span>
+                                                    {continuationState.status === 'recording' && continuationState.batchId === batch.id ? (
+                                                        <div className="flex items-center gap-2 bg-red-100 dark:bg-red-900/20 px-2.5 py-1 rounded-lg">
+                                                            <div className="w-2.5 h-2.5 bg-red-500 rounded-full animate-ping"></div>
+                                                            <span className="text-xs font-bold text-red-700 dark:text-red-300">Recording...</span>
+                                                            <button onClick={handleStopContinue} className="flex items-center gap-1 bg-red-600 text-white font-bold py-0.5 px-2 rounded hover:bg-red-700 text-xs">
+                                                                <StopIcon className="w-3.5 h-3.5"/> Stop
+                                                            </button>
+                                                        </div>
+                                                    ) : continuationState.status === 'processing' && continuationState.batchId === batch.id ? (
+                                                        <div className="flex items-center gap-1.5 bg-slate-100 dark:bg-slate-700 px-2.5 py-1 rounded-lg">
+                                                            <Spinner className="w-4 h-4" />
+                                                            <span className="text-xs font-semibold text-slate-700 dark:text-slate-300">Appending...</span>
+                                                        </div>
+                                                    ) : (
+                                                        <button 
+                                                            onClick={() => {
+                                                                setOpenAccordion(batch.id);
+                                                                handleStartContinue(batch.id);
+                                                            }} 
+                                                            className="flex items-center gap-1.5 bg-emerald-600 text-white p-1.5 rounded-lg hover:bg-emerald-700 transition-colors text-xs px-2.5 font-medium shadow-2xs" 
+                                                            title="Append extra dictation directly to this transcript"
+                                                        >
+                                                            <MicPlusIcon className="w-3.5 h-3.5" /> Append Dictation
+                                                        </button>
+                                                    )}
                                                     {batch.audioBlobs.length > 0 && (
                                                         <button onClick={() => handleDownload(batch)} className="flex items-center gap-1.5 bg-slate-500 text-white p-1.5 rounded-lg hover:bg-slate-600 transition-colors text-xs px-2.5" aria-label={`Download audio for ${batch.name}`} title="Download audio for this batch">
                                                             <DownloadIcon className="w-3.5 h-3.5" /> Download Audio
@@ -2324,6 +2443,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                 onPromptChange={(p) => updateBatchCustomPrompt(batch.id, p)}
                                                 images={batch.customImages || []}
                                                 onImagesChange={(imgs) => updateBatchCustomImages(batch.id, imgs)}
+                                                selectedModel={batch.selectedModel || selectedModel}
                                             />
                                         </div>
                                     )}
@@ -2459,6 +2579,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                     onPromptChange={(p) => updateBatchCustomPrompt(batch.id, p)}
                                                     images={batch.customImages || []}
                                                     onImagesChange={(imgs) => updateBatchCustomImages(batch.id, imgs)}
+                                                    selectedModel={batch.selectedModel || selectedModel}
                                                     className="mb-6"
                                                 />
                                                 <p className="text-slate-600 dark:text-slate-400 mb-6 text-sm">Click any finding to copy it. To select multiple, click the circle on the left. The 'Continue Dictation' button below adds new findings to this batch.</p>
@@ -2534,7 +2655,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                                 )}
                                                             </div>
 
-                                                            {isRtfOpen && (
+                                                             {isRtfOpen && (
                                                                 <div className="mb-6 p-4 bg-gradient-to-br from-blue-50/70 to-indigo-50/50 dark:from-slate-800/80 dark:to-blue-950/40 border border-blue-200/80 dark:border-blue-800/60 rounded-xl shadow-xs animate-fade-in">
                                                                     <div className="flex items-center justify-between gap-2 mb-3 pb-2 border-b border-blue-200/60 dark:border-blue-900/50">
                                                                         <div className="flex items-center gap-2">
@@ -2559,6 +2680,35 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                         </>
                                                     );
                                                 })()}
+
+                                                {/* Merge Mode Guidance Banner for Batch */}
+                                                {mergeBatchId === batch.id && (
+                                                    <div className="mb-3 p-2.5 sm:p-3 bg-blue-50/90 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800/60 rounded-xl flex flex-wrap items-center justify-between gap-2 text-xs sm:text-sm text-blue-900 dark:text-blue-200 animate-fade-in shadow-xs">
+                                                        <div className="flex items-center gap-2">
+                                                            <MergeIcon className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0" />
+                                                            <span>
+                                                                {clickMergeBatchState && clickMergeBatchState.batchId === batch.id ? (
+                                                                    <>
+                                                                        <strong className="text-blue-700 dark:text-blue-300">Finding #{clickMergeBatchState.index + 1}</strong> selected. Click another finding in this batch to merge into it, or click it again to cancel.
+                                                                    </>
+                                                                ) : (
+                                                                    <>
+                                                                        <strong>Merge Mode:</strong> Drag a finding onto another, or click one finding and then click the target to merge them together.
+                                                                    </>
+                                                                )}
+                                                            </span>
+                                                        </div>
+                                                        {clickMergeBatchState && clickMergeBatchState.batchId === batch.id && (
+                                                            <button
+                                                                onClick={() => setClickMergeBatchState(null)}
+                                                                className="text-xs font-semibold px-2.5 py-1 bg-white dark:bg-slate-800 border border-blue-300 dark:border-blue-700 rounded-md text-blue-700 dark:text-blue-300 hover:bg-blue-50 transition-colors shadow-xs"
+                                                            >
+                                                                Cancel Selection
+                                                            </button>
+                                                        )}
+                                                    </div>
+                                                )}
+
                                                 <div className="space-y-3">
                                                     {batch.findings.map((finding, index) => {
                                                         const isBold = finding.includes('BOLD::');
@@ -2586,6 +2736,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                         
                                                         const isReorderingThisBatch = reorderBatchId === batch.id;
                                                         const isMergingThisBatch = mergeBatchId === batch.id;
+                                                        const isMergeSource = isMergingThisBatch && clickMergeBatchState?.batchId === batch.id && clickMergeBatchState?.index === index;
                                                         const isDraggingThis = draggedState?.batchId === batch.id && draggedState?.index === index;
                                                         const isDragOverTarget = isMergingThisBatch && dragOverState?.batchId === batch.id && dragOverState?.index === index && draggedState?.index !== index;
                                                         
@@ -2640,24 +2791,46 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                                 onDragEnterCapture={isMergingThisBatch ? (e) => { e.preventDefault(); setDragOverState({ batchId: batch.id, index }); } : undefined}
                                                                 onDragLeaveCapture={isMergingThisBatch ? (e) => { e.preventDefault(); setDragOverState(null); } : undefined}
                                                                 className={`finding-item relative group p-3 pl-11 pr-28 sm:pr-24 border-l-4 rounded-r-lg transition-all duration-200 ${
-                                                                    isSelected && !isCurrentlyActive && !isReorderingThisBatch && !isMergingThisBatch
-                                                                    ? 'bg-blue-100 border-blue-600 dark:bg-blue-900/30 dark:border-blue-500 shadow-md'
+                                                                    isMergeSource
+                                                                    ? 'bg-blue-100 border-blue-600 dark:bg-blue-900/50 dark:border-blue-400 ring-2 ring-blue-500 shadow-md'
                                                                     : isDragOverTarget
                                                                     ? 'bg-green-100 border-green-500 dark:bg-green-900/30 dark:border-green-500 ring-2 ring-green-200 dark:ring-green-700'
+                                                                    : isSelected && !isCurrentlyActive && !isReorderingThisBatch && !isMergingThisBatch
+                                                                    ? 'bg-blue-100 border-blue-600 dark:bg-blue-900/30 dark:border-blue-500 shadow-md'
                                                                     : hasError
                                                                     ? errorClasses[highestSeverity!]
                                                                     : 'bg-slate-50 border-blue-500 dark:bg-slate-700/50 dark:border-blue-500'
-                                                                } ${!isCurrentlyActive && !isReorderingThisBatch && !isMergingThisBatch ? 'hover:bg-blue-50 dark:hover:bg-slate-700' : ''} ${isDraggingThis ? 'opacity-50 bg-slate-200 dark:bg-slate-600' : ''} ${isReorderingThisBatch ? 'cursor-grab' : ''} ${isMergingThisBatch ? 'cursor-copy' : ''}`}
+                                                                } ${!isCurrentlyActive && !isReorderingThisBatch && !isMergingThisBatch ? 'hover:bg-blue-50 dark:hover:bg-slate-700' : ''} ${isMergingThisBatch && clickMergeBatchState?.batchId === batch.id && clickMergeBatchState?.index !== index ? 'hover:ring-2 hover:ring-green-500 hover:border-green-500 cursor-pointer' : ''} ${isDraggingThis ? 'opacity-50 bg-slate-200 dark:bg-slate-600' : ''} ${isReorderingThisBatch ? 'cursor-grab' : ''} ${isMergingThisBatch ? 'cursor-pointer' : ''}`}
                                                                 role={(isReorderingThisBatch || isMergingThisBatch) ? 'listitem' : 'button'}
                                                                 aria-pressed={isSelected && !isCurrentlyActive}
                                                                 tabIndex={isCurrentlyActive ? -1 : 0}
-                                                                onClick={(isReorderingThisBatch || isMergingThisBatch || isCurrentlyActive) ? undefined : () => handleFindingClickForBatch(batch.id, index)}
-                                                                onKeyDown={(isReorderingThisBatch || isMergingThisBatch || isCurrentlyActive) ? undefined : (e) => (e.key === ' ' || e.key === 'Enter') && handleFindingClickForBatch(batch.id, index)}
+                                                                onClick={
+                                                                    isReorderingThisBatch || isCurrentlyActive
+                                                                        ? undefined
+                                                                        : isMergingThisBatch
+                                                                        ? () => handleMergeItemClickForBatch(batch.id, index)
+                                                                        : () => handleFindingClickForBatch(batch.id, index)
+                                                                }
+                                                                onKeyDown={
+                                                                    isReorderingThisBatch || isCurrentlyActive
+                                                                        ? undefined
+                                                                        : isMergingThisBatch
+                                                                        ? (e) => (e.key === ' ' || e.key === 'Enter') && handleMergeItemClickForBatch(batch.id, index)
+                                                                        : (e) => (e.key === ' ' || e.key === 'Enter') && handleFindingClickForBatch(batch.id, index)
+                                                                }
                                                             >
                                                                 {(isReorderingThisBatch || isMergingThisBatch) ? (
                                                                     <div className="absolute left-0 top-0 bottom-0 w-10 flex items-center justify-center" aria-label="Drag to reorder or merge">
                                                                         {isReorderingThisBatch && <ReorderIcon />}
-                                                                        {isMergingThisBatch && <MergeIcon className="w-5 h-5 text-slate-500 dark:text-slate-400" />}
+                                                                        {isMergingThisBatch && (
+                                                                            isMergeSource ? (
+                                                                                <div className="w-5 h-5 rounded-full bg-blue-600 text-white flex items-center justify-center text-[10px] font-bold shadow-xs animate-pulse">
+                                                                                    1
+                                                                                </div>
+                                                                            ) : (
+                                                                                <MergeIcon className={`w-5 h-5 ${dragOverState?.batchId === batch.id && dragOverState?.index === index ? 'text-green-600 dark:text-green-400 scale-110' : 'text-slate-500 dark:text-slate-400'} transition-all`} />
+                                                                            )
+                                                                        )}
                                                                     </div>
                                                                 ) : (
                                                                     <div
@@ -2887,6 +3060,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                         history={batch.chatHistory || []}
                                                         isChatting={!!batch.isChatting}
                                                         onSendMessage={(message) => handleSendMessage(batch.id, message)}
+                                                        selectedModel={batch.selectedModel}
                                                     />
                                                 )}
 

@@ -31,7 +31,8 @@ const CustomPromptInput: React.FC<{
   customDocx?: DocxTemplateData | null;
   onCustomDocxChange?: (docx: DocxTemplateData | null) => void;
   isLiveMode?: boolean;
-}> = ({ prompt, onPromptChange, className, images = [], onImagesChange, customDocx, onCustomDocxChange, isLiveMode = false }) => {
+  selectedModel?: string;
+}> = ({ prompt, onPromptChange, className, images = [], onImagesChange, customDocx, onCustomDocxChange, isLiveMode = false, selectedModel }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const { isRecording, startRecording, stopRecording, error: recorderError } = useAudioRecorder();
@@ -80,7 +81,7 @@ const CustomPromptInput: React.FC<{
       try {
         const audioBlob = await stopRecording();
         if (audioBlob && audioBlob.size > 0) {
-          const transcript = await transcribeAudioForPrompt(audioBlob);
+          const transcript = await transcribeAudioForPrompt(audioBlob, selectedModel);
           const newPrompt = prompt ? `${prompt} ${transcript}` : transcript;
           onPromptChange(newPrompt);
         }
@@ -414,6 +415,7 @@ const CustomPromptInput: React.FC<{
                 type="button"
                 onClick={handleMicClick}
                 disabled={isTranscribing}
+                title={isRecording ? 'Stop recording custom instructions' : `Dictate custom instructions using ${selectedModel || 'selected AI model'}`}
                 className={`absolute bottom-3 right-3 p-2 rounded-full text-white transition-all shadow-md disabled:opacity-50 disabled:cursor-not-allowed ${
                   isRecording
                     ? 'bg-red-600 hover:bg-red-700 animate-pulse scale-105'

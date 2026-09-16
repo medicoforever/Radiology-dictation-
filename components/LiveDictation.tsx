@@ -236,6 +236,7 @@ const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack }) => 
                         customDocx={customDocx}
                         onCustomDocxChange={setCustomDocx}
                         isLiveMode={true}
+                        selectedModel={selectedModel}
                     />
                 </div>
 

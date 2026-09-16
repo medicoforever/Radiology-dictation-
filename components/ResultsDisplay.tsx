@@ -23,6 +23,7 @@ import TrashIcon from './icons/TrashIcon';
 import PauseIcon from './icons/PauseIcon';
 import ResumeIcon from './icons/ResumeIcon';
 import { mergeAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
+import { generateDocxFromMarkdown, downloadFile } from '../services/docxService';
 import { stopRepeatingInterruptedAlert } from '../services/soundService';
 import RichTextReportEditor from './RichTextReportEditor';
 import type { DocxTemplateData } from './ui/CustomPromptInput';
@@ -209,6 +210,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   // State for Drag and Drop
   const [reorderMode, setReorderMode] = useState<boolean>(false);
   const [mergeMode, setMergeMode] = useState<boolean>(false);
+  const [clickMergeSource, setClickMergeSource] = useState<number | null>(null);
   const [draggedIndex, setDraggedIndex] = useState<number | null>(null);
   const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
   const dragItem = useRef<number | null>(null);
@@ -604,16 +606,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     if (!findings || findings.length === 0) return;
     try {
       const htmlContent = generateSingleDictationHTML(findings);
-      const blob = new Blob([htmlContent], { type: 'text/html' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      document.body.appendChild(a);
-      a.style.display = 'none';
-      a.href = url;
-      a.download = 'radiology-report.html';
-      a.click();
-      window.URL.revokeObjectURL(url);
-      a.remove();
+      downloadFile(htmlContent, 'radiology-report.html', 'text/html;charset=utf-8');
     } catch (err) {
       console.error('Failed to generate or download HTML:', err);
       showNotification('Failed to create HTML file.');
@@ -950,7 +943,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
             try {
                 const audioBlob = await complexInputRecorder.stopRecording();
                 if (audioBlob && audioBlob.size > 0) {
-                    const transcript = await transcribeAudioForPrompt(audioBlob);
+                    const transcript = await transcribeAudioForPrompt(audioBlob, selectedModel);
                     setComplexInput(prev => prev ? `${prev} ${transcript}` : transcript);
                 }
             } catch (err) {
@@ -995,31 +988,19 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         }
     };
 
-    const handleDownloadExpertNotes = () => {
+    const handleDownloadExpertNotes = async () => {
         if (!expertNotes) return;
-        
-        // Simple markdown to HTML conversion for Word-compatible file
-        let htmlContent = expertNotes
-          .replace(/^## (.*$)/gim, '<h2>$1</h2>')
-          .replace(/^### (.*$)/gim, '<h3>$1</h3>')
-          .replace(/\n/g, '<br />');
-    
-        const header = "<html xmlns:o='urn:schemas-microsoft-com:office:office' "+
-                   "xmlns:w='urn:schemas-microsoft-com:office:word' "+
-                   "xmlns='http://www.w3.org/TR/REC-html40'>"+
-                   "<head><meta charset='utf-8'><title>Expert Notes</title></head><body>";
-        const footer = "</body></html>";
-        const source = header + htmlContent + footer;
-    
-        const fileBlob = new Blob([source], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
-        const url = URL.createObjectURL(fileBlob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = 'expert-notes.docx';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
+        try {
+            const docxBlob = await generateDocxFromMarkdown(expertNotes, 'Expert Notes');
+            downloadFile(
+                docxBlob,
+                'expert-notes.docx',
+                'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            );
+        } catch (err) {
+            console.error('Failed to generate authentic docx notes:', err);
+            showNotification('Failed to generate Word document.');
+        }
     };
 
   // --- Drag and Drop Handlers ---
@@ -1027,9 +1008,14 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     setUndoState(null);
     setReorderMode(prev => !prev);
     setMergeMode(false);
+    setClickMergeSource(null);
   };
   const handleToggleMergeMode = () => {
     setUndoState(null);
+    setClickMergeSource(null);
+    setDragOverIndex(null);
+    setDraggedIndex(null);
+    dragItem.current = null;
     setMergeMode(prev => !prev);
     setReorderMode(false);
   };
@@ -1052,39 +1038,107 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     setDraggedIndex(null);
   };
 
-  // Merge
-  const handleMergeDragStart = (e: React.DragEvent, index: number) => {
-      e.dataTransfer.setData("sourceIndex", index.toString());
-      setDraggedIndex(index);
-  };
-  const handleMergeDrop = (e: React.DragEvent, targetIndex: number) => {
-      e.preventDefault();
-      const sourceIndexStr = e.dataTransfer.getData("sourceIndex");
-      if (sourceIndexStr === null) return;
-      const sourceIndex = parseInt(sourceIndexStr, 10);
-
-      if (sourceIndex === targetIndex) {
-          setDragOverIndex(null);
-          setDraggedIndex(null);
-          return;
-      }
-      
-      // Store pre-merge state for undo
-      setUndoState(findings);
-
-      const sourceFinding = findings[sourceIndex];
-      const targetFinding = findings[targetIndex];
-      
-      const mergedText = targetFinding + ' ' + sourceFinding;
-      
-      const newFindings = findings
-          .map((finding, index) => index === targetIndex ? mergedText : finding)
-          .filter((_, index) => index !== sourceIndex);
-          
-      onAllFindingsUpdate(newFindings);
-      
+  // Execute Merge safely between sourceIndex and targetIndex
+  const executeMerge = (sourceIndex: number, targetIndex: number) => {
+    if (
+      typeof sourceIndex !== 'number' ||
+      typeof targetIndex !== 'number' ||
+      isNaN(sourceIndex) ||
+      isNaN(targetIndex) ||
+      sourceIndex === targetIndex ||
+      sourceIndex < 0 ||
+      sourceIndex >= findings.length ||
+      targetIndex < 0 ||
+      targetIndex >= findings.length
+    ) {
       setDragOverIndex(null);
       setDraggedIndex(null);
+      setClickMergeSource(null);
+      return;
+    }
+
+    const sourceFinding = findings[sourceIndex];
+    const targetFinding = findings[targetIndex];
+
+    if (sourceFinding === undefined || targetFinding === undefined || typeof sourceFinding !== 'string' || typeof targetFinding !== 'string') {
+      setDragOverIndex(null);
+      setDraggedIndex(null);
+      setClickMergeSource(null);
+      return;
+    }
+
+    // Store pre-merge state for undo
+    setUndoState(findings);
+
+    const mergedText = `${targetFinding.trim()} ${sourceFinding.trim()}`.trim();
+
+    const newFindings = findings
+      .map((finding, index) => (index === targetIndex ? mergedText : finding))
+      .filter((_, index) => index !== sourceIndex);
+
+    onAllFindingsUpdate(newFindings);
+
+    setDragOverIndex(null);
+    setDraggedIndex(null);
+    setClickMergeSource(null);
+  };
+
+  // Merge Drag Handlers
+  const handleMergeDragStart = (e: React.DragEvent, index: number) => {
+    dragItem.current = index;
+    setDraggedIndex(index);
+    try {
+      e.dataTransfer.setData("text/plain", index.toString());
+      e.dataTransfer.setData("sourceIndex", index.toString());
+      e.dataTransfer.effectAllowed = "copyMove";
+    } catch {
+      // Ignore dataTransfer errors in sandboxed iframes
+    }
+  };
+
+  const handleMergeDrop = (e: React.DragEvent, targetIndex: number) => {
+    e.preventDefault();
+    let sourceIndex: number | null = null;
+
+    // Prioritize in-memory dragItem ref (immune to iframe / browser dataTransfer stripping)
+    if (dragItem.current !== null && !isNaN(dragItem.current)) {
+      sourceIndex = dragItem.current;
+    } else if (draggedIndex !== null && !isNaN(draggedIndex)) {
+      sourceIndex = draggedIndex;
+    } else {
+      try {
+        const textData = e.dataTransfer.getData("text/plain") || e.dataTransfer.getData("sourceIndex");
+        if (textData && textData.trim() !== "") {
+          const parsed = parseInt(textData.trim(), 10);
+          if (!isNaN(parsed)) {
+            sourceIndex = parsed;
+          }
+        }
+      } catch {
+        // Ignore dataTransfer errors
+      }
+    }
+
+    if (sourceIndex !== null) {
+      executeMerge(sourceIndex, targetIndex);
+    }
+
+    dragItem.current = null;
+    setDragOverIndex(null);
+    setDraggedIndex(null);
+    setClickMergeSource(null);
+  };
+
+  const handleMergeItemClick = (index: number) => {
+    if (clickMergeSource === null) {
+      setClickMergeSource(index);
+    } else if (clickMergeSource === index) {
+      // Clicking same item deselects it
+      setClickMergeSource(null);
+    } else {
+      // Merge selected source item into this target item
+      executeMerge(clickMergeSource, index);
+    }
   };
   
   const handleUndo = () => {
@@ -1218,6 +1272,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
           customDocx={customDocx}
           onCustomDocxChange={onCustomDocxChange}
           isLiveMode={isLive}
+          selectedModel={selectedModel}
           className="mb-6"
         />
 
@@ -1262,7 +1317,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                   </div>
                   <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
                     {customDocx?.name 
-                      ? `Merged into institution Word document: "${customDocx.name}". Edit formatting directly with live RTF tools or export to Word (.doc) / RTF.` 
+                      ? `Merged into institution Word document: "${customDocx.name}". Edit formatting directly with live RTF tools or export to Word (.docx) / RTF.` 
                       : `Merged with "${activeTemplateName}" template structure. Edit formatting and headings directly in rich text format.`}
                   </p>
                 </div>
@@ -1354,6 +1409,34 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         </div>
       )}
 
+      {/* Merge Mode Guidance Banner */}
+      {mergeMode && (
+        <div className="mb-3 p-2.5 sm:p-3 bg-blue-50/90 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800/60 rounded-xl flex flex-wrap items-center justify-between gap-2 text-xs sm:text-sm text-blue-900 dark:text-blue-200 animate-fade-in shadow-xs">
+          <div className="flex items-center gap-2">
+            <MergeIcon className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0" />
+            <span>
+              {clickMergeSource !== null ? (
+                <>
+                  <strong className="text-blue-700 dark:text-blue-300">Finding #{clickMergeSource + 1}</strong> selected. Click another finding to merge into it, or click it again to cancel.
+                </>
+              ) : (
+                <>
+                  <strong>Merge Mode:</strong> Drag a finding onto another, or click one finding and then click the target to merge them together.
+                </>
+              )}
+            </span>
+          </div>
+          {clickMergeSource !== null && (
+            <button
+              onClick={() => setClickMergeSource(null)}
+              className="text-xs font-semibold px-2.5 py-1 bg-white dark:bg-slate-800 border border-blue-300 dark:border-blue-700 rounded-md text-blue-700 dark:text-blue-300 hover:bg-blue-50 transition-colors shadow-xs"
+            >
+              Cancel Selection
+            </button>
+          )}
+        </div>
+      )}
+
       <div ref={findingsContainerRef} className="space-y-3 min-h-[150px]">
         {findings.map((finding, index) => {
           if (!finding && index === findings.length - 1) return null; // Don't render the trailing empty string from split
@@ -1374,6 +1457,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
             : '';
 
           const isSelected = selectedIndices.has(index);
+          const isMergeSource = mergeMode && clickMergeSource === index;
           const isEditingThis = editingIndex === index;
           const isDictatingThis = dictatingIndex === index;
           const isDictateEditingThis = dictateEditingIndex === index;
@@ -1433,24 +1517,46 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
               onDragEnterCapture={mergeMode ? (e) => { e.preventDefault(); setDragOverIndex(index); } : undefined}
               onDragLeaveCapture={mergeMode ? (e) => { e.preventDefault(); setDragOverIndex(null); } : undefined}
               className={`finding-item relative group p-3 pl-11 pr-28 sm:pr-24 border-l-4 rounded-r-lg transition-all duration-200 ${
-                  isSelected && !isCurrentlyActive && !reorderMode && !mergeMode
-                  ? 'bg-blue-100 border-blue-600 dark:bg-blue-900/30 dark:border-blue-500 shadow-md'
+                  isMergeSource
+                  ? 'bg-blue-100 border-blue-600 dark:bg-blue-900/50 dark:border-blue-400 ring-2 ring-blue-500 shadow-md'
                   : isDragOverTarget
                   ? 'bg-green-100 border-green-500 dark:bg-green-900/30 dark:border-green-500 ring-2 ring-green-200 dark:ring-green-700'
+                  : isSelected && !isCurrentlyActive && !reorderMode && !mergeMode
+                  ? 'bg-blue-100 border-blue-600 dark:bg-blue-900/30 dark:border-blue-500 shadow-md'
                   : hasError
                   ? errorClasses[highestSeverity!]
                   : 'bg-slate-50 border-blue-500 dark:bg-slate-700/50 dark:border-blue-500'
-              } ${!isCurrentlyActive && !reorderMode && !mergeMode ? 'hover:bg-blue-50 dark:hover:bg-slate-700' : ''} ${isDraggingThis ? 'opacity-50 bg-slate-200 dark:bg-slate-600' : ''} ${reorderMode ? 'cursor-grab' : ''} ${mergeMode ? 'cursor-copy' : ''}`}
+              } ${!isCurrentlyActive && !reorderMode && !mergeMode ? 'hover:bg-blue-50 dark:hover:bg-slate-700' : ''} ${mergeMode && clickMergeSource !== null && clickMergeSource !== index ? 'hover:ring-2 hover:ring-green-500 hover:border-green-500 cursor-pointer' : ''} ${isDraggingThis ? 'opacity-50 bg-slate-200 dark:bg-slate-600' : ''} ${reorderMode ? 'cursor-grab' : ''} ${mergeMode ? 'cursor-pointer' : ''}`}
               role={(reorderMode || mergeMode) ? 'listitem' : 'button'}
               aria-pressed={isSelected && !isCurrentlyActive}
               tabIndex={isCurrentlyActive ? -1 : 0}
-              onClick={(reorderMode || mergeMode || isCurrentlyActive) ? undefined : () => handleFindingClick(index)}
-              onKeyDown={(reorderMode || mergeMode || isCurrentlyActive) ? undefined : (e) => (e.key === ' ' || e.key === 'Enter') && handleFindingClick(index)}
+              onClick={
+                reorderMode || isCurrentlyActive
+                  ? undefined
+                  : mergeMode
+                  ? () => handleMergeItemClick(index)
+                  : () => handleFindingClick(index)
+              }
+              onKeyDown={
+                reorderMode || isCurrentlyActive
+                  ? undefined
+                  : mergeMode
+                  ? (e) => (e.key === ' ' || e.key === 'Enter') && handleMergeItemClick(index)
+                  : (e) => (e.key === ' ' || e.key === 'Enter') && handleFindingClick(index)
+              }
             >
               {(reorderMode || mergeMode) ? (
                   <div className="absolute left-0 top-0 bottom-0 w-10 flex items-center justify-center" aria-label="Drag to reorder or merge">
                       {reorderMode && <ReorderIcon />}
-                      {mergeMode && <MergeIcon className="w-5 h-5 text-slate-500 dark:text-slate-400" />}
+                      {mergeMode && (
+                        isMergeSource ? (
+                          <div className="w-5 h-5 rounded-full bg-blue-600 text-white flex items-center justify-center text-[10px] font-bold shadow-xs animate-pulse">
+                            1
+                          </div>
+                        ) : (
+                          <MergeIcon className={`w-5 h-5 ${dragOverIndex === index ? 'text-green-600 dark:text-green-400 scale-110' : 'text-slate-500 dark:text-slate-400'} transition-all`} />
+                        )
+                      )}
                   </div>
               ) : (
                 <div
@@ -1769,6 +1875,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
           history={chatHistory} 
           isChatting={isChatting} 
           onSendMessage={onSendMessage} 
+          selectedModel={selectedModel}
         />
       )}
 

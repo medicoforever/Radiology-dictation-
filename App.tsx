@@ -225,8 +225,8 @@ const App: React.FC = () => {
 
           // Recreate chat session asynchronously
           const chatPromise = blob 
-              ? createChat(blob, savedState.findings || [], savedState.customPrompt || '', savedState.customImages || [])
-              : createChatFromText(savedState.findings || [], savedState.customPrompt || '', savedState.customImages || []);
+              ? createChat(blob, savedState.findings || [], savedState.customPrompt || '', savedState.customImages || [], savedState.selectedModel || DEFAULT_SELECTED_MODEL)
+              : createChatFromText(savedState.findings || [], savedState.customPrompt || '', savedState.customImages || [], savedState.selectedModel || DEFAULT_SELECTED_MODEL);
 
           chatPromise
             .then(setChat)
@@ -442,7 +442,7 @@ const App: React.FC = () => {
       if (processingRequestIdRef.current !== reqId) return; // cancelled
       setFindings(processedText);
 
-      const chatSession = await createChat(audioBlobs, processedText, customPrompt, customImages);
+      const chatSession = await createChat(audioBlobs, processedText, customPrompt, customImages, selectedModel);
       if (processingRequestIdRef.current !== reqId) return; // cancelled
       setChat(chatSession);
       const aiGreeting = "I have reviewed the audio and the transcript. How can I help you further?";
@@ -526,7 +526,7 @@ const App: React.FC = () => {
         
         // Use the custom prompt from single mode for the follow-up chat
         try {
-          const chatSession = await createChatFromText(processedText, customPrompt, customImages);
+          const chatSession = await createChatFromText(processedText, customPrompt, customImages, selectedModel);
           if (processingRequestIdRef.current === reqId) {
             setChat(chatSession);
           }
@@ -586,7 +586,7 @@ const App: React.FC = () => {
       setFindings(processedText);
 
       // Recreate chat with the new findings
-      const chatSession = await createChat(audioBlob, processedText, customPrompt, customImages);
+      const chatSession = await createChat(audioBlob, processedText, customPrompt, customImages, selectedModel);
       if (processingRequestIdRef.current !== reqId) return; // cancelled
       setChat(chatSession);
       const aiGreeting = "I have re-processed the audio with your new instructions. How can I help you further?";
@@ -648,7 +648,7 @@ const App: React.FC = () => {
       const updatedFindings = [...findings, ...newFindings];
       setFindings(updatedFindings);
       
-      const chatSession = await createChat(mergedBlob, updatedFindings, customPrompt, customImages);
+      const chatSession = await createChat(mergedBlob, updatedFindings, customPrompt, customImages, selectedModel);
       setChat(chatSession);
 
       const aiGreeting = "I have updated the transcript with your new dictation. How can I help you further?";
@@ -830,10 +830,10 @@ const App: React.FC = () => {
     // Recreate chat session
     try {
       if (prev.audioBlob) {
-        const chatSession = await createChat(prev.audioBlob, prev.findings, prev.customPrompt, prev.customImages);
+        const chatSession = await createChat(prev.audioBlob, prev.findings, prev.customPrompt, prev.customImages, prev.selectedModel || DEFAULT_SELECTED_MODEL);
         setChat(chatSession);
       } else {
-        const chatSession = await createChatFromText(prev.findings, prev.customPrompt, prev.customImages);
+        const chatSession = await createChatFromText(prev.findings, prev.customPrompt, prev.customImages, prev.selectedModel || DEFAULT_SELECTED_MODEL);
         setChat(chatSession);
       }
     } catch (err) {
@@ -901,6 +901,7 @@ const App: React.FC = () => {
                 onImagesChange={setCustomImages}
                 customDocx={customDocx}
                 onCustomDocxChange={setCustomDocx}
+                selectedModel={selectedModel}
                 className="mb-6"
             />
             <AudioRecorder
