@@ -1,6 +1,7 @@
 import { GoogleGenAI, Type, GenerateContentResponse, Chat } from "@google/genai";
 import { DEFAULT_GEMINI_PROMPT, REPROCESS_GEMINI_PROMPT, TEMPLATE_GEMINI_PROMPT, REPORT_TEMPLATES, ERROR_IDENTIFIER_PROMPT, INITIAL_AGENT_PROMPT, REFINEMENT_AGENT_PROMPT, SYNTHESIZER_AGENT_PROMPT, VISUAL_TEMPLATE_GEMINI_PROMPT, getLiveModelFallbackChain, DEFAULT_SELECTED_MODEL } from '../constants';
 import { IdentifiedError } from "../types";
+import { isTableRowFinding } from "./docxService";
 
 let aiClient: GoogleGenAI | null = null;
 export const getAI = (): GoogleGenAI => {
@@ -146,6 +147,92 @@ export function isJsonModeUnsupportedError(err: any): boolean {
 }
 
 /**
+ * Sanitizes findings to ensure:
+ * 1. The exam heading (findings[0]) NEVER contains "Clinical Profile"
+ * 2. If "Clinical Profile" was attached/glued to the exam heading, it is cleanly separated into findings[1] as its own line
+ */
+export function sanitizeReportFindings(findings: string[]): string[] {
+  if (!findings || !Array.isArray(findings) || findings.length === 0) return findings || [];
+
+  const result: string[] = [];
+
+  for (let idx = 0; idx < findings.length; idx++) {
+    const raw = findings[idx];
+    if (typeof raw !== 'string') continue;
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+
+    // Check if line 0 has "Clinical profile:" glued to the scan title
+    if (idx === 0) {
+      const matchGlued = trimmed.match(/^(.*?)(?:Clinical\s*profile:?|Clinical\s*history:?)\s*(.*)$/i);
+      if (matchGlued && matchGlued[1].trim().length > 0) {
+        const titlePart = matchGlued[1].trim().replace(/^BOLD::/i, '').replace(/[*_]+$/g, '').trim();
+        let profilePart = matchGlued[2].trim().replace(/^BOLD::/i, '').trim();
+
+        // Thoroughly clean any asterisks/underscores from profilePart
+        profilePart = profilePart
+          .replace(/^[*_\s]+/, '')
+          .replace(/[*_\s]+$/, '')
+          .replace(/\.\*+$/, '.')
+          .replace(/[*_]+$/, '')
+          .trim();
+
+        // Remove prefix if present inside profilePart
+        profilePart = profilePart.replace(/^Clinical\s*(Profile|History)\s*:?\s*/i, '');
+        profilePart = profilePart.replace(/^\*+/, '').trim();
+
+        if (titlePart) {
+          result.push(titlePart);
+        }
+        if (profilePart) {
+          result.push(`Clinical Profile: ${profilePart}`);
+        } else {
+          result.push(`Clinical Profile: Routine evaluation.`);
+        }
+        continue;
+      }
+    }
+
+    // Clean and normalize Clinical Profile at any index
+    if (/^\*?\s*Clinical\s*(Profile|History):/i.test(trimmed)) {
+      let inner = trimmed.replace(/^BOLD::/i, '').trim();
+      inner = inner.replace(/^[*_\s]+/, '');
+      inner = inner.replace(/[*_\s]+$/, '');
+      inner = inner.replace(/\.\*+$/, '.');
+      inner = inner.replace(/[*_\s]+$/, '').trim();
+
+      // Normalize prefix to "Clinical Profile: "
+      inner = inner.replace(/^Clinical\s*(Profile|History)\s*:?\s*/i, 'Clinical Profile: ');
+      inner = inner.replace(/^Clinical Profile:\s*\*+/i, 'Clinical Profile: ');
+      inner = inner.replace(/[*_\s]+$/, '').trim();
+
+      result.push(inner);
+      continue;
+    }
+
+    result.push(trimmed);
+  }
+
+  // Group consecutive table row lines into a single cohesive table finding joined with '###'
+  const groupedResult: string[] = [];
+  for (let i = 0; i < result.length; i++) {
+    const item = result[i];
+    if (isTableRowFinding(item)) {
+      const tableRows: string[] = [item];
+      while (i + 1 < result.length && isTableRowFinding(result[i + 1])) {
+        i++;
+        tableRows.push(result[i]);
+      }
+      groupedResult.push(tableRows.join('###'));
+    } else {
+      groupedResult.push(item);
+    }
+  }
+
+  return groupedResult;
+}
+
+/**
  * Robustly parses and extracts an array of finding strings from any model response.
  * Handles direct JSON, Markdown code blocks, nested JSON objects, regex array matches,
  * or raw newline-delimited transcription output.
@@ -161,10 +248,10 @@ export function extractFindingsFromResponse(rawText?: string | null): string[] {
   try {
     const parsed = JSON.parse(cleaned);
     if (parsed && Array.isArray(parsed.findings) && parsed.findings.length > 0) {
-      return parsed.findings.filter((f: any) => typeof f === 'string' && f.trim().length > 0);
+      return sanitizeReportFindings(parsed.findings.filter((f: any) => typeof f === 'string' && f.trim().length > 0));
     }
     if (Array.isArray(parsed) && parsed.length > 0) {
-      return parsed.filter((f: any) => typeof f === 'string' && f.trim().length > 0);
+      return sanitizeReportFindings(parsed.filter((f: any) => typeof f === 'string' && f.trim().length > 0));
     }
   } catch {}
 
@@ -174,7 +261,7 @@ export function extractFindingsFromResponse(rawText?: string | null): string[] {
     try {
       const arr = JSON.parse(objMatch[1]);
       if (Array.isArray(arr) && arr.length > 0) {
-        return arr.filter((f: any) => typeof f === 'string' && f.trim().length > 0);
+        return sanitizeReportFindings(arr.filter((f: any) => typeof f === 'string' && f.trim().length > 0));
       }
     } catch {}
   }
@@ -185,7 +272,7 @@ export function extractFindingsFromResponse(rawText?: string | null): string[] {
     try {
       const arr = JSON.parse(arrMatch[0]);
       if (Array.isArray(arr) && arr.length > 0) {
-        return arr.filter((f: any) => typeof f === 'string' && f.trim().length > 0);
+        return sanitizeReportFindings(arr.filter((f: any) => typeof f === 'string' && f.trim().length > 0));
       }
     } catch {}
   }
@@ -197,7 +284,7 @@ export function extractFindingsFromResponse(rawText?: string | null): string[] {
     .filter(l => l.length > 0 && !l.startsWith('```') && l !== '{' && l !== '}' && !l.startsWith('"findings":'));
 
   if (lines.length > 0) {
-    return lines;
+    return sanitizeReportFindings(lines);
   }
 
   return [];
@@ -317,15 +404,132 @@ export interface DetectedTemplateInfo {
   templateContextPrompt: string;
 }
 
+export function findBuiltinTemplate(promptOrId?: string): (typeof REPORT_TEMPLATES)[number] | undefined {
+  if (!promptOrId || !promptOrId.trim()) return undefined;
+
+  const raw = promptOrId.trim();
+
+  // 1. Direct ID match (e.g., "tpl_001")
+  const directId = REPORT_TEMPLATES.find(t => t.id && t.id.toLowerCase() === raw.toLowerCase());
+  if (directId) return directId;
+
+  // 2. Explicit ID tag in prompt: [TEMPLATE_ID: tpl_001] or [TEMPLATE: tpl_001] or [ID: tpl_001]
+  const idTagMatch = raw.match(/\[(?:TEMPLATE_ID|TEMPLATE|ID):\s*([a-zA-Z0-9_-]+)\]/i);
+  if (idTagMatch) {
+    const byTag = REPORT_TEMPLATES.find(t => t.id && t.id.toLowerCase() === idTagMatch[1].toLowerCase());
+    if (byTag) return byTag;
+  }
+
+  // 3. Exact quoted or bracketed template name in prompt
+  // e.g. Use the normal "MRI SCAN OF BRAIN (PLAIN)" report template
+  const extractedMatch = raw.match(/(?:normal|use|template)\s+["'“]([^"'“”\n]+?)["'”]\s+(?:report\s+)?template/i) ||
+                         raw.match(/normal\s+(.+?)\s+report\s+template/i);
+  if (extractedMatch) {
+    const rawExtracted = extractedMatch[1].trim().toLowerCase();
+    const exactNameMatch = REPORT_TEMPLATES.find(t => t.name.toLowerCase() === rawExtracted);
+    if (exactNameMatch) return exactNameMatch;
+  }
+
+  const lower = raw.toLowerCase();
+  const cleanPrompt = ' ' + lower.replace(/[^a-z0-9]/g, ' ').replace(/\s+/g, ' ') + ' ';
+
+  const promptHasMRI = /\bmri\b|\bmagnetic\b/.test(lower);
+  const promptHasCT = /\bct\b|\bc\s*t\b|\bcomputed\b/.test(lower);
+
+  // Sort candidates by length of cleaned name descending (most specific first)
+  const sortedTemplates = [...REPORT_TEMPLATES].sort((a, b) => b.name.length - a.name.length);
+
+  // 4. Exact full clean name match with word boundaries
+  for (const t of sortedTemplates) {
+    if (promptHasMRI && !promptHasCT && (t.modality || t.category || '').toUpperCase().includes('CT')) continue;
+    if (promptHasCT && !promptHasMRI && (t.modality || t.category || '').toUpperCase().includes('MRI')) continue;
+
+    const cleanT = t.name.toLowerCase().replace(/[^a-z0-9]/g, ' ').replace(/\s+/g, ' ').trim();
+    if (cleanT && cleanPrompt.includes(' ' + cleanT + ' ')) {
+      return t;
+    }
+  }
+
+  // 5. Clean name match from extractedMatch
+  if (extractedMatch) {
+    const extractedClean = extractedMatch[1].toLowerCase().replace(/[^a-z0-9]/g, ' ').replace(/\s+/g, ' ').trim();
+    if (extractedClean) {
+      for (const t of sortedTemplates) {
+        if (promptHasMRI && !promptHasCT && (t.modality || t.category || '').toUpperCase().includes('CT')) continue;
+        if (promptHasCT && !promptHasMRI && (t.modality || t.category || '').toUpperCase().includes('MRI')) continue;
+        const cleanT = t.name.toLowerCase().replace(/[^a-z0-9]/g, ' ').replace(/\s+/g, ' ').trim();
+        if (cleanT === extractedClean) {
+          return t;
+        }
+      }
+    }
+  }
+
+  return undefined;
+}
+
+export type CustomDocxInput = { 
+  name: string; 
+  text?: string; 
+  extractedText?: string; 
+  html?: string; 
+  extractedHtml?: string;
+  data?: string;
+  size?: number;
+} | null;
+
 export function detectAndExtractTemplate(
   customPrompt?: string,
   customImages?: Array<{ data: string; mimeType: string }> | null,
-  customDocx?: { name: string; text: string; html?: string } | null
+  customDocx?: CustomDocxInput
 ): DetectedTemplateInfo {
+  const docxText = ((customDocx?.text || customDocx?.extractedText || '')).trim();
+  const docxHtml = customDocx?.html || customDocx?.extractedHtml;
+
+  // Check if a built-in template is specified via prompt or template ID tag
+  const matchedBuiltin = findBuiltinTemplate(customPrompt);
+
+  if (matchedBuiltin) {
+    const templateName = matchedBuiltin.name;
+    const templateContent = (docxText.length > 0)
+      ? docxText
+      : matchedBuiltin.content;
+    const templateHtml = docxHtml;
+    const templateContextPrompt = `
+================================================================================
+ACTIVE RADIOLOGY NORMAL REPORT TEMPLATE: "${templateName}"
+BASELINE TEMPLATE CONTENT:
+"""
+${templateContent}
+"""
+${matchedBuiltin.skillPrompt ? `
+AUTHORITATIVE CLINICAL SKILL & PHRASING DIRECTIVES:
+${matchedBuiltin.skillPrompt}
+` : ''}
+CRITICAL TEMPLATE MERGE DIRECTIVES:
+1. BASELINE STRUCTURE: Use the full structure, headings, normal findings, and layout from this "${templateName}" template as the baseline skeleton.
+2. NORMAL FINDINGS PRESERVATION: If the doctor's audio dictation states "normal", "all normal", "scan is normal", "unremarkable", or does not mention changes for any anatomical section, PRESERVE and output the complete normal findings for that section verbatim WITHOUT the 'BOLD::' prefix.
+3. ABNORMAL / DICTATED FINDINGS MERGING: When the doctor dictates specific abnormal findings, observations, or modifications, merge them into the corresponding template sections and prefix only those dictated/abnormal lines with 'BOLD::'.
+4. NEW FINDINGS: Any new findings dictated that are not covered in the template should be inserted in the appropriate clinical location with 'BOLD::'.
+5. IMPRESSION: Synthesize an accurate, comprehensive IMPRESSION based on all findings (normal and abnormal) in the format 'IMPRESSION:###point 1###point 2...'.
+6. MEASUREMENT / COMPARATIVE TABLES: When the template or report contains measurement grids or comparative anatomical tables (e.g., bilateral kidney comparisons, TAVI measurements, pulmonary artery dimensions, cardiac ventricular volumes), preserve the table rows joined by '###' (e.g. 'Col1 | Col2###Val1 | Val2') so the full tabular grid is preserved as a cohesive unit.
+================================================================================
+`;
+    return {
+      isTemplateMode: true,
+      templateType: customDocx ? 'docx' : 'builtin',
+      templateName,
+      templateContent,
+      templateHtml,
+      userInstructions: customPrompt?.trim() || '',
+      templateContextPrompt,
+    };
+  }
+
   // 1. DOCX Template
-  if (customDocx && customDocx.text && customDocx.text.trim().length > 0) {
-    const templateContent = customDocx.text.trim();
-    const templateName = customDocx.name || 'Uploaded DOCX Template';
+  if (customDocx && docxText.length > 0) {
+    const templateContent = docxText;
+    const templateName = customDocx.name ? customDocx.name.replace(/\.[^/.]+$/, '').replace(/^\d+[-_ ]*/, '') : 'Uploaded DOCX Template';
     const templateContextPrompt = `
 ================================================================================
 ACTIVE DOCX REPORT TEMPLATE: "${templateName}"
@@ -340,6 +544,7 @@ CRITICAL TEMPLATE MERGE DIRECTIVES:
 3. ABNORMAL / DICTATED FINDINGS MERGING: When the doctor dictates specific abnormal findings or modifications, merge them into the corresponding template sections and prefix only those dictated/abnormal lines with 'BOLD::'.
 4. NEW FINDINGS: Dictated findings not covered in the template should be inserted in the appropriate anatomical section with 'BOLD::'.
 5. IMPRESSION: Synthesize an accurate, comprehensive IMPRESSION based on all findings (normal and abnormal) in the standard format 'IMPRESSION:###point 1###point 2...'.
+6. MEASUREMENT / COMPARATIVE TABLES: When this template contains tables or measurement grids (delimited with '| Col 1 | Col 2 |' pipe syntax), PRESERVE the table structure. Output table rows joined by '###' (e.g. '| Col 1 | Col 2 |###| Val 1 | Val 2 |') and prefix modified or abnormal measurements with 'BOLD::' so the tabular grid is maintained intact.
 ================================================================================
 `;
     return {
@@ -347,7 +552,7 @@ CRITICAL TEMPLATE MERGE DIRECTIVES:
       templateType: 'docx',
       templateName,
       templateContent,
-      templateHtml: customDocx.html,
+      templateHtml: docxHtml,
       userInstructions: customPrompt?.trim() || '',
       templateContextPrompt,
     };
@@ -374,46 +579,6 @@ Prefix dictated/abnormal lines with 'BOLD::'.
   // 3. Text Prompt Analysis (Built-in template or Custom text template)
   if (customPrompt && customPrompt.trim().length > 0) {
     const trimmed = customPrompt.trim();
-    const lower = trimmed.toLowerCase();
-
-    // Check built-in template match from REPORT_TEMPLATES
-    const matchedBuiltin = REPORT_TEMPLATES.find(t =>
-      lower.includes(t.name.toLowerCase()) ||
-      lower.includes(t.name.toLowerCase().replace(/\s+/g, '')) ||
-      (t.name.toLowerCase().includes('chest') && lower.includes('chest') && lower.includes('x-ray')) ||
-      (t.name.toLowerCase().includes('ct brain') && lower.includes('ct') && lower.includes('brain')) ||
-      (t.name.toLowerCase().includes('mri brain') && lower.includes('mri') && lower.includes('brain')) ||
-      (t.name.toLowerCase().includes('usg abdomen') && (lower.includes('usg') || lower.includes('ultrasound')) && lower.includes('abdo'))
-    );
-
-    if (matchedBuiltin) {
-      const templateContent = matchedBuiltin.content;
-      const templateName = matchedBuiltin.name;
-      const templateContextPrompt = `
-================================================================================
-ACTIVE RADIOLOGY NORMAL REPORT TEMPLATE: "${templateName}"
-BASELINE TEMPLATE CONTENT:
-"""
-${templateContent}
-"""
-
-CRITICAL TEMPLATE MERGE DIRECTIVES:
-1. BASELINE STRUCTURE: Use the full structure, headings, normal findings, and layout from this "${templateName}" template as the baseline skeleton.
-2. NORMAL FINDINGS PRESERVATION: If the doctor's audio dictation states "normal", "all normal", "scan is normal", "unremarkable", or does not mention changes for any anatomical section, PRESERVE and output the complete normal findings for that section verbatim WITHOUT the 'BOLD::' prefix.
-3. ABNORMAL / DICTATED FINDINGS MERGING: When the doctor dictates specific abnormal findings, observations, or modifications, merge them into the corresponding template sections and prefix only those dictated/abnormal lines with 'BOLD::'.
-4. NEW FINDINGS: Any new findings dictated that are not covered in the template should be inserted in the appropriate clinical location with 'BOLD::'.
-5. IMPRESSION: Synthesize an accurate, comprehensive IMPRESSION based on all findings (normal and abnormal) in the format 'IMPRESSION:###point 1###point 2...'.
-================================================================================
-`;
-      return {
-        isTemplateMode: true,
-        templateType: 'builtin',
-        templateName,
-        templateContent,
-        userInstructions: trimmed,
-        templateContextPrompt,
-      };
-    }
 
     // Check for custom text template indicators:
     // a) Keywords indicating template merge mode
@@ -469,7 +634,7 @@ export const processAudio = async (
   customPrompt?: string,
   customImages?: Array<{ data: string; mimeType: string }> | null,
   existingFindings?: string[],
-  customDocx?: { name: string; text: string; html?: string } | null
+  customDocx?: CustomDocxInput
 ): Promise<string[]> => {
   const audioBlobs = Array.isArray(audioBlob) ? audioBlob : [audioBlob];
   if (audioBlobs.length === 0) {
@@ -616,18 +781,19 @@ export const processAudio = async (
         console.warn("Merge mode fallback attempt error:", retryErr);
       }
 
-      const selectedTemplate = REPORT_TEMPLATES.find(t =>
-        customPrompt && customPrompt.toLowerCase().includes(t.name.toLowerCase())
-      );
+      const selectedTemplate = findBuiltinTemplate(customPrompt);
       if (selectedTemplate) {
+        if (selectedTemplate.lines && selectedTemplate.lines.length > 0) {
+          return selectedTemplate.lines;
+        }
         try {
           const parsed = JSON.parse(selectedTemplate.content);
           return [
             parsed.title || "RADIOLOGY REPORT",
-            "*Clinical Profile: Routine evaluation.*",
+            "Clinical Profile: Routine evaluation.",
             parsed.technique || "Standard imaging protocol was performed.",
             ...(parsed.normal_findings || []).map((f: string) => `BOLD::${f}`),
-            `IMPRESSION:###${parsed.impression || 'Study within normal limits.'}`
+            `IMPRESSION:###${parsed.default_impression || parsed.impression || 'Study within normal limits.'}`
           ];
         } catch (e) {}
       }
@@ -781,7 +947,7 @@ export const modifyReportWithAudio = async (
   model: string, 
   customPrompt?: string,
   customImages?: Array<{ data: string; mimeType: string }> | null,
-  customDocx?: { name: string; text: string; html?: string } | null
+  customDocx?: CustomDocxInput
 ): Promise<string[]> => {
   let audioPart: any;
   if (audioBlob.type && (audioBlob.type.startsWith('text/') || audioBlob.type === 'application/json')) {
@@ -825,7 +991,7 @@ export const modifyReportWithAudio = async (
     *   **Formatting:** The entire impression MUST be a single string in the "findings" array. It must start with "IMPRESSION:" (all caps), followed by '###', then each point separated by '###'.
     *   **Adding/Replacing:** Add the newly generated impression as the last finding. If an impression already exists, replace it with the new one.
 
-5.  **Special Clinical Profile Formatting:** If a clinical profile is present, added, or modified, it MUST be a single string that starts with "Clinical Profile:" and is wrapped in single asterisks (e.g., "*Clinical Profile: ...*").
+5.  **Special Clinical Profile Formatting:** If a clinical profile is present, added, or modified, format as clean plain text starting with "Clinical Profile: ..." (do NOT wrap in asterisks and do NOT add any trailing or extra asterisks).
 
 6.  **Format Output Correctly:**
     *   Your final output must be ONLY the modified report, in the same JSON object format as the original, with a key named "findings" whose value is an array of strings.
@@ -1454,7 +1620,7 @@ Now, generate the complete report including the new impression in the specified 
 export function resolveCustomInstructionsAndTemplate(
   customPrompt?: string,
   customImages?: Array<{ data: string; mimeType: string }> | null,
-  customDocx?: { name: string; text: string; html?: string } | null
+  customDocx?: CustomDocxInput
 ): {
   instructionsText: string;
   templateContext: string;
@@ -1520,7 +1686,7 @@ export const processLiveAudioChunk = async (
   onFailover?: (failedModel: string, nextModel: string, reason: string) => void,
   historyContext?: LiveHistoryContext,
   customImages?: Array<{ data: string; mimeType: string }> | null,
-  customDocx?: { name: string; text: string; html?: string } | null
+  customDocx?: CustomDocxInput
 ): Promise<LiveChunkResult> => {
   const base64Audio = await blobToBase64(audioBlob);
   const cleanMime = getCleanMimeType(audioBlob) || 'audio/wav';
@@ -1593,7 +1759,7 @@ STRICT RADIOLOGY TRANSCRIPTION & MEDICAL FORMATTING RULES:
    - Comparative phrases: "right more than left" as "(R > L)", "left more than right" as "(L > R)".
    - Abbreviate "complaints of" to "C/o" and "history of" to "H/o".
 3. **Prefix Marker for Findings**: You MUST prefix every standard finding line with the special marker \`BOLD::\` (unless template normal findings or custom instructions specify otherwise).
-4. **Clinical Profile**: If clinical history/profile is dictated, format as single paragraph wrapped in asterisks, e.g. "*Clinical Profile: C/o RTA with TBI (GCS- 15/15).*" (do not prefix with BOLD::).
+4. **Clinical Profile**: If clinical history/profile is dictated, format as single paragraph without asterisks, e.g. "Clinical Profile: C/o RTA with TBI (GCS- 15/15)." (do not prefix with BOLD:: and do NOT add any trailing or extra asterisks).
 5. **Impression Section**: If an impression is dictated, combine title and points separated by '###', starting with "IMPRESSION:###point 1###point 2" (do not prefix with BOLD::).
 6. **Obey Spoken Voice Commands, Sentence Deletions, Voice Undo & Dynamic Modifications**:
    - **VOICE UNDO, REVERT & RESTORE DELETION (CRITICAL)**:
@@ -1727,7 +1893,7 @@ export const synthesizeLiveReport = async (
   model: string = 'gemini-3.7-flash',
   customPrompt?: string,
   customImages?: Array<{ data: string; mimeType: string }> | null,
-  customDocx?: { name: string; text: string; html?: string } | null
+  customDocx?: CustomDocxInput
 ): Promise<string[]> => {
   if (!rawFindings || rawFindings.length === 0) {
     return [];
@@ -1754,7 +1920,7 @@ Perform a comprehensive, holistic review pass over the draft to generate the fin
    - Every standard finding MUST start with \`BOLD::\` (unless the custom instruction or template specifies otherwise).
    - Dimensions standardized: "16 x 17 mm".
    - Shorthand normalized: "S/p", "C/o", "H/o", "(R > L)", "(L > R)".
-   - Clinical profile in asterisks without BOLD:: (e.g., "*Clinical Profile: C/o trauma.*").
+   - Clinical profile without asterisks and without BOLD:: (e.g., "Clinical Profile: C/o trauma.") and with no trailing or extra asterisks.
 6. **IMPRESSION**:
    - If an impression exists, ensure it is formatted as "IMPRESSION:###point 1###point 2".
    - Ensure the impression highlights the most clinically significant and acute abnormalities first.

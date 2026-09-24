@@ -4,7 +4,7 @@ import {
   stopRepeatingInterruptedAlert,
   unlockAudioContext,
 } from '../services/soundService';
-import { processLiveAudioChunk, synthesizeLiveReport, LiveHistoryContext } from '../services/geminiService';
+import { processLiveAudioChunk, synthesizeLiveReport, LiveHistoryContext, CustomDocxInput } from '../services/geminiService';
 import {
   initLiveAudioSessionCache,
   cacheAudioChunk,
@@ -213,7 +213,7 @@ export const useLiveSession = () => {
   const selectedModelRef = useRef<string>('gemini-3.7-flash');
   const customPromptRef = useRef<string>('');
   const customImagesRef = useRef<Array<{ data: string; mimeType: string }> | null>(null);
-  const customDocxRef = useRef<{ name: string; text: string; html?: string } | null>(null);
+  const customDocxRef = useRef<CustomDocxInput>(null);
 
   // Voice Activity & Silence Gating state (VAD)
   const lastSpeechTimestampRef = useRef<number>(0);
@@ -313,7 +313,7 @@ export const useLiveSession = () => {
     customImagesRef.current = images || null;
   }, []);
 
-  const syncCustomDocx = useCallback((docx?: { name: string; text: string; html?: string } | null) => {
+  const syncCustomDocx = useCallback((docx?: CustomDocxInput) => {
     customDocxRef.current = docx || null;
   }, []);
 
@@ -482,7 +482,7 @@ export const useLiveSession = () => {
     customPrompt?: string,
     model: string = 'gemini-3.7-flash',
     customImages?: Array<{ data: string; mimeType: string }> | null,
-    customDocx?: { name: string; text: string; html?: string } | null
+    customDocx?: CustomDocxInput
   ) => {
     stopRepeatingInterruptedAlert();
     stopAudio();

@@ -22,8 +22,10 @@ import DownloadIcon from './icons/DownloadIcon';
 import TrashIcon from './icons/TrashIcon';
 import PauseIcon from './icons/PauseIcon';
 import ResumeIcon from './icons/ResumeIcon';
+import UploadIcon from './icons/UploadIcon';
+import ImageIcon from './icons/ImageIcon';
 import { mergeAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
-import { generateDocxFromMarkdown, downloadFile } from '../services/docxService';
+import { generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText } from '../services/docxService';
 import { stopRepeatingInterruptedAlert } from '../services/soundService';
 import RichTextReportEditor from './RichTextReportEditor';
 import type { DocxTemplateData } from './ui/CustomPromptInput';
@@ -43,7 +45,7 @@ interface ResultsDisplayProps {
   onSwitchToBatch: () => void;
   selectedModel: string;
   onModelChange: (model: string) => void;
-  onReprocess: () => void;
+  onReprocess: (extraFiles?: File[]) => void;
   onUpdateFinding: (index: number, newText: string) => void;
   onAllFindingsUpdate: (findings: string[]) => void;
   onContinueDictation: (newAudioBlob: Blob, mergedBlob?: Blob) => Promise<void>;
@@ -71,17 +73,103 @@ interface ResultsDisplayProps {
 const parseStructuredFinding = (finding: string) => {
   const parts = finding.split('###');
   if (parts.length > 1 && parts[0].trim() !== '') {
+    const isTable = isTableRowFinding(finding) || parts.every(p => p.includes('|'));
     return {
       isStructured: true,
+      isTable,
       title: parts[0],
       points: parts.slice(1).filter(p => p.trim() !== ''),
+      tableLines: parts.map(p => p.trim()).filter(Boolean),
     };
   }
+  const isTable = isTableRowFinding(finding);
   return {
     isStructured: false,
+    isTable,
     title: finding,
     points: [],
+    tableLines: isTable ? [finding] : [],
   };
+};
+
+export const renderTableFinding = (lines: string[]) => {
+  const rows = lines.map(line => parseTableRow(line));
+  if (rows.length === 0) return null;
+  const maxCols = Math.max(...rows.map(r => r.length), 1);
+  const header = rows[0];
+  const body = rows.slice(1);
+
+  return (
+    <div className="overflow-x-auto my-2 border border-slate-200 dark:border-slate-700 rounded-lg shadow-xs bg-white dark:bg-slate-900">
+      <table className="w-full text-xs text-left border-collapse">
+        <thead>
+          <tr className="bg-slate-100 dark:bg-slate-800 text-slate-800 dark:text-slate-100 font-bold border-b border-slate-200 dark:border-slate-700">
+            {header.map((col, idx) => (
+              <th key={idx} className="px-3 py-2 border-r last:border-r-0 border-slate-200 dark:border-slate-700">
+                {col.replace(/^BOLD::/i, '')}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {body.map((row, rIdx) => (
+            <tr 
+              key={rIdx} 
+              className={`border-b last:border-b-0 border-slate-200 dark:border-slate-800 ${
+                rIdx % 2 === 1 ? 'bg-slate-50/60 dark:bg-slate-850/50' : 'bg-white dark:bg-slate-900'
+              }`}
+            >
+              {Array.from({ length: maxCols }).map((_, cIdx) => {
+                const val = row[cIdx] || '';
+                const isBold = val.startsWith('BOLD::');
+                const cleanVal = val.replace(/^BOLD::/, '');
+                return (
+                  <td key={cIdx} className="px-3 py-2 border-r last:border-r-0 border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-300">
+                    {isBold ? <strong>{cleanVal}</strong> : cleanVal}
+                  </td>
+                );
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+};
+
+export const isReportTitle = (text: string, index: number): boolean => {
+  if (index !== 0) return false;
+  const t = text.replace(/BOLD::/g, '').trim();
+  if (!t) return false;
+  if (t === 'C.T.SCAN OF BRAIN (PLAIN)') return true;
+  if (/^(MRI|CT|C\.T\.|USG|ULTRASOUND|X-RAY|NCCT|CECT|HRCT|PET-CT|DEXA)\b/i.test(t)) return true;
+  if (t === t.toUpperCase() && t.length < 120 && !t.startsWith('IMPRESSION') && !t.startsWith('*')) return true;
+  return false;
+};
+
+export const sanitizeTitleText = (text: string): string => {
+  return text
+    .replace(/^BOLD::/i, '')
+    .replace(/\s*clinical\s*(profile|history)\s*:?.*$/i, '')
+    .trim();
+};
+
+export const isClinicalProfileFinding = (text: string): boolean => {
+  const clean = text.replace(/^BOLD::/i, '').replace(/^[*_\s]+|[*_\s]+$/g, '').trim();
+  return /^clinical\s*(profile|history):/i.test(clean);
+};
+
+export const formatClinicalProfileText = (text: string): string => {
+  let clean = text.replace(/^BOLD::/i, '').trim();
+  clean = clean.replace(/^[*_\s]+/, '');
+  clean = clean.replace(/[*_\s]+$/, '');
+  clean = clean.replace(/\.\*+$/, '.');
+  clean = clean.replace(/[*_]+$/, '').trim();
+  clean = clean.replace(/^Clinical\s*(Profile|History)\s*:?\s*/i, 'Clinical Profile: ');
+  clean = clean.replace(/^Clinical Profile:\s*\*+/i, 'Clinical Profile: ');
+  clean = clean.replace(/[*_\s]+$/, '').trim();
+  clean = clean.replace(/^[*_\s]+/, '').trim();
+  return clean.trim();
 };
 
 
@@ -138,11 +226,13 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     ))
   );
 
-  const activeTemplateName = customDocx?.name
-    ? customDocx.name.replace(/\.[^/.]+$/, '')
-    : (detectedTemplate.templateName || (customImages && customImages.length > 0
-      ? 'Reference Image Template'
-      : (customPrompt?.match(/normal (.*?) report template/i)?.[1] || 'Radiology Template')));
+  const activeTemplateName = detectedTemplate.templateName
+    ? detectedTemplate.templateName
+    : (customDocx?.name
+      ? customDocx.name.replace(/\.[^/.]+$/, '').replace(/^\d+[-_ ]*/, '')
+      : (customImages && customImages.length > 0
+        ? 'Reference Image Template'
+        : (customPrompt?.match(/normal (.*?) report template/i)?.[1] || 'Radiology Template')));
 
   // State to toggle RTF editor view (defaults to open in template merge mode, or user toggleable)
   const [showRtfEditor, setShowRtfEditor] = useState<boolean>(true);
@@ -217,6 +307,66 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   const dragOverItem = useRef<number | null>(null);
   const [undoState, setUndoState] = useState<string[] | null>(null);
   const [isMakingSelection, setIsMakingSelection] = useState<boolean>(false);
+
+  // States for extra file(s) / image(s) / text for Update Transcript
+  const [extraFiles, setExtraFiles] = useState<File[]>([]);
+  const [showExtraOptions, setShowExtraOptions] = useState<boolean>(false);
+  const [extraTextExpanded, setExtraTextExpanded] = useState<boolean>(false);
+  const extraFileInputRef = useRef<HTMLInputElement>(null);
+  const extraImageInputRef = useRef<HTMLInputElement>(null);
+
+  const handleExtraFilesSelected = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files: File[] = Array.from(e.target.files || []);
+    if (files.length > 0) {
+      const imageFiles: File[] = files.filter((f: File) => f.type.startsWith('image/'));
+      const otherFiles: File[] = files.filter((f: File) => !f.type.startsWith('image/'));
+
+      if (imageFiles.length > 0) {
+        imageFiles.forEach((imgFile: File) => {
+          const reader = new FileReader();
+          reader.onloadend = () => {
+            if (reader.result) {
+              const base64data = (reader.result as string).split(',')[1];
+              onCustomImagesChange([...(customImages || []), { data: base64data, mimeType: imgFile.type }]);
+            }
+          };
+          reader.readAsDataURL(imgFile);
+        });
+      }
+
+      if (otherFiles.length > 0) {
+        setExtraFiles(prev => [...prev, ...otherFiles]);
+      }
+      setShowExtraOptions(true);
+    }
+    if (e.target) e.target.value = '';
+  };
+
+  const handleExtraImagesSelected = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files: File[] = Array.from(e.target.files || []);
+    if (files.length > 0) {
+      files.forEach((imgFile: File) => {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          if (reader.result) {
+            const base64data = (reader.result as string).split(',')[1];
+            onCustomImagesChange([...(customImages || []), { data: base64data, mimeType: imgFile.type }]);
+          }
+        };
+        reader.readAsDataURL(imgFile);
+      });
+      setShowExtraOptions(true);
+    }
+    if (e.target) e.target.value = '';
+  };
+
+  const handleRemoveExtraFile = (index: number) => {
+    setExtraFiles(prev => prev.filter((_, i) => i !== index));
+  };
+
+  const handleRemoveCustomImage = (index: number) => {
+    onCustomImagesChange((customImages || []).filter((_, i) => i !== index));
+  };
 
   useEffect(() => {
     // Keep viewport positioned at the top of the report findings when results display loads
@@ -380,14 +530,23 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         const finding = findings[i];
         const isBold = finding.includes('BOLD::');
         const cleanFinding = finding.replace(/BOLD::/g, '');
-        const isTitle = cleanFinding.trim() === 'C.T.SCAN OF BRAIN (PLAIN)';
-        const { isStructured, title, points } = parseStructuredFinding(cleanFinding);
-        const isImpression = isStructured && title.trim().toUpperCase() === 'IMPRESSION:';
-        const isItalic = !isStructured && cleanFinding.startsWith('*') && cleanFinding.endsWith('*');
+        const isTitle = isReportTitle(cleanFinding, i);
+        const displayFinding = isTitle ? sanitizeTitleText(cleanFinding) : cleanFinding;
+        const isClinicalProfile = isClinicalProfileFinding(displayFinding);
+        const { isStructured, isTable, title, points, tableLines } = parseStructuredFinding(displayFinding);
+        const isImpression = isStructured && !isTable && title.trim().toUpperCase() === 'IMPRESSION:';
+        const isItalic = !isTable && (isClinicalProfile || (!isStructured && displayFinding.startsWith('*') && displayFinding.endsWith('*')));
 
         if (isTitle) {
-          acc.plain.push(cleanFinding);
-          acc.html.push(`<p style="text-align:center;"><strong><u>${cleanFinding}</u></strong></p>`);
+          acc.plain.push(displayFinding);
+          acc.html.push(`<p style="text-align:center;"><strong><u>${displayFinding}</u></strong></p>`);
+        } else if (isClinicalProfile) {
+          const profText = formatClinicalProfileText(displayFinding);
+          acc.plain.push(profText);
+          acc.html.push(`<p><em>${profText}</em></p>`);
+        } else if (isTable) {
+          acc.plain.push(tableToPlainText(tableLines));
+          acc.html.push(parseMarkdownTable(tableLines));
         } else if (isImpression) {
             acc.plain.push(`${title.toUpperCase()}\n${points.map(p => `• ${p}`).join('\n')}`);
             acc.html.push(`<p><strong style="text-decoration: underline;">${title.toUpperCase()}</strong></p><ul>${points.map(p => `<li><strong>${p}</strong></li>`).join('')}</ul>`);
@@ -398,8 +557,9 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
           acc.html.push(htmlContent);
         } else {
           if (isItalic) {
-              acc.plain.push(cleanFinding.slice(1, -1));
-              acc.html.push(`<p><em>${cleanFinding.slice(1, -1)}</em></p>`);
+              const italicText = cleanFinding.replace(/^\*+|\*+$/g, '').trim();
+              acc.plain.push(italicText);
+              acc.html.push(`<p><em>${italicText}</em></p>`);
           } else {
               acc.plain.push(cleanFinding);
               acc.html.push(isBold ? `<p><strong>${cleanFinding}</strong></p>` : `<p>${cleanFinding}</p>`);
@@ -477,17 +637,26 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     const findingToCopy = findings[index];
     const isBold = findingToCopy.includes('BOLD::');
     const cleanFinding = findingToCopy.replace(/BOLD::/g, '');
-    const isTitle = cleanFinding.trim() === 'C.T.SCAN OF BRAIN (PLAIN)';
-    const { isStructured, title, points } = parseStructuredFinding(cleanFinding);
-    const isImpression = isStructured && title.trim().toUpperCase() === 'IMPRESSION:';
-    const isItalic = !isStructured && cleanFinding.startsWith('*') && cleanFinding.endsWith('*');
+    const isTitle = isReportTitle(cleanFinding, index);
+    const displayFinding = isTitle ? sanitizeTitleText(cleanFinding) : cleanFinding;
+    const isClinicalProfile = isClinicalProfileFinding(displayFinding);
+    const { isStructured, isTable, title, points, tableLines } = parseStructuredFinding(displayFinding);
+    const isImpression = isStructured && !isTable && title.trim().toUpperCase() === 'IMPRESSION:';
+    const isItalic = !isTable && (isClinicalProfile || (!isStructured && displayFinding.startsWith('*') && displayFinding.endsWith('*')));
 
     let plainText: string;
     let htmlText: string;
 
     if (isTitle) {
-      plainText = cleanFinding;
-      htmlText = `<p style="text-align:center;"><strong><u>${cleanFinding}</u></strong></p>`;
+      plainText = displayFinding;
+      htmlText = `<p style="text-align:center;"><strong><u>${displayFinding}</u></strong></p>`;
+    } else if (isClinicalProfile) {
+      const profText = formatClinicalProfileText(displayFinding);
+      plainText = profText;
+      htmlText = `<p><em>${profText}</em></p>`;
+    } else if (isTable) {
+      plainText = tableToPlainText(tableLines);
+      htmlText = parseMarkdownTable(tableLines);
     } else if (isImpression) {
         plainText = `${title.toUpperCase()}\n${points.map(p => `• ${p}`).join('\n')}`;
         htmlText = `<p><strong style="text-decoration: underline;">${title.toUpperCase()}</strong></p><ul>${points.map(p => `<li><strong>${p}</strong></li>`).join('')}</ul>`;
@@ -498,7 +667,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         htmlText = htmlContent;
     } else {
         if (isItalic) {
-            plainText = cleanFinding.slice(1, -1);
+            plainText = cleanFinding.replace(/^\*+|\*+$/g, '').trim();
             htmlText = `<p><em>${plainText}</em></p>`;
         } else {
             plainText = cleanFinding;
@@ -529,33 +698,48 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   const handleCopyAll = async () => {
     if (!findings || findings.length === 0) return;
 
-    const allTextPlain = findings.map(f => {
-      const isBold = f.includes('BOLD::');
+    const allTextPlain = findings.map((f, i) => {
       const cleanFinding = f.replace(/BOLD::/g, '');
-      const { isStructured, title, points } = parseStructuredFinding(cleanFinding);
-      const isImpression = isStructured && title.trim().toUpperCase() === 'IMPRESSION:';
+      const isTitle = isReportTitle(cleanFinding, i);
+      const displayFinding = isTitle ? sanitizeTitleText(cleanFinding) : cleanFinding;
+      if (isClinicalProfileFinding(displayFinding)) {
+        return formatClinicalProfileText(displayFinding);
+      }
+      const { isStructured, isTable, title, points, tableLines } = parseStructuredFinding(displayFinding);
+      const isImpression = isStructured && !isTable && title.trim().toUpperCase() === 'IMPRESSION:';
 
+      if (isTable) {
+        return tableToPlainText(tableLines);
+      }
       if (isImpression) {
           return `${title.toUpperCase()}\n${points.map(p => `• ${p}`).join('\n')}`;
       }
       if (isStructured) {
         return [title, ...points].join('\n');
       }
-      if (cleanFinding.startsWith('*') && cleanFinding.endsWith('*')) {
-        return cleanFinding.slice(1, -1);
+      if (displayFinding.startsWith('*') && displayFinding.endsWith('*')) {
+        return displayFinding.replace(/^\*+|\*+$/g, '').trim();
       }
-      return cleanFinding;
+      return displayFinding;
     }).join('\n\n');
 
-    const allTextHtml = findings.map(f => {
+    const allTextHtml = findings.map((f, i) => {
       const isBold = f.includes('BOLD::');
       const cleanFinding = f.replace(/BOLD::/g, '');
-      const isTitle = cleanFinding.trim() === 'C.T.SCAN OF BRAIN (PLAIN)';
-      const { isStructured, title, points } = parseStructuredFinding(cleanFinding);
-      const isImpression = isStructured && title.trim().toUpperCase() === 'IMPRESSION:';
+      const isTitle = isReportTitle(cleanFinding, i);
+      const displayFinding = isTitle ? sanitizeTitleText(cleanFinding) : cleanFinding;
+      if (isClinicalProfileFinding(displayFinding)) {
+        const profText = formatClinicalProfileText(displayFinding);
+        return `<p><em>${profText}</em></p>`;
+      }
+      const { isStructured, isTable, title, points, tableLines } = parseStructuredFinding(displayFinding);
+      const isImpression = isStructured && !isTable && title.trim().toUpperCase() === 'IMPRESSION:';
       
       if (isTitle) {
-          return `<p style="text-align:center;"><strong><u>${cleanFinding}</u></strong></p>`;
+          return `<p style="text-align:center;"><strong><u>${displayFinding}</u></strong></p>`;
+      }
+      if (isTable) {
+          return parseMarkdownTable(tableLines);
       }
       if (isImpression) {
           return `<p><strong style="text-decoration: underline;">${title.toUpperCase()}</strong></p><ul>${points.map(p => `<li><strong>${p}</strong></li>`).join('')}</ul>`;
@@ -565,10 +749,10 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         htmlContent += points.map(p => isBold ? `<p><strong>${p}</strong></p>` : `<p>${p}</p>`).join('');
         return htmlContent;
       }
-      if (cleanFinding.startsWith('*') && cleanFinding.endsWith('*')) {
-        return `<p><em>${cleanFinding.slice(1, -1)}</em></p>`;
+      if (displayFinding.startsWith('*') && displayFinding.endsWith('*')) {
+        return `<p><em>${displayFinding.replace(/^\*+|\*+$/g, '').trim()}</em></p>`;
       }
-      return isBold ? `<p><strong>${cleanFinding}</strong></p>` : `<p>${cleanFinding}</p>`;
+      return isBold ? `<p><strong>${displayFinding}</strong></p>` : `<p>${displayFinding}</p>`;
     }).join('');
 
     const success = await copyToClipboard(allTextPlain, allTextHtml);
@@ -622,8 +806,13 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     const isBold = findingToEdit.includes('BOLD::');
     const cleanFinding = findingToEdit.replace(/BOLD::/g, '');
     
+    const isClinicalProfile = isClinicalProfileFinding(cleanFinding);
     const { isStructured, title, points } = parseStructuredFinding(cleanFinding);
-    const textForEditing = isStructured ? [title, ...points].join('\n') : cleanFinding;
+    const textForEditing = isClinicalProfile
+      ? formatClinicalProfileText(cleanFinding)
+      : isStructured
+      ? [title, ...points].join('\n')
+      : cleanFinding;
     
     setEditingText(textForEditing);
     setDictateEditingIndex(null);
@@ -686,9 +875,12 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
       let newText = editingText;
       if (isStructured) {
         newText = editingText.split('\n').filter(line => line.trim() !== '').join('###');
+      } else if (isClinicalProfileFinding(editingText)) {
+        const profText = formatClinicalProfileText(editingText);
+        newText = profText;
       }
       
-      if(isBold && !newText.startsWith('BOLD::')) {
+      if(isBold && !newText.startsWith('BOLD::') && !isClinicalProfileFinding(newText)) {
         newText = `BOLD::${newText}`;
       }
       
@@ -1236,31 +1428,183 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
       {errorCheckStatus === 'complete' && identifiedErrors.length > 0 && <ErrorLegend />}
 
       {!isLive && audioBlob && (
-        <div className="bg-slate-100 dark:bg-slate-900/50 p-3 rounded-lg mb-4 flex flex-col sm:flex-row items-center justify-between gap-3 shadow-sm">
-          <div className="flex items-center gap-2 w-full sm:w-auto">
-            <label htmlFor="model-select-reprocess" className="text-sm font-medium text-slate-700 dark:text-slate-300 whitespace-nowrap">Process again with:</label>
-            <select 
-                id="model-select-reprocess"
-                value={selectedModel}
-                onChange={(e) => onModelChange(e.target.value)}
-                className="bg-white border border-slate-300 text-slate-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block p-2 w-full dark:bg-slate-700 dark:border-slate-600 dark:text-white"
-                aria-label="Select AI model for reprocessing"
-            >
-                {AVAILABLE_MODELS.map((model) => (
-                    <option key={model.value} value={model.value}>{model.label}</option>
-                ))}
-            </select>
+        <div className="bg-slate-100 dark:bg-slate-900/50 p-3.5 rounded-xl mb-4 shadow-sm border border-slate-200/80 dark:border-slate-800">
+          <div className="flex flex-col sm:flex-row items-center justify-between gap-3">
+            <div className="flex items-center gap-2 w-full sm:w-auto">
+              <label htmlFor="model-select-reprocess" className="text-sm font-medium text-slate-700 dark:text-slate-300 whitespace-nowrap">Process again with:</label>
+              <select 
+                  id="model-select-reprocess"
+                  value={selectedModel}
+                  onChange={(e) => onModelChange(e.target.value)}
+                  className="bg-white border border-slate-300 text-slate-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block p-2 w-full sm:w-auto dark:bg-slate-700 dark:border-slate-600 dark:text-white"
+                  aria-label="Select AI model for reprocessing"
+              >
+                  {AVAILABLE_MODELS.map((model) => (
+                      <option key={model.value} value={model.value}>{model.label}</option>
+                  ))}
+              </select>
+            </div>
+
+            <div className="flex items-center gap-2 w-full sm:w-auto justify-end flex-wrap">
+              <button
+                type="button"
+                onClick={() => setShowExtraOptions(prev => !prev)}
+                className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold transition-all border ${
+                  showExtraOptions || extraFiles.length > 0 || (customImages && customImages.length > 0)
+                    ? 'bg-blue-50 dark:bg-blue-950/60 border-blue-400 dark:border-blue-700 text-blue-700 dark:text-blue-300'
+                    : 'bg-white dark:bg-slate-800 border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700'
+                }`}
+                title="Add extra files, images, or instructions to update the transcript"
+              >
+                <span>📎</span>
+                <span>Add File(s) / Image(s) / Text</span>
+                {(extraFiles.length > 0 || (customImages && customImages.length > 0) || customPrompt.trim().length > 0) && (
+                  <span className="ml-1 px-1.5 py-0.2 rounded-full text-[10px] bg-blue-600 text-white font-bold">
+                    {extraFiles.length + (customImages?.length || 0) + (customPrompt.trim().length > 0 ? 1 : 0)}
+                  </span>
+                )}
+              </button>
+
+              <button
+                onClick={() => {
+                  setExpertNotes(null);
+                  setUndoState(findings);
+                  onReprocess(extraFiles.length > 0 ? extraFiles : undefined);
+                  setExtraFiles([]);
+                }}
+                className="bg-blue-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50 transition-colors w-full sm:w-auto flex-shrink-0"
+              >
+                Update Transcript
+              </button>
+            </div>
           </div>
-          <button
-              onClick={() => {
-                setExpertNotes(null);
-                setUndoState(findings);
-                onReprocess();
-              }}
-              className="bg-blue-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50 transition-colors w-full sm:w-auto flex-shrink-0"
-            >
-              Update Transcript
-            </button>
+
+          {/* Collapsible / Expandable Extra Options Panel */}
+          {showExtraOptions && (
+            <div className="mt-3 pt-3 border-t border-slate-200 dark:border-slate-700/80 flex flex-col gap-3">
+              <input 
+                type="file" 
+                ref={extraFileInputRef} 
+                onChange={handleExtraFilesSelected} 
+                multiple 
+                accept="audio/*,video/*,image/*,.pdf,.doc,.docx,.txt,.csv,.rtf,.webm,.mp4,.mp3,.wav,.m4a,.png,.jpg,.jpeg" 
+                className="hidden" 
+                aria-hidden="true" 
+              />
+              <input 
+                type="file" 
+                ref={extraImageInputRef} 
+                onChange={handleExtraImagesSelected} 
+                multiple 
+                accept="image/*" 
+                className="hidden" 
+                aria-hidden="true" 
+              />
+
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => extraFileInputRef.current?.click()}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 transition-colors shadow-xs"
+                >
+                  <UploadIcon className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+                  <span>+ Add File(s) (Audio, PDF, DOCX, TXT)</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => extraImageInputRef.current?.click()}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 transition-colors shadow-xs"
+                >
+                  <ImageIcon className="w-3.5 h-3.5 text-indigo-600 dark:text-indigo-400" />
+                  <span>+ Add Image(s) / Scan</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setExtraTextExpanded(prev => !prev)}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors shadow-xs ${
+                    extraTextExpanded || customPrompt.trim().length > 0
+                      ? 'bg-blue-100 dark:bg-blue-900/60 border-blue-400 text-blue-800 dark:text-blue-200'
+                      : 'bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200'
+                  }`}
+                >
+                  <PencilIcon className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+                  <span>{extraTextExpanded ? 'Hide Extra Text' : '+ Add Extra Text / Notes'}</span>
+                </button>
+              </div>
+
+              {/* Staged Extra Files List */}
+              {extraFiles.length > 0 && (
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  <span className="text-xs font-semibold text-slate-500 dark:text-slate-400">Attached Files:</span>
+                  {extraFiles.map((file, fIdx) => (
+                    <div key={`extra-f-${fIdx}`} className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-blue-50 dark:bg-blue-900/40 border border-blue-200 dark:border-blue-800 text-xs font-medium text-blue-900 dark:text-blue-200">
+                      <span className="truncate max-w-[140px]" title={file.name}>{file.name}</span>
+                      <span className="text-[10px] text-blue-600 dark:text-blue-400">({(file.size / 1024).toFixed(0)} KB)</span>
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveExtraFile(fIdx)}
+                        className="text-blue-500 hover:text-red-600 dark:hover:text-red-400 font-bold ml-0.5"
+                        title="Remove file"
+                        aria-label={`Remove file ${file.name}`}
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Staged Extra Images List */}
+              {customImages && customImages.length > 0 && (
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  <span className="text-xs font-semibold text-slate-500 dark:text-slate-400">Reference Images:</span>
+                  {customImages.map((img, iIdx) => (
+                    <div key={`extra-img-${iIdx}`} className="relative group inline-flex items-center gap-1 p-1 rounded-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700">
+                      <img src={`data:${img.mimeType};base64,${img.data}`} alt="Ref" className="w-8 h-8 rounded object-cover" />
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveCustomImage(iIdx)}
+                        className="text-slate-400 hover:text-red-600 dark:hover:text-red-400 font-bold px-1 text-xs"
+                        title="Remove image"
+                        aria-label="Remove image"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Staged Extra Text Area */}
+              {(extraTextExpanded || customPrompt.trim().length > 0) && (
+                <div className="flex flex-col gap-1.5 pt-1">
+                  <div className="flex items-center justify-between">
+                    <label className="text-xs font-semibold text-slate-700 dark:text-slate-300">
+                      Extra Instructions / Text Notes for Update:
+                    </label>
+                    {customPrompt.trim().length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => onCustomPromptChange('')}
+                        className="text-[11px] text-red-500 hover:underline"
+                      >
+                        Clear Text
+                      </button>
+                    )}
+                  </div>
+                  <textarea
+                    value={customPrompt}
+                    onChange={(e) => onCustomPromptChange(e.target.value)}
+                    placeholder="Add any extra notes, clinical corrections, or dictation instructions to apply to this transcript update..."
+                    className="w-full text-xs p-2.5 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-100 focus:ring-2 focus:ring-blue-500 focus:outline-none resize-y min-h-[60px]"
+                    rows={2}
+                  />
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -1443,10 +1787,22 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
           
           const isBold = finding.includes('BOLD::');
           const cleanFinding = finding.replace(/BOLD::/g, '');
-          const isTitle = cleanFinding.trim() === 'C.T.SCAN OF BRAIN (PLAIN)';
-          const { isStructured, title, points } = parseStructuredFinding(cleanFinding);
-          const isItalic = !isStructured && cleanFinding.startsWith('*') && cleanFinding.endsWith('*');
-          const textToDisplay = isItalic ? cleanFinding.slice(1, -1) : isStructured ? title : cleanFinding;
+          const isTitle = isReportTitle(cleanFinding, index);
+          const displayFinding = isTitle ? sanitizeTitleText(cleanFinding) : cleanFinding;
+          const isClinicalProfile = isClinicalProfileFinding(displayFinding);
+          const { isStructured, isTable, title, points, tableLines } = parseStructuredFinding(displayFinding);
+          const isItalic = !isTable && (isClinicalProfile || (!isStructured && displayFinding.startsWith('*') && displayFinding.endsWith('*')));
+          
+          let textToDisplay: string;
+          if (isClinicalProfile) {
+            textToDisplay = formatClinicalProfileText(displayFinding);
+          } else if (isItalic) {
+            textToDisplay = displayFinding.replace(/^\*+|\*+$/g, '').trim();
+          } else if (isStructured) {
+            textToDisplay = title;
+          } else {
+            textToDisplay = displayFinding;
+          }
 
           const textContainerClasses = isTitle
             ? 'text-center font-bold underline'
@@ -1603,7 +1959,9 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                   <div
                     className={`text-slate-700 dark:text-slate-200 whitespace-pre-wrap ${!isCurrentlyActive && !reorderMode && !mergeMode ? 'cursor-pointer' : 'cursor-default'} ${textContainerClasses}`}
                   >
-                    {isImpression ? (
+                    {isTable ? (
+                      renderTableFinding(tableLines)
+                    ) : isImpression ? (
                         <>
                             <span className="font-bold underline uppercase">{title}</span>
                             <ul className="list-disc list-inside pl-4 mt-1">

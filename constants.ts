@@ -119,7 +119,7 @@ Follow these strict instructions to produce a clean and accurate report:
     - For comparative phrases like "right more than left", use the format "(R > L)". Similarly, for "left more than right", use "(L > R)".
     - Abbreviate "complaints of" to "C/o".
     - Abbreviate "history of" to "H/o".
-3. If a clinical profile is dictated, it must be a single, cohesive paragraph. This paragraph must start with "Clinical Profile:" and the entire string (including the prefix) must be wrapped in single asterisks. For example: "*Clinical Profile: C/o RTA with TBI (GCS- 15/15), Planned for discharge.*" This is the only context in which asterisks should be used.
+3. If a clinical profile is dictated, it must be a single, cohesive paragraph. This paragraph must start with "Clinical Profile:" and the entire string (including the prefix) must be wrapped in single asterisks. For example: "*Clinical Profile: C/o RTA with TBI (GCS- 15/15), Planned for discharge.*" Do NOT add duplicate or extra asterisks at the end or inside the text. This is the only context in which asterisks should be used.
 4. Completely ignore all non-verbal sounds (like coughing, sneezing) and any irrelevant side-conversations. However, you MUST include any dictation related to patient information if it's part of the clinical profile.
 5. Group related detailed findings into a single, coherent sentence or paragraph. Start a new line for distinct findings. Do not use bullet points or numbered lists.
 6. If the dictation includes languages other than English, transcribe and translate the relevant medical findings into proper English.
@@ -181,14 +181,14 @@ STRICT INSTRUCTIONS:
     c.  **Minor Findings**: Any minor, unrelated dictated findings should be placed at the very end of the findings section, just before the IMPRESSION.
 4.  **Generate Impression**: You must analyze all findings (both dictated and from the template) to synthesize a new, clinically relevant impression. This new impression completely REPLACES the template's default impression and must be generated according to the strict criteria in rule #11.
 5.  **Assemble Final Report**: You must construct the final report in this EXACT order:
-    a.  The template's title (e.g., "C.T.SCAN OF BRAIN (PLAIN)")
-    b.  The Clinical Profile. If no clinical profile is dictated, you MUST still include the line "*Clinical Profile:*".
+    a.  The template's title ONLY (e.g., "C.T.SCAN OF BRAIN (PLAIN)"). You must NEVER append, concatenate, or attach "Clinical Profile" or any other text to this title line.
+    b.  The Clinical Profile as its own separate array item directly following the title. If no clinical profile is dictated, you MUST still include the line "*Clinical Profile:*".
     c.  The template's technique point.
     d.  All integrated, new, and remaining template findings.
     e.  The new, AI-generated impression.
 6.  **Formatting Rules**:
     a.  **Dictated Findings Formatting**: You MUST prefix every finding that originates from the user's dictation with the special marker \`BOLD::\`. Do NOT add this prefix to any text that comes from the template itself (e.g., title, technique, normal findings).
-    b.  **Clinical Profile Formatting**: The clinical profile MUST be a single, cohesive paragraph that starts with "Clinical Profile:" and is wrapped entirely in single asterisks (e.g., "*Clinical Profile: C/o RTA.*"). The text "Clinical Profile:" inside the asterisks must be in italics.
+    b.  **Clinical Profile Formatting**: The clinical profile MUST be a single, cohesive paragraph wrapped in single asterisks (e.g., "*Clinical Profile: C/o RTA.*"). Do NOT add internal asterisks, markdown, or extra asterisks at the end.
     c.  **No Other Markdown**: Do not use any other markdown formatting (like for bolding). The only exception is the asterisks for the clinical profile.
 
 7. **Specific Transcription Rules**:
@@ -239,40 +239,22 @@ Example of desired JSON output for template workflow:
 ---
 `;
 
+import { ALL_RADNITO_TEMPLATES } from './services/builtInTemplates';
+
 export interface ReportTemplate {
+  id?: string;
   name: string;
   description: string;
   content: string; // This will be a stringified JSON
+  category?: string;
+  modality?: string;
+  lines?: string[];
+  fileName?: string;
+  docxBase64?: string;
+  skillPrompt?: string;
 }
 
-export const REPORT_TEMPLATES: ReportTemplate[] = [
-  {
-    name: "CT Brain PLAIN",
-    description: "Standard normal report for a non-contrast CT scan of the brain.",
-    content: JSON.stringify(
-      {
-        title: "C.T.SCAN OF BRAIN (PLAIN)",
-        technique: "Serial axial sections of the brain were studied from the base to the vertex.",
-        normal_findings: [
-          "The sections of the brain do not reveal any area of altered tissue density.",
-          "The C.P.Angles and posterior fossa contents are normal.",
-          "The ventricular system shows normal anatomical configuration.",
-          "There is no midline shift seen.",
-          "The basal cisterns, cortical sulci and sylvian fissures are normal.",
-          "The sella, parasellar and suprasellar regions are normal."
-        ],
-        // FIX: The key 'default_impression' was not properly quoted, causing a syntax error.
-        // Also corrected a typo in "neuroparenchymal".
-        "default_impression": "IMPRESSION:###No significant neuroparenchymal abnormality noted"
-      }, null, 2) // Pretty print JSON for readability
-  }
-  // Future templates can be added here
-  // {
-  //   name: "HRCT Thorax",
-  //   description: "Standard normal report for a high-resolution CT of the thorax.",
-  //   content: JSON.stringify({ ... })
-  // }
-];
+export const REPORT_TEMPLATES: ReportTemplate[] = ALL_RADNITO_TEMPLATES;
 
 
 export const LIVE_GEMINI_PROMPT = `You are an expert medical transcriptionist specializing in radiology, correcting a live audio stream from a speech-to-text tool. Your primary task is to provide a clean, accurate, and faithful real-time transcript of the radiologist's dictation. Your goal is to be a perfect, literal transcriber that only corrects speech-to-text errors, not to interpret, add, or generate new medical information.

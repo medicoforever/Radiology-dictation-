@@ -29,7 +29,9 @@ import { autoSaveSingleDictation, autoSaveLiveDictation, SaveResult, syncPending
 import { DriveStatusBadge } from './components/DriveStatusBadge';
 import { DriveAutoSaveToast } from './components/DriveAutoSaveToast';
 import { DriveReportsModal } from './components/DriveReportsModal';
-import { RotateCcw, X, ExternalLink, Power, Sparkles, Trash2, Download } from 'lucide-react';
+import { RotateCcw, X, ExternalLink, Power, Sparkles, Trash2, Download, Settings } from 'lucide-react';
+import WorkstationSyncModal from './components/WorkstationSyncModal';
+import { checkAndAutoSyncReport } from './services/workstationSync';
 
 interface ChatMessage {
   author: 'You' | 'AI';
@@ -119,6 +121,22 @@ const App: React.FC = () => {
   const [multipleFilesModal, setMultipleFilesModal] = useState<File[] | null>(null);
   const [pendingBatchFiles, setPendingBatchFiles] = useState<File[] | null>(null);
   const [isReportsModalOpen, setIsReportsModalOpen] = useState<boolean>(false);
+  const [isWorkstationSyncModalOpen, setIsWorkstationSyncModalOpen] = useState<boolean>(false);
+  const [syncToastMessage, setSyncToastMessage] = useState<string | null>(null);
+  const syncToastTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  const handleWorkstationSettingsSaved = useCallback(() => {
+    if (syncToastTimeoutRef.current) {
+      clearTimeout(syncToastTimeoutRef.current);
+    }
+    setSyncToastMessage('Settings saved to this device');
+    syncToastTimeoutRef.current = setTimeout(() => {
+      setSyncToastMessage(null);
+    }, 3500);
+
+    checkAndAutoSyncReport(300, findings.length > 0 ? { findings, timestamp: activeDictationTimestampRef.current || Date.now() } : undefined);
+  }, [findings]);
+
   const [driveSaveResult, setDriveSaveResult] = useState<SaveResult | null>(null);
   const processingRequestIdRef = useRef<number>(0);
   const activeDictationTimestampRef = useRef<number | null>(null);
@@ -468,6 +486,9 @@ const App: React.FC = () => {
           setDriveSaveResult(result);
         }
       }).catch(err => console.warn('Drive auto-save background notice:', err));
+
+      // Trigger Hospital Workstation Auto-Sync if configured (pure report HTML)
+      checkAndAutoSyncReport(300, { findings: processedText, timestamp });
     } catch (err) {
       if (processingRequestIdRef.current !== reqId) return; // cancelled
       console.error(err);
@@ -559,6 +580,9 @@ const App: React.FC = () => {
           }
         }).catch(err => console.warn('Drive live auto-save notice:', err));
 
+        // Trigger Hospital Workstation Auto-Sync if configured (pure report HTML)
+        checkAndAutoSyncReport(300, { findings: processedText, timestamp });
+
     } catch (err) {
         if (processingRequestIdRef.current !== reqId) return; // cancelled
         console.error(err);
@@ -568,9 +592,9 @@ const App: React.FC = () => {
     }
   }, [selectedModel, customPrompt, customImages]);
 
-  const handleReprocess = useCallback(async () => {
-    if (!audioBlob) {
-      setError('No audio available to reprocess.');
+  const handleReprocess = useCallback(async (extraFiles?: File[]) => {
+    if (!audioBlob && (!extraFiles || extraFiles.length === 0)) {
+      setError('No audio or input files available to reprocess.');
       setStatus(AppStatus.Error);
       return;
     }
@@ -580,13 +604,24 @@ const App: React.FC = () => {
     setError(null);
     
     try {
+      const currentBlobs = audioBlob 
+        ? (Array.isArray(audioBlob) ? audioBlob : [audioBlob])
+        : [];
+      const blobsToProcess = extraFiles && extraFiles.length > 0
+        ? [...currentBlobs, ...extraFiles]
+        : currentBlobs;
+
+      if (extraFiles && extraFiles.length > 0) {
+        setAudioBlob(blobsToProcess.length === 1 ? blobsToProcess[0] : blobsToProcess);
+      }
+
       // Reprocess clean from the original input audio/template/prompt without feeding in previous model output
-      const processedText = await processAudio(audioBlob, selectedModel, customPrompt, customImages, undefined, customDocx);
+      const processedText = await processAudio(blobsToProcess, selectedModel, customPrompt, customImages, undefined, customDocx);
       if (processingRequestIdRef.current !== reqId) return; // cancelled
       setFindings(processedText);
 
       // Recreate chat with the new findings
-      const chatSession = await createChat(audioBlob, processedText, customPrompt, customImages, selectedModel);
+      const chatSession = await createChat(blobsToProcess, processedText, customPrompt, customImages, selectedModel);
       if (processingRequestIdRef.current !== reqId) return; // cancelled
       setChat(chatSession);
       const aiGreeting = "I have re-processed the audio with your new instructions. How can I help you further?";
@@ -602,6 +637,9 @@ const App: React.FC = () => {
           setDriveSaveResult(result);
         }
       }).catch(err => console.warn('Drive reprocess auto-save notice:', err));
+
+      // Trigger Hospital Workstation Auto-Sync if configured (pure report HTML)
+      checkAndAutoSyncReport(300, { findings: processedText, timestamp });
     } catch (err) {
       if (processingRequestIdRef.current !== reqId) return; // cancelled
       console.error(err);
@@ -611,14 +649,22 @@ const App: React.FC = () => {
   }, [audioBlob, selectedModel, customPrompt, customImages, customDocx, findings]);
 
   const handleUpdateFinding = (index: number, newText: string) => {
+    let updatedFindingsToSync: string[] = [];
     setFindings(prevFindings => {
       const updatedFindings = [...prevFindings];
       if (updatedFindings[index] !== undefined) {
         updatedFindings[index] = newText;
       }
+      updatedFindingsToSync = updatedFindings;
       return updatedFindings;
     });
+    checkAndAutoSyncReport(400, { findings: updatedFindingsToSync, timestamp: activeDictationTimestampRef.current || Date.now() });
   };
+
+  const handleAllFindingsUpdate = useCallback((newFindings: string[]) => {
+    setFindings(newFindings);
+    checkAndAutoSyncReport(400, { findings: newFindings, timestamp: activeDictationTimestampRef.current || Date.now() });
+  }, []);
 
   const handleAudioBlobUpdate = useCallback((newBlob: Blob) => {
     setAudioBlob(newBlob);
@@ -667,6 +713,9 @@ const App: React.FC = () => {
           setDriveSaveResult(result);
         }
       }).catch(err => console.warn('Drive continuation auto-save notice:', err));
+
+      // Trigger Hospital Workstation Auto-Sync if configured (pure report HTML)
+      checkAndAutoSyncReport(300, { findings: updatedFindings, timestamp });
 
     } catch (err) {
       console.error("Error during dictation continuation:", err);
@@ -956,7 +1005,7 @@ const App: React.FC = () => {
             onModelChange={setSelectedModel}
             onReprocess={handleReprocess}
             onUpdateFinding={handleUpdateFinding}
-            onAllFindingsUpdate={setFindings}
+            onAllFindingsUpdate={handleAllFindingsUpdate}
             onContinueDictation={handleContinueDictation}
             onAudioBlobUpdate={handleAudioBlobUpdate}
             customPrompt={customPrompt}
@@ -1059,7 +1108,10 @@ const App: React.FC = () => {
                     isErrorCheckEnabled={isErrorCheckEnabled}
                     initialFiles={pendingBatchFiles}
                     onClearInitialFiles={() => setPendingBatchFiles(null)}
-                    onSaveToDrive={(res) => setDriveSaveResult(res)}
+                    onSaveToDrive={(res) => {
+                      setDriveSaveResult(res);
+                      checkAndAutoSyncReport(300);
+                    }}
                     onBack={() => {
                         resetSingleMode();
                         setMode('single');
@@ -1091,6 +1143,7 @@ const App: React.FC = () => {
       success: true,
       fileName: reportName,
     });
+    checkAndAutoSyncReport(300, { findings: loadedFindings, timestamp: Date.now() });
   };
 
   return (
@@ -1126,6 +1179,16 @@ const App: React.FC = () => {
               </h1>
             </div>
             <div className="justify-self-end flex items-center gap-1.5 sm:gap-2">
+              <button
+                id="workstation-sync-header-btn"
+                onClick={() => setIsWorkstationSyncModalOpen(true)}
+                className="p-2 sm:p-2.5 rounded-xl text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors shrink-0 shadow-sm border border-slate-200/60 dark:border-slate-700/60 cursor-pointer min-h-[36px] min-w-[36px] flex items-center justify-center gap-1.5"
+                aria-label="Workstation Sync"
+                title="Workstation Sync"
+              >
+                <Settings className="w-5 h-5 text-slate-600 dark:text-slate-300" />
+                <span className="text-xs font-semibold text-slate-700 dark:text-slate-200 hidden md:inline">Workstation Sync</span>
+              </button>
               <button
                 onClick={() => setIsPowerMode(prev => !prev)}
                 className={`p-2 sm:p-2.5 rounded-xl transition-all shrink-0 shadow-sm border cursor-pointer min-h-[36px] min-w-[36px] flex items-center justify-center ${
@@ -1555,6 +1618,30 @@ const App: React.FC = () => {
                 <X className="w-4 h-4" />
               </button>
             </div>
+          </div>
+        )}
+
+        {/* Workstation Sync Modal */}
+        <WorkstationSyncModal
+          isOpen={isWorkstationSyncModalOpen}
+          onClose={() => setIsWorkstationSyncModalOpen(false)}
+          onSaved={handleWorkstationSettingsSaved}
+        />
+
+        {/* Workstation Sync Saved Toast */}
+        {syncToastMessage && (
+          <div
+            id="workstation-sync-toast"
+            className="fixed bottom-5 left-5 z-50 max-w-sm bg-slate-900/95 dark:bg-slate-800/95 backdrop-blur-md text-white border border-slate-700/80 shadow-2xl rounded-2xl p-3.5 flex items-center gap-3 animate-in fade-in slide-in-from-bottom-3 duration-200"
+            role="status"
+            aria-live="polite"
+          >
+            <div className="w-7 h-7 rounded-full bg-emerald-500/20 text-emerald-400 flex items-center justify-center shrink-0 font-bold text-sm">
+              ✓
+            </div>
+            <p className="text-xs sm:text-sm font-semibold text-slate-100">
+              {syncToastMessage}
+            </p>
           </div>
         )}
       </div>

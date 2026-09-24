@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import ChevronDownIcon from '../icons/ChevronDownIcon';
 import SparklesIcon from '../icons/SparklesIcon';
 import { useAudioRecorder } from '../../hooks/useAudioRecorder';
@@ -11,8 +11,10 @@ import { REPORT_TEMPLATES, ReportTemplate } from '../../constants';
 import ImageIcon from '../icons/ImageIcon';
 import CloseIcon from '../icons/CloseIcon';
 import TrashIcon from '../icons/TrashIcon';
+import SearchIcon from '../icons/SearchIcon';
 import { saveUserTemplate, getUserTemplates, deleteUserTemplate, UserTemplate } from '../../services/templateStorage';
 import { parseDocx } from '../../services/docxService';
+import { getTemplateDocxBase64 } from '../../services/builtInTemplates';
 
 export interface DocxTemplateData {
   name: string;
@@ -95,8 +97,51 @@ const CustomPromptInput: React.FC<{
     }
   };
 
-  const handleSelectTemplate = (template: ReportTemplate) => {
-    onPromptChange(`Use the normal ${template.name} report template. Integrate my dictation and generate a new impression.`);
+  const [savedSearchQuery, setSavedSearchQuery] = useState('');
+  const [savedModalityFilter, setSavedModalityFilter] = useState<'ALL' | 'CT' | 'MRI' | 'USER'>('ALL');
+
+  const filteredSavedTemplates = useMemo(() => {
+    let list = savedTemplates;
+    if (savedModalityFilter === 'CT') {
+      list = list.filter(t => (t.modality || t.category || '').toUpperCase().includes('CT'));
+    } else if (savedModalityFilter === 'MRI') {
+      list = list.filter(t => (t.modality || t.category || '').toUpperCase().includes('MRI'));
+    } else if (savedModalityFilter === 'USER') {
+      list = list.filter(t => !t.isBuiltIn);
+    }
+    if (savedSearchQuery.trim()) {
+      const q = savedSearchQuery.toLowerCase().trim();
+      list = list.filter(t => t.name.toLowerCase().includes(q) || (t.text && t.text.toLowerCase().includes(q)));
+    }
+    return list;
+  }, [savedTemplates, savedModalityFilter, savedSearchQuery]);
+
+  const handleSelectTemplate = async (template: ReportTemplate) => {
+    // 1. Tag prompt with exact template ID and quoted name for 100% deterministic detection
+    const promptText = `[TEMPLATE_ID: ${template.id}] Use the normal "${template.name}" report template. Integrate my dictation and generate a new impression.`;
+    onPromptChange(promptText);
+
+    // 2. Fetch docxBase64 asynchronously if not already present
+    let docx = template.docxBase64;
+    if (!docx && template.id) {
+      try {
+        docx = await getTemplateDocxBase64(template.id);
+      } catch (err) {
+        console.warn('Error loading docx for template:', err);
+      }
+    }
+
+    // 3. Always update customDocx so old template is guaranteed to be replaced!
+    if (onCustomDocxChange) {
+      const extractedText = template.lines ? template.lines.join('\n') : template.content;
+      onCustomDocxChange({
+        name: template.fileName || `${template.name}.docx`,
+        data: docx || '',
+        size: docx ? Math.round(docx.length * 0.75) : 0,
+        extractedText,
+      });
+    }
+
     setAppliedTemplateName(`Built-in ${template.name}`);
     setIsModalOpen(false);
     setTimeout(() => setAppliedTemplateName(null), 4000);
@@ -326,13 +371,40 @@ const CustomPromptInput: React.FC<{
     }
   };
 
-  const handleApplyCustomTemplate = (template: UserTemplate) => {
-    onPromptChange(template.text || `Use the custom ${template.name} report template. Integrate dictation into the layout and synthesize a new impression.`);
+  const handleApplyCustomTemplate = async (template: UserTemplate) => {
+    const cleanId = template.id.startsWith('builtin_') ? template.id.replace('builtin_', '') : null;
+    const isBuiltIn = template.isBuiltIn || Boolean(cleanId);
+
+    let docxData = template.docxFile || null;
+
+    if (isBuiltIn && cleanId && (!docxData || !docxData.data)) {
+      try {
+        const docxBase64 = await getTemplateDocxBase64(cleanId);
+        if (docxBase64) {
+          docxData = {
+            name: `${template.name}.docx`,
+            data: docxBase64,
+            size: Math.round(docxBase64.length * 0.75),
+            extractedText: template.text || '',
+          };
+        }
+      } catch (err) {
+        console.warn('Could not load docx for builtin template:', err);
+      }
+    }
+
+    const tag = cleanId ? `[TEMPLATE_ID: ${cleanId}] ` : `[TEMPLATE: ${template.name}] `;
+    const promptText = isBuiltIn && cleanId
+      ? `${tag}Use the normal "${template.name}" report template. Integrate my dictation and generate a new impression.`
+      : (template.text ? `${tag}${template.text}` : `${tag}Use the custom "${template.name}" report template. Integrate dictation into the layout and synthesize a new impression.`);
+
+    onPromptChange(promptText);
+
     if (onImagesChange) {
-      onImagesChange(template.images);
+      onImagesChange(template.images || []);
     }
     if (onCustomDocxChange) {
-      onCustomDocxChange(template.docxFile || null);
+      onCustomDocxChange(docxData);
     }
     setAppliedTemplateName(template.name);
     setTimeout(() => {
@@ -543,29 +615,105 @@ const CustomPromptInput: React.FC<{
 
             {/* A. SAVED CUSTOM TEMPLATES TAB */}
             {activeTab === 'saved' && (
-              <div className="space-y-2">
+              <div className="space-y-3">
                 {templateSaveSuccess && (
                   <div className="p-2 text-xs text-green-700 bg-green-50 dark:bg-green-950/40 dark:text-green-300 border border-green-150 rounded-lg text-center animate-pulse">
                     ✓ Custom template saved permanently to your browser database!
                   </div>
                 )}
-                {savedTemplates.length === 0 ? (
-                  <div className="text-center py-6 border border-dashed border-slate-200 dark:border-slate-800 rounded-xl bg-slate-50/50 dark:bg-slate-950/35">
-                    <SparklesIcon className="w-8 h-8 text-slate-300 dark:text-slate-600 mx-auto mb-2" />
-                    <p className="text-sm font-semibold text-slate-600 dark:text-slate-300">No saved templates yet</p>
-                    <p className="text-xs text-slate-400 dark:text-slate-500 mt-1 mb-3">Create one to store text or screenshot guidelines permanently.</p>
+
+                {/* Filter and Search Bar for Templates */}
+                <div className="flex flex-col sm:flex-row gap-2 items-stretch sm:items-center justify-between pb-1">
+                  <div className="relative flex-1">
+                    <input
+                      type="text"
+                      value={savedSearchQuery}
+                      onChange={(e) => setSavedSearchQuery(e.target.value)}
+                      placeholder="Filter templates..."
+                      className="w-full py-1.5 pl-8 pr-6 text-xs border border-slate-200 dark:border-slate-800 rounded-lg bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200 placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    />
+                    <div className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400">
+                      <SearchIcon className="w-3.5 h-3.5" />
+                    </div>
+                    {savedSearchQuery && (
+                      <button
+                        type="button"
+                        onClick={() => setSavedSearchQuery('')}
+                        className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-slate-400 hover:text-slate-600"
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-1 bg-slate-100 dark:bg-slate-800/80 p-0.5 rounded-lg flex-shrink-0 text-[10px]">
                     <button
                       type="button"
-                      onClick={() => setActiveTab('create')}
+                      onClick={() => setSavedModalityFilter('ALL')}
+                      className={`px-2 py-1 rounded-md font-semibold transition-all ${
+                        savedModalityFilter === 'ALL'
+                          ? 'bg-white dark:bg-slate-700 text-blue-600 dark:text-blue-300 shadow-xs'
+                          : 'text-slate-500 hover:text-slate-800 dark:text-slate-400'
+                      }`}
+                    >
+                      All ({savedTemplates.length})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSavedModalityFilter('CT')}
+                      className={`px-2 py-1 rounded-md font-semibold transition-all ${
+                        savedModalityFilter === 'CT'
+                          ? 'bg-blue-600 text-white shadow-xs'
+                          : 'text-slate-500 hover:text-slate-800 dark:text-slate-400'
+                      }`}
+                    >
+                      CT
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSavedModalityFilter('MRI')}
+                      className={`px-2 py-1 rounded-md font-semibold transition-all ${
+                        savedModalityFilter === 'MRI'
+                          ? 'bg-purple-600 text-white shadow-xs'
+                          : 'text-slate-500 hover:text-slate-800 dark:text-slate-400'
+                      }`}
+                    >
+                      MRI
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSavedModalityFilter('USER')}
+                      className={`px-2 py-1 rounded-md font-semibold transition-all ${
+                        savedModalityFilter === 'USER'
+                          ? 'bg-amber-600 text-white shadow-xs'
+                          : 'text-slate-500 hover:text-slate-800 dark:text-slate-400'
+                      }`}
+                    >
+                      My Uploads
+                    </button>
+                  </div>
+                </div>
+
+                {filteredSavedTemplates.length === 0 ? (
+                  <div className="text-center py-6 border border-dashed border-slate-200 dark:border-slate-800 rounded-xl bg-slate-50/50 dark:bg-slate-950/35">
+                    <SparklesIcon className="w-8 h-8 text-slate-300 dark:text-slate-600 mx-auto mb-2" />
+                    <p className="text-sm font-semibold text-slate-600 dark:text-slate-300">No matching templates found</p>
+                    <p className="text-xs text-slate-400 dark:text-slate-500 mt-1 mb-3">Try adjusting your search query or modality filters.</p>
+                    <button
+                      type="button"
+                      onClick={() => { setSavedSearchQuery(''); setSavedModalityFilter('ALL'); }}
                       className="text-xs font-bold py-1.5 px-3 rounded-lg bg-blue-50 text-blue-700 hover:bg-blue-100 dark:bg-blue-950/40 dark:text-blue-300 border border-blue-100 dark:border-blue-900/50 transition-colors"
                     >
-                      + Create Custom Template
+                      Reset Filters
                     </button>
                   </div>
                 ) : (
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 max-h-60 overflow-y-auto pr-1">
-                    {savedTemplates.map((tmpl) => {
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 max-h-72 overflow-y-auto pr-1">
+                    {filteredSavedTemplates.map((tmpl) => {
                       const isConfirming = deletingTemplateId === tmpl.id;
+                      const isCT = (tmpl.modality || tmpl.category || '').toUpperCase().includes('CT');
+                      const isMRI = (tmpl.modality || tmpl.category || '').toUpperCase().includes('MRI');
+
                       return (
                         <div 
                           key={tmpl.id}
@@ -608,6 +756,20 @@ const CustomPromptInput: React.FC<{
                             </div>
 
                             <div className="flex flex-wrap items-center gap-1.5 mt-1">
+                              {tmpl.isBuiltIn && (
+                                <span className="text-[9px] bg-blue-100 dark:bg-blue-950 text-blue-700 dark:text-blue-300 font-bold px-1.5 py-0.5 rounded">
+                                  Built-In
+                                </span>
+                              )}
+                              {(isCT || isMRI) && (
+                                <span className={`text-[9px] font-extrabold px-1.5 py-0.5 rounded ${
+                                  isCT 
+                                    ? 'bg-blue-50 text-blue-700 dark:bg-blue-950/60 dark:text-blue-300 border border-blue-200 dark:border-blue-900' 
+                                    : 'bg-purple-50 text-purple-700 dark:bg-purple-950/60 dark:text-purple-300 border border-purple-200 dark:border-purple-900'
+                                }`}>
+                                  {isCT ? 'CT' : 'MRI'}
+                                </span>
+                              )}
                               {tmpl.docxFile && (
                                 <span className="text-[9px] bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 font-bold px-1.5 py-0.5 rounded border border-indigo-200 dark:border-indigo-900/50 flex items-center gap-1">
                                   📄 DOCX: {tmpl.docxFile.name} ({(tmpl.docxFile.size / 1024).toFixed(1)} KB)
@@ -623,13 +785,15 @@ const CustomPromptInput: React.FC<{
                                   📷 {tmpl.images.length} {tmpl.images.length === 1 ? 'screenshot' : 'screenshots'}
                                 </span>
                               )}
-                              <span className="text-[9px] text-slate-400 dark:text-slate-500">
-                                • {new Date(tmpl.createdAt).toLocaleDateString()}
-                              </span>
+                              {!tmpl.isBuiltIn && (
+                                <span className="text-[9px] text-slate-400 dark:text-slate-500">
+                                  • {new Date(tmpl.createdAt).toLocaleDateString()}
+                                </span>
+                              )}
                             </div>
 
                             {tmpl.text && (
-                              <p className="text-xs text-slate-500 dark:text-slate-400 mt-2 line-clamp-2 italic bg-white dark:bg-slate-950/50 p-2 rounded border border-slate-150/40 dark:border-slate-800/40 leading-relaxed">
+                              <p className="text-xs text-slate-500 dark:text-slate-400 mt-2 line-clamp-2 italic bg-white dark:bg-slate-950/50 p-2 rounded border border-slate-150/40 dark:border-slate-800/40 leading-relaxed font-mono">
                                 "{tmpl.text}"
                               </p>
                             )}

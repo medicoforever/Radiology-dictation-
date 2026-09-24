@@ -5,7 +5,7 @@ import YinYangMicIcon from './icons/YinYangMicIcon';
 import WarningIcon from './icons/WarningIcon';
 import DownloadIcon from './icons/DownloadIcon';
 import ResultsDisplay from './ResultsDisplay';
-import CustomPromptInput from './ui/CustomPromptInput';
+import CustomPromptInput, { DocxTemplateData } from './ui/CustomPromptInput';
 import { DEFAULT_LIVE_MODEL, LIVE_DICTATION_MODELS, getLiveModelFallbackChain } from '../constants';
 import { getIncompleteLiveAudioSessions, recoverLiveSessionAudioAsBlob, clearSessionAudioCache } from '../services/audioCacheService';
 import { triggerAudioDownload } from '../services/audioMerger';
@@ -19,7 +19,7 @@ const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack }) => 
     const [findings, setFindings] = useState<string[]>([]);
     const [customPrompt, setCustomPrompt] = useState('');
     const [customImages, setCustomImages] = useState<Array<{ data: string; mimeType: string }>>([]);
-    const [customDocx, setCustomDocx] = useState<{ name: string; text: string; html?: string } | null>(null);
+    const [customDocx, setCustomDocx] = useState<DocxTemplateData | null>(null);
     const [selectedModel, setSelectedModel] = useState<string>(DEFAULT_LIVE_MODEL || 'gemini-3.7-flash');
     const [interruptedSession, setInterruptedSession] = useState<{ sessionId: string; createdAt: number; totalChunks: number } | null>(null);
     const [isRecovering, setIsRecovering] = useState(false);

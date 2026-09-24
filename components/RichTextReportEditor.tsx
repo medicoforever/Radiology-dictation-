@@ -59,6 +59,15 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
     }
   };
 
+  const handleInsertTable = () => {
+    if (typeof document !== 'undefined' && editorRef.current) {
+      editorRef.current.focus();
+      const sampleTableHtml = `<table style="width: 100%; border-collapse: collapse; margin: 16px 0; border: 1px solid #cbd5e1; font-size: 13.5px;"><thead><tr style="background-color: #f1f5f9;"><th style="border: 1px solid #cbd5e1; padding: 8px 12px; text-align: left; font-weight: bold; color: #0f172a;">Parameter</th><th style="border: 1px solid #cbd5e1; padding: 8px 12px; text-align: left; font-weight: bold; color: #0f172a;">Measurement</th><th style="border: 1px solid #cbd5e1; padding: 8px 12px; text-align: left; font-weight: bold; color: #0f172a;">Reference / Status</th></tr></thead><tbody><tr><td style="border: 1px solid #cbd5e1; padding: 8px 12px; text-align: left; color: #334155;">Structure 1</td><td style="border: 1px solid #cbd5e1; padding: 8px 12px; text-align: left; color: #334155;">Normal</td><td style="border: 1px solid #cbd5e1; padding: 8px 12px; text-align: left; color: #334155;">Within normal limits</td></tr><tr style="background-color: #f8fafc;"><td style="border: 1px solid #cbd5e1; padding: 8px 12px; text-align: left; color: #334155;">Structure 2</td><td style="border: 1px solid #cbd5e1; padding: 8px 12px; text-align: left; color: #334155;">Normal</td><td style="border: 1px solid #cbd5e1; padding: 8px 12px; text-align: left; color: #334155;">Within normal limits</td></tr></tbody></table><p><br></p>`;
+      document.execCommand('insertHTML', false, sampleTableHtml);
+      handleInput();
+    }
+  };
+
   const handleCopyRichText = async () => {
     if (!editorRef.current) return;
     const html = editorRef.current.innerHTML;
@@ -125,6 +134,10 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
     .impression-section { margin-top: 24px; padding: 16px; background: #eff6ff; border-left: 4px solid #2563eb; border-radius: 6px; }
     ul { padding-left: 24px; margin-bottom: 12px; }
     li { margin-bottom: 6px; font-size: 14px; }
+    table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 13.5px; }
+    th, td { border: 1px solid #cbd5e1; padding: 8px 12px; text-align: left; vertical-align: top; }
+    th { background: #f1f5f9; font-weight: 700; color: #0f172a; }
+    tr:nth-child(even) td { background: #f8fafc; }
   </style>
 </head>
 <body>
@@ -190,6 +203,10 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
             .impression-section { margin-top: 20px; padding: 12px; background: #eff6ff; border: 1px solid #bfdbfe; }
             ul { padding-left: 20px; }
             li { margin-bottom: 6px; }
+            table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 10pt; }
+            th, td { border: 1px solid #cbd5e1; padding: 6px 10px; text-align: left; }
+            th { background: #f1f5f9; font-weight: bold; }
+            tr:nth-child(even) td { background: #f8fafc; }
           </style>
         </head>
         <body>
@@ -214,7 +231,23 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
       .filter(Boolean);
     
     if (paragraphs.length > 0) {
-      onUpdateFindings(paragraphs);
+      const sanitized = paragraphs.map(p => {
+        if (/^clinical\s*(profile|history):/i.test(p.replace(/^[*_\s]+/, ''))) {
+          const inner = p
+            .replace(/^[*_\s]+/, '')
+            .replace(/[*_\s]+$/, '')
+            .replace(/\.\*+$/, '.')
+            .replace(/[*_\s]+$/, '')
+            .replace(/^Clinical\s*(Profile|History)\s*:?\s*/i, 'Clinical Profile: ')
+            .replace(/^Clinical Profile:\s*\*+/i, 'Clinical Profile: ')
+            .replace(/[*_\s]+$/, '')
+            .replace(/^[*_\s]+/, '')
+            .trim();
+          return inner;
+        }
+        return p;
+      });
+      onUpdateFindings(sanitized);
       setIsSynced(true);
     }
   };
@@ -393,6 +426,18 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
             title="Numbered List"
           >
             1. List
+          </button>
+        </div>
+
+        {/* Table insert */}
+        <div className="flex items-center rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-700 overflow-hidden shadow-xs">
+          <button
+            type="button"
+            onClick={handleInsertTable}
+            className="px-2.5 h-7 flex items-center justify-center gap-1 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-600"
+            title="Insert Measurement/Report Table"
+          >
+            <span className="text-sm">⊞</span> Table
           </button>
         </div>
 

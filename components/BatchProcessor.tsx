@@ -26,14 +26,16 @@ import DownloadIcon from './icons/DownloadIcon';
 import ReorderIcon from './icons/ReorderIcon';
 import MergeIcon from './icons/MergeIcon';
 import MicScribbleIcon from './icons/MicScribbleIcon';
-import CustomPromptInput from './ui/CustomPromptInput';
+import CustomPromptInput, { DocxTemplateData } from './ui/CustomPromptInput';
+import ImageIcon from './icons/ImageIcon';
 import SparklesIcon from './icons/SparklesIcon';
 import { IdentifiedError } from '../types';
 import { AVAILABLE_MODELS } from '../constants';
 import WarningIcon from './icons/WarningIcon';
 import BrainIcon from './icons/BrainIcon';
 import { autoSaveBatchDictations, SaveResult, BatchFolderInfo, isDriveConnected, subscribeToAuth } from '../services/googleDriveService';
-import { generateDocxFromMarkdown, downloadFile } from '../services/docxService';
+import { generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText } from '../services/docxService';
+import { isClinicalProfileFinding, formatClinicalProfileText } from './ResultsDisplay';
 
 const BATCH_DRIVE_FOLDER_KEY = 'radiologyDictationBatchDriveFolder';
 const BATCH_SESSION_TIMESTAMP_KEY = 'radiologyDictationBatchSessionTimestamp';
@@ -56,6 +58,8 @@ interface Batch {
     selectedModel: string;
     customPrompt: string;
     customImages?: Array<{ data: string; mimeType: string }>;
+    customDocx?: DocxTemplateData | null;
+    extraFiles?: File[];
     error?: string;
     chat?: Chat | null;
     chatHistory?: ChatMessage[];
@@ -82,7 +86,7 @@ interface SerializableAudioBlob {
     data: string;
     type: string;
 }
-interface SerializableBatch extends Omit<Batch, 'audioBlobs' | 'chat'> {
+interface SerializableBatch extends Omit<Batch, 'audioBlobs' | 'chat' | 'extraFiles'> {
     audioCount?: number;
     audioBlobs?: SerializableAudioBlob[];
 }
@@ -90,17 +94,68 @@ interface SerializableBatch extends Omit<Batch, 'audioBlobs' | 'chat'> {
 const parseStructuredFinding = (finding: string) => {
   const parts = finding.split('###');
   if (parts.length > 1 && parts[0].trim() !== '') {
+    const isTable = isTableRowFinding(finding) || parts.every(p => p.includes('|'));
     return {
       isStructured: true,
+      isTable,
       title: parts[0],
       points: parts.slice(1).filter(p => p.trim() !== ''),
+      tableLines: parts.map(p => p.trim()).filter(Boolean),
     };
   }
+  const isTable = isTableRowFinding(finding);
   return {
     isStructured: false,
+    isTable,
     title: finding,
     points: [],
+    tableLines: isTable ? [finding] : [],
   };
+};
+
+const renderBatchTableFinding = (lines: string[]) => {
+  const rows = lines.map(line => parseTableRow(line));
+  if (rows.length === 0) return null;
+  const maxCols = Math.max(...rows.map(r => r.length), 1);
+  const header = rows[0];
+  const body = rows.slice(1);
+
+  return (
+    <div className="overflow-x-auto my-2 border border-slate-200 dark:border-slate-700 rounded-lg shadow-xs bg-white dark:bg-slate-900">
+      <table className="w-full text-xs text-left border-collapse">
+        <thead>
+          <tr className="bg-slate-100 dark:bg-slate-800 text-slate-800 dark:text-slate-100 font-bold border-b border-slate-200 dark:border-slate-700">
+            {header.map((col, idx) => (
+              <th key={idx} className="px-3 py-2 border-r last:border-r-0 border-slate-200 dark:border-slate-700">
+                {col.replace(/^BOLD::/i, '')}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {body.map((row, rIdx) => (
+            <tr 
+              key={rIdx} 
+              className={`border-b last:border-b-0 border-slate-200 dark:border-slate-800 ${
+                rIdx % 2 === 1 ? 'bg-slate-50/60 dark:bg-slate-850/50' : 'bg-white dark:bg-slate-900'
+              }`}
+            >
+              {Array.from({ length: maxCols }).map((_, cIdx) => {
+                const val = row[cIdx] || '';
+                const isBold = val.startsWith('BOLD::');
+                const cleanVal = val.replace(/^BOLD::/, '');
+                return (
+                  <td key={cIdx} className="px-3 py-2 border-r last:border-r-0 border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-300">
+                    {isBold ? <strong>{cleanVal}</strong> : cleanVal}
+                  </td>
+                );
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
 };
 
 
@@ -257,6 +312,76 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     const [pasteModalTargetBatchId, setPasteModalTargetBatchId] = useState<string | null>(null);
     const [clipboardPastedText, setClipboardPastedText] = useState('');
     const [driveBatchFolder, setDriveBatchFolder] = useState<BatchFolderInfo | null>(null);
+    const [batchExtraOptionsOpen, setBatchExtraOptionsOpen] = useState<{ [batchId: string]: boolean }>({});
+    const [batchExtraTextOpen, setBatchExtraTextOpen] = useState<{ [batchId: string]: boolean }>({});
+
+    const handleBatchExtraFilesSelected = (batchId: string, event: React.ChangeEvent<HTMLInputElement>) => {
+        const files: File[] = Array.from(event.target.files || []);
+        if (files.length > 0) {
+            const imageFiles = files.filter(f => f.type.startsWith('image/'));
+            const otherFiles = files.filter(f => !f.type.startsWith('image/'));
+
+            if (imageFiles.length > 0) {
+                imageFiles.forEach(imgFile => {
+                    const reader = new FileReader();
+                    reader.onloadend = () => {
+                        if (reader.result) {
+                            const base64data = (reader.result as string).split(',')[1];
+                            setBatches(prev => prev.map(b => b.id === batchId ? {
+                                ...b,
+                                customImages: [...(b.customImages || []), { data: base64data, mimeType: imgFile.type }]
+                            } : b));
+                        }
+                    };
+                    reader.readAsDataURL(imgFile);
+                });
+            }
+
+            if (otherFiles.length > 0) {
+                setBatches(prev => prev.map(b => b.id === batchId ? {
+                    ...b,
+                    extraFiles: [...(b.extraFiles || []), ...otherFiles]
+                } : b));
+            }
+            setBatchExtraOptionsOpen(prev => ({ ...prev, [batchId]: true }));
+        }
+        if (event.target) event.target.value = '';
+    };
+
+    const handleBatchExtraImagesSelected = (batchId: string, event: React.ChangeEvent<HTMLInputElement>) => {
+        const files: File[] = Array.from(event.target.files || []);
+        if (files.length > 0) {
+            files.forEach(imgFile => {
+                const reader = new FileReader();
+                reader.onloadend = () => {
+                    if (reader.result) {
+                        const base64data = (reader.result as string).split(',')[1];
+                        setBatches(prev => prev.map(b => b.id === batchId ? {
+                            ...b,
+                            customImages: [...(b.customImages || []), { data: base64data, mimeType: imgFile.type }]
+                        } : b));
+                    }
+                };
+                reader.readAsDataURL(imgFile);
+            });
+            setBatchExtraOptionsOpen(prev => ({ ...prev, [batchId]: true }));
+        }
+        if (event.target) event.target.value = '';
+    };
+
+    const handleRemoveBatchExtraFile = (batchId: string, index: number) => {
+        setBatches(prev => prev.map(b => b.id === batchId ? {
+            ...b,
+            extraFiles: (b.extraFiles || []).filter((_, i) => i !== index)
+        } : b));
+    };
+
+    const handleRemoveBatchCustomImage = (batchId: string, index: number) => {
+        setBatches(prev => prev.map(b => b.id === batchId ? {
+            ...b,
+            customImages: (b.customImages || []).filter((_, i) => i !== index)
+        } : b));
+    };
 
     // Global Ctrl+V listener to directly capture text pastes when not actively recording or typing
     useEffect(() => {
@@ -763,6 +888,10 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         setBatches(prev => prev.map(b => b.id === id ? { ...b, customImages: images } : b));
     };
 
+    const updateBatchCustomDocx = (id: string, docx: DocxTemplateData | null) => {
+        setBatches(prev => prev.map(b => b.id === id ? { ...b, customDocx: docx } : b));
+    };
+
     const handleRecordOrResume = async (batch: Batch) => {
         if (isBusy) return;
         setIsBusy(true);
@@ -1092,7 +1221,8 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     
     const handleReprocessBatch = async (batchId: string) => {
         const batch = batches.find(b => b.id === batchId);
-        if (!batch || batch.audioBlobs.length === 0) return;
+        const allBlobs = [...(batch?.audioBlobs || []), ...(batch?.extraFiles || [])];
+        if (!batch || allBlobs.length === 0) return;
 
         if (batch && batch.findings) {
             setUndoStates(prev => ({ ...prev, [batchId]: [...batch.findings!] }));
@@ -1104,19 +1234,18 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         setBatches(prev => prev.map(b => b.id === batchId ? {...b, status: 'processing', error: undefined } : b));
 
         try {
-            const mergedBlob = await mergeMultipleAudioBlobs(batch.audioBlobs);
-            const findings = await processAudio(mergedBlob, batch.selectedModel, batch.customPrompt, batch.customImages);
+            const findings = await processAudio(allBlobs, batch.selectedModel, batch.customPrompt, batch.customImages, undefined, batch.customDocx);
             
             if (batchProcessingIdRef.current[batchId] !== currentReqId) return;
 
-            const chatSession = await createChat(mergedBlob, findings, batch.customPrompt, batch.customImages, batch.selectedModel);
+            const chatSession = await createChat(allBlobs, findings, batch.customPrompt, batch.customImages, batch.selectedModel);
             const aiGreeting = "I have reviewed the audio and transcript for this dictation. How can I help you further?";
             const initialChatHistory = [{ author: 'AI' as const, text: `${findings.join('\n\n')}\n\n${aiGreeting}` }];
 
             if (batchProcessingIdRef.current[batchId] !== currentReqId) return;
 
             setBatches(prev => {
-                const updated = prev.map(b => b.id === batchId ? { ...b, status: 'complete', findings, chat: chatSession, chatHistory: initialChatHistory, isChatting: false } : b);
+                const updated = prev.map(b => b.id === batchId ? { ...b, audioBlobs: allBlobs, extraFiles: [], status: 'complete', findings, chat: chatSession, chatHistory: initialChatHistory, isChatting: false } : b);
                 saveBatchesToDrive(updated);
                 return updated;
             });
@@ -1221,13 +1350,21 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
           const isBold = finding.includes('BOLD::');
           const cleanFinding = finding.replace(/BOLD::/g, '');
           const isTitle = cleanFinding.trim() === 'C.T.SCAN OF BRAIN (PLAIN)';
-          const { isStructured, title, points } = parseStructuredFinding(cleanFinding);
-          const isImpression = isStructured && title.trim().toUpperCase() === 'IMPRESSION:';
-          const isItalic = !isStructured && cleanFinding.startsWith('*') && cleanFinding.endsWith('*');
+          const isClinicalProfile = isClinicalProfileFinding(cleanFinding);
+          const { isStructured, isTable, title, points, tableLines } = parseStructuredFinding(cleanFinding);
+          const isImpression = isStructured && !isTable && title.trim().toUpperCase() === 'IMPRESSION:';
+          const isItalic = !isTable && (isClinicalProfile || (!isStructured && cleanFinding.startsWith('*') && cleanFinding.endsWith('*')));
           
           if (isTitle) {
             acc.plain.push(cleanFinding);
             acc.html.push(`<p style="text-align:center;"><strong><u>${cleanFinding}</u></strong></p>`);
+          } else if (isClinicalProfile) {
+            const profText = formatClinicalProfileText(cleanFinding);
+            acc.plain.push(profText);
+            acc.html.push(`<p><em>${profText}</em></p>`);
+          } else if (isTable) {
+            acc.plain.push(tableToPlainText(tableLines));
+            acc.html.push(parseMarkdownTable(tableLines));
           } else if (isImpression) {
             acc.plain.push(`${title.toUpperCase()}\n${points.map(p => `• ${p}`).join('\n')}`);
             acc.html.push(`<p><strong style="text-decoration: underline;">${title.toUpperCase()}</strong></p><ul>${points.map(p => `<li><strong>${p}</strong></li>`).join('')}</ul>`);
@@ -1325,15 +1462,22 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         const isBold = findingToCopy.includes('BOLD::');
         const cleanFinding = findingToCopy.replace(/BOLD::/g, '');
         const isTitle = cleanFinding.trim() === 'C.T.SCAN OF BRAIN (PLAIN)';
-        const { isStructured, title, points } = parseStructuredFinding(cleanFinding);
-        const isImpression = isStructured && title.trim().toUpperCase() === 'IMPRESSION:';
-        const isItalic = !isStructured && cleanFinding.startsWith('*') && cleanFinding.endsWith('*');
+        const isClinicalProfile = isClinicalProfileFinding(cleanFinding);
+        const { isStructured, isTable, title, points, tableLines } = parseStructuredFinding(cleanFinding);
+        const isImpression = isStructured && !isTable && title.trim().toUpperCase() === 'IMPRESSION:';
+        const isItalic = !isTable && (isClinicalProfile || (!isStructured && cleanFinding.startsWith('*') && cleanFinding.endsWith('*')));
         let plainText: string;
         let htmlText: string;
         
         if (isTitle) {
           plainText = cleanFinding;
           htmlText = `<p style="text-align:center;"><strong><u>${cleanFinding}</u></strong></p>`;
+        } else if (isClinicalProfile) {
+          plainText = formatClinicalProfileText(cleanFinding);
+          htmlText = `<p><em>${plainText}</em></p>`;
+        } else if (isTable) {
+          plainText = tableToPlainText(tableLines);
+          htmlText = parseMarkdownTable(tableLines);
         } else if (isImpression) {
             plainText = `${title.toUpperCase()}\n${points.map(p => `• ${p}`).join('\n')}`;
             htmlText = `<p><strong style="text-decoration: underline;">${title.toUpperCase()}</strong></p><ul>${points.map(p => `<li><strong>${p}</strong></li>`).join('')}</ul>`;
@@ -1375,10 +1519,16 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         const allTextPlain = batch.findings.map(f => {
             const isBold = f.includes('BOLD::');
             const cleanFinding = f.replace(/BOLD::/g, '');
-            const { isStructured, title, points } = parseStructuredFinding(cleanFinding);
-            const isImpression = isStructured && title.trim().toUpperCase() === 'IMPRESSION:';
+            const { isStructured, isTable, title, points, tableLines } = parseStructuredFinding(cleanFinding);
+            const isImpression = isStructured && !isTable && title.trim().toUpperCase() === 'IMPRESSION:';
+            if (isTable) {
+              return tableToPlainText(tableLines);
+            }
             if (isImpression) {
                 return `${title.toUpperCase()}\n${points.map(p => `• ${p}`).join('\n')}`;
+            }
+            if (isClinicalProfileFinding(cleanFinding)) {
+                return formatClinicalProfileText(cleanFinding);
             }
             if (isStructured) {
               return [title, ...points].join('\n');
@@ -1393,13 +1543,19 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             const isBold = f.includes('BOLD::');
             const cleanFinding = f.replace(/BOLD::/g, '');
             const isTitle = cleanFinding.trim() === 'C.T.SCAN OF BRAIN (PLAIN)';
-            const { isStructured, title, points } = parseStructuredFinding(cleanFinding);
-            const isImpression = isStructured && title.trim().toUpperCase() === 'IMPRESSION:';
+            const { isStructured, isTable, title, points, tableLines } = parseStructuredFinding(cleanFinding);
+            const isImpression = isStructured && !isTable && title.trim().toUpperCase() === 'IMPRESSION:';
             if (isTitle) {
               return `<p style="text-align:center;"><strong><u>${cleanFinding}</u></strong></p>`;
             }
+            if (isTable) {
+              return parseMarkdownTable(tableLines);
+            }
             if (isImpression) {
                 return `<p><strong style="text-decoration: underline;">${title.toUpperCase()}</strong></p><ul>${points.map(p => `<li><strong>${p}</strong></li>`).join('')}</ul>`;
+            }
+            if (isClinicalProfileFinding(cleanFinding)) {
+                return `<p><em>${formatClinicalProfileText(cleanFinding)}</em></p>`;
             }
             if (isStructured) {
                 let htmlContent = isBold ? `<p><strong>${title}</strong></p>` : `<p>${title}</p>`;
@@ -1437,6 +1593,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                 const { isStructured, title, points } = parseStructuredFinding(cleanFinding);
                 const isImpression = isStructured && title.trim().toUpperCase() === 'IMPRESSION:';
                 if (isImpression) return `${title.toUpperCase()}\n${points.map(p => `• ${p}`).join('\n')}`;
+                if (isClinicalProfileFinding(cleanFinding)) return formatClinicalProfileText(cleanFinding);
                 if (isStructured) return [title, ...points].join('\n');
                 if (cleanFinding.startsWith('*') && cleanFinding.endsWith('*')) return cleanFinding.slice(1, -1);
                 return cleanFinding;
@@ -1449,6 +1606,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                 const isImpression = isStructured && title.trim().toUpperCase() === 'IMPRESSION:';
                 if (isTitle) return `<p style="text-align:center;"><strong><u>${cleanFinding}</u></strong></p>`;
                 if (isImpression) return `<p><strong style="text-decoration: underline;">${title.toUpperCase()}</strong></p><ul>${points.map(p => `<li><strong>${p}</strong></li>`).join('')}</ul>`;
+                if (isClinicalProfileFinding(cleanFinding)) return `<p><em>${formatClinicalProfileText(cleanFinding)}</em></p>`;
                 if (isStructured) {
                   let htmlContent = isBold ? `<p><strong>${title}</strong></p>` : `<p>${title}</p>`;
                   htmlContent += points.map(p => isBold ? `<p><strong>${p}</strong></p>` : `<p>${p}</p>`).join('');
@@ -1507,8 +1665,13 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         const findingToEdit = batch.findings[index];
         const isBold = findingToEdit.includes('BOLD::');
         const cleanFinding = findingToEdit.replace(/BOLD::/g, '');
+        const isClinicalProfile = isClinicalProfileFinding(cleanFinding);
         const { isStructured, title, points } = parseStructuredFinding(cleanFinding);
-        const textForEditing = isStructured ? [title, ...points].join('\n') : cleanFinding;
+        const textForEditing = isClinicalProfile
+            ? formatClinicalProfileText(cleanFinding)
+            : isStructured
+            ? [title, ...points].join('\n')
+            : cleanFinding;
         
         setEditingText(textForEditing);
         setDictatingState(null);
@@ -1559,9 +1722,11 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                 let newText = editingText;
                 if (isStructured) {
                     newText = editingText.split('\n').filter(line => line.trim() !== '').join('###');
+                } else if (isClinicalProfileFinding(editingText)) {
+                    newText = formatClinicalProfileText(editingText);
                 }
                 
-                if (isBold && !newText.startsWith('BOLD::')) {
+                if (isBold && !newText.startsWith('BOLD::') && !isClinicalProfileFinding(newText)) {
                   newText = `BOLD::${newText}`;
                 }
 
@@ -2552,33 +2717,186 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                     )}
                                                   </div>
                                                 </div>
-                                                <div className="bg-slate-100 dark:bg-slate-900/50 p-3 rounded-lg mb-4 flex flex-col sm:flex-row items-center justify-between gap-3 shadow-sm">
-                                                    <div className="flex items-center gap-2 w-full sm:w-auto">
-                                                        <label htmlFor={`model-select-${batch.id}`} className="text-sm font-medium text-slate-700 dark:text-slate-300 whitespace-nowrap">Process again with:</label>
-                                                        <select 
-                                                            id={`model-select-${batch.id}`}
-                                                            value={batch.selectedModel}
-                                                            onChange={(e) => updateBatchModel(batch.id, e.target.value)}
-                                                            className="bg-white border border-slate-300 text-slate-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block p-2 w-full dark:bg-slate-700 dark:border-slate-600 dark:text-white"
-                                                            aria-label="Select AI model for reprocessing"
-                                                        >
-                                                            {AVAILABLE_MODELS.map((model) => (
-                                                                <option key={model.value} value={model.value}>{model.label}</option>
-                                                            ))}
-                                                        </select>
+                                                <div className="bg-slate-100 dark:bg-slate-900/50 p-3.5 rounded-xl mb-4 shadow-sm border border-slate-200/80 dark:border-slate-800">
+                                                    <div className="flex flex-col sm:flex-row items-center justify-between gap-3">
+                                                        <div className="flex items-center gap-2 w-full sm:w-auto">
+                                                            <label htmlFor={`model-select-${batch.id}`} className="text-sm font-medium text-slate-700 dark:text-slate-300 whitespace-nowrap">Process again with:</label>
+                                                            <select 
+                                                                id={`model-select-${batch.id}`}
+                                                                value={batch.selectedModel}
+                                                                onChange={(e) => updateBatchModel(batch.id, e.target.value)}
+                                                                className="bg-white border border-slate-300 text-slate-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block p-2 w-full sm:w-auto dark:bg-slate-700 dark:border-slate-600 dark:text-white"
+                                                                aria-label="Select AI model for reprocessing"
+                                                            >
+                                                                {AVAILABLE_MODELS.map((model) => (
+                                                                    <option key={model.value} value={model.value}>{model.label}</option>
+                                                                ))}
+                                                            </select>
+                                                        </div>
+
+                                                        <div className="flex items-center gap-2 w-full sm:w-auto justify-end flex-wrap">
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => setBatchExtraOptionsOpen(prev => ({ ...prev, [batch.id]: !prev[batch.id] }))}
+                                                                className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold transition-all border ${
+                                                                    batchExtraOptionsOpen[batch.id] || (batch.extraFiles && batch.extraFiles.length > 0) || (batch.customImages && batch.customImages.length > 0)
+                                                                        ? 'bg-blue-50 dark:bg-blue-950/60 border-blue-400 dark:border-blue-700 text-blue-700 dark:text-blue-300'
+                                                                        : 'bg-white dark:bg-slate-800 border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700'
+                                                                }`}
+                                                                title="Add extra files, images, or instructions to update the transcript for this batch"
+                                                            >
+                                                                <span>📎</span>
+                                                                <span>Add File(s) / Image(s) / Text</span>
+                                                                {(((batch.extraFiles?.length || 0) + (batch.customImages?.length || 0) + (batch.customPrompt?.trim().length > 0 ? 1 : 0)) > 0) && (
+                                                                    <span className="ml-1 px-1.5 py-0.2 rounded-full text-[10px] bg-blue-600 text-white font-bold">
+                                                                        {(batch.extraFiles?.length || 0) + (batch.customImages?.length || 0) + (batch.customPrompt?.trim().length > 0 ? 1 : 0)}
+                                                                    </span>
+                                                                )}
+                                                            </button>
+
+                                                            <button
+                                                                onClick={() => handleReprocessBatch(batch.id)}
+                                                                className="bg-blue-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50 transition-colors w-full sm:w-auto flex-shrink-0"
+                                                            >
+                                                                Update Transcript
+                                                            </button>
+                                                        </div>
                                                     </div>
-                                                    <button
-                                                        onClick={() => handleReprocessBatch(batch.id)}
-                                                        className="bg-blue-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50 transition-colors w-full sm:w-auto flex-shrink-0"
-                                                        >
-                                                        Update Transcript
-                                                    </button>
+
+                                                    {/* Collapsible / Expandable Extra Options Panel for Batch */}
+                                                    {batchExtraOptionsOpen[batch.id] && (
+                                                        <div className="mt-3 pt-3 border-t border-slate-200 dark:border-slate-700/80 flex flex-col gap-3">
+                                                            <input 
+                                                                type="file" 
+                                                                id={`batch-extra-files-${batch.id}`}
+                                                                onChange={(e) => handleBatchExtraFilesSelected(batch.id, e)} 
+                                                                multiple 
+                                                                accept="audio/*,video/*,image/*,.pdf,.doc,.docx,.txt,.csv,.rtf,.webm,.mp4,.mp3,.wav,.m4a,.png,.jpg,.jpeg" 
+                                                                className="hidden" 
+                                                                aria-hidden="true" 
+                                                            />
+                                                            <input 
+                                                                type="file" 
+                                                                id={`batch-extra-images-${batch.id}`}
+                                                                onChange={(e) => handleBatchExtraImagesSelected(batch.id, e)} 
+                                                                multiple 
+                                                                accept="image/*" 
+                                                                className="hidden" 
+                                                                aria-hidden="true" 
+                                                            />
+
+                                                            <div className="flex flex-wrap items-center gap-2">
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={() => document.getElementById(`batch-extra-files-${batch.id}`)?.click()}
+                                                                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 transition-colors shadow-xs"
+                                                                >
+                                                                    <UploadIcon className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+                                                                    <span>+ Add File(s) (Audio, PDF, DOCX, TXT)</span>
+                                                                </button>
+
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={() => document.getElementById(`batch-extra-images-${batch.id}`)?.click()}
+                                                                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 transition-colors shadow-xs"
+                                                                >
+                                                                    <ImageIcon className="w-3.5 h-3.5 text-indigo-600 dark:text-indigo-400" />
+                                                                    <span>+ Add Image(s) / Scan</span>
+                                                                </button>
+
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={() => setBatchExtraTextOpen(prev => ({ ...prev, [batch.id]: !prev[batch.id] }))}
+                                                                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors shadow-xs ${
+                                                                        batchExtraTextOpen[batch.id] || (batch.customPrompt && batch.customPrompt.trim().length > 0)
+                                                                            ? 'bg-blue-100 dark:bg-blue-900/60 border-blue-400 text-blue-800 dark:text-blue-200'
+                                                                            : 'bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200'
+                                                                    }`}
+                                                                >
+                                                                    <PencilIcon className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+                                                                    <span>{batchExtraTextOpen[batch.id] ? 'Hide Extra Text' : '+ Add Extra Text / Notes'}</span>
+                                                                </button>
+                                                            </div>
+
+                                                            {/* Staged Extra Files List */}
+                                                            {batch.extraFiles && batch.extraFiles.length > 0 && (
+                                                                <div className="flex flex-wrap items-center gap-2 pt-1">
+                                                                    <span className="text-xs font-semibold text-slate-500 dark:text-slate-400">Attached Files:</span>
+                                                                    {batch.extraFiles.map((file, fIdx) => (
+                                                                        <div key={`batch-extra-f-${batch.id}-${fIdx}`} className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-blue-50 dark:bg-blue-900/40 border border-blue-200 dark:border-blue-800 text-xs font-medium text-blue-900 dark:text-blue-200">
+                                                                            <span className="truncate max-w-[140px]" title={file.name}>{file.name}</span>
+                                                                            <span className="text-[10px] text-blue-600 dark:text-blue-400">({(file.size / 1024).toFixed(0)} KB)</span>
+                                                                            <button
+                                                                                type="button"
+                                                                                onClick={() => handleRemoveBatchExtraFile(batch.id, fIdx)}
+                                                                                className="text-blue-500 hover:text-red-600 dark:hover:text-red-400 font-bold ml-0.5"
+                                                                                title="Remove file"
+                                                                                aria-label={`Remove file ${file.name}`}
+                                                                            >
+                                                                                ✕
+                                                                            </button>
+                                                                        </div>
+                                                                    ))}
+                                                                </div>
+                                                            )}
+
+                                                            {/* Staged Extra Images List */}
+                                                            {batch.customImages && batch.customImages.length > 0 && (
+                                                                <div className="flex flex-wrap items-center gap-2 pt-1">
+                                                                    <span className="text-xs font-semibold text-slate-500 dark:text-slate-400">Reference Images:</span>
+                                                                    {batch.customImages.map((img, iIdx) => (
+                                                                        <div key={`batch-extra-img-${batch.id}-${iIdx}`} className="relative group inline-flex items-center gap-1 p-1 rounded-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700">
+                                                                            <img src={`data:${img.mimeType};base64,${img.data}`} alt="Ref" className="w-8 h-8 rounded object-cover" />
+                                                                            <button
+                                                                                type="button"
+                                                                                onClick={() => handleRemoveBatchCustomImage(batch.id, iIdx)}
+                                                                                className="text-slate-400 hover:text-red-600 dark:hover:text-red-400 font-bold px-1 text-xs"
+                                                                                title="Remove image"
+                                                                                aria-label="Remove image"
+                                                                            >
+                                                                                ✕
+                                                                            </button>
+                                                                        </div>
+                                                                    ))}
+                                                                </div>
+                                                            )}
+
+                                                            {/* Staged Extra Text Area */}
+                                                            {(batchExtraTextOpen[batch.id] || (batch.customPrompt && batch.customPrompt.trim().length > 0)) && (
+                                                                <div className="flex flex-col gap-1.5 pt-1">
+                                                                    <div className="flex items-center justify-between">
+                                                                        <label className="text-xs font-semibold text-slate-700 dark:text-slate-300">
+                                                                            Extra Instructions / Text Notes for Batch Update:
+                                                                        </label>
+                                                                        {batch.customPrompt && batch.customPrompt.trim().length > 0 && (
+                                                                            <button
+                                                                                type="button"
+                                                                                onClick={() => updateBatchCustomPrompt(batch.id, '')}
+                                                                                className="text-[11px] text-red-500 hover:underline"
+                                                                            >
+                                                                                Clear Text
+                                                                            </button>
+                                                                        )}
+                                                                    </div>
+                                                                    <textarea
+                                                                        value={batch.customPrompt || ''}
+                                                                        onChange={(e) => updateBatchCustomPrompt(batch.id, e.target.value)}
+                                                                        placeholder="Add any extra notes, clinical corrections, or dictation instructions to apply when updating this batch..."
+                                                                        className="w-full text-xs p-2.5 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-100 focus:ring-2 focus:ring-blue-500 focus:outline-none resize-y min-h-[60px]"
+                                                                        rows={2}
+                                                                    />
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    )}
                                                 </div>
                                                 <CustomPromptInput 
                                                     prompt={batch.customPrompt}
                                                     onPromptChange={(p) => updateBatchCustomPrompt(batch.id, p)}
                                                     images={batch.customImages || []}
                                                     onImagesChange={(imgs) => updateBatchCustomImages(batch.id, imgs)}
+                                                    customDocx={batch.customDocx}
+                                                    onCustomDocxChange={(docx) => updateBatchCustomDocx(batch.id, docx)}
                                                     selectedModel={batch.selectedModel || selectedModel}
                                                     className="mb-6"
                                                 />
@@ -2714,9 +3032,16 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                         const isBold = finding.includes('BOLD::');
                                                         const cleanFinding = finding.replace(/BOLD::/g, '');
                                                         const isTitle = cleanFinding.trim() === 'C.T.SCAN OF BRAIN (PLAIN)';
-                                                        const { isStructured, title, points } = parseStructuredFinding(cleanFinding);
-                                                        const isItalic = !isStructured && cleanFinding.startsWith('*') && cleanFinding.endsWith('*');
-                                                        const textToDisplay = isItalic ? cleanFinding.slice(1, -1) : isStructured ? title : cleanFinding;
+                                                        const isClinicalProfile = isClinicalProfileFinding(cleanFinding);
+                                                        const { isStructured, isTable, title, points, tableLines } = parseStructuredFinding(cleanFinding);
+                                                        const isItalic = !isTable && (isClinicalProfile || (!isStructured && cleanFinding.startsWith('*') && cleanFinding.endsWith('*')));
+                                                        const textToDisplay = isClinicalProfile 
+                                                            ? formatClinicalProfileText(cleanFinding) 
+                                                            : isItalic 
+                                                            ? cleanFinding.slice(1, -1) 
+                                                            : isStructured 
+                                                            ? title 
+                                                            : cleanFinding;
 
                                                         const textContainerClasses = isTitle
                                                             ? 'text-center font-bold underline'
@@ -2886,6 +3211,8 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                                                         ))}
                                                                                     </ul>
                                                                                 </>
+                                                                            ) : isTable ? (
+                                                                                renderBatchTableFinding(tableLines)
                                                                             ) : isStructured ? (
                                                                               <>
                                                                                 <span>{title}</span>
