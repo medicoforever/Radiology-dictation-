@@ -29,9 +29,10 @@ import { autoSaveSingleDictation, autoSaveLiveDictation, SaveResult, syncPending
 import { DriveStatusBadge } from './components/DriveStatusBadge';
 import { DriveAutoSaveToast } from './components/DriveAutoSaveToast';
 import { DriveReportsModal } from './components/DriveReportsModal';
-import { RotateCcw, X, ExternalLink, Power, Sparkles, Trash2, Download, Settings } from 'lucide-react';
+import { RotateCcw, X, ExternalLink, Power, Sparkles, Trash2, Download, Settings, ShieldCheck } from 'lucide-react';
 import WorkstationSyncModal from './components/WorkstationSyncModal';
 import { checkAndAutoSyncReport } from './services/workstationSync';
+import { OwnershipModal } from './components/ui/OwnershipModal';
 
 interface ChatMessage {
   author: 'You' | 'AI';
@@ -122,6 +123,7 @@ const App: React.FC = () => {
   const [pendingBatchFiles, setPendingBatchFiles] = useState<File[] | null>(null);
   const [isReportsModalOpen, setIsReportsModalOpen] = useState<boolean>(false);
   const [isWorkstationSyncModalOpen, setIsWorkstationSyncModalOpen] = useState<boolean>(false);
+  const [isOwnershipModalOpen, setIsOwnershipModalOpen] = useState<boolean>(false);
   const [syncToastMessage, setSyncToastMessage] = useState<string | null>(null);
   const syncToastTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
@@ -1467,6 +1469,28 @@ const App: React.FC = () => {
                 </a>
               </li>
             </ul>
+
+            {/* Legal Authorship, Copyright & Provenance Claim */}
+            <div className="mt-4 pt-3.5 border-t border-slate-200/80 dark:border-slate-700/80 flex flex-col sm:flex-row items-center justify-between gap-3 text-center sm:text-left">
+              <div className="flex flex-col gap-0.5 min-w-0">
+                <p className="text-[11px] sm:text-xs font-semibold text-slate-700 dark:text-slate-300">
+                  © 2024–2026 <span className="font-bold text-slate-900 dark:text-white">RADDOC™</span> • Created &amp; Authored by <span className="font-mono text-blue-600 dark:text-blue-400 font-medium">medicoforever002@gmail.com</span>
+                </p>
+                <p className="text-[10px] sm:text-[11px] text-slate-500 dark:text-slate-400">
+                  Proprietary medical AI dictation software • All Rights Reserved
+                </p>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setIsOwnershipModalOpen(true)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-blue-50 hover:bg-blue-100 dark:bg-slate-700/90 dark:hover:bg-slate-700 text-blue-700 dark:text-blue-300 font-semibold text-xs border border-blue-200 dark:border-slate-600 transition-colors shadow-2xs cursor-pointer shrink-0"
+                title="View legal authorship certificate, canonical Applet ID, and copyright terms"
+              >
+                <ShieldCheck className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+                <span>Legal Ownership &amp; Provenance</span>
+              </button>
+            </div>
           </div>
         </footer>
 
@@ -1626,6 +1650,12 @@ const App: React.FC = () => {
           isOpen={isWorkstationSyncModalOpen}
           onClose={() => setIsWorkstationSyncModalOpen(false)}
           onSaved={handleWorkstationSettingsSaved}
+        />
+
+        {/* Ownership & Provenance Certificate Modal */}
+        <OwnershipModal
+          isOpen={isOwnershipModalOpen}
+          onClose={() => setIsOwnershipModalOpen(false)}
         />
 
         {/* Workstation Sync Saved Toast */}

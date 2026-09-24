@@ -1,3 +1,13 @@
+/**
+ * PROPRIETARY CLINICAL TEMPLATE DATABASE
+ * (C) 2024-2026 RADDOC™ - Medical AI Dictation Suite
+ * Author & Registered Creator: medicoforever002@gmail.com
+ * Canonical Applet ID: 3f0807e3-2494-4289-a3a6-c12032da731c
+ * Digital Provenance Hash: RADDOC-SHA256:3f0807e3-2494-4289-a3a6-c12032da731c:medicoforever002@gmail.com:ORIGIN
+ * All Rights Reserved. Commercial reproduction, uncredited redistribution, or extraction
+ * without express written consent from the author is strictly prohibited under international copyright laws.
+ */
+
 export interface BuiltInTemplateItem {
   id: string;
   name: string;

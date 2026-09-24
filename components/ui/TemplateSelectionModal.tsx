@@ -91,10 +91,6 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
     }
   }, [filteredTemplates, selectedPreview]);
 
-  if (!isOpen) {
-    return null;
-  }
-
   // Parse details for preview pane
   const parsedPreview = useMemo(() => {
     if (!selectedPreview) return null;
@@ -143,6 +139,10 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
 
     return { title, technique, findings, impression };
   }, [selectedPreview]);
+
+  if (!isOpen) {
+    return null;
+  }
 
   return (
     <div

@@ -362,6 +362,11 @@ const CustomPromptInput: React.FC<{
   };
 
   const handleDeleteCustomTemplate = async (id: string) => {
+    // Built-in templates cannot be deleted
+    if (id.startsWith('builtin_') || id.startsWith('tpl_')) {
+      setDeletingTemplateId(null);
+      return;
+    }
     try {
       await deleteUserTemplate(id);
       setDeletingTemplateId(null);
@@ -725,12 +730,19 @@ const CustomPromptInput: React.FC<{
                                 {tmpl.name}
                               </h4>
                               
-                              {!isConfirming ? (
+                              {tmpl.isBuiltIn ? (
+                                <span 
+                                  className="inline-flex items-center gap-1 text-[10px] font-semibold text-slate-500 dark:text-slate-400 bg-slate-100 dark:bg-slate-800/80 px-1.5 py-0.5 rounded border border-slate-200/80 dark:border-slate-700/80 flex-shrink-0 select-none"
+                                  title="Built-in clinical template (permanent, non-deletable)"
+                                >
+                                  <span className="text-[10px]">🔒</span> Built-in
+                                </span>
+                              ) : !isConfirming ? (
                                 <button
                                   type="button"
                                   onClick={() => setDeletingTemplateId(tmpl.id)}
                                   className="text-slate-400 hover:text-red-500 p-0.5 rounded-md hover:bg-red-50 dark:hover:bg-red-950/20 transition-all flex-shrink-0"
-                                  title="Delete template permanently"
+                                  title="Delete custom template permanently"
                                 >
                                   <TrashIcon className="w-3.5 h-3.5" />
                                 </button>
@@ -756,9 +768,9 @@ const CustomPromptInput: React.FC<{
                             </div>
 
                             <div className="flex flex-wrap items-center gap-1.5 mt-1">
-                              {tmpl.isBuiltIn && (
-                                <span className="text-[9px] bg-blue-100 dark:bg-blue-950 text-blue-700 dark:text-blue-300 font-bold px-1.5 py-0.5 rounded">
-                                  Built-In
+                              {!tmpl.isBuiltIn && (
+                                <span className="text-[9px] bg-amber-50 dark:bg-amber-950/50 text-amber-700 dark:text-amber-300 font-bold px-1.5 py-0.5 rounded border border-amber-200/80 dark:border-amber-900/50">
+                                  Custom
                                 </span>
                               )}
                               {(isCT || isMRI) && (

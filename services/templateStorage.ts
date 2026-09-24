@@ -25,27 +25,7 @@ const STORE_TEMPLATES = 'user_templates';
 const DB_VERSION = 1;
 const HIDDEN_BUILTINS_KEY = 'rad_hidden_builtin_templates';
 
-function getHiddenBuiltinIds(): Set<string> {
-  try {
-    if (typeof window === 'undefined' || !window.localStorage) return new Set();
-    const raw = localStorage.getItem(HIDDEN_BUILTINS_KEY);
-    if (raw) {
-      const arr = JSON.parse(raw);
-      if (Array.isArray(arr)) return new Set(arr);
-    }
-  } catch {}
-  return new Set();
-}
-
-function saveHiddenBuiltinId(id: string) {
-  try {
-    if (typeof window === 'undefined' || !window.localStorage) return;
-    const current = getHiddenBuiltinIds();
-    current.add(id);
-    localStorage.setItem(HIDDEN_BUILTINS_KEY, JSON.stringify(Array.from(current)));
-  } catch {}
-}
-
+// Ensure any previously hidden built-in IDs are purged so all 72 built-in templates are always visible
 export function restoreAllBuiltInTemplates(): void {
   try {
     if (typeof window !== 'undefined' && window.localStorage) {
@@ -53,6 +33,9 @@ export function restoreAllBuiltInTemplates(): void {
     }
   } catch {}
 }
+
+// Auto-clean any legacy hidden builtin state on startup
+restoreAllBuiltInTemplates();
 
 let dbPromise: Promise<IDBDatabase | null> | null = null;
 
@@ -165,46 +148,43 @@ export async function getUserTemplates(): Promise<UserTemplate[]> {
       });
     }
 
-    // Convert all 72 templates into UserTemplate format so they are directly available as custom built-ins
-    const hiddenSet = getHiddenBuiltinIds();
-    const builtInCustoms: UserTemplate[] = ALL_RADNITO_TEMPLATES
-      .filter(t => !hiddenSet.has(t.id) && !hiddenSet.has(`builtin_${t.id}`))
-      .map(t => {
-        let extractedText = '';
-        if (t.lines && t.lines.length > 0) {
-          extractedText = t.lines.join('\n');
-        } else {
-          try {
-            const parsed = JSON.parse(t.content);
-            extractedText = [
-              parsed.title,
-              parsed.technique,
-              ...(parsed.normal_findings || []),
-              parsed.default_impression
-            ].filter(Boolean).join('\n');
-          } catch {
-            extractedText = t.content;
-          }
+    // Convert all 72 authoritative templates into UserTemplate format - permanently built in and non-deletable
+    const builtInCustoms: UserTemplate[] = ALL_RADNITO_TEMPLATES.map(t => {
+      let extractedText = '';
+      if (t.lines && t.lines.length > 0) {
+        extractedText = t.lines.join('\n');
+      } else {
+        try {
+          const parsed = JSON.parse(t.content);
+          extractedText = [
+            parsed.title,
+            parsed.technique,
+            ...(parsed.normal_findings || []),
+            parsed.default_impression
+          ].filter(Boolean).join('\n');
+        } catch {
+          extractedText = t.content;
         }
+      }
 
-        return {
-          id: `builtin_${t.id}`,
-          name: t.name,
-          text: extractedText,
-          images: [],
-          docxFile: t.docxBase64 ? {
-            name: t.fileName || `${t.name}.docx`,
-            data: t.docxBase64,
-            size: Math.round(t.docxBase64.length * 0.75),
-            extractedText: extractedText,
-          } : undefined,
-          createdAt: 1700000000000,
-          isBuiltIn: true,
-          modality: t.modality,
-          category: t.category,
-          lines: t.lines,
-        };
-      });
+      return {
+        id: `builtin_${t.id}`,
+        name: t.name,
+        text: extractedText,
+        images: [],
+        docxFile: t.docxBase64 ? {
+          name: t.fileName || `${t.name}.docx`,
+          data: t.docxBase64,
+          size: Math.round(t.docxBase64.length * 0.75),
+          extractedText: extractedText,
+        } : undefined,
+        createdAt: 1700000000000,
+        isBuiltIn: true,
+        modality: t.modality,
+        category: t.category,
+        lines: t.lines,
+      };
+    });
 
     return [...userCreated, ...builtInCustoms];
   } catch (err) {
@@ -214,15 +194,17 @@ export async function getUserTemplates(): Promise<UserTemplate[]> {
 }
 
 /**
- * Delete a custom template
+ * Delete a user-created custom template.
+ * Built-in system templates (all 72 templates) are permanent and cannot be deleted.
  */
 export async function deleteUserTemplate(id: string): Promise<void> {
-  try {
-    if (id.startsWith('builtin_') || id.startsWith('tpl_')) {
-      saveHiddenBuiltinId(id);
-      return;
-    }
+  // Built-in templates are permanent system fixtures and cannot be deleted
+  if (id.startsWith('builtin_') || id.startsWith('tpl_')) {
+    console.warn(`Attempted to delete built-in template ${id}, which is protected and non-deletable.`);
+    return;
+  }
 
+  try {
     const db = await getDB();
     if (!db) return;
 
