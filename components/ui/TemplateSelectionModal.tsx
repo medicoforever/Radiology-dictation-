@@ -12,15 +12,52 @@ interface TemplateSelectionModalProps {
   onSelectTemplate: (template: ReportTemplate) => void;
 }
 
-const REGION_TAGS = [
+interface RegionTag {
+  id: string;
+  label: string;
+  titleMatch?: string[];
+  exclude?: string[];
+}
+
+const REGION_TAGS: RegionTag[] = [
   { id: 'ALL', label: 'All Regions' },
-  { id: 'BRAIN', label: '🧠 Brain & Head', match: ['brain', 'temporal', 'head', 'pns', 'sella', 'pituitary', 'orbit', 'cerebell', 'skull', 'facial'] },
-  { id: 'SPINE', label: '🦴 Spine', match: ['spine', 'cervical', 'lumbar', 'dorsal', 'thoracic', 'myelo', 'sacro'] },
-  { id: 'STROKE', label: '⚡ Stroke & Trauma', match: ['stroke', 'trauma'] },
-  { id: 'CHEST', label: '🫁 Chest & Thorax', match: ['chest', 'thorax', 'hrct', 'lung', 'mediastin'] },
-  { id: 'ABDOMEN', label: '🩺 Abdomen & Pelvis', match: ['abdomen', 'pelvis', 'kub', 'urogram', 'liver', 'pancreas', 'mrcp', 'adrenal', 'pelvimetry'] },
-  { id: 'MSK', label: '🦵 MSK & Extremities', match: ['joint', 'knee', 'shoulder', 'wrist', 'ankle', 'elbow', 'hip', 'forearm', 'thigh', 'leg', 'foot', 'arm', 'hand'] },
-  { id: 'CARDIAC', label: '❤️ Cardiac & Angio', match: ['cardiac', 'coronary', 'angio', 'tavi', 'aorta', 'aortogram', 'cabg'] },
+  { 
+    id: 'BRAIN', 
+    label: '🧠 Brain & Head', 
+    titleMatch: ['brain', 'temporal', 'head', 'pns', 'sella', 'pituitary', 'orbit', 'cerebell', 'calvarium', 'skull', 'facial'] 
+  },
+  { 
+    id: 'SPINE', 
+    label: '🦴 Spine', 
+    titleMatch: ['spine', 'cervical', 'lumbar', 'dorsal', 'thoracic spine', 'myelogram', 'sacroiliac', 'whole spine'] 
+  },
+  { 
+    id: 'STROKE', 
+    label: '⚡ Stroke & Trauma', 
+    titleMatch: ['stroke', 'trauma'] 
+  },
+  { 
+    id: 'CHEST', 
+    label: '🫁 Chest & Thorax', 
+    titleMatch: ['chest', 'thorax', 'hrct', 'lung', 'mediastin'],
+    exclude: ['angio', 'angiography', 'coronary']
+  },
+  { 
+    id: 'ABDOMEN', 
+    label: '🩺 Abdomen & Pelvis', 
+    titleMatch: ['abdomen', 'pelvis', 'kub', 'urogram', 'liver', 'pancreas', 'mrcp', 'adrenal', 'pelvimetry', 'triphasic'],
+    exclude: ['angio', 'angiography', 'trauma']
+  },
+  { 
+    id: 'MSK', 
+    label: '🦵 MSK & Extremities', 
+    titleMatch: ['joint', 'knee', 'shoulder', 'wrist', 'ankle', 'elbow', 'hip', 'forearm', 'thigh', 'leg', 'foot', 'arm', 'hand', 'extremit', 'musculoskeletal'] 
+  },
+  { 
+    id: 'CARDIAC', 
+    label: '❤️ Cardiac & Angio', 
+    titleMatch: ['angio', 'angiography', 'angiogram', 'coronary', 'cardiac', 'aorta', 'aortogram', 'tavi', 'cabg', 'renal angio'] 
+  },
 ];
 
 const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen, onClose, templates, onSelectTemplate }) => {
@@ -59,10 +96,18 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
     // Region filter
     if (regionFilter !== 'ALL') {
       const activeRegion = REGION_TAGS.find(r => r.id === regionFilter);
-      if (activeRegion && activeRegion.match) {
+      if (activeRegion && activeRegion.titleMatch) {
         list = list.filter(t => {
-          const text = `${t.name} ${t.description} ${t.lines ? t.lines.join(' ') : ''}`.toLowerCase();
-          return activeRegion.match!.some(keyword => text.includes(keyword));
+          // Focus matching on template name, category, and short description to prevent deep finding cross-contamination
+          const headerText = `${t.name} ${t.category || ''} ${t.description || ''}`.toLowerCase();
+          
+          // Check exclusions first (e.g. prevent angio or trauma from bleeding into regular plain abdomen/chest)
+          if (activeRegion.exclude && activeRegion.exclude.some(ex => headerText.includes(ex))) {
+            return false;
+          }
+
+          // Check if template title matches the targeted clinical region keywords
+          return activeRegion.titleMatch!.some(keyword => headerText.includes(keyword));
         });
       }
     }
