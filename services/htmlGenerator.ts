@@ -9,560 +9,623 @@ interface ReportBatch {
 
 const getEmbeddedScript = () => `
 // Embedded script for standalone HTML report functionality
-document.addEventListener('DOMContentLoaded', () => {
-    // --- STATE ---
-    let multiSelectMode = false;
-    const selections = {}; // { [batchId]: Set<number> }
-    let notificationTimeout = null;
+(function() {
+    function initReport() {
+        // --- STATE ---
+        let multiSelectMode = false;
+        const selections = {}; // { [batchId]: Set<number> }
+        let notificationTimeout = null;
 
-    let reorderBatchId = null;
-    let mergeBatchId = null;
-    const lastMerges = {}; // { [batchId]: { containerHTML: string } }
-    let dragStartInfo = null; // { batchId, index, element }
+        let reorderBatchId = null;
+        let mergeBatchId = null;
+        const lastMerges = {}; // { [batchId]: { containerHTML: string } }
+        let dragStartInfo = null; // { batchId, index, element }
 
-    // --- DOM ELEMENTS ---
-    const notificationEl = document.getElementById('notification');
-    const multiSelectBanner = document.getElementById('multi-select-banner');
-    const multiSelectToggle = document.getElementById('multi-select-toggle');
-    
-    // --- HELPER FUNCTIONS ---
-    const showNotification = (text) => {
-        if (notificationTimeout) clearTimeout(notificationTimeout);
-        notificationEl.textContent = text;
-        notificationEl.classList.remove('opacity-0');
-        notificationTimeout = setTimeout(() => {
-            notificationEl.classList.add('opacity-0');
-        }, 2000);
-    };
+        // --- DOM ELEMENTS ---
+        const notificationEl = document.getElementById('notification');
+        const multiSelectToggle = document.getElementById('multi-select-toggle');
+        
+        // --- HELPER FUNCTIONS ---
+        const showNotification = (text) => {
+            if (!notificationEl) return;
+            if (notificationTimeout) clearTimeout(notificationTimeout);
+            notificationEl.textContent = text;
+            notificationEl.classList.remove('opacity-0');
+            notificationTimeout = setTimeout(() => {
+                notificationEl.classList.add('opacity-0');
+            }, 2000);
+        };
 
-    const copyToClipboard = async (plainText, htmlText) => {
-        try {
-            if (window.ClipboardItem) {
-                const htmlBlob = new Blob([htmlText], { type: 'text/html' });
-                const textBlob = new Blob([plainText], { type: 'text/plain' });
-                const clipboardItem = new ClipboardItem({
-                    'text/html': htmlBlob,
-                    'text/plain': textBlob,
-                });
-                await navigator.clipboard.write([clipboardItem]);
-                return true;
-            }
-            throw new Error('ClipboardItem API not available.');
-        } catch (err) {
-            console.warn('Rich text copy failed, falling back to plain text.', err);
+        const copyToClipboard = async (plainText, htmlText) => {
             try {
-                await navigator.clipboard.writeText(plainText);
-                return true;
+                if (navigator.clipboard && window.ClipboardItem && window.isSecureContext) {
+                    const htmlBlob = new Blob([htmlText], { type: 'text/html' });
+                    const textBlob = new Blob([plainText], { type: 'text/plain' });
+                    const clipboardItem = new ClipboardItem({
+                        'text/html': htmlBlob,
+                        'text/plain': textBlob,
+                    });
+                    await navigator.clipboard.write([clipboardItem]);
+                    return true;
+                }
+            } catch (err) {
+                console.warn('Rich text copy failed, falling back.', err);
+            }
+
+            try {
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    await navigator.clipboard.writeText(plainText);
+                    return true;
+                }
             } catch (fallbackErr) {
-                console.error('Plain text copy failed as well.', fallbackErr);
+                console.warn('writeText failed, falling back to execCommand.', fallbackErr);
+            }
+
+            try {
+                const tempTextArea = document.createElement('textarea');
+                tempTextArea.value = plainText;
+                tempTextArea.style.position = 'fixed';
+                tempTextArea.style.left = '-9999px';
+                tempTextArea.style.top = '-9999px';
+                tempTextArea.setAttribute('readonly', '');
+                document.body.appendChild(tempTextArea);
+                tempTextArea.select();
+                const successful = document.execCommand('copy');
+                document.body.removeChild(tempTextArea);
+                return successful;
+            } catch (execErr) {
+                console.error('Copy execution failed entirely.', execErr);
                 return false;
             }
-        }
-    };
-    
-    const isClinicalProfileFinding = (text) => {
-        const clean = text.replace(/^BOLD::/i, '').replace(/^[*_\\s]+|[*_\\s]+$/g, '').trim();
-        return /^clinical\\s*(profile|history):/i.test(clean);
-    };
+        };
+        
+        const isClinicalProfileFinding = (text) => {
+            const clean = text.replace(/^BOLD::/i, '').replace(/^[*_\\s]+|[*_\\s]+$/g, '').trim();
+            return /^clinical\\s*(profile|history):/i.test(clean);
+        };
 
-    const cleanClinicalProfileText = (text) => {
-        let inner = text.replace(/^BOLD::/i, '').trim();
-        inner = inner.replace(/^[*_\\s]+/, '');
-        inner = inner.replace(/[*_\\s]+$/, '');
-        inner = inner.replace(/\\.\\*+$/, '.');
-        inner = inner.replace(/[*_\\s]+$/, '').trim();
-        inner = inner.replace(/^Clinical\\s*(Profile|History)\\s*:?\\s*/i, 'Clinical Profile: ');
-        inner = inner.replace(/^Clinical Profile:\\s*\\*+/i, 'Clinical Profile: ');
-        inner = inner.replace(/[*_\\s]+$/, '').trim();
-        inner = inner.replace(/^[*_\\s]+/, '').trim();
-        return inner.trim();
-    };
+        const cleanClinicalProfileText = (text) => {
+            let inner = text.replace(/^BOLD::/i, '').trim();
+            inner = inner.replace(/^[*_\\s]+/, '');
+            inner = inner.replace(/[*_\\s]+$/, '');
+            inner = inner.replace(/\\.\\*+$/, '.');
+            inner = inner.replace(/[*_\\s]+$/, '').trim();
+            inner = inner.replace(/^Clinical\\s*(Profile|History)\\s*:?\\s*/i, 'Clinical Profile: ');
+            inner = inner.replace(/^Clinical Profile:\\s*\\*+/i, 'Clinical Profile: ');
+            inner = inner.replace(/[*_\\s]+$/, '').trim();
+            inner = inner.replace(/^[*_\\s]+/, '').trim();
+            return inner.trim();
+        };
 
-    const getCopyContent = (findingEl) => {
-        const rawFinding = decodeURIComponent(findingEl.dataset.findingRaw || '');
-        const tableEl = findingEl.querySelector('table');
-        if (tableEl) {
-            const plainText = tableEl.innerText || tableEl.textContent || rawFinding;
-            const htmlText = tableEl.outerHTML;
-            return { plainText, htmlText };
-        }
-
-        const isBold = rawFinding.includes('BOLD::');
-        const cleanFinding = rawFinding.replace(/BOLD::/g, '');
-        const isTitle = cleanFinding.trim() === 'C.T.SCAN OF BRAIN (PLAIN)';
-        const isClinicalProfile = isClinicalProfileFinding(cleanFinding);
-        const parts = cleanFinding.split('###');
-        const isStructured = parts.length > 1;
-        const isImpression = isStructured && parts[0].trim().toUpperCase() === 'IMPRESSION:';
-        const isItalic = isClinicalProfile || (!isStructured && cleanFinding.startsWith('*') && cleanFinding.endsWith('*'));
-
-        let plainText, htmlText;
-
-        if (isTitle) {
-            plainText = cleanFinding;
-            htmlText = \`<p style="text-align:center;"><strong><u>\${cleanFinding}</u></strong></p>\`;
-        } else if (isClinicalProfile) {
-            plainText = cleanClinicalProfileText(cleanFinding);
-            htmlText = \`<p><em>\${plainText}</em></p>\`;
-        } else if (isImpression) {
-            const title = parts[0];
-            const points = parts.slice(1);
-            plainText = \`\${title.toUpperCase()}\\n\${points.map(p => \`• \${p}\`).join('\\n')}\`;
-            htmlText = \`<p><strong style="text-decoration: underline;">\${title.toUpperCase()}</strong></p><ul>\${points.map(p => \`<li><strong>\${p}</strong></li>\`).join('')}</ul>\`;
-        } else if (isStructured) {
-            plainText = parts.join('\\n');
-            let htmlContent = isBold ? \`<p><strong>\${parts[0]}</strong></p>\` : \`<p>\${parts[0]}</p>\`;
-            htmlContent += parts.slice(1).map(p => isBold ? \`<p><strong>\${p}</strong></p>\` : \`<p>\${p}</p>\`).join('');
-            htmlText = htmlContent;
-        } else {
-            if (isItalic) {
-                plainText = cleanFinding.slice(1, -1);
-                htmlText = \`<p><em>\${plainText}</em></p>\`;
-            } else {
-                plainText = cleanFinding;
-                htmlText = isBold ? \`<p><strong>\${cleanFinding}</strong></p>\` : \`<p>\${cleanFinding}</p>\`;
+        const getCopyContent = (findingEl) => {
+            const rawFinding = decodeURIComponent(findingEl.dataset.findingRaw || '');
+            const tableEl = findingEl.querySelector('table');
+            if (tableEl) {
+                const plainText = tableEl.innerText || tableEl.textContent || rawFinding;
+                const htmlText = tableEl.outerHTML;
+                return { plainText, htmlText };
             }
-        }
-        return { plainText, htmlText };
-    };
-    
-    const reIndexFindings = (batchId) => {
-        const findings = document.querySelectorAll(\`.finding-item[data-batch-id="\${batchId}"]\`);
-        findings.forEach((finding, index) => {
-            finding.dataset.findingIndex = index;
-        });
-    };
 
-    const updateFindingSelection = (batchId, index, shouldSelect) => {
-        if (!selections[batchId]) {
-            selections[batchId] = new Set();
-        }
-        const findingEl = document.querySelector(\`.finding-item[data-batch-id="\${batchId}"][data-finding-index="\${index}"]\`);
-        if (!findingEl) return;
-        const checkboxEl = findingEl.querySelector('[role="checkbox"] > div');
-        if (!checkboxEl) return;
-        
-        if (shouldSelect) {
-            selections[batchId].add(index);
-            findingEl.classList.add('selected');
-            checkboxEl.classList.add('bg-blue-600', 'border-blue-600');
-            checkboxEl.classList.remove('border-slate-400', 'bg-white');
-        } else {
-            selections[batchId].delete(index);
-            findingEl.classList.remove('selected');
-            checkboxEl.classList.remove('bg-blue-600', 'border-blue-600');
-            checkboxEl.classList.add('border-slate-400', 'bg-white');
-        }
-    };
+            const isBold = rawFinding.includes('BOLD::');
+            const cleanFinding = rawFinding.replace(/BOLD::/g, '');
+            const isTitle = cleanFinding.trim() === 'C.T.SCAN OF BRAIN (PLAIN)';
+            const isClinicalProfile = isClinicalProfileFinding(cleanFinding);
+            const parts = cleanFinding.split('###');
+            const isStructured = parts.length > 1;
+            const isImpression = isStructured && parts[0].trim().toUpperCase() === 'IMPRESSION:';
+            const isItalic = isClinicalProfile || (!isStructured && cleanFinding.startsWith('*') && cleanFinding.endsWith('*'));
 
-    const copyBatchSelection = async (batchId) => {
-        const selection = selections[batchId];
-        if (!selection || selection.size === 0) {
-            showNotification('Selection cleared.');
-            return;
-        }
-
-        const sortedIndices = Array.from(selection).sort((a, b) => a - b);
-        
-        let plainTexts = [];
-        let htmlTexts = [];
-
-        sortedIndices.forEach(i => {
-            const findingEl = document.querySelector(\`.finding-item[data-batch-id="\${batchId}"][data-finding-index="\${i}"]\`);
-            if (findingEl) {
-                const { plainText, htmlText } = getCopyContent(findingEl);
-                plainTexts.push(plainText);
-                htmlTexts.push(htmlText);
-            }
-        });
-        
-        const plainText = plainTexts.join('\\n');
-        const htmlText = htmlTexts.join('');
-
-        const success = await copyToClipboard(plainText, htmlText);
-        const notificationText = success
-            ? \`Copied \${selection.size} finding\${selection.size > 1 ? 's' : ''}!\`
-            : 'Copy failed!';
-        showNotification(notificationText);
-    };
-
-    const toggleMultiSelectMode = (enabled) => {
-        multiSelectMode = enabled;
-        if (enabled) {
-            multiSelectBanner.classList.remove('hidden');
-            multiSelectBanner.classList.add('flex');
-            if (multiSelectToggle) multiSelectToggle.checked = true;
-        } else {
-            multiSelectBanner.classList.add('hidden');
-            multiSelectBanner.classList.remove('flex');
-            if (multiSelectToggle) multiSelectToggle.checked = false;
-            Object.keys(selections).forEach(batchId => {
-                if(selections[batchId]){
-                    selections[batchId].forEach(index => {
-                        updateFindingSelection(batchId, index, false);
-                    });
-                    selections[batchId].clear();
-                }
-            });
-        }
-    };
-
-    // --- EDITING LOGIC ---
-    let currentEditing = null; // { batchId, index, originalHTML }
-    
-    const cancelAllEdits = () => {
-        if (!currentEditing) return;
-        const { batchId, index, originalHTML } = currentEditing;
-        const findingEl = document.querySelector(\`.finding-item[data-batch-id="\${batchId}"][data-finding-index="\${index}"]\`);
-        if (findingEl) {
-            const tempDiv = document.createElement('div');
-            tempDiv.innerHTML = originalHTML;
-            while (findingEl.firstChild) { findingEl.removeChild(findingEl.firstChild); }
-            while (tempDiv.firstChild) { findingEl.appendChild(tempDiv.firstChild); }
-            addFindingEventListeners(findingEl, batchId, index);
-        }
-        currentEditing = null;
-    }
-
-    const startEditing = (findingEl, batchId, index) => {
-        cancelAllEdits();
-
-        const originalHTML = findingEl.innerHTML;
-        currentEditing = { batchId, index, originalHTML: originalHTML };
-        
-        const { plainText } = getCopyContent(findingEl);
-
-        findingEl.innerHTML = \`
-            <div class="flex flex-col gap-2">
-                <textarea class="w-full p-2 border rounded-md font-semibold text-slate-700 focus:ring-2 focus:ring-blue-500 focus:outline-none" rows="3"></textarea>
-                <div class="flex justify-end gap-2">
-                    <button class="edit-cancel text-sm font-semibold py-1 px-3 rounded-lg bg-slate-200 text-slate-700 hover:bg-slate-300">Cancel</button>
-                    <button class="edit-save text-sm font-semibold py-1 px-3 rounded-lg bg-blue-600 text-white hover:bg-blue-700">Save</button>
-                </div>
-            </div>
-        \`;
-        const textarea = findingEl.querySelector('textarea');
-        textarea.value = plainText;
-        textarea.rows = Math.max(3, plainText.split('\\n').length);
-        textarea.focus();
-
-        findingEl.querySelector('.edit-save').addEventListener('click', () => {
-            const newText = findingEl.querySelector('textarea').value;
-            const oldRawFinding = decodeURIComponent(findingEl.dataset.findingRaw || '');
-            const isBold = oldRawFinding.startsWith('BOLD::');
-            
-            const newClean = newText.split('\\n').filter(Boolean).join('###');
-            const newRawFinding = (isBold ? 'BOLD::' : '') + newClean;
-            
-            const tempDiv = document.createElement('div');
-            tempDiv.innerHTML = originalHTML;
-            while (findingEl.firstChild) { findingEl.removeChild(findingEl.firstChild); }
-            while (tempDiv.firstChild) { findingEl.appendChild(tempDiv.firstChild); }
-
-            findingEl.dataset.findingRaw = encodeURIComponent(newRawFinding);
-            
-            const newParts = newClean.split('###');
-            const textEl = findingEl.querySelector('.finding-text');
-            const isTitle = newClean.trim() === 'C.T.SCAN OF BRAIN (PLAIN)';
-            const isClinicalProfile = isClinicalProfileFinding(newClean);
-            const isImpression = newParts.length > 1 && newParts[0].trim().toUpperCase() === 'IMPRESSION:';
-            const isItalic = isClinicalProfile || (newParts.length === 1 && newClean.startsWith('*') && newClean.endsWith('*'));
+            let plainText, htmlText;
 
             if (isTitle) {
-                textEl.className = 'finding-text text-slate-700 cursor-pointer text-center font-bold underline';
-                textEl.innerHTML = newClean;
+                plainText = cleanFinding;
+                htmlText = \`<p style="text-align:center;"><strong><u>\${cleanFinding}</u></strong></p>\`;
             } else if (isClinicalProfile) {
-                const profText = cleanClinicalProfileText(newClean);
-                textEl.className = 'finding-text text-slate-700 cursor-pointer italic';
-                textEl.innerHTML = profText;
-                findingEl.dataset.findingRaw = encodeURIComponent((isBold ? 'BOLD::' : '') + profText);
+                plainText = cleanClinicalProfileText(cleanFinding);
+                htmlText = \`<p><em>\${plainText}</em></p>\`;
             } else if (isImpression) {
-                textEl.className = 'finding-text text-slate-700 cursor-pointer';
-                textEl.innerHTML = \`<strong class="underline uppercase">\${newParts[0]}</strong><ul class="list-disc list-inside pl-4 mt-1">\${newParts.slice(1).map(p => \`<li class="font-bold">\${p}</li>\`).join('')}</ul>\`;
-            } else if (newParts.length > 1) {
-                textEl.className = 'finding-text text-slate-700 cursor-pointer';
-                textEl.innerHTML = \`<strong class="font-bold">\${newParts[0]}</strong>\${newParts.slice(1).map(p => \`<span class="block font-semibold">\${p}</span>\`).join('')}\`;
+                const title = parts[0];
+                const points = parts.slice(1);
+                plainText = \`\${title.toUpperCase()}\\n\${points.map(p => \`• \${p}\`).join('\\n')}\`;
+                htmlText = \`<p><strong style="text-decoration: underline;">\${title.toUpperCase()}</strong></p><ul>\${points.map(p => \`<li><strong>\${p}</strong></li>\`).join('')}</ul>\`;
+            } else if (isStructured) {
+                plainText = parts.join('\\n');
+                let htmlContent = isBold ? \`<p><strong>\${parts[0]}</strong></p>\` : \`<p>\${parts[0]}</p>\`;
+                htmlContent += parts.slice(1).map(p => isBold ? \`<p><strong>\${p}</strong></p>\` : \`<p>\${p}</p>\`).join('');
+                htmlText = htmlContent;
             } else {
-                textEl.className = \`finding-text text-slate-700 cursor-pointer \${isItalic ? 'italic' : isBold ? 'font-bold' : ''}\`;
-                textEl.innerHTML = isItalic ? newClean.slice(1, -1) : newClean;
+                if (isItalic) {
+                    plainText = cleanFinding.slice(1, -1);
+                    htmlText = \`<p><em>\${plainText}</em></p>\`;
+                } else {
+                    plainText = cleanFinding;
+                    htmlText = isBold ? \`<p><strong>\${cleanFinding}</strong></p>\` : \`<p>\${cleanFinding}</p>\`;
+                }
             }
-            
-            addFindingEventListeners(findingEl, batchId, index);
-            currentEditing = null;
-        });
-
-        findingEl.querySelector('.edit-cancel').addEventListener('click', () => {
-            const tempDiv = document.createElement('div');
-            tempDiv.innerHTML = originalHTML;
-            while (findingEl.firstChild) { findingEl.removeChild(findingEl.firstChild); }
-            while (tempDiv.firstChild) { findingEl.appendChild(tempDiv.firstChild); }
-            addFindingEventListeners(findingEl, batchId, index);
-            currentEditing = null;
-        });
-    };
-
-    // --- REORDER/MERGE LOGIC ---
-    const updateUIForModes = () => {
-        document.querySelectorAll('[data-batch-findings-container-id]').forEach(container => {
-            const batchId = container.dataset.batchFindingsContainerId;
-            const reorderBtn = document.querySelector(\`.reorder-toggle-btn[data-batch-id="\${batchId}"]\`);
-            const mergeBtn = document.querySelector(\`.merge-toggle-btn[data-batch-id="\${batchId}"]\`);
-
-            if (batchId === reorderBatchId) {
-                container.classList.add('reorder-mode');
-                container.classList.remove('merge-mode');
-                if (reorderBtn) reorderBtn.textContent = 'Done';
-                if (mergeBtn) mergeBtn.textContent = 'Merge';
-            } else if (batchId === mergeBatchId) {
-                container.classList.add('merge-mode');
-                container.classList.remove('reorder-mode');
-                if (mergeBtn) mergeBtn.textContent = 'Done';
-                if (reorderBtn) reorderBtn.textContent = 'Reorder';
-            } else {
-                container.classList.remove('reorder-mode', 'merge-mode');
-                if (reorderBtn) reorderBtn.textContent = 'Reorder';
-                if (mergeBtn) mergeBtn.textContent = 'Merge';
-            }
-        });
-    };
-    
-    const hideUndoButton = (batchId) => {
-        const undoBtn = document.querySelector(\`.undo-merge-btn[data-batch-id="\${batchId}"]\`);
-        if (undoBtn) undoBtn.classList.add('hidden');
-        delete lastMerges[batchId];
-    };
-
-    const toggleReorderMode = (batchId) => {
-        cancelAllEdits();
-        hideUndoButton(batchId);
-        mergeBatchId = null;
-        reorderBatchId = reorderBatchId === batchId ? null : batchId;
-        updateUIForModes();
-    };
-
-    const toggleMergeMode = (batchId) => {
-        cancelAllEdits();
-        hideUndoButton(batchId);
-        reorderBatchId = null;
-        mergeBatchId = mergeBatchId === batchId ? null : batchId;
-        updateUIForModes();
-    };
-
-    const undoMerge = (batchId) => {
-        const undoState = lastMerges[batchId];
-        if (!undoState) return;
-        const container = document.querySelector(\`[data-batch-findings-container-id="\${batchId}"]\`);
-        container.innerHTML = undoState.containerHTML;
-        // Re-attach all listeners for the restored content
-        container.querySelectorAll('.finding-item').forEach(findingEl => {
-            const id = findingEl.dataset.batchId;
-            const index = parseInt(findingEl.dataset.findingIndex, 10);
-            addFindingEventListeners(findingEl, id, index);
-        });
-        hideUndoButton(batchId);
-    };
-
-    // --- EVENT LISTENER ATTACHMENT ---
-    const addFindingEventListeners = (findingEl, batchId, index) => {
-        const textEl = findingEl.querySelector('.finding-text');
-        const selectionHandle = findingEl.querySelector('.selection-handle');
-        const editBtn = findingEl.querySelector('.edit-btn');
+            return { plainText, htmlText };
+        };
         
-        textEl.addEventListener('click', async () => {
-            if (multiSelectMode || currentEditing || reorderBatchId || mergeBatchId) return;
-            
-            const { plainText, htmlText } = getCopyContent(findingEl);
-            
-            const success = await copyToClipboard(plainText, htmlText);
-            
-            if (success) {
-                updateFindingSelection(batchId, index, true);
-                setTimeout(() => updateFindingSelection(batchId, index, false), 500);
-                showNotification('Copied!');
-            } else {
-                showNotification('Copy failed!');
-            }
-        });
-
-        selectionHandle.addEventListener('click', () => {
-            if (currentEditing || reorderBatchId || mergeBatchId) return;
-            if (!multiSelectMode) {
-                toggleMultiSelectMode(true);
-            }
-            const selection = selections[batchId] || new Set();
-            const isSelected = selection.has(index);
-            updateFindingSelection(batchId, index, !isSelected);
-            copyBatchSelection(batchId);
-        });
-
-        if (editBtn) {
-            editBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                if (reorderBatchId || mergeBatchId) return;
-                startEditing(findingEl, batchId, index);
+        const reIndexFindings = (batchId) => {
+            const findings = document.querySelectorAll(\`.finding-item[data-batch-id="\${batchId}"]\`);
+            findings.forEach((finding, index) => {
+                finding.dataset.findingIndex = index.toString();
             });
-        }
+        };
 
-        // Drag and Drop Listeners
-        findingEl.addEventListener('dragstart', (e) => {
-            if (reorderBatchId !== batchId && mergeBatchId !== batchId) {
-                e.preventDefault();
+        const updateFindingSelection = (batchId, index, shouldSelect) => {
+            if (!selections[batchId]) {
+                selections[batchId] = new Set();
+            }
+            const findingEl = document.querySelector(\`.finding-item[data-batch-id="\${batchId}"][data-finding-index="\${index}"]\`);
+            if (!findingEl) return;
+            const checkboxEl = findingEl.querySelector('[role="checkbox"] > div');
+            
+            if (shouldSelect) {
+                selections[batchId].add(index);
+                findingEl.classList.add('selected');
+                if (checkboxEl) {
+                    checkboxEl.classList.add('bg-blue-600', 'border-blue-600');
+                    checkboxEl.classList.remove('border-slate-400', 'bg-white');
+                    checkboxEl.textContent = '✓';
+                    checkboxEl.style.color = '#ffffff';
+                    checkboxEl.style.fontSize = '11px';
+                    checkboxEl.style.fontWeight = 'bold';
+                    checkboxEl.style.display = 'flex';
+                    checkboxEl.style.alignItems = 'center';
+                    checkboxEl.style.justifyContent = 'center';
+                }
+            } else {
+                selections[batchId].delete(index);
+                findingEl.classList.remove('selected');
+                if (checkboxEl) {
+                    checkboxEl.classList.remove('bg-blue-600', 'border-blue-600');
+                    checkboxEl.classList.add('border-slate-400', 'bg-white');
+                    checkboxEl.textContent = '';
+                }
+            }
+        };
+
+        const copyBatchSelection = async (batchId) => {
+            const selection = selections[batchId];
+            if (!selection || selection.size === 0) {
+                showNotification('Selection cleared.');
                 return;
             }
-            dragStartInfo = { batchId, index, element: findingEl };
-            e.dataTransfer.effectAllowed = 'move';
-            e.dataTransfer.setData('text/plain', JSON.stringify({ batchId, index }));
-            setTimeout(() => findingEl.classList.add('dragging'), 0);
-        });
 
-        findingEl.addEventListener('dragend', (e) => {
-            findingEl.classList.remove('dragging');
-            dragStartInfo = null;
-        });
-
-        findingEl.addEventListener('dragover', (e) => {
-            e.preventDefault();
-        });
-
-        findingEl.addEventListener('dragenter', (e) => {
-            e.preventDefault();
-            if (mergeBatchId === batchId && dragStartInfo && dragStartInfo.index !== index) {
-                findingEl.classList.add('drag-over');
-            }
-        });
-
-        findingEl.addEventListener('dragleave', (e) => {
-            findingEl.classList.remove('drag-over');
-        });
-
-        findingEl.addEventListener('drop', (e) => {
-            e.preventDefault();
-            findingEl.classList.remove('drag-over');
-            if (!dragStartInfo || dragStartInfo.batchId !== batchId) return;
-            const sourceIndex = dragStartInfo.index;
-            const targetIndex = index;
-            if (sourceIndex === targetIndex) return;
-
-            // Reorder
-            if (reorderBatchId === batchId) {
-                const container = findingEl.parentNode;
-                const sourceEl = dragStartInfo.element;
-                const targetEl = findingEl;
-                if (sourceIndex < targetIndex) {
-                    container.insertBefore(sourceEl, targetEl.nextSibling);
-                } else {
-                    container.insertBefore(sourceEl, targetEl);
-                }
-                reIndexFindings(batchId);
-            }
-
-            // Merge
-            if (mergeBatchId === batchId) {
-                const container = findingEl.parentNode;
-                lastMerges[batchId] = { containerHTML: container.innerHTML };
-
-                const sourceEl = dragStartInfo.element;
-                const targetEl = findingEl;
-                const sourceData = getCopyContent(sourceEl);
-                const targetData = getCopyContent(targetEl);
-                
-                const mergedRaw = targetData.plainText + ' ' + sourceData.plainText;
-                targetEl.dataset.findingRaw = encodeURIComponent(mergedRaw);
-                targetEl.querySelector('.finding-text').innerHTML += ' ' + sourceEl.querySelector('.finding-text').innerHTML;
-                
-                sourceEl.remove();
-                reIndexFindings(batchId);
-                const undoBtn = document.querySelector(\`.undo-merge-btn[data-batch-id="\${batchId}"]\`);
-                if (undoBtn) undoBtn.classList.remove('hidden');
-            }
-        });
-    }
-
-    // --- INITIALIZATION ---
-    if (multiSelectToggle) {
-        multiSelectToggle.addEventListener('change', () => toggleMultiSelectMode(multiSelectToggle.checked));
-    }
-    
-    document.querySelectorAll('.finding-item').forEach(findingEl => {
-        const batchId = findingEl.dataset.batchId;
-        const index = parseInt(findingEl.dataset.findingIndex, 10);
-        addFindingEventListeners(findingEl, batchId, index);
-    });
-
-    document.querySelectorAll('.copy-all-btn').forEach(btn => {
-        btn.addEventListener('click', async (e) => {
-            const batchId = e.currentTarget.dataset.batchId;
-            const findingElements = document.querySelectorAll('.finding-item[data-batch-id="' + batchId + '"]');
+            const sortedIndices = Array.from(selection).sort((a, b) => a - b);
             
-            if (findingElements.length === 0) return;
-
             let plainTexts = [];
             let htmlTexts = [];
 
-            findingElements.forEach(el => {
-                const { plainText, htmlText } = getCopyContent(el);
-                plainTexts.push(plainText);
-                htmlTexts.push(htmlText);
+            sortedIndices.forEach(i => {
+                const findingEl = document.querySelector(\`.finding-item[data-batch-id="\${batchId}"][data-finding-index="\${i}"]\`);
+                if (findingEl) {
+                    const { plainText, htmlText } = getCopyContent(findingEl);
+                    plainTexts.push(plainText);
+                    htmlTexts.push(htmlText);
+                }
+            });
+            
+            const plainText = plainTexts.join('\\n\\n');
+            const htmlText = htmlTexts.join('');
+
+            const success = await copyToClipboard(plainText, htmlText);
+            const notificationText = success
+                ? \`Copied \${selection.size} finding\${selection.size > 1 ? 's' : ''}!\`
+                : 'Copy failed!';
+            showNotification(notificationText);
+        };
+
+        const toggleMultiSelectMode = (enabled) => {
+            multiSelectMode = enabled;
+            if (multiSelectToggle) {
+                multiSelectToggle.checked = enabled;
+            }
+            if (enabled) {
+                if (reorderBatchId || mergeBatchId) {
+                    reorderBatchId = null;
+                    mergeBatchId = null;
+                    updateUIForModes();
+                }
+            } else {
+                Object.keys(selections).forEach(batchId => {
+                    if (selections[batchId]) {
+                        selections[batchId].forEach(index => {
+                            updateFindingSelection(batchId, index, false);
+                        });
+                        selections[batchId].clear();
+                    }
+                });
+                showNotification('Selection cleared.');
+            }
+        };
+
+        // --- EDITING LOGIC ---
+        let currentEditing = null; // { batchId, index, originalHTML }
+        
+        const cancelAllEdits = () => {
+            if (!currentEditing) return;
+            const { batchId, index, originalHTML } = currentEditing;
+            const findingEl = document.querySelector(\`.finding-item[data-batch-id="\${batchId}"][data-finding-index="\${index}"]\`);
+            if (findingEl) {
+                const tempDiv = document.createElement('div');
+                tempDiv.innerHTML = originalHTML;
+                while (findingEl.firstChild) { findingEl.removeChild(findingEl.firstChild); }
+                while (tempDiv.firstChild) { findingEl.appendChild(tempDiv.firstChild); }
+                addFindingEventListeners(findingEl, batchId);
+            }
+            currentEditing = null;
+        };
+
+        const startEditing = (findingEl, batchId, index) => {
+            cancelAllEdits();
+
+            const originalHTML = findingEl.innerHTML;
+            currentEditing = { batchId, index, originalHTML: originalHTML };
+            
+            const { plainText } = getCopyContent(findingEl);
+
+            findingEl.innerHTML = \`
+                <div class="flex flex-col gap-2">
+                    <textarea class="w-full p-2 border rounded-md font-semibold text-slate-700 focus:ring-2 focus:ring-blue-500 focus:outline-none" rows="3"></textarea>
+                    <div class="flex justify-end gap-2">
+                        <button class="edit-cancel text-sm font-semibold py-1 px-3 rounded-lg bg-slate-200 text-slate-700 hover:bg-slate-300">Cancel</button>
+                        <button class="edit-save text-sm font-semibold py-1 px-3 rounded-lg bg-blue-600 text-white hover:bg-blue-700">Save</button>
+                    </div>
+                </div>
+            \`;
+            const textarea = findingEl.querySelector('textarea');
+            textarea.value = plainText;
+            textarea.rows = Math.max(3, plainText.split('\\n').length);
+            textarea.focus();
+
+            findingEl.querySelector('.edit-save').addEventListener('click', () => {
+                const newText = findingEl.querySelector('textarea').value;
+                const oldRawFinding = decodeURIComponent(findingEl.dataset.findingRaw || '');
+                const isBold = oldRawFinding.startsWith('BOLD::');
+                
+                const newClean = newText.split('\\n').filter(Boolean).join('###');
+                const newRawFinding = (isBold ? 'BOLD::' : '') + newClean;
+                
+                const tempDiv = document.createElement('div');
+                tempDiv.innerHTML = originalHTML;
+                while (findingEl.firstChild) { findingEl.removeChild(findingEl.firstChild); }
+                while (tempDiv.firstChild) { findingEl.appendChild(tempDiv.firstChild); }
+
+                findingEl.dataset.findingRaw = encodeURIComponent(newRawFinding);
+                
+                const newParts = newClean.split('###');
+                const textEl = findingEl.querySelector('.finding-text');
+                const isTitle = newClean.trim() === 'C.T.SCAN OF BRAIN (PLAIN)';
+                const isClinicalProfile = isClinicalProfileFinding(newClean);
+                const isImpression = newParts.length > 1 && newParts[0].trim().toUpperCase() === 'IMPRESSION:';
+                const isItalic = isClinicalProfile || (newParts.length === 1 && newClean.startsWith('*') && newClean.endsWith('*'));
+
+                if (isTitle) {
+                    textEl.className = 'finding-text text-slate-700 cursor-pointer text-center font-bold underline';
+                    textEl.innerHTML = newClean;
+                } else if (isClinicalProfile) {
+                    const profText = cleanClinicalProfileText(newClean);
+                    textEl.className = 'finding-text text-slate-700 cursor-pointer italic';
+                    textEl.innerHTML = profText;
+                    findingEl.dataset.findingRaw = encodeURIComponent((isBold ? 'BOLD::' : '') + profText);
+                } else if (isImpression) {
+                    textEl.className = 'finding-text text-slate-700 cursor-pointer';
+                    textEl.innerHTML = \`<strong class="underline uppercase">\${newParts[0]}</strong><ul class="list-disc list-inside pl-4 mt-1">\${newParts.slice(1).map(p => \`<li class="font-bold">\${p}</li>\`).join('')}</ul>\`;
+                } else if (newParts.length > 1) {
+                    textEl.className = 'finding-text text-slate-700 cursor-pointer';
+                    textEl.innerHTML = \`<strong class="font-bold">\${newParts[0]}</strong>\${newParts.slice(1).map(p => \`<span class="block font-semibold">\${p}</span>\`).join('')}\`;
+                } else {
+                    textEl.className = \`finding-text text-slate-700 cursor-pointer \${isItalic ? 'italic' : isBold ? 'font-bold' : ''}\`;
+                    textEl.innerHTML = isItalic ? newClean.slice(1, -1) : newClean;
+                }
+                
+                addFindingEventListeners(findingEl, batchId);
+                currentEditing = null;
             });
 
-            const plainText = plainTexts.join('\n');
-            const htmlText = htmlTexts.join('');
-            const success = await copyToClipboard(plainText, htmlText);
+            findingEl.querySelector('.edit-cancel').addEventListener('click', () => {
+                const tempDiv = document.createElement('div');
+                tempDiv.innerHTML = originalHTML;
+                while (findingEl.firstChild) { findingEl.removeChild(findingEl.firstChild); }
+                while (tempDiv.firstChild) { findingEl.appendChild(tempDiv.firstChild); }
+                addFindingEventListeners(findingEl, batchId);
+                currentEditing = null;
+            });
+        };
 
-            if (success) {
-                e.currentTarget.textContent = 'Copied!';
-                setTimeout(() => { e.currentTarget.textContent = 'Copy All'; }, 2000);
+        // --- REORDER/MERGE LOGIC ---
+        const updateUIForModes = () => {
+            document.querySelectorAll('[data-batch-findings-container-id]').forEach(container => {
+                const batchId = container.dataset.batchFindingsContainerId;
+                const reorderBtn = document.querySelector(\`.reorder-toggle-btn[data-batch-id="\${batchId}"]\`);
+                const mergeBtn = document.querySelector(\`.merge-toggle-btn[data-batch-id="\${batchId}"]\`);
+
+                if (batchId === reorderBatchId) {
+                    container.classList.add('reorder-mode');
+                    container.classList.remove('merge-mode');
+                    if (reorderBtn) reorderBtn.textContent = 'Done';
+                    if (mergeBtn) mergeBtn.textContent = 'Merge';
+                } else if (batchId === mergeBatchId) {
+                    container.classList.add('merge-mode');
+                    container.classList.remove('reorder-mode');
+                    if (mergeBtn) mergeBtn.textContent = 'Done';
+                    if (reorderBtn) reorderBtn.textContent = 'Reorder';
+                } else {
+                    container.classList.remove('reorder-mode', 'merge-mode');
+                    if (reorderBtn) reorderBtn.textContent = 'Reorder';
+                    if (mergeBtn) mergeBtn.textContent = 'Merge';
+                }
+            });
+        };
+        
+        const hideUndoButton = (batchId) => {
+            const undoBtn = document.querySelector(\`.undo-merge-btn[data-batch-id="\${batchId}"]\`);
+            if (undoBtn) undoBtn.classList.add('hidden');
+            delete lastMerges[batchId];
+        };
+
+        const toggleReorderMode = (batchId) => {
+            if (multiSelectMode) toggleMultiSelectMode(false);
+            cancelAllEdits();
+            hideUndoButton(batchId);
+            mergeBatchId = null;
+            reorderBatchId = reorderBatchId === batchId ? null : batchId;
+            updateUIForModes();
+        };
+
+        const toggleMergeMode = (batchId) => {
+            if (multiSelectMode) toggleMultiSelectMode(false);
+            cancelAllEdits();
+            hideUndoButton(batchId);
+            reorderBatchId = null;
+            mergeBatchId = mergeBatchId === batchId ? null : batchId;
+            updateUIForModes();
+        };
+
+        const undoMerge = (batchId) => {
+            const undoState = lastMerges[batchId];
+            if (!undoState) return;
+            const container = document.querySelector(\`[data-batch-findings-container-id="\${batchId}"]\`);
+            if (!container) return;
+            container.innerHTML = undoState.containerHTML;
+            reIndexFindings(batchId);
+            container.querySelectorAll('.finding-item').forEach(findingEl => {
+                const id = findingEl.dataset.batchId;
+                addFindingEventListeners(findingEl, id);
+            });
+            hideUndoButton(batchId);
+        };
+
+        // --- EVENT LISTENER ATTACHMENT ---
+        const addFindingEventListeners = (findingEl, batchId) => {
+            const textEl = findingEl.querySelector('.finding-text');
+            const selectionHandle = findingEl.querySelector('.selection-handle');
+            const editBtn = findingEl.querySelector('.edit-btn');
+            
+            if (textEl) {
+                textEl.addEventListener('click', async () => {
+                    if (currentEditing || reorderBatchId || mergeBatchId) return;
+                    const currentIndex = parseInt(findingEl.dataset.findingIndex, 10);
+                    
+                    if (multiSelectMode) {
+                        const selection = selections[batchId] || new Set();
+                        const isSelected = selection.has(currentIndex);
+                        updateFindingSelection(batchId, currentIndex, !isSelected);
+                        copyBatchSelection(batchId);
+                        return;
+                    }
+
+                    const { plainText, htmlText } = getCopyContent(findingEl);
+                    const success = await copyToClipboard(plainText, htmlText);
+                    
+                    if (success) {
+                        updateFindingSelection(batchId, currentIndex, true);
+                        setTimeout(() => updateFindingSelection(batchId, currentIndex, false), 500);
+                        showNotification('Copied!');
+                    } else {
+                        showNotification('Copy failed!');
+                    }
+                });
             }
-        });
-    });
 
-    const copyAllTranscriptsBtn = document.getElementById('copy-all-transcripts');
-    if (copyAllTranscriptsBtn) {
-        copyAllTranscriptsBtn.addEventListener('click', async () => {
-            const batches = Array.from(document.querySelectorAll('[data-batch-container-id]'));
-            let plainText = '';
-            let htmlText = '';
+            if (selectionHandle) {
+                selectionHandle.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    if (currentEditing || reorderBatchId || mergeBatchId) return;
+                    if (!multiSelectMode) {
+                        toggleMultiSelectMode(true);
+                    }
+                    const currentIndex = parseInt(findingEl.dataset.findingIndex, 10);
+                    const selection = selections[batchId] || new Set();
+                    const isSelected = selection.has(currentIndex);
+                    updateFindingSelection(batchId, currentIndex, !isSelected);
+                    copyBatchSelection(batchId);
+                });
+            }
 
-            batches.forEach(batchEl => {
-                const batchId = batchEl.dataset.batchContainerId;
-                const batchName = batchEl.querySelector('h3').textContent;
-                const findingElements = document.querySelectorAll('.finding-item[data-batch-id="' + batchId + '"]');
-                
-                if (findingElements.length > 0) {
-                    let batchPlainText = [];
-                    let batchHtmlText = '';
+            if (editBtn) {
+                editBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    if (reorderBatchId || mergeBatchId) return;
+                    const currentIndex = parseInt(findingEl.dataset.findingIndex, 10);
+                    startEditing(findingEl, batchId, currentIndex);
+                });
+            }
 
-                    findingElements.forEach(el => {
-                        const { plainText: findingPlainText, htmlText: findingHtmlText } = getCopyContent(el);
-                        batchPlainText.push(findingPlainText);
-                        batchHtmlText += findingHtmlText;
-                    });
+            // Drag and Drop Listeners
+            findingEl.addEventListener('dragstart', (e) => {
+                if (reorderBatchId !== batchId && mergeBatchId !== batchId) {
+                    e.preventDefault();
+                    return;
+                }
+                const currentIndex = parseInt(findingEl.dataset.findingIndex, 10);
+                dragStartInfo = { batchId, index: currentIndex, element: findingEl };
+                e.dataTransfer.effectAllowed = 'move';
+                e.dataTransfer.setData('text/plain', JSON.stringify({ batchId, index: currentIndex }));
+                setTimeout(() => findingEl.classList.add('dragging'), 0);
+            });
 
-                    plainText += \`[\${batchName}]\\n\${batchPlainText.join('\\n')}\\n\\n\`;
-                    htmlText += \`<h3>\${batchName}</h3>\` + batchHtmlText;
+            findingEl.addEventListener('dragend', () => {
+                findingEl.classList.remove('dragging');
+                dragStartInfo = null;
+            });
+
+            findingEl.addEventListener('dragover', (e) => {
+                e.preventDefault();
+            });
+
+            findingEl.addEventListener('dragenter', (e) => {
+                e.preventDefault();
+                const currentIndex = parseInt(findingEl.dataset.findingIndex, 10);
+                if (mergeBatchId === batchId && dragStartInfo && dragStartInfo.index !== currentIndex) {
+                    findingEl.classList.add('drag-over');
                 }
             });
 
-            if (plainText.length === 0) return;
+            findingEl.addEventListener('dragleave', () => {
+                findingEl.classList.remove('drag-over');
+            });
 
-            const success = await copyToClipboard(plainText.trim(), htmlText.trim());
-            if (success) {
-                copyAllTranscriptsBtn.textContent = 'Copied!';
-                setTimeout(() => { copyAllTranscriptsBtn.textContent = 'Copy All Transcripts'; }, 2000);
-            }
+            findingEl.addEventListener('drop', (e) => {
+                e.preventDefault();
+                findingEl.classList.remove('drag-over');
+                if (!dragStartInfo || dragStartInfo.batchId !== batchId) return;
+                const sourceIndex = dragStartInfo.index;
+                const targetIndex = parseInt(findingEl.dataset.findingIndex, 10);
+                if (sourceIndex === targetIndex) return;
+
+                // Reorder
+                if (reorderBatchId === batchId) {
+                    const container = findingEl.parentNode;
+                    const sourceEl = dragStartInfo.element;
+                    const targetEl = findingEl;
+                    if (sourceIndex < targetIndex) {
+                        container.insertBefore(sourceEl, targetEl.nextSibling);
+                    } else {
+                        container.insertBefore(sourceEl, targetEl);
+                    }
+                    reIndexFindings(batchId);
+                }
+
+                // Merge
+                if (mergeBatchId === batchId) {
+                    const container = findingEl.parentNode;
+                    lastMerges[batchId] = { containerHTML: container.innerHTML };
+
+                    const sourceEl = dragStartInfo.element;
+                    const targetEl = findingEl;
+                    const sourceData = getCopyContent(sourceEl);
+                    const targetData = getCopyContent(targetEl);
+                    
+                    const mergedRaw = targetData.plainText + ' ' + sourceData.plainText;
+                    targetEl.dataset.findingRaw = encodeURIComponent(mergedRaw);
+                    const targetTextEl = targetEl.querySelector('.finding-text');
+                    const sourceTextEl = sourceEl.querySelector('.finding-text');
+                    if (targetTextEl && sourceTextEl) {
+                        targetTextEl.innerHTML += ' ' + sourceTextEl.innerHTML;
+                    }
+                    
+                    sourceEl.remove();
+                    reIndexFindings(batchId);
+                    const undoBtn = document.querySelector(\`.undo-merge-btn[data-batch-id="\${batchId}"]\`);
+                    if (undoBtn) undoBtn.classList.remove('hidden');
+                }
+            });
+        };
+
+        // --- INITIALIZATION ---
+        if (multiSelectToggle) {
+            multiSelectToggle.addEventListener('change', () => toggleMultiSelectMode(multiSelectToggle.checked));
+        }
+        
+        document.querySelectorAll('.finding-item').forEach(findingEl => {
+            const batchId = findingEl.dataset.batchId;
+            addFindingEventListeners(findingEl, batchId);
+        });
+
+        document.querySelectorAll('.copy-all-btn').forEach(btn => {
+            btn.addEventListener('click', async (e) => {
+                const batchId = e.currentTarget.dataset.batchId;
+                const findingElements = document.querySelectorAll('.finding-item[data-batch-id="' + batchId + '"]');
+                
+                if (findingElements.length === 0) return;
+
+                let plainTexts = [];
+                let htmlTexts = [];
+
+                findingElements.forEach(el => {
+                    const { plainText, htmlText } = getCopyContent(el);
+                    plainTexts.push(plainText);
+                    htmlTexts.push(htmlText);
+                });
+
+                const plainText = plainTexts.join('\\n\\n');
+                const htmlText = htmlTexts.join('');
+                const success = await copyToClipboard(plainText, htmlText);
+
+                if (success) {
+                    e.currentTarget.textContent = 'Copied!';
+                    setTimeout(() => { e.currentTarget.textContent = 'Copy All'; }, 2000);
+                }
+            });
+        });
+
+        const copyAllTranscriptsBtn = document.getElementById('copy-all-transcripts');
+        if (copyAllTranscriptsBtn) {
+            copyAllTranscriptsBtn.addEventListener('click', async () => {
+                const batches = Array.from(document.querySelectorAll('[data-batch-container-id]'));
+                let plainText = '';
+                let htmlText = '';
+
+                batches.forEach(batchEl => {
+                    const batchId = batchEl.dataset.batchContainerId;
+                    const headingEl = batchEl.querySelector('h3');
+                    const batchName = headingEl ? headingEl.textContent : 'Batch';
+                    const findingElements = document.querySelectorAll('.finding-item[data-batch-id="' + batchId + '"]');
+                    
+                    if (findingElements.length > 0) {
+                        let batchPlainText = [];
+                        let batchHtmlText = '';
+
+                        findingElements.forEach(el => {
+                            const { plainText: findingPlainText, htmlText: findingHtmlText } = getCopyContent(el);
+                            batchPlainText.push(findingPlainText);
+                            batchHtmlText += findingHtmlText;
+                        });
+
+                        plainText += \`[\${batchName}]\\n\${batchPlainText.join('\\n')}\\n\\n\`;
+                        htmlText += \`<h3>\${batchName}</h3>\` + batchHtmlText;
+                    }
+                });
+
+                if (plainText.length === 0) return;
+
+                const success = await copyToClipboard(plainText.trim(), htmlText.trim());
+                if (success) {
+                    copyAllTranscriptsBtn.textContent = 'Copied!';
+                    setTimeout(() => { copyAllTranscriptsBtn.textContent = 'Copy All Transcripts'; }, 2000);
+                }
+            });
+        }
+
+        document.querySelectorAll('.reorder-toggle-btn').forEach(btn => {
+            btn.addEventListener('click', () => toggleReorderMode(btn.dataset.batchId));
+        });
+        document.querySelectorAll('.merge-toggle-btn').forEach(btn => {
+            btn.addEventListener('click', () => toggleMergeMode(btn.dataset.batchId));
+        });
+        document.querySelectorAll('.undo-merge-btn').forEach(btn => {
+            btn.addEventListener('click', () => undoMerge(btn.dataset.batchId));
         });
     }
 
-    document.querySelectorAll('.reorder-toggle-btn').forEach(btn => {
-        btn.addEventListener('click', () => toggleReorderMode(btn.dataset.batchId));
-    });
-    document.querySelectorAll('.merge-toggle-btn').forEach(btn => {
-        btn.addEventListener('click', () => toggleMergeMode(btn.dataset.batchId));
-    });
-    document.querySelectorAll('.undo-merge-btn').forEach(btn => {
-        btn.addEventListener('click', () => undoMerge(btn.dataset.batchId));
-    });
-});
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initReport);
+    } else {
+        initReport();
+    }
+})();
 `;
 
 const getHTMLTemplate = (title: string, content: string): string => `
@@ -965,23 +1028,20 @@ const getHTMLTemplate = (title: string, content: string): string => `
 
       /* Multi-select bottom floating banner */
       #multi-select-banner {
-        display: none;
         position: fixed;
-        bottom: 1.5rem;
+        bottom: 1.25rem;
         left: 50%;
         transform: translateX(-50%);
         z-index: 9000;
-        background-color: #0f172a;
+        background-color: #1e293b;
         color: #ffffff;
         border-radius: 9999px;
         box-shadow: 0 10px 25px rgba(0, 0, 0, 0.3);
+        display: flex;
         align-items: center;
         gap: 1rem;
-        padding: 0.6rem 1.5rem;
+        padding: 0.5rem 1.25rem;
         transition: all 0.3s ease-in-out;
-      }
-      #multi-select-banner.flex {
-        display: flex !important;
       }
       .sr-only {
         position: absolute;
@@ -1001,6 +1061,7 @@ const getHTMLTemplate = (title: string, content: string): string => `
         background-color: #475569;
         border-radius: 9999px;
         transition: background-color 0.2s;
+        cursor: pointer;
       }
       .toggle-thumb {
         position: absolute;
@@ -1011,12 +1072,13 @@ const getHTMLTemplate = (title: string, content: string): string => `
         height: 1rem;
         border-radius: 9999px;
         transition: transform 0.2s;
+        cursor: pointer;
       }
       #multi-select-toggle:checked ~ .toggle-track {
-        background-color: #2563eb;
+        background-color: #2563eb !important;
       }
       #multi-select-toggle:checked ~ .toggle-thumb {
-        transform: translateX(1.5rem);
+        transform: translateX(1.5rem) !important;
       }
 
       /* Batch cards */
@@ -1083,9 +1145,9 @@ const getHTMLTemplate = (title: string, content: string): string => `
     
     <div id="notification" class="fixed bottom-4 right-4 bg-slate-800 text-white text-sm font-bold py-2 px-4 rounded-lg shadow-lg z-50 transition-all duration-300 ease-in-out opacity-0" role="alert"></div>
 
-    <div id="multi-select-banner" class="hidden fixed bottom-5 left-1/2 -translate-x-1/2 z-40 bg-slate-800 text-white rounded-full shadow-lg items-center gap-4 px-5 py-2 transition-all duration-300 ease-in-out">
+    <div id="multi-select-banner" class="fixed bottom-5 left-1/2 -translate-x-1/2 z-40 bg-slate-800 text-white rounded-full shadow-lg flex items-center gap-4 px-5 py-2 transition-all duration-300 ease-in-out">
         <p class="text-sm font-semibold">Multi-select Mode</p>
-        <label for="multi-select-toggle" class="flex items-center cursor-pointer">
+        <label for="multi-select-toggle" class="flex items-center cursor-pointer select-none">
             <span class="mr-2 text-sm font-medium text-slate-300">OFF</span>
             <div class="relative">
                 <input 
@@ -1093,8 +1155,8 @@ const getHTMLTemplate = (title: string, content: string): string => `
                     id="multi-select-toggle" 
                     class="sr-only peer"
                 />
-                <div class="toggle-track w-12 h-6 bg-slate-600 rounded-full peer-checked:bg-blue-600"></div>
-                <div class="toggle-thumb absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform peer-checked:translate-x-6"></div>
+                <div class="toggle-track w-12 h-6 bg-slate-600 rounded-full peer-checked:bg-blue-600 transition-colors cursor-pointer"></div>
+                <div class="toggle-thumb absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform peer-checked:translate-x-6 cursor-pointer"></div>
             </div>
             <span class="ml-2 text-sm font-medium">ON</span>
         </label>
@@ -1229,7 +1291,7 @@ export const generateSingleDictationHTML = (findings: string[], timestamp?: numb
             ` : ''}
         </div>
         
-        <p class="text-slate-600 mb-6">Click any finding to copy it. Use the buttons above for advanced editing.</p>
+        <p class="text-slate-600 mb-6">Click any finding to copy it. Use the buttons above for advanced editing, or use Multi-select Mode at the bottom to copy multiple findings.</p>
 
         ${renderFindingsList(findings, 'single')}
     `;

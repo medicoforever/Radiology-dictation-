@@ -4,6 +4,7 @@ import SearchIcon from '../icons/SearchIcon';
 import CloseIcon from '../icons/CloseIcon';
 import { FileText, Check, Sparkles, Filter, Eye } from 'lucide-react';
 import { isTableRowFinding, parseTableRow } from '../../services/docxService';
+import { getUpcomingTemplate, setUpcomingTemplate, clearUpcomingTemplate, subscribeToUpcomingTemplate, UpcomingTemplateConfig } from '../../services/upcomingTemplateService';
 
 interface TemplateSelectionModalProps {
   isOpen: boolean;
@@ -65,6 +66,16 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
   const [modalityFilter, setModalityFilter] = useState<'ALL' | 'CT' | 'MRI'>('ALL');
   const [regionFilter, setRegionFilter] = useState<string>('ALL');
   const [selectedPreview, setSelectedPreview] = useState<ReportTemplate | null>(null);
+  const [activeUpcoming, setActiveUpcoming] = useState<UpcomingTemplateConfig | null>(() => getUpcomingTemplate());
+  const [useForUpcoming, setUseForUpcoming] = useState<boolean>(false);
+
+  useEffect(() => {
+    setActiveUpcoming(getUpcomingTemplate());
+    const unsubscribe = subscribeToUpcomingTemplate((config) => {
+      setActiveUpcoming(config);
+    });
+    return unsubscribe;
+  }, []);
 
   useEffect(() => {
     if (!isOpen) {
@@ -72,8 +83,19 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
       setModalityFilter('ALL');
       setRegionFilter('ALL');
       setSelectedPreview(null);
+      setUseForUpcoming(false);
+    } else {
+      setActiveUpcoming(getUpcomingTemplate());
     }
   }, [isOpen]);
+
+  const handleConfirmSelect = async (template: ReportTemplate, forUpcoming = useForUpcoming) => {
+    if (forUpcoming) {
+      await setUpcomingTemplate(template);
+      setActiveUpcoming(getUpcomingTemplate());
+    }
+    onSelectTemplate(template);
+  };
 
   const ctCount = useMemo(() => {
     return templates.filter(t => (t.modality || t.category || '').toUpperCase().includes('CT')).length;
@@ -225,6 +247,29 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
           </button>
         </header>
 
+        {/* Active Upcoming Template Banner */}
+        {activeUpcoming && (
+          <div className="bg-emerald-50 dark:bg-emerald-950/60 border-b border-emerald-200 dark:border-emerald-800/80 px-4 py-2 flex items-center justify-between text-xs flex-shrink-0 animate-fade-in">
+            <div className="flex items-center gap-2 text-emerald-800 dark:text-emerald-200 font-semibold min-w-0">
+              <span className="shrink-0 text-sm">📌</span>
+              <span className="truncate">
+                Active for upcoming reports: <strong className="underline">{activeUpcoming.name}</strong>
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                clearUpcomingTemplate();
+                setActiveUpcoming(null);
+              }}
+              className="text-emerald-700 hover:text-emerald-900 dark:text-emerald-300 dark:hover:text-emerald-100 font-bold px-2.5 py-1 rounded-md hover:bg-emerald-100 dark:hover:bg-emerald-900/60 transition-colors shrink-0 cursor-pointer text-xs"
+              title="Remove template for upcoming reports"
+            >
+              ✕ Remove
+            </button>
+          </div>
+        )}
+
         {/* Filter Controls Bar */}
         <div className="p-4 border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 space-y-3 flex-shrink-0">
           <div className="flex flex-col sm:flex-row gap-3 items-stretch sm:items-center justify-between">
@@ -311,6 +356,24 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
               </button>
             ))}
           </div>
+
+          {/* Upcoming Reports Option Toggle */}
+          <div className="pt-2 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between flex-wrap gap-2">
+            <label className="flex items-center gap-2 text-xs font-semibold text-slate-700 dark:text-slate-300 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={useForUpcoming}
+                onChange={(e) => setUseForUpcoming(e.target.checked)}
+                className="rounded border-slate-300 dark:border-slate-600 text-blue-600 focus:ring-blue-500 h-4 w-4"
+              />
+              <span>Use selected template for upcoming reports (Single & Batch dictations)</span>
+            </label>
+            {useForUpcoming && (
+              <span className="text-[11px] font-medium text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/40 px-2 py-0.5 rounded border border-emerald-300 dark:border-emerald-700">
+                Will be set as active template for upcoming dictations
+              </span>
+            )}
+          </div>
         </div>
 
         {/* Content Body: Split View (List on left, Preview on right) */}
@@ -325,6 +388,7 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
               <ul className="space-y-1.5">
                 {filteredTemplates.map((template) => {
                   const isSelected = selectedPreview?.name === template.name;
+                  const isCurrentUpcoming = Boolean(activeUpcoming && (activeUpcoming.id === template.id || activeUpcoming.name === template.name));
                   const isCT = (template.modality || template.category || '').toUpperCase().includes('CT');
                   const isMRI = (template.modality || template.category || '').toUpperCase().includes('MRI');
                   const linesCount = template.lines?.length || 0;
@@ -335,8 +399,8 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
                         role="button"
                         tabIndex={0}
                         onClick={() => setSelectedPreview(template)}
-                        onDoubleClick={() => onSelectTemplate(template)}
-                        onKeyDown={(e) => { if (e.key === 'Enter') onSelectTemplate(template); }}
+                        onDoubleClick={() => handleConfirmSelect(template)}
+                        onKeyDown={(e) => { if (e.key === 'Enter') handleConfirmSelect(template); }}
                         className={`w-full text-left p-3 rounded-xl transition-all flex items-start justify-between gap-2.5 border cursor-pointer ${
                           isSelected
                             ? 'bg-blue-50/80 dark:bg-blue-950/40 border-blue-400 dark:border-blue-600 ring-1 ring-blue-400 shadow-xs'
@@ -344,7 +408,7 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
                         }`}
                       >
                         <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-1.5 mb-1">
+                          <div className="flex items-center gap-1.5 mb-1 flex-wrap">
                             <span
                               className={`text-[9px] font-extrabold uppercase px-1.5 py-0.5 rounded tracking-wide ${
                                 isCT
@@ -356,6 +420,11 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
                             >
                               {template.modality || (isCT ? 'CT' : isMRI ? 'MRI' : 'SCAN')}
                             </span>
+                            {isCurrentUpcoming && (
+                              <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300 border border-emerald-300 dark:border-emerald-700 animate-pulse">
+                                📌 Active for Upcoming
+                              </span>
+                            )}
                             {linesCount > 0 && (
                               <span className="text-[10px] text-slate-400 dark:text-slate-500">
                                 {linesCount} lines
@@ -371,18 +440,41 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
                         </div>
 
                         <div className="flex flex-col items-end gap-1.5 flex-shrink-0 pt-0.5">
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              onSelectTemplate(template);
-                            }}
-                            className="flex items-center gap-1 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 active:scale-95 text-white text-xs font-bold rounded-lg shadow-xs transition-all cursor-pointer"
-                            title={`Select ${template.name}`}
-                          >
-                            <Check className="w-3.5 h-3.5" />
-                            <span>Select</span>
-                          </button>
+                          <div className="flex items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleConfirmSelect(template, false);
+                              }}
+                              className="flex items-center gap-1 px-2.5 py-1.5 bg-blue-600 hover:bg-blue-700 active:scale-95 text-white text-xs font-bold rounded-lg shadow-xs transition-all cursor-pointer"
+                              title={`Use ${template.name} for this report only`}
+                            >
+                              <Check className="w-3.5 h-3.5" />
+                              <span>Select</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (isCurrentUpcoming) {
+                                  clearUpcomingTemplate();
+                                  setActiveUpcoming(null);
+                                } else {
+                                  handleConfirmSelect(template, true);
+                                }
+                              }}
+                              className={`flex items-center gap-1 px-2 py-1.5 text-xs font-bold rounded-lg border transition-all cursor-pointer ${
+                                isCurrentUpcoming
+                                  ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300 border-emerald-300 dark:border-emerald-700 hover:bg-red-50 hover:text-red-700 hover:border-red-300'
+                                  : 'bg-slate-100 hover:bg-emerald-50 text-slate-700 hover:text-emerald-700 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-emerald-950/40 border-slate-200 dark:border-slate-700'
+                              }`}
+                              title={isCurrentUpcoming ? 'Click to remove this template from upcoming reports' : `Use ${template.name} for upcoming reports in Single & Batch`}
+                            >
+                              <span>📌</span>
+                              <span className="text-[11px] hidden sm:inline">{isCurrentUpcoming ? 'Remove' : 'Upcoming'}</span>
+                            </button>
+                          </div>
                           {isSelected ? (
                             <span className="text-[10px] text-blue-600 dark:text-blue-400 font-semibold flex items-center gap-0.5">
                               <Eye className="w-3 h-3" /> Previewing
@@ -545,17 +637,56 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
                 </div>
 
                 {/* Bottom Action Footer */}
-                <div className="pt-3 mt-2 border-t border-slate-200 dark:border-slate-800 flex items-center justify-between flex-shrink-0">
-                  <span className="text-[11px] text-slate-400">
-                    Click "Use Template" to insert this structure into dictation.
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => onSelectTemplate(selectedPreview)}
-                    className="flex items-center gap-1.5 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-xl shadow-xs transition-colors"
-                  >
-                    Select "{selectedPreview.name}"
-                  </button>
+                <div className="pt-3 mt-2 border-t border-slate-200 dark:border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3 flex-shrink-0">
+                  <div className="flex items-center gap-2">
+                    {activeUpcoming && (activeUpcoming.id === selectedPreview.id || activeUpcoming.name === selectedPreview.name) ? (
+                      <div className="flex items-center gap-2 text-xs text-emerald-800 dark:text-emerald-200 font-bold bg-emerald-50 dark:bg-emerald-950/60 px-3 py-1.5 rounded-lg border border-emerald-300 dark:border-emerald-700">
+                        <span>📌 Active for upcoming reports</span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            clearUpcomingTemplate();
+                            setActiveUpcoming(null);
+                          }}
+                          className="ml-2 text-xs text-red-600 dark:text-red-400 hover:underline font-bold cursor-pointer"
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    ) : (
+                      <label className="flex items-center gap-2 text-xs text-slate-700 dark:text-slate-300 cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={useForUpcoming}
+                          onChange={(e) => setUseForUpcoming(e.target.checked)}
+                          className="rounded border-slate-300 dark:border-slate-600 text-blue-600 focus:ring-blue-500 h-4 w-4"
+                        />
+                        <span className="font-semibold text-slate-800 dark:text-slate-200">
+                          Use for upcoming reports <span className="font-normal text-slate-500 dark:text-slate-400">(Single &amp; Batch)</span>
+                        </span>
+                      </label>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2 flex-wrap justify-end">
+                    <button
+                      type="button"
+                      onClick={() => handleConfirmSelect(selectedPreview, false)}
+                      className="flex items-center justify-center gap-1.5 px-3.5 py-2 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold rounded-xl border border-slate-300 dark:border-slate-600 transition-colors cursor-pointer"
+                      title="Apply only to current report without saving for upcoming dictations"
+                    >
+                      <Check className="w-3.5 h-3.5" />
+                      <span>Apply to Current Only</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleConfirmSelect(selectedPreview, true)}
+                      className="flex items-center justify-center gap-1.5 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded-xl shadow-xs transition-colors cursor-pointer"
+                      title="Use this template for upcoming reports across Single and Batch dictations"
+                    >
+                      <span>📌</span>
+                      <span>Use for Upcoming Reports</span>
+                    </button>
+                  </div>
                 </div>
               </div>
             ) : (

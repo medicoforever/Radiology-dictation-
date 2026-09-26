@@ -1,5 +1,5 @@
 import { GoogleGenAI, Type, GenerateContentResponse, Chat } from "@google/genai";
-import { DEFAULT_GEMINI_PROMPT, REPROCESS_GEMINI_PROMPT, TEMPLATE_GEMINI_PROMPT, REPORT_TEMPLATES, ERROR_IDENTIFIER_PROMPT, INITIAL_AGENT_PROMPT, REFINEMENT_AGENT_PROMPT, SYNTHESIZER_AGENT_PROMPT, VISUAL_TEMPLATE_GEMINI_PROMPT, getLiveModelFallbackChain, DEFAULT_SELECTED_MODEL } from '../constants';
+import { DEFAULT_GEMINI_PROMPT, REPROCESS_GEMINI_PROMPT, TEMPLATE_GEMINI_PROMPT, REPORT_TEMPLATES, ERROR_IDENTIFIER_PROMPT, INITIAL_AGENT_PROMPT, REFINEMENT_AGENT_PROMPT, SYNTHESIZER_AGENT_PROMPT, VISUAL_TEMPLATE_GEMINI_PROMPT, getLiveModelFallbackChain, DEFAULT_SELECTED_MODEL, ReportTemplate } from '../constants';
 import { IdentifiedError } from "../types";
 import { isTableRowFinding } from "./docxService";
 
@@ -814,6 +814,161 @@ export const processAudio = async (
       "BOLD::Ventricles, basal cisterns, and cortical sulci are normal for patient age.",
       "IMPRESSION:###NORMAL CT BRAIN STUDY WITHOUT ACUTE INTRACRANIAL ABNORMALITY."
     ];
+  }
+};
+
+/**
+ * Merges pre-existing dictated findings with a selected template after dictation.
+ * Surgically gathers prompt texts from TEMPLATE_GEMINI_PROMPT and CRITICAL TEMPLATE MERGE DIRECTIVES
+ * without altering existing behavior.
+ */
+export const mergeDictatedFindingsWithTemplate = async (
+  dictatedFindings: string[],
+  template: ReportTemplate | { name: string; content?: string; lines?: string[]; skillPrompt?: string; id?: string; fileName?: string; docxBase64?: string },
+  model: string = DEFAULT_SELECTED_MODEL,
+  audioBlob?: Blob | Blob[] | null,
+  customPrompt?: string,
+  customDocx?: CustomDocxInput
+): Promise<string[]> => {
+  if (!dictatedFindings || dictatedFindings.length === 0) {
+    throw new Error("No dictated findings available to merge with template.");
+  }
+
+  const templateName = template.name || 'Report Template';
+  const docxText = ((customDocx?.text || customDocx?.extractedText || '')).trim();
+  const templateContent = docxText.length > 0
+    ? docxText
+    : (template.lines && template.lines.length > 0
+      ? template.lines.join('\n')
+      : (template.content || ''));
+  const skillPrompt = template.skillPrompt || '';
+
+  // 1. Surgically gathered template prompt based on TEMPLATE_GEMINI_PROMPT
+  const templateBasePrompt = TEMPLATE_GEMINI_PROMPT.replace(
+    '[INSERT_TEMPLATE_HERE]',
+    `BASELINE TEMPLATE CONTENT FOR "${templateName}":\n"""\n${templateContent}\n"""`
+  );
+
+  // 2. Surgically gathered merge directives from detectAndExtractTemplate
+  const templateContextPrompt = `
+================================================================================
+ACTIVE RADIOLOGY NORMAL REPORT TEMPLATE: "${templateName}"
+BASELINE TEMPLATE CONTENT:
+"""
+${templateContent}
+"""
+${skillPrompt ? `
+AUTHORITATIVE CLINICAL SKILL & PHRASING DIRECTIVES:
+${skillPrompt}
+` : ''}
+CRITICAL TEMPLATE MERGE DIRECTIVES:
+1. BASELINE STRUCTURE: Use the full structure, headings, normal findings, and layout from this "${templateName}" template as the baseline skeleton.
+2. NORMAL FINDINGS PRESERVATION: If the doctor's dictation states "normal", "all normal", "scan is normal", "unremarkable", or does not mention changes for any anatomical section, PRESERVE and output the complete normal findings for that section verbatim WITHOUT the 'BOLD::' prefix.
+3. ABNORMAL / DICTATED FINDINGS MERGING: When the doctor dictates specific abnormal findings, observations, or modifications, merge them into the corresponding template sections and prefix only those dictated/abnormal lines with 'BOLD::'.
+4. NEW FINDINGS: Any new findings dictated that are not covered in the template should be inserted in the appropriate clinical location with 'BOLD::'.
+5. IMPRESSION: Synthesize an accurate, comprehensive IMPRESSION based on all findings (normal and abnormal) in the format 'IMPRESSION:###point 1###point 2...'.
+6. MEASUREMENT / COMPARATIVE TABLES: When the template or report contains measurement grids or comparative anatomical tables (e.g., bilateral kidney comparisons, TAVI measurements, pulmonary artery dimensions, cardiac ventricular volumes), preserve the table rows joined by '###' (e.g. 'Col1 | Col2###Val1 | Val2') so the full tabular grid is preserved as a cohesive unit.
+================================================================================
+`;
+
+  const dictatedFindingsDirective = `
+================================================================================
+DOCTOR'S PREVIOUSLY DICTATED FINDINGS TO MERGE INTO "${templateName}":
+"""
+${JSON.stringify({ findings: dictatedFindings }, null, 2)}
+"""
+
+TASK INSTRUCTIONS:
+You are provided with the doctor's actual dictated findings above.
+Carefully integrate these dictated findings into the "${templateName}" baseline template following all rules:
+- Any anatomical sections where the dictation describes pathology, abnormal lesions, or modifications must be updated with the dictated findings and prefixed with 'BOLD::'.
+- Any anatomical sections from the template that were normal or not mentioned in the dictation must remain present verbatim without 'BOLD::'.
+- Clinical profile if dictated or present must be preserved as its own line (*Clinical Profile: ...*).
+- Generate a new, comprehensive IMPRESSION synthesizing all normal and abnormal findings starting with 'IMPRESSION:###'.
+- Return ONLY a JSON object with the "findings" string array in the assembled report order.
+================================================================================
+`;
+
+  const parts: any[] = [
+    { text: templateContextPrompt },
+    { text: templateBasePrompt },
+    { text: dictatedFindingsDirective },
+  ];
+
+  if (customPrompt && customPrompt.trim()) {
+    parts.push({
+      text: `Additional User Instructions:\n${customPrompt.trim()}`
+    });
+  }
+
+  // If audio is available, attach it as additional context
+  if (audioBlob) {
+    const audioBlobs = Array.isArray(audioBlob) ? audioBlob : [audioBlob];
+    for (const blob of audioBlobs) {
+      if (blob && blob.size > 0 && blob.type && blob.type.startsWith('audio/')) {
+        try {
+          const base64Audio = await blobToBase64(blob);
+          parts.push({
+            inlineData: {
+              mimeType: getCleanMimeType(blob),
+              data: base64Audio,
+            },
+          });
+        } catch (e) {
+          console.warn("Could not encode audio for template merge:", e);
+        }
+      }
+    }
+  }
+
+  const targetModel = resolveApiTargetModel(model);
+
+  try {
+    const rawResponseText = await generateContentWithJsonFallback(targetModel, parts, responseSchema, 0.1);
+    const mergedFindings = extractFindingsFromResponse(rawResponseText);
+
+    if (mergedFindings && mergedFindings.length > 0) {
+      return mergedFindings;
+    }
+    throw new Error("Invalid response format received while merging template.");
+  } catch (error) {
+    console.warn("mergeDictatedFindingsWithTemplate primary attempt failed, trying fallback:", error);
+
+    // Direct JSON prompt fallback
+    try {
+      const fallbackModel = 'gemini-3.7-flash';
+      const retryResponse = await getAI().models.generateContent({
+        model: fallbackModel,
+        contents: {
+          parts: [
+            ...parts,
+            { text: "\n\nCRITICAL OUTPUT REQUIREMENT: Output ONLY a valid JSON object in the exact format: {\"findings\": [\"finding 1\", \"finding 2\", ...]}" }
+          ]
+        }
+      });
+      const retryText = retryResponse.text?.trim() || '';
+      const parsed = extractFindingsFromResponse(retryText);
+      if (parsed && parsed.length > 0) {
+        return parsed;
+      }
+    } catch (retryErr) {
+      console.warn("mergeDictatedFindingsWithTemplate fallback failed:", retryErr);
+    }
+
+    // Baseline template lines fallback with dictated findings appended
+    if (template.lines && template.lines.length > 0) {
+      const title = template.lines[0] || templateName;
+      const filteredDictated = dictatedFindings.filter(f => !f.toLowerCase().includes('normal') && !f.startsWith('IMPRESSION'));
+      return [
+        title,
+        "*Clinical Profile: Routine evaluation.*",
+        ...template.lines.slice(1, -2),
+        ...filteredDictated.map(f => f.startsWith('BOLD::') ? f : `BOLD::${f}`),
+        template.lines[template.lines.length - 1] || "IMPRESSION:###Study evaluated."
+      ];
+    }
+
+    throw error instanceof Error ? error : new Error("Failed to merge findings with template.");
   }
 };
 

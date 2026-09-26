@@ -15,6 +15,7 @@ import SearchIcon from '../icons/SearchIcon';
 import { saveUserTemplate, getUserTemplates, deleteUserTemplate, UserTemplate } from '../../services/templateStorage';
 import { parseDocx } from '../../services/docxService';
 import { getTemplateDocxBase64 } from '../../services/builtInTemplates';
+import { getUpcomingTemplate, setUpcomingTemplate, clearUpcomingTemplate, subscribeToUpcomingTemplate, UpcomingTemplateConfig } from '../../services/upcomingTemplateService';
 
 export interface DocxTemplateData {
   name: string;
@@ -40,7 +41,6 @@ const CustomPromptInput: React.FC<{
   const { isRecording, startRecording, stopRecording, error: recorderError } = useAudioRecorder();
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [transcriptionError, setTranscriptionError] = useState<string | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
   const dragCounter = useRef(0);
 
@@ -57,8 +57,15 @@ const CustomPromptInput: React.FC<{
   const [templateSaveError, setTemplateSaveError] = useState<string | null>(null);
   const [appliedTemplateName, setAppliedTemplateName] = useState<string | null>(null);
   const [deletingTemplateId, setDeletingTemplateId] = useState<string | null>(null);
+  const [activeUpcoming, setActiveUpcoming] = useState<UpcomingTemplateConfig | null>(() => getUpcomingTemplate());
   const templateFileInputRef = useRef<HTMLInputElement>(null);
   const templateDocxInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    setActiveUpcoming(getUpcomingTemplate());
+    const unsub = subscribeToUpcomingTemplate(setActiveUpcoming);
+    return unsub;
+  }, []);
 
   // Load saved templates from browser database
   const loadSavedTemplates = async () => {
@@ -261,13 +268,6 @@ const CustomPromptInput: React.FC<{
     }
   };
 
-  const handleImageFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
-    processFiles(event.target.files);
-    if (event.target) {
-        event.target.value = "";
-    }
-  };
-
   const handleTemplateImageSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
     processTemplateFiles(event.target.files);
     if (event.target) {
@@ -376,7 +376,7 @@ const CustomPromptInput: React.FC<{
     }
   };
 
-  const handleApplyCustomTemplate = async (template: UserTemplate) => {
+  const handleApplyCustomTemplate = async (template: UserTemplate, forUpcoming = false) => {
     const cleanId = template.id.startsWith('builtin_') ? template.id.replace('builtin_', '') : null;
     const isBuiltIn = template.isBuiltIn || Boolean(cleanId);
 
@@ -403,6 +403,16 @@ const CustomPromptInput: React.FC<{
       ? `${tag}Use the normal "${template.name}" report template. Integrate my dictation and generate a new impression.`
       : (template.text ? `${tag}${template.text}` : `${tag}Use the custom "${template.name}" report template. Integrate dictation into the layout and synthesize a new impression.`);
 
+    if (forUpcoming) {
+      await setUpcomingTemplate({
+        ...template,
+        docxBase64: docxData?.data,
+        lines: template.lines,
+        text: promptText,
+      });
+      setActiveUpcoming(getUpcomingTemplate());
+    }
+
     onPromptChange(promptText);
 
     if (onImagesChange) {
@@ -411,7 +421,7 @@ const CustomPromptInput: React.FC<{
     if (onCustomDocxChange) {
       onCustomDocxChange(docxData);
     }
-    setAppliedTemplateName(template.name);
+    setAppliedTemplateName(forUpcoming ? `${template.name} (Active for Upcoming Reports)` : template.name);
     setTimeout(() => {
       setAppliedTemplateName(null);
     }, 4000);
@@ -811,13 +821,43 @@ const CustomPromptInput: React.FC<{
                             )}
                           </div>
 
-                          <button
-                            type="button"
-                            onClick={() => handleApplyCustomTemplate(tmpl)}
-                            className="w-full mt-1.5 py-1 px-3 text-xs font-bold text-center rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-950 text-blue-700 dark:text-blue-300 hover:bg-blue-100 dark:hover:bg-blue-900/60 transition-colors"
-                          >
-                            Use Template
-                          </button>
+                          {activeUpcoming && (activeUpcoming.id === tmpl.id || activeUpcoming.name === tmpl.name || (tmpl.id.startsWith('builtin_') && activeUpcoming.id === tmpl.id.replace('builtin_', ''))) ? (
+                            <div className="w-full mt-1.5 p-1.5 rounded-lg border border-emerald-300 dark:border-emerald-700 bg-emerald-50 dark:bg-emerald-950/40 flex items-center justify-between text-xs text-emerald-800 dark:text-emerald-200">
+                              <span className="font-bold text-[11px] truncate flex items-center gap-1">
+                                <span>📌</span> Active for Upcoming
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  clearUpcomingTemplate();
+                                  setActiveUpcoming(null);
+                                }}
+                                className="text-[11px] font-bold text-red-600 dark:text-red-400 hover:underline px-1 py-0.5 rounded cursor-pointer"
+                              >
+                                Remove
+                              </button>
+                            </div>
+                          ) : (
+                            <div className="w-full mt-1.5 flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => handleApplyCustomTemplate(tmpl, false)}
+                                className="flex-1 py-1 px-2.5 text-xs font-bold text-center rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-950 text-blue-700 dark:text-blue-300 hover:bg-blue-100 dark:hover:bg-blue-900/60 transition-colors"
+                                title="Use this template for current report only"
+                              >
+                                Use Template
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleApplyCustomTemplate(tmpl, true)}
+                                className="py-1 px-2 text-xs font-bold text-center rounded-lg border border-emerald-300 dark:border-emerald-700 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-900/60 transition-colors flex items-center gap-1 shrink-0"
+                                title="Use this template for upcoming reports in Single & Batch dictations"
+                              >
+                                <span>📌</span>
+                                <span className="text-[11px]">Upcoming</span>
+                              </button>
+                            </div>
+                          )}
                         </div>
                       );
                     })}
@@ -1029,26 +1069,6 @@ const CustomPromptInput: React.FC<{
             )}
 
           </div>
-
-          <div className="text-[11px] text-slate-400 dark:text-slate-500 leading-relaxed bg-slate-50 dark:bg-slate-950 p-2.5 rounded-lg border border-slate-100 dark:border-slate-800 flex flex-col sm:flex-row gap-2 justify-between">
-            <span>
-              ℹ️ Custom instructions, DOCX documents, and reference images fine-tune the AI's transcription style, report format, and structure.
-            </span>
-            {!isLiveMode && (
-              <span className="font-semibold text-blue-600 dark:text-blue-400 flex-shrink-0 cursor-pointer hover:underline" onClick={() => fileInputRef.current?.click()}>
-                + Click here to attach screenshots or .docx report template to active session
-              </span>
-            )}
-          </div>
-          
-          <input
-              type="file"
-              ref={fileInputRef}
-              onChange={handleImageFileSelect}
-              className="hidden"
-              accept="image/*,.docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-              multiple
-          />
         </div>
       )}
     </div>

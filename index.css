@@ -1,3 +1,266 @@
 @import "tailwindcss";
 
 @custom-variant dark (&:where(.dark, .dark *));
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fadeIn {
+  animation: fadeIn 0.18s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* ==========================================================================
+   MULTI-MODE THEMES
+   Supported Modes: light, dark, colourful, magical, creative, soothing, sunset, ocean
+   ========================================================================== */
+
+/* Base transition for smooth theme switching */
+body, #root, #root > div {
+  transition: background-color 0.3s ease, color 0.3s ease, border-color 0.3s ease;
+}
+
+/* --------------------------------------------------------------------------
+   1. COLOURFUL MODE (Vibrant rainbow prism & cheerful radiance)
+   -------------------------------------------------------------------------- */
+html[data-theme="colourful"] body,
+html[data-theme="colourful"] #root > div:first-child {
+  background: 
+    radial-gradient(at 0% 0%, rgba(254, 205, 211, 0.8) 0px, transparent 45%),
+    radial-gradient(at 100% 0%, rgba(254, 240, 138, 0.75) 0px, transparent 45%),
+    radial-gradient(at 100% 100%, rgba(187, 247, 208, 0.8) 0px, transparent 50%),
+    radial-gradient(at 0% 100%, rgba(199, 210, 254, 0.85) 0px, transparent 50%),
+    radial-gradient(at 50% 50%, rgba(253, 230, 138, 0.4) 0px, transparent 60%),
+    linear-gradient(135deg, #fff1f2 0%, #fdf4ff 30%, #eff6ff 65%, #f0fdf4 100%) !important;
+  background-attachment: fixed !important;
+}
+
+html[data-theme="colourful"] .bg-white {
+  background-color: rgba(255, 255, 255, 0.88) !important;
+  backdrop-filter: blur(14px) !important;
+  -webkit-backdrop-filter: blur(14px) !important;
+  border-color: rgba(217, 70, 239, 0.25) !important;
+  box-shadow: 0 10px 28px -5px rgba(236, 72, 153, 0.12), 0 4px 12px -2px rgba(99, 102, 241, 0.1) !important;
+}
+
+html[data-theme="colourful"] header h1 span {
+  background: linear-gradient(135deg, #e11d48 0%, #9333ea 50%, #2563eb 100%) !important;
+  -webkit-background-clip: text !important;
+  -webkit-text-fill-color: transparent !important;
+}
+
+html[data-theme="colourful"] .bg-blue-600 {
+  background: linear-gradient(135deg, #ec4899 0%, #8b5cf6 50%, #3b82f6 100%) !important;
+  border-color: transparent !important;
+}
+
+html[data-theme="colourful"] .bg-blue-600:hover {
+  background: linear-gradient(135deg, #db2777 0%, #7c3aed 50%, #2563eb 100%) !important;
+}
+
+/* --------------------------------------------------------------------------
+   2. MAGICAL MODE (Enchanted cosmic violet & starlight night)
+   -------------------------------------------------------------------------- */
+html[data-theme="magical"] body,
+html[data-theme="magical"] #root > div:first-child {
+  background: 
+    radial-gradient(at 85% 15%, rgba(168, 85, 247, 0.38) 0px, transparent 50%),
+    radial-gradient(at 15% 85%, rgba(236, 72, 153, 0.3) 0px, transparent 50%),
+    radial-gradient(at 50% 40%, rgba(99, 102, 241, 0.28) 0px, transparent 65%),
+    radial-gradient(at 20% 30%, rgba(192, 132, 252, 0.2) 0px, transparent 40%),
+    linear-gradient(160deg, #0d061f 0%, #150a2e 45%, #080314 100%) !important;
+  background-attachment: fixed !important;
+}
+
+html[data-theme="magical"] .dark\:bg-slate-800,
+html[data-theme="magical"] .dark\:bg-slate-900\/60,
+html[data-theme="magical"] .dark\:bg-slate-900,
+html[data-theme="magical"] .bg-slate-800 {
+  background-color: rgba(27, 15, 51, 0.86) !important;
+  backdrop-filter: blur(16px) !important;
+  -webkit-backdrop-filter: blur(16px) !important;
+  border-color: rgba(192, 132, 252, 0.35) !important;
+  box-shadow: 0 12px 35px -8px rgba(168, 85, 247, 0.28), 0 0 20px rgba(192, 132, 252, 0.14) !important;
+}
+
+html[data-theme="magical"] header h1 span {
+  background: linear-gradient(135deg, #f472b6 0%, #c084fc 45%, #818cf8 100%) !important;
+  -webkit-background-clip: text !important;
+  -webkit-text-fill-color: transparent !important;
+  filter: drop-shadow(0 0 14px rgba(192, 132, 252, 0.45));
+}
+
+html[data-theme="magical"] .bg-blue-600 {
+  background: linear-gradient(135deg, #a855f7 0%, #ec4899 50%, #6366f1 100%) !important;
+  border-color: rgba(232, 121, 249, 0.4) !important;
+  box-shadow: 0 4px 18px rgba(168, 85, 247, 0.45) !important;
+}
+
+html[data-theme="magical"] .bg-blue-600:hover {
+  background: linear-gradient(135deg, #9333ea 0%, #db2777 50%, #4f46e5 100%) !important;
+}
+
+/* --------------------------------------------------------------------------
+   3. CREATIVE MODE (Art studio, warm terracotta, coral & sunlit gold)
+   -------------------------------------------------------------------------- */
+html[data-theme="creative"] body,
+html[data-theme="creative"] #root > div:first-child {
+  background: 
+    radial-gradient(at 95% 5%, rgba(253, 186, 116, 0.6) 0px, transparent 45%),
+    radial-gradient(at 5% 95%, rgba(254, 205, 211, 0.55) 0px, transparent 45%),
+    radial-gradient(at 50% 30%, rgba(254, 240, 138, 0.45) 0px, transparent 55%),
+    radial-gradient(at 80% 80%, rgba(251, 146, 60, 0.25) 0px, transparent 50%),
+    linear-gradient(135deg, #fff7ed 0%, #ffedd5 40%, #fff1f2 80%, #fefce8 100%) !important;
+  background-attachment: fixed !important;
+}
+
+html[data-theme="creative"] .bg-white {
+  background-color: rgba(255, 253, 249, 0.94) !important;
+  backdrop-filter: blur(14px) !important;
+  -webkit-backdrop-filter: blur(14px) !important;
+  border-color: rgba(249, 115, 22, 0.28) !important;
+  box-shadow: 0 10px 28px -5px rgba(234, 88, 12, 0.14), 0 4px 8px -2px rgba(245, 158, 11, 0.08) !important;
+}
+
+html[data-theme="creative"] header h1 span {
+  background: linear-gradient(135deg, #ea580c 0%, #e11d48 50%, #b45309 100%) !important;
+  -webkit-background-clip: text !important;
+  -webkit-text-fill-color: transparent !important;
+}
+
+html[data-theme="creative"] .bg-blue-600 {
+  background: linear-gradient(135deg, #f97316 0%, #ea580c 45%, #e11d48 100%) !important;
+  border-color: transparent !important;
+}
+
+html[data-theme="creative"] .bg-blue-600:hover {
+  background: linear-gradient(135deg, #ea580c 0%, #c2410c 45%, #be123c 100%) !important;
+}
+
+/* --------------------------------------------------------------------------
+   4. SOOTHING MODE (Zen eucalyptus, tranquil jade sage & calming mint)
+   -------------------------------------------------------------------------- */
+html[data-theme="soothing"] body,
+html[data-theme="soothing"] #root > div:first-child {
+  background: 
+    radial-gradient(at 15% 15%, rgba(209, 250, 229, 0.75) 0px, transparent 50%),
+    radial-gradient(at 85% 85%, rgba(204, 251, 241, 0.65) 0px, transparent 50%),
+    radial-gradient(at 50% 50%, rgba(220, 252, 231, 0.5) 0px, transparent 60%),
+    radial-gradient(at 80% 20%, rgba(167, 243, 208, 0.4) 0px, transparent 40%),
+    linear-gradient(145deg, #f0fdf4 0%, #ecfdf5 35%, #f0fdfa 70%, #f4faf6 100%) !important;
+  background-attachment: fixed !important;
+}
+
+html[data-theme="soothing"] .bg-white {
+  background-color: rgba(255, 255, 255, 0.94) !important;
+  backdrop-filter: blur(14px) !important;
+  -webkit-backdrop-filter: blur(14px) !important;
+  border-color: rgba(52, 211, 153, 0.35) !important;
+  box-shadow: 0 8px 25px -4px rgba(16, 185, 129, 0.12), 0 2px 6px -1px rgba(20, 184, 166, 0.08) !important;
+}
+
+html[data-theme="soothing"] header h1 span {
+  background: linear-gradient(135deg, #059669 0%, #0d9488 50%, #0284c7 100%) !important;
+  -webkit-background-clip: text !important;
+  -webkit-text-fill-color: transparent !important;
+}
+
+html[data-theme="soothing"] .bg-blue-600 {
+  background: linear-gradient(135deg, #059669 0%, #0d9488 100%) !important;
+  border-color: transparent !important;
+}
+
+html[data-theme="soothing"] .bg-blue-600:hover {
+  background: linear-gradient(135deg, #047857 0%, #0f766e 100%) !important;
+}
+
+/* --------------------------------------------------------------------------
+   5. SUNSET GLOW MODE (Warm twilight, fiery peach & dusk rose)
+   -------------------------------------------------------------------------- */
+html[data-theme="sunset"] body,
+html[data-theme="sunset"] #root > div:first-child {
+  background: 
+    radial-gradient(at 15% 20%, rgba(244, 63, 94, 0.38) 0px, transparent 50%),
+    radial-gradient(at 85% 75%, rgba(249, 115, 22, 0.38) 0px, transparent 50%),
+    radial-gradient(at 50% 90%, rgba(168, 85, 247, 0.32) 0px, transparent 60%),
+    radial-gradient(at 70% 30%, rgba(251, 146, 60, 0.25) 0px, transparent 45%),
+    linear-gradient(160deg, #1c0e29 0%, #2c1238 40%, #150920 100%) !important;
+  background-attachment: fixed !important;
+}
+
+html[data-theme="sunset"] .dark\:bg-slate-800,
+html[data-theme="sunset"] .dark\:bg-slate-900\/60,
+html[data-theme="sunset"] .dark\:bg-slate-900,
+html[data-theme="sunset"] .bg-slate-800 {
+  background-color: rgba(41, 19, 54, 0.88) !important;
+  backdrop-filter: blur(16px) !important;
+  -webkit-backdrop-filter: blur(16px) !important;
+  border-color: rgba(251, 146, 60, 0.35) !important;
+  box-shadow: 0 12px 32px -6px rgba(249, 115, 22, 0.24), 0 0 18px rgba(244, 63, 94, 0.16) !important;
+}
+
+html[data-theme="sunset"] header h1 span {
+  background: linear-gradient(135deg, #fb923c 0%, #f43f5e 50%, #c084fc 100%) !important;
+  -webkit-background-clip: text !important;
+  -webkit-text-fill-color: transparent !important;
+  filter: drop-shadow(0 0 14px rgba(249, 115, 22, 0.4));
+}
+
+html[data-theme="sunset"] .bg-blue-600 {
+  background: linear-gradient(135deg, #f97316 0%, #f43f5e 50%, #c026d3 100%) !important;
+  border-color: rgba(251, 146, 60, 0.3) !important;
+  box-shadow: 0 4px 16px rgba(249, 115, 22, 0.35) !important;
+}
+
+html[data-theme="sunset"] .bg-blue-600:hover {
+  background: linear-gradient(135deg, #ea580c 0%, #e11d48 50%, #a21caf 100%) !important;
+}
+
+/* --------------------------------------------------------------------------
+   6. OCEAN BREEZE MODE (Deep marine sapphire & bioluminescent cyan)
+   -------------------------------------------------------------------------- */
+html[data-theme="ocean"] body,
+html[data-theme="ocean"] #root > div:first-child {
+  background: 
+    radial-gradient(at 75% 20%, rgba(14, 165, 233, 0.35) 0px, transparent 50%),
+    radial-gradient(at 20% 80%, rgba(20, 184, 166, 0.3) 0px, transparent 50%),
+    radial-gradient(at 50% 50%, rgba(6, 182, 212, 0.25) 0px, transparent 60%),
+    radial-gradient(at 80% 80%, rgba(56, 189, 248, 0.2) 0px, transparent 40%),
+    linear-gradient(160deg, #07152b 0%, #0a2244 40%, #040c19 100%) !important;
+  background-attachment: fixed !important;
+}
+
+html[data-theme="ocean"] .dark\:bg-slate-800,
+html[data-theme="ocean"] .dark\:bg-slate-900\/60,
+html[data-theme="ocean"] .dark\:bg-slate-900,
+html[data-theme="ocean"] .bg-slate-800 {
+  background-color: rgba(10, 28, 56, 0.88) !important;
+  backdrop-filter: blur(16px) !important;
+  -webkit-backdrop-filter: blur(16px) !important;
+  border-color: rgba(56, 189, 248, 0.35) !important;
+  box-shadow: 0 12px 35px -8px rgba(14, 165, 233, 0.26), 0 0 18px rgba(45, 212, 191, 0.15) !important;
+}
+
+html[data-theme="ocean"] header h1 span {
+  background: linear-gradient(135deg, #38bdf8 0%, #2dd4bf 50%, #818cf8 100%) !important;
+  -webkit-background-clip: text !important;
+  -webkit-text-fill-color: transparent !important;
+  filter: drop-shadow(0 0 14px rgba(56, 189, 248, 0.4));
+}
+
+html[data-theme="ocean"] .bg-blue-600 {
+  background: linear-gradient(135deg, #0284c7 0%, #06b6d4 50%, #14b8a6 100%) !important;
+  border-color: rgba(56, 189, 248, 0.3) !important;
+  box-shadow: 0 4px 16px rgba(14, 165, 233, 0.35) !important;
+}
+
+html[data-theme="ocean"] .bg-blue-600:hover {
+  background: linear-gradient(135deg, #0369a1 0%, #0891b2 50%, #0f766e 100%) !important;
+}

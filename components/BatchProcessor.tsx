@@ -1,11 +1,14 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useAudioRecorder } from '../hooks/useAudioRecorder';
-import { processAudio, createChat, blobToBase64, continueAudioDictation, base64ToBlob, modifyFindingWithAudio, modifyReportWithAudio, identifyPotentialErrors, runComplexImpressionGeneration, transcribeAudioForPrompt, detectAndExtractTemplate } from '../services/geminiService';
+import { processAudio, createChat, blobToBase64, continueAudioDictation, base64ToBlob, modifyFindingWithAudio, modifyReportWithAudio, identifyPotentialErrors, runComplexImpressionGeneration, transcribeAudioForPrompt, detectAndExtractTemplate, mergeDictatedFindingsWithTemplate } from '../services/geminiService';
 import { saveAudioBlob, getAudioBlob, clearUnusedAudioBlobs } from '../services/audioStorage';
 import { mergeMultipleAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
-import { ClipboardPaste } from 'lucide-react';
+import { ClipboardPaste, X } from 'lucide-react';
 import PasteTextModal from './PasteTextModal';
 import RichTextReportEditor from './RichTextReportEditor';
+import TemplateSelectionModal from './ui/TemplateSelectionModal';
+import { getTemplateDocxBase64 } from '../services/builtInTemplates';
+import { getUpcomingTemplate, clearUpcomingTemplate, subscribeToUpcomingTemplate, UpcomingTemplateConfig } from '../services/upcomingTemplateService';
 
 import Spinner from './ui/Spinner';
 import MicIcon from './icons/MicIcon';
@@ -30,7 +33,7 @@ import CustomPromptInput, { DocxTemplateData } from './ui/CustomPromptInput';
 import ImageIcon from './icons/ImageIcon';
 import SparklesIcon from './icons/SparklesIcon';
 import { IdentifiedError } from '../types';
-import { AVAILABLE_MODELS } from '../constants';
+import { AVAILABLE_MODELS, REPORT_TEMPLATES, ReportTemplate } from '../constants';
 import WarningIcon from './icons/WarningIcon';
 import BrainIcon from './icons/BrainIcon';
 import { autoSaveBatchDictations, SaveResult, BatchFolderInfo, isDriveConnected, subscribeToAuth } from '../services/googleDriveService';
@@ -239,6 +242,80 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         setBatches(prev => prev.map(b => b.id === batchId ? { ...b, findings: newFindings } : b));
     };
 
+    // State for Post-Dictation Template Merging per batch
+    const [templateModalBatchId, setTemplateModalBatchId] = useState<string | null>(null);
+    const [mergingBatchId, setMergingBatchId] = useState<string | null>(null);
+    const [mergingTemplateName, setMergingTemplateName] = useState<string | null>(null);
+
+    const handleSelectBatchTemplateToMerge = async (template: ReportTemplate) => {
+        const batchId = templateModalBatchId;
+        if (!batchId) return;
+        setTemplateModalBatchId(null);
+
+        const targetBatch = batches.find(b => b.id === batchId);
+        if (!targetBatch || !targetBatch.findings) return;
+
+        setMergingBatchId(batchId);
+        setMergingTemplateName(template.name);
+        setUndoStates(prev => ({ ...prev, [batchId]: [...targetBatch.findings!] }));
+
+        let docx = template.docxBase64;
+        if (!docx && template.id) {
+            try {
+                docx = await getTemplateDocxBase64(template.id);
+            } catch (err) {
+                console.warn('Error loading docx for template:', err);
+            }
+        }
+        const extractedText = template.lines ? template.lines.join('\n') : template.content;
+        const docxData: DocxTemplateData = {
+            name: template.fileName || `${template.name}.docx`,
+            data: docx || '',
+            size: docx ? Math.round(docx.length * 0.75) : 0,
+            extractedText,
+        };
+        const promptText = `[TEMPLATE_ID: ${template.id}] Use the normal "${template.name}" report template. Integrate my dictation and generate a new impression.`;
+
+        // Update batch configuration with template
+        setBatches(prev => prev.map(b => b.id === batchId ? {
+            ...b,
+            customPrompt: promptText,
+            customDocx: docxData,
+        } : b));
+
+        try {
+            const mergedFindings = await mergeDictatedFindingsWithTemplate(
+                targetBatch.findings,
+                template,
+                targetBatch.selectedModel || selectedModel,
+                targetBatch.audioBlobs,
+                promptText,
+                docxData
+            );
+
+            setBatches(prev => prev.map(b => b.id === batchId ? {
+                ...b,
+                findings: mergedFindings,
+            } : b));
+
+            showNotification(`Merged ${targetBatch.name} with ${template.name}!`);
+
+            // Auto-save to Google Drive
+            setTimeout(() => {
+                setBatches(current => {
+                    saveBatchesToDrive(current);
+                    return current;
+                });
+            }, 100);
+        } catch (err) {
+            console.error(`Failed to merge batch ${batchId} with template:`, err);
+            showNotification(`Failed to merge with template: ${err instanceof Error ? err.message : String(err)}`);
+        } finally {
+            setMergingBatchId(null);
+            setMergingTemplateName(null);
+        }
+    };
+
     // State for 'Dictate Report Changes' feature
     const [modificationState, setModificationState] = useState<{ batchId: string | null; status: 'idle' | 'recording' | 'processing' }>({ batchId: null, status: 'idle' });
     const [modificationError, setModificationError] = useState<{ batchId: string | null; message: string | null }>({ batchId: null, message: null });
@@ -261,6 +338,30 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             return [];
         }
     });
+    const [upcomingTemplate, setUpcomingTemplateState] = useState<UpcomingTemplateConfig | null>(() => getUpcomingTemplate());
+
+    useEffect(() => {
+        setUpcomingTemplateState(getUpcomingTemplate());
+        const unsubscribe = subscribeToUpcomingTemplate((config) => {
+            setUpcomingTemplateState(config);
+            if (config) {
+                // Prepopulate idle/unprocessed batches that don't have custom edits yet
+                setBatches(prev => prev.map(b => (!b.findings && (!b.customPrompt || b.customPrompt === globalCustomPrompt)) ? {
+                    ...b,
+                    customPrompt: config.promptText,
+                    customDocx: config.docxData || null
+                } : b));
+            } else {
+                // If cleared, revert batches that had the upcoming template back to globalCustomPrompt
+                setBatches(prev => prev.map(b => (!b.findings && b.customPrompt && b.customPrompt.startsWith('[TEMPLATE_ID:')) ? {
+                    ...b,
+                    customPrompt: globalCustomPrompt,
+                    customDocx: null
+                } : b));
+            }
+        });
+        return unsubscribe;
+    }, [globalCustomPrompt]);
     const [isMakingSelection, setIsMakingSelection] = useState<boolean>(false);
 
     // State for 'Complex Impression Generation' per batch
@@ -419,6 +520,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             setPasteModalTargetBatchId(null);
         } else {
             // Create a new batch for each file
+            const currentUpcoming = getUpcomingTemplate();
             const newBatches: Batch[] = files.map((file, idx) => ({
                 id: `batch-${Date.now()}-${idx}-${Math.random().toString(36).substring(2, 6)}`,
                 name: file.name.replace(/\.[^/.]+$/, "").replace(/_/g, " ") || `Batch ${batches.length + idx + 1}`,
@@ -426,7 +528,8 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                 findings: null,
                 status: 'complete',
                 selectedModel: selectedModel,
-                customPrompt: globalCustomPrompt,
+                customPrompt: currentUpcoming ? currentUpcoming.promptText : globalCustomPrompt,
+                customDocx: currentUpcoming ? (currentUpcoming.docxData || null) : null,
                 customImages: [...globalCustomImages],
             }));
             setBatches(prev => [...prev, ...newBatches]);
@@ -601,6 +704,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     // Handle initialFiles passed from App (e.g. when multiple files uploaded from single mode)
     useEffect(() => {
         if (isRestored && initialFiles && initialFiles.length > 0) {
+            const currentUpcoming = getUpcomingTemplate();
             const newBatches: Batch[] = initialFiles.map((file, idx) => ({
                 id: `batch-${Date.now()}-${idx}`,
                 name: file.name.replace(/\.[^/.]+$/, "") || `Dictation Batch ${Date.now() + idx}`,
@@ -608,7 +712,8 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                 findings: null,
                 status: 'complete',
                 selectedModel: selectedModel,
-                customPrompt: globalCustomPrompt,
+                customPrompt: currentUpcoming ? currentUpcoming.promptText : globalCustomPrompt,
+                customDocx: currentUpcoming ? (currentUpcoming.docxData || null) : null,
                 customImages: [...globalCustomImages],
             }));
             setBatches(prev => [...prev, ...newBatches]);
@@ -823,18 +928,33 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     }, [complexInputRecorder.error, complexGeneratorVisibleForBatchId]);
 
     const addBatch = () => {
+        handleAddNewBatch();
+    };
+
+    const handleAddNewBatch = () => {
+        const newId = crypto.randomUUID();
+        const nextBatchNumber = batches.length + 1;
+        const currentUpcoming = getUpcomingTemplate();
         const newBatch: Batch = {
-            id: crypto.randomUUID(),
-            name: `Dictation #${batches.length + 1}`,
+            id: newId,
+            name: `Dictation #${nextBatchNumber}`,
             audioBlobs: [],
             findings: null,
             status: 'idle',
             isChatting: false,
             selectedModel: selectedModel,
-            customPrompt: globalCustomPrompt,
+            customPrompt: currentUpcoming ? currentUpcoming.promptText : globalCustomPrompt,
+            customDocx: currentUpcoming ? (currentUpcoming.docxData || null) : null,
             customImages: [...globalCustomImages],
         };
         setBatches(prev => [...prev, newBatch]);
+        showNotification(`Created Dictation #${nextBatchNumber}`);
+        setTimeout(() => {
+            const cardEl = document.getElementById(`batch-card-${newId}`);
+            if (cardEl) {
+                cardEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }
+        }, 120);
     };
     
     const removeBatch = (id: string) => {
@@ -1042,6 +1162,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                 setUploadTargetBatchId(null);
                 setIsUploadReplace(false);
             } else {
+                const currentUpcoming = getUpcomingTemplate();
                 const newBatches: Batch[] = files.map((file, idx) => ({
                     id: `batch-${Date.now()}-${idx}`,
                     name: file.name.replace(/\.[^/.]+$/, "") || `Dictation Batch ${batches.length + idx + 1}`,
@@ -1049,7 +1170,8 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                     findings: null,
                     status: 'complete',
                     selectedModel: selectedModel,
-                    customPrompt: globalCustomPrompt,
+                    customPrompt: currentUpcoming ? currentUpcoming.promptText : globalCustomPrompt,
+                    customDocx: currentUpcoming ? (currentUpcoming.docxData || null) : null,
                     customImages: [...globalCustomImages],
                 }));
                 setBatches(prev => [...prev, ...newBatches]);
@@ -1097,6 +1219,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             const files: File[] = Array.from(e.dataTransfer.files);
 
             if (files.length > 0) {
+                const currentUpcoming = getUpcomingTemplate();
                 const newBatches: Batch[] = files.map((file, idx) => ({
                     id: `batch-${Date.now()}-${idx}`,
                     name: file.name.replace(/\.[^/.]+$/, "") || `Dictation Batch ${batches.length + idx + 1}`,
@@ -1104,7 +1227,8 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                     findings: null,
                     status: 'complete',
                     selectedModel: selectedModel,
-                    customPrompt: globalCustomPrompt,
+                    customPrompt: currentUpcoming ? currentUpcoming.promptText : globalCustomPrompt,
+                    customDocx: currentUpcoming ? (currentUpcoming.docxData || null) : null,
                     customImages: [...globalCustomImages],
                 }));
                 setBatches(prev => [...prev, ...newBatches]);
@@ -1192,11 +1316,14 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             const currentReqId = batchProcessingIdRef.current[batch.id];
             try {
                 const mergedBlob = await mergeMultipleAudioBlobs(batch.audioBlobs);
-                const findings = await processAudio(mergedBlob, batch.selectedModel, batch.customPrompt, batch.customImages);
+                const currentUpcoming = getUpcomingTemplate();
+                const effectivePrompt = batch.customPrompt || (currentUpcoming ? currentUpcoming.promptText : globalCustomPrompt);
+                const effectiveDocx = batch.customDocx || (currentUpcoming ? (currentUpcoming.docxData || null) : null);
+                const findings = await processAudio(mergedBlob, batch.selectedModel, effectivePrompt, batch.customImages, undefined, effectiveDocx);
                 
                 if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
 
-                const chatSession = await createChat(mergedBlob, findings, batch.customPrompt, batch.customImages, batch.selectedModel);
+                const chatSession = await createChat(mergedBlob, findings, effectivePrompt, batch.customImages, batch.selectedModel);
                 const aiGreeting = "I have reviewed the audio and transcript for this dictation. How can I help you further?";
                 const initialChatHistory = [{ author: 'AI' as const, text: `${findings.join('\n\n')}\n\n${aiGreeting}` }];
 
@@ -2239,6 +2366,12 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
 
     return (
         <div>
+            <TemplateSelectionModal
+                isOpen={templateModalBatchId !== null}
+                onClose={() => setTemplateModalBatchId(null)}
+                templates={REPORT_TEMPLATES}
+                onSelectTemplate={handleSelectBatchTemplateToMerge}
+            />
             {copier && copier.visible && (
                 <SelectionCopier
                 x={copier.x}
@@ -2249,7 +2382,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                 />
             )}
             {copyNotification.visible && (
-                <div className="fixed bottom-4 right-4 bg-slate-800 text-white text-sm font-bold py-2 px-4 rounded-lg shadow-lg z-50 transition-all duration-300 ease-in-out" role="alert">
+                <div className="fixed bottom-20 right-5 bg-slate-800 text-white text-sm font-bold py-2 px-4 rounded-lg shadow-lg z-50 transition-all duration-300 ease-in-out" role="alert">
                 {copyNotification.text}
                 </div>
             )}
@@ -2367,6 +2500,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                 {batches.map((batch, index) => (
                         <div 
                             key={batch.id} 
+                            id={`batch-card-${batch.id}`}
                             draggable={isBatchReorderMode}
                             onDragStart={e => handleBatchDragStart(e, index)}
                             onDragOver={e => {
@@ -2568,16 +2702,31 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                             <span className="text-xs font-semibold text-slate-700 dark:text-slate-300">Appending...</span>
                                                         </div>
                                                     ) : (
-                                                        <button 
-                                                            onClick={() => {
-                                                                setOpenAccordion(batch.id);
-                                                                handleStartContinue(batch.id);
-                                                            }} 
-                                                            className="flex items-center gap-1.5 bg-emerald-600 text-white p-1.5 rounded-lg hover:bg-emerald-700 transition-colors text-xs px-2.5 font-medium shadow-2xs" 
-                                                            title="Append extra dictation directly to this transcript"
-                                                        >
-                                                            <MicPlusIcon className="w-3.5 h-3.5" /> Append Dictation
-                                                        </button>
+                                                        <>
+                                                            <button 
+                                                                type="button"
+                                                                onClick={() => {
+                                                                    setOpenAccordion(batch.id);
+                                                                    setTemplateModalBatchId(batch.id);
+                                                                }} 
+                                                                disabled={mergingBatchId === batch.id}
+                                                                className="flex items-center gap-1.5 bg-indigo-600 hover:bg-indigo-700 text-white p-1.5 rounded-lg transition-colors text-xs px-2.5 font-medium shadow-2xs disabled:opacity-50" 
+                                                                title="Select a normal report template and merge with this batch's dictated findings"
+                                                            >
+                                                                <SparklesIcon className="w-3.5 h-3.5 text-yellow-300" />
+                                                                <span>Merge with Template</span>
+                                                            </button>
+                                                            <button 
+                                                                onClick={() => {
+                                                                    setOpenAccordion(batch.id);
+                                                                    handleStartContinue(batch.id);
+                                                                }} 
+                                                                className="flex items-center gap-1.5 bg-emerald-600 text-white p-1.5 rounded-lg hover:bg-emerald-700 transition-colors text-xs px-2.5 font-medium shadow-2xs" 
+                                                                title="Append extra dictation directly to this transcript"
+                                                            >
+                                                                <MicPlusIcon className="w-3.5 h-3.5" /> Append Dictation
+                                                            </button>
+                                                        </>
                                                     )}
                                                     {batch.audioBlobs.length > 0 && (
                                                         <button onClick={() => handleDownload(batch)} className="flex items-center gap-1.5 bg-slate-500 text-white p-1.5 rounded-lg hover:bg-slate-600 transition-colors text-xs px-2.5" aria-label={`Download audio for ${batch.name}`} title="Download audio for this batch">
@@ -2717,6 +2866,21 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                     )}
                                                   </div>
                                                 </div>
+
+                                                {mergingBatchId === batch.id && (
+                                                    <div className="mb-4 p-3.5 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-300 dark:border-emerald-700/80 flex items-center gap-3 animate-fade-in shadow-xs" role="status">
+                                                        <Spinner className="w-5 h-5 text-emerald-600 dark:text-emerald-400 flex-shrink-0" />
+                                                        <div>
+                                                            <p className="text-sm font-bold text-emerald-900 dark:text-emerald-200">
+                                                                Merging dictated findings with {mergingTemplateName || 'template'}...
+                                                            </p>
+                                                            <p className="text-xs text-emerald-700 dark:text-emerald-400 mt-0.5">
+                                                                Preserving normal template findings, updating dictated findings with bold formatting, and generating impression.
+                                                            </p>
+                                                        </div>
+                                                    </div>
+                                                )}
+
                                                 <div className="bg-slate-100 dark:bg-slate-900/50 p-3.5 rounded-xl mb-4 shadow-sm border border-slate-200/80 dark:border-slate-800">
                                                     <div className="flex flex-col sm:flex-row items-center justify-between gap-3">
                                                         <div className="flex items-center gap-2 w-full sm:w-auto">
@@ -2752,6 +2916,17 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                                         {(batch.extraFiles?.length || 0) + (batch.customImages?.length || 0) + (batch.customPrompt?.trim().length > 0 ? 1 : 0)}
                                                                     </span>
                                                                 )}
+                                                            </button>
+
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => setTemplateModalBatchId(batch.id)}
+                                                                disabled={mergingBatchId === batch.id}
+                                                                className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-bold transition-all bg-emerald-600 hover:bg-emerald-700 text-white shadow-sm disabled:opacity-50 flex-shrink-0"
+                                                                title="Select a normal report template and merge with this batch's dictated findings"
+                                                            >
+                                                                <SparklesIcon className="w-3.5 h-3.5 text-yellow-300" />
+                                                                <span>Merge with Template</span>
                                                             </button>
 
                                                             <button
@@ -3539,6 +3714,21 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                     handlePasteBatches(files);
                 }}
             />
+
+            {/* Floating Quick Action Button for Instant New Batch Dictation */}
+            <div className="fixed bottom-5 right-5 z-40 flex items-center gap-2 print:hidden">
+              <button
+                type="button"
+                onClick={handleAddNewBatch}
+                id="floating-new-batch-dictation-btn"
+                className="group flex items-center gap-2 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-bold py-2.5 px-4 rounded-full shadow-lg hover:shadow-xl transition-all duration-200 border border-blue-400/40 hover:scale-105 cursor-pointer text-xs sm:text-sm"
+                title="Add New Batch Dictation"
+                aria-label="Add New Batch Dictation"
+              >
+                <MicIcon className="w-4 h-4 shrink-0 text-white group-hover:scale-110 transition-transform" />
+                <span className="whitespace-nowrap font-bold">+ New Batch Dictation</span>
+              </button>
+            </div>
 
             {multiSelectMode && (
                 <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-40 bg-slate-800 text-white rounded-full shadow-lg flex items-center gap-4 px-5 py-2 transition-all duration-300 ease-in-out">

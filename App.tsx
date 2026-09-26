@@ -33,6 +33,8 @@ import { RotateCcw, X, ExternalLink, Power, Sparkles, Trash2, Download, Settings
 import WorkstationSyncModal from './components/WorkstationSyncModal';
 import { checkAndAutoSyncReport } from './services/workstationSync';
 import { OwnershipModal } from './components/ui/OwnershipModal';
+import ThemeSelector from './components/ThemeSelector';
+import { getUpcomingTemplate, clearUpcomingTemplate, subscribeToUpcomingTemplate, UpcomingTemplateConfig } from './services/upcomingTemplateService';
 
 interface ChatMessage {
   author: 'You' | 'AI';
@@ -102,6 +104,27 @@ const App: React.FC = () => {
   const [customPrompt, setCustomPrompt] = useState<string>('');
   const [customImages, setCustomImages] = useState<Array<{ data: string; mimeType: string }>>([]);
   const [customDocx, setCustomDocx] = useState<DocxTemplateData | null>(null);
+  const [upcomingTemplate, setUpcomingTemplateState] = useState<UpcomingTemplateConfig | null>(() => getUpcomingTemplate());
+
+  useEffect(() => {
+    const initialUpcoming = getUpcomingTemplate();
+    if (initialUpcoming) {
+      setUpcomingTemplateState(initialUpcoming);
+      setCustomPrompt(prev => prev ? prev : initialUpcoming.promptText);
+      setCustomDocx(prev => prev ? prev : (initialUpcoming.docxData || null));
+    }
+    const unsubscribe = subscribeToUpcomingTemplate((config) => {
+      setUpcomingTemplateState(config);
+      if (config) {
+        setCustomPrompt(config.promptText);
+        setCustomDocx(config.docxData || null);
+      } else {
+        setCustomPrompt('');
+        setCustomDocx(null);
+      }
+    });
+    return unsubscribe;
+  }, []);
   const [identifiedErrors, setIdentifiedErrors] = useState<IdentifiedError[]>([]);
   const [errorCheckStatus, setErrorCheckStatus] = useState<'idle' | 'checking' | 'complete'>('idle');
   const [theme, setTheme] = useState(() => {
@@ -172,13 +195,18 @@ const App: React.FC = () => {
   } | null>(null);
 
   useEffect(() => {
-    if (theme === 'dark') {
+    const allThemeClasses = ['theme-light', 'theme-dark', 'theme-colourful', 'theme-magical', 'theme-creative', 'theme-soothing', 'theme-sunset', 'theme-ocean'];
+    document.documentElement.classList.remove(...allThemeClasses);
+    document.documentElement.classList.add(`theme-${theme}`);
+    document.documentElement.setAttribute('data-theme', theme);
+
+    const isDarkVariant = ['dark', 'magical', 'sunset', 'ocean'].includes(theme);
+    if (isDarkVariant) {
       document.documentElement.classList.add('dark');
-      localStorage.setItem('theme', 'dark');
     } else {
       document.documentElement.classList.remove('dark');
-      localStorage.setItem('theme', 'light');
     }
+    localStorage.setItem('theme', theme);
   }, [theme]);
   
   useEffect(() => {
@@ -823,14 +851,21 @@ const App: React.FC = () => {
     setChatHistory([]);
     setIsChatting(false);
     setMode('single');
-    setCustomPrompt(''); // Reset custom prompt as well
+    const currentUpcoming = getUpcomingTemplate();
+    if (currentUpcoming) {
+      setCustomPrompt(currentUpcoming.promptText);
+      setCustomDocx(currentUpcoming.docxData || null);
+    } else {
+      setCustomPrompt('');
+      setCustomDocx(null);
+    }
     setCustomImages([]);
-    setCustomDocx(null);
     setIdentifiedErrors([]);
     setErrorCheckStatus('idle');
     activeDictationTimestampRef.current = null;
     activeDictationIsLiveRef.current = false;
     driveSyncedHashRef.current = null;
+    window.scrollTo({ top: 0, behavior: 'instant' });
   };
 
   const handleUndoReset = async () => {
@@ -1203,14 +1238,10 @@ const App: React.FC = () => {
               >
                 <Power className={`w-5 h-5 ${isPowerMode ? '' : 'opacity-80'}`} />
               </button>
-              <button
-                onClick={toggleTheme}
-                className="p-2 sm:p-2.5 rounded-xl text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors shrink-0 shadow-sm border border-slate-200/60 dark:border-slate-700/60 cursor-pointer min-h-[36px] min-w-[36px] flex items-center justify-center"
-                aria-label="Toggle theme"
-                title={theme === 'light' ? 'Switch to Dark Mode' : 'Switch to Light Mode'}
-              >
-                {theme === 'light' ? <MoonIcon className="w-5 h-5" /> : <SunIcon className="w-5 h-5" />}
-              </button>
+              <ThemeSelector 
+                currentTheme={theme} 
+                onThemeChange={(newTheme) => setTheme(newTheme)} 
+              />
             </div>
           </div>
           <p className="text-center text-slate-600 dark:text-slate-400 text-xs sm:text-sm max-w-xl mx-auto px-2">
@@ -1301,6 +1332,36 @@ const App: React.FC = () => {
               </div>
           </div>
         </header>
+
+        {/* Active Upcoming Template Banner */}
+        {upcomingTemplate && (
+          <div className="mb-4 max-w-xl mx-auto p-2.5 sm:p-3 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-300 dark:border-emerald-700/80 rounded-xl shadow-xs flex items-center justify-between gap-3 animate-fade-in">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="text-base shrink-0">📌</span>
+              <div className="min-w-0">
+                <p className="text-xs sm:text-sm font-bold text-emerald-900 dark:text-emerald-200 truncate">
+                  Active Template for Upcoming Reports: <span className="underline">{upcomingTemplate.name}</span>
+                </p>
+                <p className="text-[11px] text-emerald-700 dark:text-emerald-400">
+                  Applied automatically to upcoming single & batch dictations.
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                clearUpcomingTemplate();
+                setCustomPrompt('');
+                setCustomDocx(null);
+              }}
+              className="shrink-0 flex items-center gap-1 text-xs font-bold text-emerald-800 dark:text-emerald-200 bg-emerald-100 hover:bg-emerald-200 dark:bg-emerald-900/60 dark:hover:bg-emerald-800/80 px-2.5 py-1.5 rounded-lg border border-emerald-300 dark:border-emerald-700 transition-colors cursor-pointer"
+              title="Remove template for upcoming reports and return to normal default"
+            >
+              <X className="w-3.5 h-3.5" />
+              <span>Remove</span>
+            </button>
+          </div>
+        )}
 
         {/* Zero-Loss Interrupted Dictation Recovery Banner */}
         {recoveredInFlightAudio && (

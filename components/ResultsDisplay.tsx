@@ -1,7 +1,7 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import ChatInterface from './ChatInterface';
 import { useAudioRecorder } from '../hooks/useAudioRecorder';
-import { continueAudioDictation, modifyFindingWithAudio, modifyReportWithAudio, runComplexImpressionGeneration, transcribeAudioForPrompt, detectAndExtractTemplate } from '../services/geminiService';
+import { continueAudioDictation, modifyFindingWithAudio, modifyReportWithAudio, runComplexImpressionGeneration, transcribeAudioForPrompt, detectAndExtractTemplate, mergeDictatedFindingsWithTemplate } from '../services/geminiService';
 import Spinner from './ui/Spinner';
 import PencilIcon from './icons/PencilIcon';
 import MicPlusIcon from './icons/MicPlusIcon';
@@ -14,7 +14,7 @@ import ReorderIcon from './icons/ReorderIcon';
 import MergeIcon from './icons/MergeIcon';
 import CustomPromptInput from './ui/CustomPromptInput';
 import { IdentifiedError } from '../types';
-import { AVAILABLE_MODELS } from '../constants';
+import { AVAILABLE_MODELS, REPORT_TEMPLATES, ReportTemplate } from '../constants';
 import WarningIcon from './icons/WarningIcon';
 import BrainIcon from './icons/BrainIcon';
 import MicIcon from './icons/MicIcon';
@@ -23,6 +23,9 @@ import TrashIcon from './icons/TrashIcon';
 import PauseIcon from './icons/PauseIcon';
 import ResumeIcon from './icons/ResumeIcon';
 import UploadIcon from './icons/UploadIcon';
+import SparklesIcon from './icons/SparklesIcon';
+import TemplateSelectionModal from './ui/TemplateSelectionModal';
+import { getTemplateDocxBase64 } from '../services/builtInTemplates';
 import ImageIcon from './icons/ImageIcon';
 import { mergeAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
 import { generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText } from '../services/docxService';
@@ -236,6 +239,59 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
 
   // State to toggle RTF editor view (defaults to open in template merge mode, or user toggleable)
   const [showRtfEditor, setShowRtfEditor] = useState<boolean>(true);
+
+  // State for Post-Dictation Template Merging
+  const [isTemplateModalOpen, setIsTemplateModalOpen] = useState<boolean>(false);
+  const [isMergingTemplate, setIsMergingTemplate] = useState<boolean>(false);
+  const [mergingTemplateName, setMergingTemplateName] = useState<string | null>(null);
+
+  const handleSelectTemplateToMerge = async (template: ReportTemplate) => {
+    setIsTemplateModalOpen(false);
+    setIsMergingTemplate(true);
+    setMergingTemplateName(template.name);
+    setUndoState(findings); // Save snapshot for instant undo
+
+    // Update active template prompt tag and DOCX data
+    let docx = template.docxBase64;
+    if (!docx && template.id) {
+      try {
+        docx = await getTemplateDocxBase64(template.id);
+      } catch (err) {
+        console.warn('Error loading docx for template:', err);
+      }
+    }
+    const extractedText = template.lines ? template.lines.join('\n') : template.content;
+    const docxData: DocxTemplateData = {
+      name: template.fileName || `${template.name}.docx`,
+      data: docx || '',
+      size: docx ? Math.round(docx.length * 0.75) : 0,
+      extractedText,
+    };
+    if (onCustomDocxChange) {
+      onCustomDocxChange(docxData);
+    }
+    const promptText = `[TEMPLATE_ID: ${template.id}] Use the normal "${template.name}" report template. Integrate my dictation and generate a new impression.`;
+    onCustomPromptChange(promptText);
+
+    try {
+      const merged = await mergeDictatedFindingsWithTemplate(
+        findings,
+        template,
+        selectedModel,
+        audioBlob,
+        promptText,
+        docxData
+      );
+      onAllFindingsUpdate(merged);
+      showNotification(`Merged with ${template.name}!`);
+    } catch (err) {
+      console.error("Failed to merge dictated findings with template:", err);
+      showNotification(`Merge failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    } finally {
+      setIsMergingTemplate(false);
+      setMergingTemplateName(null);
+    }
+  };
 
   // State for Edit Mode
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
@@ -781,10 +837,30 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     triggerAudioDownload(targetBlob, 'radiology-dictation-merged');
   };
   
-  const handleRecordNew = () => {
+  const handleRecordNew = useCallback(() => {
     setExpertNotes(null);
     onReset();
-  }
+  }, [onReset]);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Support Alt+N / Option+N for instant New Dictation
+      if (e.altKey && (e.key === 'n' || e.key === 'N')) {
+        const target = e.target as HTMLElement | null;
+        if (target) {
+          const tagName = target.tagName?.toUpperCase();
+          if (tagName === 'INPUT' || tagName === 'TEXTAREA' || target.isContentEditable) {
+            return;
+          }
+        }
+        e.preventDefault();
+        handleRecordNew();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [handleRecordNew]);
 
   const handleDownloadHTML = () => {
     if (!findings || findings.length === 0) return;
@@ -1357,6 +1433,12 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
 
   return (
     <div className="p-4">
+      <TemplateSelectionModal 
+        isOpen={isTemplateModalOpen}
+        onClose={() => setIsTemplateModalOpen(false)}
+        templates={REPORT_TEMPLATES}
+        onSelectTemplate={handleSelectTemplateToMerge}
+      />
       {copier && copier.visible && (
         <SelectionCopier 
           x={copier.x}
@@ -1367,8 +1449,22 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         />
       )}
       {copyNotification.visible && (
-        <div className="fixed bottom-4 right-4 bg-slate-800 text-white text-sm font-bold py-2 px-4 rounded-lg shadow-lg z-50 transition-all duration-300 ease-in-out" role="alert">
+        <div className="fixed bottom-20 right-5 bg-slate-800 text-white text-sm font-bold py-2 px-4 rounded-lg shadow-lg z-50 transition-all duration-300 ease-in-out" role="alert">
           {copyNotification.text}
+        </div>
+      )}
+
+      {isMergingTemplate && (
+        <div className="mb-4 p-4 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-300 dark:border-emerald-700/80 flex items-center gap-3 animate-fade-in shadow-xs" role="status">
+          <Spinner className="w-5 h-5 text-emerald-600 dark:text-emerald-400 flex-shrink-0" />
+          <div>
+            <p className="text-sm font-bold text-emerald-900 dark:text-emerald-200">
+              Merging dictated findings with {mergingTemplateName || 'template'}...
+            </p>
+            <p className="text-xs text-emerald-700 dark:text-emerald-400 mt-0.5">
+              Preserving normal template findings, updating dictated findings with bold formatting, and synthesizing impression.
+            </p>
+          </div>
         </div>
       )}
 
@@ -1463,6 +1559,17 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                     {extraFiles.length + (customImages?.length || 0) + (customPrompt.trim().length > 0 ? 1 : 0)}
                   </span>
                 )}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setIsTemplateModalOpen(true)}
+                disabled={isMergingTemplate}
+                className="flex items-center gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-2 px-3.5 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-opacity-50 transition-colors w-full sm:w-auto flex-shrink-0 disabled:opacity-50 shadow-xs"
+                title="Select a normal report template and merge with the current dictation findings"
+              >
+                <SparklesIcon className="w-3.5 h-3.5 text-yellow-300" />
+                <span>Merge with Template</span>
               </button>
 
               <button
@@ -2419,6 +2526,24 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         </div>
       )}
       </div>
+
+      {/* Floating Quick Action Button for Instant Next Dictation */}
+      {!isLive && (
+        <div className="fixed bottom-5 right-5 z-40 flex items-center gap-2 print:hidden">
+          <button
+            type="button"
+            onClick={handleRecordNew}
+            id="floating-new-dictation-btn"
+            className="group flex items-center gap-2 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-bold py-2.5 px-4 rounded-full shadow-lg hover:shadow-xl transition-all duration-200 border border-blue-400/40 hover:scale-105 cursor-pointer text-xs sm:text-sm"
+            title="Start New Dictation (Alt+N)"
+            aria-label="Start New Dictation"
+          >
+            <MicIcon className="w-4 h-4 shrink-0 text-white group-hover:scale-110 transition-transform" />
+            <span className="whitespace-nowrap font-bold">+ New Dictation</span>
+            <span className="hidden md:inline-block text-[10px] bg-blue-800 text-blue-200 font-mono px-1.5 py-0.5 rounded-full">Alt+N</span>
+          </button>
+        </div>
+      )}
 
       {multiSelectMode && (
           <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-40 bg-slate-800 text-white rounded-full shadow-lg flex items-center gap-4 px-5 py-2 transition-all duration-300 ease-in-out">
