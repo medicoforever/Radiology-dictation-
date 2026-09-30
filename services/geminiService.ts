@@ -404,30 +404,54 @@ export interface DetectedTemplateInfo {
   templateContextPrompt: string;
 }
 
-export function findBuiltinTemplate(promptOrId?: string): (typeof REPORT_TEMPLATES)[number] | undefined {
-  if (!promptOrId || !promptOrId.trim()) return undefined;
+export function findBuiltinTemplates(promptOrId?: string): (typeof REPORT_TEMPLATES)[number][] {
+  if (!promptOrId || !promptOrId.trim()) return [];
 
   const raw = promptOrId.trim();
+  const matched: (typeof REPORT_TEMPLATES)[number][] = [];
 
-  // 1. Direct ID match (e.g., "tpl_001")
+  // 1. Direct ID match (e.g. single "tpl_001")
   const directId = REPORT_TEMPLATES.find(t => t.id && t.id.toLowerCase() === raw.toLowerCase());
-  if (directId) return directId;
-
-  // 2. Explicit ID tag in prompt: [TEMPLATE_ID: tpl_001] or [TEMPLATE: tpl_001] or [ID: tpl_001]
-  const idTagMatch = raw.match(/\[(?:TEMPLATE_ID|TEMPLATE|ID):\s*([a-zA-Z0-9_-]+)\]/i);
-  if (idTagMatch) {
-    const byTag = REPORT_TEMPLATES.find(t => t.id && t.id.toLowerCase() === idTagMatch[1].toLowerCase());
-    if (byTag) return byTag;
+  if (directId) {
+    return [directId];
   }
 
-  // 3. Exact quoted or bracketed template name in prompt
-  // e.g. Use the normal "MRI SCAN OF BRAIN (PLAIN)" report template
+  // 2. Explicit ID tags in prompt: [TEMPLATE_ID: tpl_001, tpl_002] or [TEMPLATE_IDS: ...] or multiple tags
+  const idTagMatches = [...raw.matchAll(/\[(?:TEMPLATE_ID|TEMPLATE_IDS|TEMPLATES|TEMPLATE|ID):\s*([^\]]+)\]/gi)];
+  for (const match of idTagMatches) {
+    const idsStr = match[1];
+    const parts = idsStr.split(/[,;\s]+/).map(p => p.trim()).filter(Boolean);
+    for (const part of parts) {
+      const cleanPart = part.replace(/^builtin_/i, '').toLowerCase();
+      const byId = REPORT_TEMPLATES.find(t => t.id && t.id.toLowerCase() === cleanPart);
+      if (byId && !matched.some(m => m.id === byId.id)) {
+        matched.push(byId);
+      }
+    }
+  }
+
+  // 3. Exact quoted or bracketed template names in prompt
+  // e.g. Use combined report templates: "MRI SCAN OF BRAIN (PLAIN)" and "MRI CERVICAL SPINE"
+  const quoteMatches = [...raw.matchAll(/["'“]([^"'“”\n]+?)["'”]/gi)];
+  for (const q of quoteMatches) {
+    const rawExtracted = q[1].trim().toLowerCase();
+    const exactNameMatch = REPORT_TEMPLATES.find(t => t.name.toLowerCase() === rawExtracted);
+    if (exactNameMatch && !matched.some(m => m.id === exactNameMatch.id)) {
+      matched.push(exactNameMatch);
+    }
+  }
+
+  if (matched.length > 0) {
+    return matched;
+  }
+
+  // 4. Single template fallback search
   const extractedMatch = raw.match(/(?:normal|use|template)\s+["'“]([^"'“”\n]+?)["'”]\s+(?:report\s+)?template/i) ||
                          raw.match(/normal\s+(.+?)\s+report\s+template/i);
   if (extractedMatch) {
     const rawExtracted = extractedMatch[1].trim().toLowerCase();
     const exactNameMatch = REPORT_TEMPLATES.find(t => t.name.toLowerCase() === rawExtracted);
-    if (exactNameMatch) return exactNameMatch;
+    if (exactNameMatch) return [exactNameMatch];
   }
 
   const lower = raw.toLowerCase();
@@ -436,21 +460,18 @@ export function findBuiltinTemplate(promptOrId?: string): (typeof REPORT_TEMPLAT
   const promptHasMRI = /\bmri\b|\bmagnetic\b/.test(lower);
   const promptHasCT = /\bct\b|\bc\s*t\b|\bcomputed\b/.test(lower);
 
-  // Sort candidates by length of cleaned name descending (most specific first)
   const sortedTemplates = [...REPORT_TEMPLATES].sort((a, b) => b.name.length - a.name.length);
 
-  // 4. Exact full clean name match with word boundaries
   for (const t of sortedTemplates) {
     if (promptHasMRI && !promptHasCT && (t.modality || t.category || '').toUpperCase().includes('CT')) continue;
     if (promptHasCT && !promptHasMRI && (t.modality || t.category || '').toUpperCase().includes('MRI')) continue;
 
     const cleanT = t.name.toLowerCase().replace(/[^a-z0-9]/g, ' ').replace(/\s+/g, ' ').trim();
     if (cleanT && cleanPrompt.includes(' ' + cleanT + ' ')) {
-      return t;
+      return [t];
     }
   }
 
-  // 5. Clean name match from extractedMatch
   if (extractedMatch) {
     const extractedClean = extractedMatch[1].toLowerCase().replace(/[^a-z0-9]/g, ' ').replace(/\s+/g, ' ').trim();
     if (extractedClean) {
@@ -459,13 +480,18 @@ export function findBuiltinTemplate(promptOrId?: string): (typeof REPORT_TEMPLAT
         if (promptHasCT && !promptHasMRI && (t.modality || t.category || '').toUpperCase().includes('MRI')) continue;
         const cleanT = t.name.toLowerCase().replace(/[^a-z0-9]/g, ' ').replace(/\s+/g, ' ').trim();
         if (cleanT === extractedClean) {
-          return t;
+          return [t];
         }
       }
     }
   }
 
-  return undefined;
+  return [];
+}
+
+export function findBuiltinTemplate(promptOrId?: string): (typeof REPORT_TEMPLATES)[number] | undefined {
+  const matches = findBuiltinTemplates(promptOrId);
+  return matches.length > 0 ? matches[0] : undefined;
 }
 
 export type CustomDocxInput = { 
@@ -486,8 +512,57 @@ export function detectAndExtractTemplate(
   const docxText = ((customDocx?.text || customDocx?.extractedText || '')).trim();
   const docxHtml = customDocx?.html || customDocx?.extractedHtml;
 
-  // Check if a built-in template is specified via prompt or template ID tag
-  const matchedBuiltin = findBuiltinTemplate(customPrompt);
+  // Check if built-in templates are specified via prompt or template ID tag
+  const matchedBuiltins = findBuiltinTemplates(customPrompt);
+
+  if (matchedBuiltins.length > 1) {
+    const templateNames = matchedBuiltins.map(t => t.name).join(' + ');
+    const templateContent = (docxText.length > 0)
+      ? docxText
+      : matchedBuiltins.map((t, idx) => {
+          const content = t.lines && t.lines.length > 0 ? t.lines.join('\n') : (t.content || '');
+          return `================================================================================\nTEMPLATE ${idx + 1}: "${t.name}"\n--------------------------------------------------------------------------------\n${content}\n${t.skillPrompt ? `CLINICAL SKILL DIRECTIVES FOR THIS SECTION:\n${t.skillPrompt}\n` : ''}`;
+        }).join('\n\n');
+
+    const templateContextPrompt = `
+================================================================================
+ACTIVE COMBINED RADIOLOGY REPORT TEMPLATES (${matchedBuiltins.length} TEMPLATES COMBINED):
+${matchedBuiltins.map((t, idx) => {
+  const content = t.lines && t.lines.length > 0 ? t.lines.join('\n') : (t.content || '');
+  return `--------------------------------------------------------------------------------
+TEMPLATE ${idx + 1}: "${t.name}"
+BASELINE TEMPLATE CONTENT:
+"""
+${content}
+"""
+${t.skillPrompt ? `AUTHORITATIVE CLINICAL SKILL & PHRASING DIRECTIVES:\n${t.skillPrompt}` : ''}
+`;
+}).join('\n')}
+================================================================================
+CRITICAL MULTI-TEMPLATE COMBINATION & MERGE DIRECTIVES:
+1. UNIFIED COHESIVE REPORT: Combine these ${matchedBuiltins.length} templates into a single, comprehensive, seamlessly integrated multi-study report.
+   - Maintain the logical clinical order of anatomical regions (e.g. Brain sections followed by Cervical Spine sections; Chest followed by Abdomen and Pelvis).
+   - Combine the study title/header into a unified examination title (e.g. "CT SCAN OF BRAIN AND CERVICAL SPINE (PLAIN)").
+   - Group Technique / Protocol lines under the Technique section.
+2. ACCURATE FINDINGS PLACEMENT: When the doctor dictates findings, accurately place each dictated finding into its corresponding anatomical section across the combined templates (e.g., intracranial/cerebral findings in the brain sections, vertebral/disc findings in the spine sections, pulmonary findings in the lung sections, hepatic findings in the liver section).
+   - Prefix only dictated/abnormal or modified lines with 'BOLD::'.
+3. NORMAL FINDINGS PRESERVATION: For any anatomical regions from either template where no abnormalities were dictated or where the dictation indicated normal/unremarkable, preserve the complete normal baseline findings verbatim WITHOUT the 'BOLD::' prefix.
+4. COMBINED CLINICAL IMPRESSION: Synthesize ONE unified, comprehensive, prioritized IMPRESSION covering all examined regions (format: 'IMPRESSION:###point 1###point 2...'). Prioritize significant acute abnormalities first, followed by incidental findings or normal summaries for the respective regions.
+5. PRESERVE TABULAR DATA: When any template contains measurement tables or comparative grids, preserve them intact with rows joined by '###'.
+================================================================================
+`;
+    return {
+      isTemplateMode: true,
+      templateType: customDocx ? 'docx' : 'builtin',
+      templateName: templateNames,
+      templateContent,
+      templateHtml: docxHtml,
+      userInstructions: customPrompt?.trim() || '',
+      templateContextPrompt,
+    };
+  }
+
+  const matchedBuiltin = matchedBuiltins[0];
 
   if (matchedBuiltin) {
     const templateName = matchedBuiltin.name;
@@ -824,7 +899,7 @@ export const processAudio = async (
  */
 export const mergeDictatedFindingsWithTemplate = async (
   dictatedFindings: string[],
-  template: ReportTemplate | { name: string; content?: string; lines?: string[]; skillPrompt?: string; id?: string; fileName?: string; docxBase64?: string },
+  template: ReportTemplate | ReportTemplate[] | { name: string; content?: string; lines?: string[]; skillPrompt?: string; id?: string; fileName?: string; docxBase64?: string },
   model: string = DEFAULT_SELECTED_MODEL,
   audioBlob?: Blob | Blob[] | null,
   customPrompt?: string,
@@ -834,23 +909,71 @@ export const mergeDictatedFindingsWithTemplate = async (
     throw new Error("No dictated findings available to merge with template.");
   }
 
-  const templateName = template.name || 'Report Template';
+  const isMulti = Array.isArray(template) && template.length > 1;
+  const templates: Array<{ name: string; content?: string; lines?: string[]; skillPrompt?: string; id?: string; fileName?: string; docxBase64?: string }> = Array.isArray(template) ? template : [template];
+  const templateName = templates.map(t => t.name).join(' + ');
+
   const docxText = ((customDocx?.text || customDocx?.extractedText || '')).trim();
-  const templateContent = docxText.length > 0
-    ? docxText
-    : (template.lines && template.lines.length > 0
-      ? template.lines.join('\n')
-      : (template.content || ''));
-  const skillPrompt = template.skillPrompt || '';
 
-  // 1. Surgically gathered template prompt based on TEMPLATE_GEMINI_PROMPT
-  const templateBasePrompt = TEMPLATE_GEMINI_PROMPT.replace(
-    '[INSERT_TEMPLATE_HERE]',
-    `BASELINE TEMPLATE CONTENT FOR "${templateName}":\n"""\n${templateContent}\n"""`
-  );
+  let templateContent = '';
+  let templateBasePrompt = '';
+  let templateContextPrompt = '';
 
-  // 2. Surgically gathered merge directives from detectAndExtractTemplate
-  const templateContextPrompt = `
+  if (isMulti) {
+    templateContent = docxText.length > 0
+      ? docxText
+      : templates.map((t, idx) => {
+          const content = t.lines && t.lines.length > 0 ? t.lines.join('\n') : (t.content || '');
+          return `================================================================================\nTEMPLATE ${idx + 1}: "${t.name}"\n--------------------------------------------------------------------------------\n${content}\n${t.skillPrompt ? `CLINICAL SKILL DIRECTIVES FOR THIS SECTION:\n${t.skillPrompt}\n` : ''}`;
+        }).join('\n\n');
+
+    templateBasePrompt = TEMPLATE_GEMINI_PROMPT.replace(
+      '[INSERT_TEMPLATE_HERE]',
+      `BASELINE COMBINED TEMPLATES FOR "${templateName}":\n"""\n${templateContent}\n"""`
+    );
+
+    templateContextPrompt = `
+================================================================================
+ACTIVE COMBINED RADIOLOGY REPORT TEMPLATES (${templates.length} TEMPLATES COMBINED):
+${templates.map((t, idx) => {
+  const content = t.lines && t.lines.length > 0 ? t.lines.join('\n') : (t.content || '');
+  return `--------------------------------------------------------------------------------
+TEMPLATE ${idx + 1}: "${t.name}"
+BASELINE TEMPLATE CONTENT:
+"""
+${content}
+"""
+${t.skillPrompt ? `AUTHORITATIVE CLINICAL SKILL & PHRASING DIRECTIVES:\n${t.skillPrompt}` : ''}
+`;
+}).join('\n')}
+================================================================================
+CRITICAL MULTI-TEMPLATE COMBINATION & MERGE DIRECTIVES:
+1. UNIFIED COHESIVE REPORT: Combine these ${templates.length} templates into a single, comprehensive, seamlessly integrated multi-study report.
+   - Maintain the logical clinical order of anatomical regions (e.g. Brain sections followed by Cervical Spine sections; Chest followed by Abdomen and Pelvis).
+   - Combine the study title/header into a unified examination title (e.g. "CT SCAN OF BRAIN AND CERVICAL SPINE (PLAIN)").
+   - Group Technique / Protocol lines under the Technique section.
+2. ACCURATE FINDINGS PLACEMENT: When the doctor dictates findings, accurately place each dictated finding into its corresponding anatomical section across the combined templates (e.g., intracranial/cerebral findings in the brain sections, vertebral/disc findings in the spine sections, pulmonary findings in the lung sections, hepatic findings in the liver section).
+   - Prefix only dictated/abnormal or modified lines with 'BOLD::'.
+3. NORMAL FINDINGS PRESERVATION: For any anatomical regions from either template where no abnormalities were dictated or where the dictation indicated normal/unremarkable, preserve the complete normal baseline findings verbatim WITHOUT the 'BOLD::' prefix.
+4. COMBINED CLINICAL IMPRESSION: Synthesize ONE unified, comprehensive, prioritized IMPRESSION covering all examined regions (format: 'IMPRESSION:###point 1###point 2...'). Prioritize significant acute abnormalities first, followed by incidental findings or normal summaries for the respective regions.
+5. PRESERVE TABULAR DATA: When any template contains measurement tables or comparative grids, preserve them intact with rows joined by '###'.
+================================================================================
+`;
+  } else {
+    const singleT = templates[0];
+    templateContent = docxText.length > 0
+      ? docxText
+      : (singleT.lines && singleT.lines.length > 0
+        ? singleT.lines.join('\n')
+        : (singleT.content || ''));
+    const skillPrompt = singleT.skillPrompt || '';
+
+    templateBasePrompt = TEMPLATE_GEMINI_PROMPT.replace(
+      '[INSERT_TEMPLATE_HERE]',
+      `BASELINE TEMPLATE CONTENT FOR "${templateName}":\n"""\n${templateContent}\n"""`
+    );
+
+    templateContextPrompt = `
 ================================================================================
 ACTIVE RADIOLOGY NORMAL REPORT TEMPLATE: "${templateName}"
 BASELINE TEMPLATE CONTENT:
@@ -870,6 +993,7 @@ CRITICAL TEMPLATE MERGE DIRECTIVES:
 6. MEASUREMENT / COMPARATIVE TABLES: When the template or report contains measurement grids or comparative anatomical tables (e.g., bilateral kidney comparisons, TAVI measurements, pulmonary artery dimensions, cardiac ventricular volumes), preserve the table rows joined by '###' (e.g. 'Col1 | Col2###Val1 | Val2') so the full tabular grid is preserved as a cohesive unit.
 ================================================================================
 `;
+  }
 
   const dictatedFindingsDirective = `
 ================================================================================
@@ -884,6 +1008,7 @@ Carefully integrate these dictated findings into the "${templateName}" baseline 
 - Any anatomical sections where the dictation describes pathology, abnormal lesions, or modifications must be updated with the dictated findings and prefixed with 'BOLD::'.
 - Any anatomical sections from the template that were normal or not mentioned in the dictation must remain present verbatim without 'BOLD::'.
 - Clinical profile if dictated or present must be preserved as its own line (*Clinical Profile: ...*).
+- If the dictated findings contain previous or intermediate "IMPRESSION:" lines from continued dictation sessions, consolidate all findings into ONE single comprehensive final IMPRESSION at the end of the report (format: 'IMPRESSION:###point 1###point 2...'). Do NOT leave intermediate impressions scattered in the body of the report.
 - Generate a new, comprehensive IMPRESSION synthesizing all normal and abnormal findings starting with 'IMPRESSION:###'.
 - Return ONLY a JSON object with the "findings" string array in the assembled report order.
 ================================================================================
@@ -901,11 +1026,12 @@ Carefully integrate these dictated findings into the "${templateName}" baseline 
     });
   }
 
-  // If audio is available, attach it as additional context
+  // Template merging is primarily a text reasoning task between dictatedFindings and the template.
+  // Only attach audio if it is a compact clip (< 6MB, non-WAV) to avoid exceeding the Gemini 20MB payload limit.
   if (audioBlob) {
     const audioBlobs = Array.isArray(audioBlob) ? audioBlob : [audioBlob];
     for (const blob of audioBlobs) {
-      if (blob && blob.size > 0 && blob.type && blob.type.startsWith('audio/')) {
+      if (blob && blob.size > 0 && blob.size < 6 * 1024 * 1024 && blob.type && blob.type.startsWith('audio/') && !blob.type.includes('wav')) {
         try {
           const base64Audio = await blobToBase64(blob);
           parts.push({
@@ -934,14 +1060,15 @@ Carefully integrate these dictated findings into the "${templateName}" baseline 
   } catch (error) {
     console.warn("mergeDictatedFindingsWithTemplate primary attempt failed, trying fallback:", error);
 
-    // Direct JSON prompt fallback
+    // Direct JSON prompt fallback using text-only parts to guarantee payload fits
     try {
       const fallbackModel = 'gemini-3.7-flash';
+      const textOnlyParts = parts.filter(p => !p.inlineData);
       const retryResponse = await getAI().models.generateContent({
         model: fallbackModel,
         contents: {
           parts: [
-            ...parts,
+            ...textOnlyParts,
             { text: "\n\nCRITICAL OUTPUT REQUIREMENT: Output ONLY a valid JSON object in the exact format: {\"findings\": [\"finding 1\", \"finding 2\", ...]}" }
           ]
         }
@@ -956,15 +1083,28 @@ Carefully integrate these dictated findings into the "${templateName}" baseline 
     }
 
     // Baseline template lines fallback with dictated findings appended
-    if (template.lines && template.lines.length > 0) {
-      const title = template.lines[0] || templateName;
+    if (isMulti) {
+      const allLines = templates.flatMap(t => t.lines || []);
+      const filteredDictated = dictatedFindings.filter(f => !f.toLowerCase().includes('normal') && !f.startsWith('IMPRESSION'));
+      return [
+        `COMBINED REPORT: ${templateName}`,
+        "*Clinical Profile: Multi-region evaluation.*",
+        ...allLines.filter(l => !l.startsWith('IMPRESSION') && !l.toLowerCase().startsWith('clinical profile')),
+        ...filteredDictated.map(f => f.startsWith('BOLD::') ? f : `BOLD::${f}`),
+        "IMPRESSION:###Multi-region examination evaluated."
+      ];
+    }
+
+    const singleFirst = templates[0];
+    if (singleFirst && singleFirst.lines && singleFirst.lines.length > 0) {
+      const title = singleFirst.lines[0] || templateName;
       const filteredDictated = dictatedFindings.filter(f => !f.toLowerCase().includes('normal') && !f.startsWith('IMPRESSION'));
       return [
         title,
         "*Clinical Profile: Routine evaluation.*",
-        ...template.lines.slice(1, -2),
+        ...singleFirst.lines.slice(1, -2),
         ...filteredDictated.map(f => f.startsWith('BOLD::') ? f : `BOLD::${f}`),
-        template.lines[template.lines.length - 1] || "IMPRESSION:###Study evaluated."
+        singleFirst.lines[singleFirst.lines.length - 1] || "IMPRESSION:###Study evaluated."
       ];
     }
 
@@ -1317,8 +1457,16 @@ export const createChat = async (
 
   for (let i = 0; i < audioBlobs.length; i++) {
     const blob = audioBlobs[i];
-    const base64Audio = await blobToBase64(blob);
     const cleanMime = getCleanMimeType(blob);
+
+    if (blob.size > 15 * 1024 * 1024) {
+      userMessageParts.push({
+        text: `This is dictation / input document #${i + 1} (${(blob.size / (1024 * 1024)).toFixed(1)} MB).`
+      });
+      continue;
+    }
+
+    const base64Audio = await blobToBase64(blob);
 
     if (cleanMime.startsWith('text/')) {
       try {

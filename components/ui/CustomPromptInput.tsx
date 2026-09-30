@@ -2,7 +2,8 @@ import React, { useState, useRef, useEffect, useMemo } from 'react';
 import ChevronDownIcon from '../icons/ChevronDownIcon';
 import SparklesIcon from '../icons/SparklesIcon';
 import { useAudioRecorder } from '../../hooks/useAudioRecorder';
-import { transcribeAudioForPrompt } from '../../services/geminiService';
+import { transcribeAudioForPrompt, findBuiltinTemplates } from '../../services/geminiService';
+import { FileText } from 'lucide-react';
 import MicIcon from '../icons/MicIcon';
 import StopIcon from '../icons/StopIcon';
 import Spinner from './Spinner';
@@ -58,8 +59,92 @@ const CustomPromptInput: React.FC<{
   const [appliedTemplateName, setAppliedTemplateName] = useState<string | null>(null);
   const [deletingTemplateId, setDeletingTemplateId] = useState<string | null>(null);
   const [activeUpcoming, setActiveUpcoming] = useState<UpcomingTemplateConfig | null>(() => getUpcomingTemplate());
+  const [selectedSavedTemplateIds, setSelectedSavedTemplateIds] = useState<string[]>([]);
   const templateFileInputRef = useRef<HTMLInputElement>(null);
   const templateDocxInputRef = useRef<HTMLInputElement>(null);
+
+  const toggleSavedTemplateSelection = (tmplId: string) => {
+    setSelectedSavedTemplateIds(prev => {
+      if (prev.includes(tmplId)) {
+        return prev.filter(id => id !== tmplId);
+      } else {
+        return [...prev, tmplId];
+      }
+    });
+  };
+
+  const handleApplySavedCombination = async (forUpcoming = false) => {
+    if (selectedSavedTemplateIds.length === 0) return;
+    const selected = savedTemplates.filter(t => selectedSavedTemplateIds.includes(t.id));
+    if (selected.length === 0) return;
+
+    if (selected.length === 1) {
+      handleApplyCustomTemplate(selected[0], forUpcoming);
+      setSelectedSavedTemplateIds([]);
+      return;
+    }
+
+    const reportTemplates: ReportTemplate[] = selected.map(t => {
+      const cleanId = t.id.startsWith('builtin_') ? t.id.replace('builtin_', '') : t.id;
+      return {
+        id: cleanId,
+        name: t.name,
+        category: t.category || (t.id.includes('ct') ? 'CT' : t.id.includes('mri') ? 'MRI' : 'GENERAL'),
+        modality: t.modality || (t.id.includes('ct') ? 'CT' : t.id.includes('mri') ? 'MRI' : undefined),
+        lines: t.lines || (t.text ? t.text.split('\n') : []),
+        content: t.text || (t.lines ? t.lines.join('\n') : ''),
+        docxBase64: t.docxFile?.data,
+        fileName: t.docxFile?.name,
+      };
+    });
+
+    if (forUpcoming) {
+      await setUpcomingTemplate(reportTemplates);
+      setActiveUpcoming(getUpcomingTemplate());
+    }
+
+    await handleSelectTemplate(reportTemplates);
+    setSelectedSavedTemplateIds([]);
+  };
+
+  const activeTemplateDisplayName = useMemo(() => {
+    if (appliedTemplateName) {
+      return appliedTemplateName;
+    }
+    if (activeUpcoming) {
+      return activeUpcoming.name;
+    }
+    const matched = findBuiltinTemplates(prompt);
+    if (matched.length > 0) {
+      return matched.map(t => t.name).join(' + ');
+    }
+    if (customDocx) {
+      return customDocx.name;
+    }
+    return null;
+  }, [appliedTemplateName, activeUpcoming, prompt, customDocx]);
+
+  const isCombinedTemplateActive = useMemo(() => {
+    if (activeTemplateDisplayName && (activeTemplateDisplayName.includes('+') || activeTemplateDisplayName.toLowerCase().includes('combined'))) {
+      return true;
+    }
+    const matched = findBuiltinTemplates(prompt);
+    return matched.length > 1;
+  }, [activeTemplateDisplayName, prompt]);
+
+  const handleClearActiveTemplates = () => {
+    onPromptChange('');
+    if (onCustomDocxChange) {
+      onCustomDocxChange(null);
+    }
+    if (onImagesChange) {
+      onImagesChange([]);
+    }
+    setAppliedTemplateName(null);
+    setSelectedSavedTemplateIds([]);
+    clearUpcomingTemplate();
+    setActiveUpcoming(null);
+  };
 
   useEffect(() => {
     setActiveUpcoming(getUpcomingTemplate());
@@ -123,7 +208,52 @@ const CustomPromptInput: React.FC<{
     return list;
   }, [savedTemplates, savedModalityFilter, savedSearchQuery]);
 
-  const handleSelectTemplate = async (template: ReportTemplate) => {
+  const handleSelectTemplate = async (template: ReportTemplate | ReportTemplate[]) => {
+    if (Array.isArray(template)) {
+      if (template.length === 1) {
+        return handleSelectTemplate(template[0]);
+      }
+      const ids = template.map(t => t.id).filter(Boolean);
+      const names = template.map(t => `"${t.name}"`).join(' and ');
+      const promptText = `[TEMPLATE_ID: ${ids.join(', ')}] Use combined report templates: ${names}. Integrate my dictation into a unified multi-region report with findings properly placed in their respective anatomical sections and generate a synthesized impression.`;
+      onPromptChange(promptText);
+
+      const combinedExtractedText = template.map(t => {
+        const content = t.lines ? t.lines.join('\n') : (t.content || '');
+        return `=== TEMPLATE: ${t.name} ===\n${content}`;
+      }).join('\n\n');
+
+      let firstDocx = '';
+      for (const t of template) {
+        if (t.docxBase64) {
+          firstDocx = t.docxBase64;
+          break;
+        } else if (t.id) {
+          try {
+            const d = await getTemplateDocxBase64(t.id);
+            if (d) {
+              firstDocx = d;
+              break;
+            }
+          } catch (e) {}
+        }
+      }
+
+      if (onCustomDocxChange) {
+        onCustomDocxChange({
+          name: `${template.map(t => t.name).join(' + ')}.docx`,
+          data: firstDocx,
+          size: firstDocx ? Math.round(firstDocx.length * 0.75) : 0,
+          extractedText: combinedExtractedText,
+        });
+      }
+
+      setAppliedTemplateName(`Combined (${template.length}): ${template.map(t => t.name).join(' + ')}`);
+      setIsModalOpen(false);
+      setTimeout(() => setAppliedTemplateName(null), 4000);
+      return;
+    }
+
     // 1. Tag prompt with exact template ID and quoted name for 100% deterministic detection
     const promptText = `[TEMPLATE_ID: ${template.id}] Use the normal "${template.name}" report template. Integrate my dictation and generate a new impression.`;
     onPromptChange(promptText);
@@ -469,6 +599,59 @@ const CustomPromptInput: React.FC<{
                 </div>
             )}
 
+          {/* Report Template Selector & Multi-Combine Bar */}
+          <div className="p-3 sm:p-3.5 bg-slate-50 dark:bg-slate-950/60 rounded-xl border border-slate-200/80 dark:border-slate-800 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <div className="p-2 rounded-xl bg-blue-100 dark:bg-blue-900/60 text-blue-600 dark:text-blue-300 shrink-0">
+                <FileText className="w-5 h-5" />
+              </div>
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-xs sm:text-sm font-bold text-slate-800 dark:text-slate-100">
+                    {activeTemplateDisplayName ? (
+                      <span className="text-blue-600 dark:text-blue-400">Report Template: {activeTemplateDisplayName}</span>
+                    ) : (
+                      <span>Report Template: <span className="text-slate-500 font-normal">None (Standard Free-form)</span></span>
+                    )}
+                  </span>
+                  {isCombinedTemplateActive && (
+                    <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-300 border border-blue-200 dark:border-blue-800 flex items-center gap-1">
+                      <SparklesIcon className="w-3 h-3 text-blue-600 dark:text-blue-400" />
+                      Multi-Region Combined
+                    </span>
+                  )}
+                </div>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
+                  {activeTemplateDisplayName 
+                    ? 'Dictated findings will be automatically routed into respective anatomical sections.'
+                    : 'Choose 1 or select multiple templates to combine and dictate multi-study reports.'}
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => setIsModalOpen(true)}
+                className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold rounded-xl bg-blue-600 hover:bg-blue-700 active:scale-95 text-white transition-all shadow-sm cursor-pointer"
+                title="Select one or multiple templates to combine"
+              >
+                <SparklesIcon className="w-3.5 h-3.5" />
+                <span>{activeTemplateDisplayName ? 'Change / Combine Templates' : 'Select Template(s)'}</span>
+              </button>
+              {activeTemplateDisplayName && (
+                <button
+                  type="button"
+                  onClick={handleClearActiveTemplates}
+                  className="text-xs text-slate-500 hover:text-red-600 dark:text-slate-400 dark:hover:text-red-400 font-semibold px-2 py-1.5 transition-colors cursor-pointer"
+                  title="Clear selected templates"
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+          </div>
+
           {appliedTemplateName && (
             <div className="p-3 text-xs text-green-700 bg-green-50 dark:bg-green-950/40 dark:text-green-300 rounded-lg border border-green-200 dark:border-green-900/50 flex justify-between items-center animate-fade-in shadow-sm">
               <span className="flex items-center gap-1.5">
@@ -709,6 +892,64 @@ const CustomPromptInput: React.FC<{
                   </div>
                 </div>
 
+                {/* Combined Selection Bar for My Templates */}
+                {selectedSavedTemplateIds.length > 0 && (
+                  <div className="p-2.5 bg-blue-50 dark:bg-blue-950/70 border border-blue-300 dark:border-blue-700/80 rounded-xl flex flex-col gap-2 shadow-xs animate-fade-in">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-1.5 text-xs font-bold text-blue-900 dark:text-blue-100 min-w-0">
+                        <SparklesIcon className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400 shrink-0" />
+                        <span className="truncate">Combined Selection ({selectedSavedTemplateIds.length} Templates)</span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setSelectedSavedTemplateIds([])}
+                        className="text-[11px] font-semibold text-slate-500 hover:text-red-600 dark:text-slate-400 dark:hover:text-red-400 cursor-pointer shrink-0"
+                      >
+                        Clear
+                      </button>
+                    </div>
+                    <div className="flex flex-wrap gap-1 max-h-20 overflow-y-auto">
+                      {selectedSavedTemplateIds.map((id, idx) => {
+                        const t = savedTemplates.find(st => st.id === id);
+                        if (!t) return null;
+                        return (
+                          <span
+                            key={id}
+                            className="inline-flex items-center gap-1 text-[11px] font-medium bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200 px-2 py-0.5 rounded-md border border-blue-200 dark:border-blue-800"
+                          >
+                            <span className="w-3.5 h-3.5 rounded-full bg-blue-600 text-white text-[9px] flex items-center justify-center font-bold shrink-0">{idx + 1}</span>
+                            <span className="truncate max-w-[120px]">{t.name}</span>
+                            <button
+                              type="button"
+                              onClick={() => toggleSavedTemplateSelection(id)}
+                              className="text-slate-400 hover:text-red-500 font-bold ml-0.5 cursor-pointer"
+                            >
+                              ✕
+                            </button>
+                          </span>
+                        );
+                      })}
+                    </div>
+                    <div className="flex items-center gap-2 pt-1 border-t border-blue-200 dark:border-blue-800">
+                      <button
+                        type="button"
+                        onClick={() => handleApplySavedCombination(false)}
+                        className="flex-1 py-1.5 px-3 bg-blue-600 hover:bg-blue-700 active:scale-95 text-white text-xs font-bold rounded-lg shadow-xs flex items-center justify-center gap-1.5 transition-all cursor-pointer"
+                      >
+                        <span>✓ Use Combined ({selectedSavedTemplateIds.length} Templates)</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleApplySavedCombination(true)}
+                        className="py-1.5 px-3 bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white text-xs font-bold rounded-lg shadow-xs flex items-center justify-center gap-1 transition-all cursor-pointer shrink-0"
+                        title="Set combined templates active for upcoming dictations"
+                      >
+                        <span>📌 Upcoming</span>
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 {filteredSavedTemplates.length === 0 ? (
                   <div className="text-center py-6 border border-dashed border-slate-200 dark:border-slate-800 rounded-xl bg-slate-50/50 dark:bg-slate-950/35">
                     <SparklesIcon className="w-8 h-8 text-slate-300 dark:text-slate-600 mx-auto mb-2" />
@@ -728,17 +969,48 @@ const CustomPromptInput: React.FC<{
                       const isConfirming = deletingTemplateId === tmpl.id;
                       const isCT = (tmpl.modality || tmpl.category || '').toUpperCase().includes('CT');
                       const isMRI = (tmpl.modality || tmpl.category || '').toUpperCase().includes('MRI');
+                      const isSelectedForCombine = selectedSavedTemplateIds.includes(tmpl.id);
+                      const combineIndex = selectedSavedTemplateIds.indexOf(tmpl.id);
 
                       return (
                         <div 
                           key={tmpl.id}
-                          className="p-3 border border-slate-200 dark:border-slate-800 rounded-xl bg-slate-50/30 dark:bg-slate-950/30 hover:border-slate-300 dark:hover:border-slate-700 transition-all flex flex-col justify-between gap-2.5"
+                          className={`p-3 border rounded-xl transition-all flex flex-col justify-between gap-2.5 ${
+                            isSelectedForCombine
+                              ? 'bg-blue-50/90 dark:bg-blue-950/60 border-blue-400 dark:border-blue-600 ring-1 ring-blue-400 shadow-xs'
+                              : 'bg-slate-50/30 dark:bg-slate-950/30 border-slate-200 dark:border-slate-800 hover:border-slate-300 dark:hover:border-slate-700'
+                          }`}
                         >
                           <div>
-                            <div className="flex justify-between items-start gap-1">
-                              <h4 className="font-bold text-sm text-slate-800 dark:text-slate-100 truncate" title={tmpl.name}>
-                                {tmpl.name}
-                              </h4>
+                            <div className="flex justify-between items-start gap-1.5">
+                              <div className="flex items-center gap-1.5 min-w-0 flex-1">
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    toggleSavedTemplateSelection(tmpl.id);
+                                  }}
+                                  className={`p-1 rounded-lg border transition-all shrink-0 cursor-pointer ${
+                                    isSelectedForCombine
+                                      ? 'bg-blue-600 text-white border-blue-600 shadow-xs'
+                                      : 'bg-white hover:bg-blue-50 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-400 border-slate-300 dark:border-slate-600 hover:border-blue-400'
+                                  }`}
+                                  title={isSelectedForCombine ? `Remove ${tmpl.name} from combined selection` : `Select ${tmpl.name} to combine with another template`}
+                                >
+                                  {isSelectedForCombine ? (
+                                    <span className="w-3.5 h-3.5 flex items-center justify-center font-bold text-[10px]">
+                                      {combineIndex + 1}
+                                    </span>
+                                  ) : (
+                                    <span className="w-3.5 h-3.5 flex items-center justify-center text-[10px] text-slate-400 font-bold">
+                                      +
+                                    </span>
+                                  )}
+                                </button>
+                                <h4 className="font-bold text-sm text-slate-800 dark:text-slate-100 truncate" title={tmpl.name}>
+                                  {tmpl.name}
+                                </h4>
+                              </div>
                               
                               {tmpl.isBuiltIn ? (
                                 <span 
@@ -841,20 +1113,32 @@ const CustomPromptInput: React.FC<{
                             <div className="w-full mt-1.5 flex items-center gap-1.5">
                               <button
                                 type="button"
-                                onClick={() => handleApplyCustomTemplate(tmpl, false)}
+                                onClick={() => {
+                                  if (selectedSavedTemplateIds.length >= 2 && isSelectedForCombine) {
+                                    handleApplySavedCombination(false);
+                                  } else {
+                                    handleApplyCustomTemplate(tmpl, false);
+                                  }
+                                }}
                                 className="flex-1 py-1 px-2.5 text-xs font-bold text-center rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-950 text-blue-700 dark:text-blue-300 hover:bg-blue-100 dark:hover:bg-blue-900/60 transition-colors"
-                                title="Use this template for current report only"
+                                title={selectedSavedTemplateIds.length >= 2 && isSelectedForCombine ? `Use combined ${selectedSavedTemplateIds.length} templates for this report` : "Use this template for current report only"}
                               >
-                                Use Template
+                                {selectedSavedTemplateIds.length >= 2 && isSelectedForCombine ? `Apply Combined (${selectedSavedTemplateIds.length})` : 'Use Template'}
                               </button>
                               <button
                                 type="button"
-                                onClick={() => handleApplyCustomTemplate(tmpl, true)}
+                                onClick={() => {
+                                  if (selectedSavedTemplateIds.length >= 2 && isSelectedForCombine) {
+                                    handleApplySavedCombination(true);
+                                  } else {
+                                    handleApplyCustomTemplate(tmpl, true);
+                                  }
+                                }}
                                 className="py-1 px-2 text-xs font-bold text-center rounded-lg border border-emerald-300 dark:border-emerald-700 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-900/60 transition-colors flex items-center gap-1 shrink-0"
                                 title="Use this template for upcoming reports in Single & Batch dictations"
                               >
                                 <span>📌</span>
-                                <span className="text-[11px]">Upcoming</span>
+                                <span className="text-[11px]">{selectedSavedTemplateIds.length >= 2 && isSelectedForCombine ? `Upcoming (${selectedSavedTemplateIds.length})` : 'Upcoming'}</span>
                               </button>
                             </div>
                           )}

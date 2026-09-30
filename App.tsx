@@ -1,7 +1,7 @@
 
 
 
-import React, { useState, useCallback, useEffect, useRef } from 'react';
+import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import AudioRecorder from './components/AudioRecorder';
 import ResultsDisplay from './components/ResultsDisplay';
 import { AppStatus, IdentifiedError } from './types';
@@ -721,7 +721,33 @@ const App: React.FC = () => {
       } catch (_) {}
 
       const newFindings = await processAudio(newAudioBlob, selectedModel, customPrompt, customImages, undefined, customDocx);
-      const updatedFindings = [...findings, ...newFindings];
+      
+      // Consolidate findings cleanly: keep findings grouped together and synthesize impression at the end
+      const priorNonImpression = findings.filter(f => !f.startsWith('IMPRESSION:'));
+      const priorImpression = findings.find(f => f.startsWith('IMPRESSION:'));
+      const newNonImpression = newFindings.filter(f => !f.startsWith('IMPRESSION:'));
+      const newImpression = newFindings.find(f => f.startsWith('IMPRESSION:'));
+
+      const filteredNewNonImpression = newNonImpression.filter((f, idx) => {
+        if (idx === 0 && priorNonImpression.length > 0 && f.replace(/^BOLD::/i, '').trim().toUpperCase() === priorNonImpression[0].replace(/^BOLD::/i, '').trim().toUpperCase()) {
+          return false;
+        }
+        return true;
+      });
+
+      let finalImpression = newImpression || priorImpression;
+      if (priorImpression && newImpression && priorImpression !== newImpression) {
+        const priorPoints = priorImpression.replace(/^IMPRESSION:###?/i, '').split('###').filter(Boolean);
+        const newPoints = newImpression.replace(/^IMPRESSION:###?/i, '').split('###').filter(Boolean);
+        const combinedPoints = Array.from(new Set([...priorPoints, ...newPoints]));
+        finalImpression = `IMPRESSION:###${combinedPoints.join('###')}`;
+      }
+
+      const updatedFindings = [
+        ...priorNonImpression,
+        ...filteredNewNonImpression,
+        ...(finalImpression ? [finalImpression] : [])
+      ];
       setFindings(updatedFindings);
       
       const chatSession = await createChat(mergedBlob, updatedFindings, customPrompt, customImages, selectedModel);

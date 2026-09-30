@@ -34,7 +34,80 @@ export const getUpcomingTemplate = (): UpcomingTemplateConfig | null => {
   }
 };
 
-export const setUpcomingTemplate = async (template: ReportTemplate | any): Promise<UpcomingTemplateConfig> => {
+export const setUpcomingTemplate = async (template: ReportTemplate | ReportTemplate[] | any): Promise<UpcomingTemplateConfig> => {
+  if (Array.isArray(template)) {
+    if (template.length === 1) {
+      return setUpcomingTemplate(template[0]);
+    }
+    const cleanIds = template.map(t => {
+      let id = t.id || t.name;
+      if (typeof id === 'string' && id.startsWith('builtin_')) {
+        id = id.replace('builtin_', '');
+      }
+      return id;
+    });
+
+    const combinedName = template.map(t => t.name).join(' + ');
+    const combinedPrompt = `[TEMPLATE_ID: ${cleanIds.join(', ')}] Use combined report templates: ${template.map(t => `"${t.name}"`).join(' and ')}. Integrate my dictation into a unified multi-region report with findings properly placed and generate a synthesized impression.`;
+
+    const combinedExtractedText = template.map(t => {
+      const content = t.lines ? t.lines.join('\n') : (t.content || '');
+      return `=== TEMPLATE: ${t.name} ===\n${content}`;
+    }).join('\n\n');
+
+    let firstDocx = '';
+    for (const t of template) {
+      if (t.docxBase64) {
+        firstDocx = t.docxBase64;
+        break;
+      } else if (t.id) {
+        try {
+          const d = await getTemplateDocxBase64(t.id);
+          if (d) {
+            firstDocx = d;
+            break;
+          }
+        } catch (e) {}
+      }
+    }
+
+    const docxData: DocxTemplateData = {
+      name: `${combinedName}.docx`,
+      data: firstDocx,
+      size: firstDocx ? Math.round(firstDocx.length * 0.75) : 0,
+      extractedText: combinedExtractedText,
+    };
+
+    const config: UpcomingTemplateConfig = {
+      id: cleanIds.join(','),
+      name: combinedName,
+      promptText: combinedPrompt,
+      docxData,
+      category: 'Combined',
+      modality: 'COMBINED',
+      lines: template.flatMap(t => t.lines || []),
+      content: combinedExtractedText,
+    };
+
+    try {
+      if (typeof window !== 'undefined') {
+        localStorage.setItem(UPCOMING_TEMPLATE_KEY, JSON.stringify(config));
+      }
+    } catch (err) {
+      console.warn('Failed to save upcoming combined template to localStorage', err);
+    }
+
+    listeners.forEach((listener) => {
+      try {
+        listener(config);
+      } catch (e) {
+        console.error('Error notifying upcoming template listener:', e);
+      }
+    });
+
+    return config;
+  }
+
   let cleanId = template.id || template.name;
   if (typeof cleanId === 'string' && cleanId.startsWith('builtin_')) {
     cleanId = cleanId.replace('builtin_', '');

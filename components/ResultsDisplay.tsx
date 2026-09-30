@@ -32,6 +32,7 @@ import { generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRo
 import { stopRepeatingInterruptedAlert } from '../services/soundService';
 import RichTextReportEditor from './RichTextReportEditor';
 import type { DocxTemplateData } from './ui/CustomPromptInput';
+import { CheckSquare } from 'lucide-react';
 
 interface ChatMessage {
   author: 'You' | 'AI';
@@ -245,45 +246,87 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   const [isMergingTemplate, setIsMergingTemplate] = useState<boolean>(false);
   const [mergingTemplateName, setMergingTemplateName] = useState<string | null>(null);
 
-  const handleSelectTemplateToMerge = async (template: ReportTemplate) => {
+  const handleSelectTemplateToMerge = async (template: ReportTemplate | ReportTemplate[]) => {
     setIsTemplateModalOpen(false);
     setIsMergingTemplate(true);
-    setMergingTemplateName(template.name);
     setUndoState(findings); // Save snapshot for instant undo
 
-    // Update active template prompt tag and DOCX data
-    let docx = template.docxBase64;
-    if (!docx && template.id) {
-      try {
-        docx = await getTemplateDocxBase64(template.id);
-      } catch (err) {
-        console.warn('Error loading docx for template:', err);
+    const templates = Array.isArray(template) ? template : [template];
+    const isMulti = templates.length > 1;
+    const templateName = templates.map(t => t.name).join(' + ');
+    setMergingTemplateName(templateName);
+
+    let docxData: DocxTemplateData;
+    let promptText: string;
+
+    if (isMulti) {
+      const ids = templates.map(t => t.id).filter(Boolean).join(', ');
+      const names = templates.map(t => `"${t.name}"`).join(' and ');
+      promptText = `[TEMPLATE_ID: ${ids}] Use combined report templates: ${names}. Integrate my dictation into a unified multi-region report with findings properly placed in their respective anatomical sections and generate a synthesized impression.`;
+
+      const combinedExtractedText = templates.map(t => {
+        const content = t.lines ? t.lines.join('\n') : (t.content || '');
+        return `=== TEMPLATE: ${t.name} ===\n${content}`;
+      }).join('\n\n');
+
+      let firstDocx = '';
+      for (const t of templates) {
+        if (t.docxBase64) {
+          firstDocx = t.docxBase64;
+          break;
+        } else if (t.id) {
+          try {
+            const d = await getTemplateDocxBase64(t.id);
+            if (d) {
+              firstDocx = d;
+              break;
+            }
+          } catch (e) {}
+        }
       }
+
+      docxData = {
+        name: `${templateName}.docx`,
+        data: firstDocx,
+        size: firstDocx ? Math.round(firstDocx.length * 0.75) : 0,
+        extractedText: combinedExtractedText,
+      };
+    } else {
+      const singleT = templates[0];
+      let docx = singleT.docxBase64;
+      if (!docx && singleT.id) {
+        try {
+          docx = await getTemplateDocxBase64(singleT.id);
+        } catch (err) {
+          console.warn('Error loading docx for template:', err);
+        }
+      }
+      const extractedText = singleT.lines ? singleT.lines.join('\n') : singleT.content;
+      docxData = {
+        name: singleT.fileName || `${singleT.name}.docx`,
+        data: docx || '',
+        size: docx ? Math.round(docx.length * 0.75) : 0,
+        extractedText,
+      };
+      promptText = `[TEMPLATE_ID: ${singleT.id}] Use the normal "${singleT.name}" report template. Integrate my dictation and generate a new impression.`;
     }
-    const extractedText = template.lines ? template.lines.join('\n') : template.content;
-    const docxData: DocxTemplateData = {
-      name: template.fileName || `${template.name}.docx`,
-      data: docx || '',
-      size: docx ? Math.round(docx.length * 0.75) : 0,
-      extractedText,
-    };
+
     if (onCustomDocxChange) {
       onCustomDocxChange(docxData);
     }
-    const promptText = `[TEMPLATE_ID: ${template.id}] Use the normal "${template.name}" report template. Integrate my dictation and generate a new impression.`;
     onCustomPromptChange(promptText);
 
     try {
       const merged = await mergeDictatedFindingsWithTemplate(
         findings,
-        template,
+        templates,
         selectedModel,
         audioBlob,
         promptText,
         docxData
       );
       onAllFindingsUpdate(merged);
-      showNotification(`Merged with ${template.name}!`);
+      showNotification(`Merged with ${templateName}!`);
     } catch (err) {
       console.error("Failed to merge dictated findings with template:", err);
       showNotification(`Merge failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
@@ -1288,11 +1331,18 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     setReorderMode(false);
   };
 
-  // Reorder
-  const handleReorderDragStart = (index: number) => {
+  // Reorder Drag Handlers
+  const handleReorderDragStart = (e: React.DragEvent | undefined, index: number) => {
     dragItem.current = index;
     setDraggedIndex(index);
+    if (e && e.dataTransfer) {
+      try {
+        e.dataTransfer.setData("text/plain", index.toString());
+        e.dataTransfer.effectAllowed = "move";
+      } catch (_) {}
+    }
   };
+
   const handleReorderDragEnd = () => {
     if (dragItem.current !== null && dragOverItem.current !== null && dragItem.current !== dragOverItem.current) {
         setUndoState(findings);
@@ -1304,6 +1354,93 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     dragItem.current = null;
     dragOverItem.current = null;
     setDraggedIndex(null);
+  };
+
+  // Touch Drag Support for Mobile & Tablets
+  const touchDragRef = useRef<{
+    sourceIndex: number;
+    startX: number;
+    startY: number;
+    isDragging: boolean;
+  } | null>(null);
+
+  const handleRowTouchStart = (e: React.TouchEvent, index: number) => {
+    if (!reorderMode && !mergeMode) return;
+    const touch = e.touches[0];
+    touchDragRef.current = {
+      sourceIndex: index,
+      startX: touch.clientX,
+      startY: touch.clientY,
+      isDragging: false,
+    };
+  };
+
+  const handleRowTouchMove = (e: React.TouchEvent) => {
+    if (!reorderMode && !mergeMode) return;
+    if (!touchDragRef.current) return;
+    const touch = e.touches[0];
+    const deltaX = Math.abs(touch.clientX - touchDragRef.current.startX);
+    const deltaY = Math.abs(touch.clientY - touchDragRef.current.startY);
+
+    // If moved more than 6px, initiate touch drag
+    if (!touchDragRef.current.isDragging && (deltaX > 6 || deltaY > 6)) {
+      touchDragRef.current.isDragging = true;
+      const src = touchDragRef.current.sourceIndex;
+      if (reorderMode) {
+        dragItem.current = src;
+        setDraggedIndex(src);
+      } else if (mergeMode) {
+        dragItem.current = src;
+        setDraggedIndex(src);
+      }
+    }
+
+    if (touchDragRef.current.isDragging) {
+      if (e.cancelable) {
+        e.preventDefault();
+      }
+      const el = document.elementFromPoint(touch.clientX, touch.clientY);
+      const targetItem = el?.closest('.finding-item');
+      if (targetItem) {
+        const targetIdxStr = targetItem.getAttribute('data-finding-index');
+        if (targetIdxStr !== null) {
+          const targetIdx = parseInt(targetIdxStr, 10);
+          if (!isNaN(targetIdx)) {
+            if (reorderMode) {
+              dragOverItem.current = targetIdx;
+            } else if (mergeMode) {
+              setDragOverIndex(targetIdx);
+            }
+          }
+        }
+      }
+    }
+  };
+
+  const handleRowTouchEnd = () => {
+    if (!reorderMode && !mergeMode) return;
+    const state = touchDragRef.current;
+    touchDragRef.current = null;
+    if (!state) return;
+
+    if (state.isDragging) {
+      if (reorderMode) {
+        handleReorderDragEnd();
+      } else if (mergeMode) {
+        if (dragOverIndex !== null && state.sourceIndex !== dragOverIndex) {
+          executeMerge(state.sourceIndex, dragOverIndex);
+        } else {
+          setDraggedIndex(null);
+          setDragOverIndex(null);
+          dragItem.current = null;
+        }
+      }
+    } else {
+      // Tap without dragging in mergeMode: tap-to-merge
+      if (mergeMode) {
+        handleMergeItemClick(state.sourceIndex);
+      }
+    }
   };
 
   // Execute Merge safely between sourceIndex and targetIndex
@@ -1837,6 +1974,28 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                 </button>
               )}
               <button
+                type="button"
+                onClick={() => {
+                  setMultiSelectMode(prev => {
+                    const next = !prev;
+                    if (!next) {
+                      setSelectedIndices(new Set<number>());
+                      setSelectionSnippets({});
+                    }
+                    return next;
+                  });
+                }}
+                className={`text-xs sm:text-sm font-semibold py-1.5 px-3 rounded-lg transition-colors flex items-center gap-1.5 shadow-sm ${
+                  multiSelectMode
+                    ? 'bg-blue-600 text-white hover:bg-blue-700'
+                    : 'bg-white text-slate-700 hover:bg-slate-200 border border-slate-200 dark:border-slate-600 dark:bg-slate-700 dark:text-slate-200 dark:hover:bg-slate-600'
+                }`}
+                title="Toggle Multi-select Mode to select and copy multiple findings"
+              >
+                <CheckSquare className={`w-4 h-4 ${multiSelectMode ? 'text-white' : 'text-slate-600 dark:text-slate-400'}`} />
+                {multiSelectMode ? 'Done Selecting' : 'Multi-select'}
+              </button>
+              <button
                   onClick={handleToggleMergeMode}
                   className={`text-xs sm:text-sm font-semibold py-1.5 px-3 rounded-lg transition-colors flex items-center gap-1.5 shadow-sm ${mergeMode ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-white text-slate-700 hover:bg-slate-200 border border-slate-200 dark:border-slate-600 dark:bg-slate-700 dark:text-slate-200 dark:hover:bg-slate-600'}`}
                 >
@@ -1866,25 +2025,33 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
           <div className="flex items-center gap-2">
             <MergeIcon className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0" />
             <span>
-              {clickMergeSource !== null ? (
-                <>
-                  <strong className="text-blue-700 dark:text-blue-300">Finding #{clickMergeSource + 1}</strong> selected. Click another finding to merge into it, or click it again to cancel.
-                </>
-              ) : (
-                <>
-                  <strong>Merge Mode:</strong> Drag a finding onto another, or click one finding and then click the target to merge them together.
-                </>
+              <strong>Merge Mode:</strong> Drag a finding from anywhere on the row onto another, or tap two rows to merge.
+              {clickMergeSource !== null && (
+                <span className="ml-2 font-bold text-amber-700 dark:text-amber-300">
+                  (Row #{clickMergeSource + 1} selected — tap target row to merge)
+                </span>
               )}
             </span>
           </div>
           {clickMergeSource !== null && (
             <button
+              type="button"
               onClick={() => setClickMergeSource(null)}
-              className="text-xs font-semibold px-2.5 py-1 bg-white dark:bg-slate-800 border border-blue-300 dark:border-blue-700 rounded-md text-blue-700 dark:text-blue-300 hover:bg-blue-50 transition-colors shadow-xs"
+              className="text-xs text-blue-600 hover:text-blue-800 dark:text-blue-400 underline font-semibold"
             >
               Cancel Selection
             </button>
           )}
+        </div>
+      )}
+
+      {/* Reorder Mode Guidance Banner */}
+      {reorderMode && (
+        <div className="mb-3 p-2.5 sm:p-3 bg-blue-50/90 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800/60 rounded-xl flex items-center gap-2 text-xs sm:text-sm text-blue-900 dark:text-blue-200 animate-fade-in shadow-xs">
+          <ReorderIcon className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0" />
+          <span>
+            <strong>Reorder Mode:</strong> Drag any row from anywhere on the card up or down to change its position in the report.
+          </span>
         </div>
       )}
 
@@ -1920,7 +2087,6 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
             : '';
 
           const isSelected = selectedIndices.has(index);
-          const isMergeSource = mergeMode && clickMergeSource === index;
           const isEditingThis = editingIndex === index;
           const isDictatingThis = dictatingIndex === index;
           const isDictateEditingThis = dictateEditingIndex === index;
@@ -1929,6 +2095,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
           const isCurrentlyActive = isEditingThis || isProcessingThis || hasErrorThis || isDictateEditingThis || isDictatingThis;
           const isDraggingThis = draggedIndex === index;
           const isDragOverTarget = mergeMode && dragOverIndex === index && draggedIndex !== index;
+          const isClickMergeSource = mergeMode && clickMergeSource === index;
           
           const errorsForThisFinding = identifiedErrors.filter(e => e.findingIndex === index);
           
@@ -1963,78 +2130,88 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
             <div
               key={index}
               data-finding-index={index}
-              draggable={reorderMode || mergeMode}
+              draggable={!isCurrentlyActive && (reorderMode || mergeMode)}
               onDragStart={
-                reorderMode ? () => handleReorderDragStart(index) :
-                mergeMode ? (e) => handleMergeDragStart(e, index) :
+                !isCurrentlyActive && reorderMode ? (e) => handleReorderDragStart(e, index) :
+                !isCurrentlyActive && mergeMode ? (e) => handleMergeDragStart(e, index) :
                 undefined
               }
               onDragEnd={
                 reorderMode ? handleReorderDragEnd :
-                mergeMode ? () => { setDraggedIndex(null); setDragOverIndex(null); } :
+                mergeMode ? () => { setDraggedIndex(null); setDragOverIndex(null); dragItem.current = null; } :
                 undefined
               }
               onDragEnter={reorderMode ? () => (dragOverItem.current = index) : undefined}
-              onDrop={mergeMode ? (e) => handleMergeDrop(e, index) : undefined}
+              onDrop={
+                reorderMode ? handleReorderDragEnd :
+                mergeMode ? (e) => handleMergeDrop(e, index) :
+                undefined
+              }
               onDragOver={mergeMode || reorderMode ? (e) => e.preventDefault() : undefined}
               onDragEnterCapture={mergeMode ? (e) => { e.preventDefault(); setDragOverIndex(index); } : undefined}
               onDragLeaveCapture={mergeMode ? (e) => { e.preventDefault(); setDragOverIndex(null); } : undefined}
-              className={`finding-item relative group p-3 pl-11 pr-28 sm:pr-24 border-l-4 rounded-r-lg transition-all duration-200 ${
-                  isMergeSource
-                  ? 'bg-blue-100 border-blue-600 dark:bg-blue-900/50 dark:border-blue-400 ring-2 ring-blue-500 shadow-md'
-                  : isDragOverTarget
+              onTouchStart={!isCurrentlyActive ? (e) => handleRowTouchStart(e, index) : undefined}
+              onTouchMove={!isCurrentlyActive ? handleRowTouchMove : undefined}
+              onTouchEnd={!isCurrentlyActive ? handleRowTouchEnd : undefined}
+              className={`finding-item relative group p-3 ${(reorderMode || mergeMode) ? 'pl-16 select-none cursor-grab active:cursor-grabbing' : 'pl-11 cursor-pointer'} pr-28 sm:pr-24 border-l-4 rounded-r-lg transition-all duration-200 ${
+                  isDragOverTarget
                   ? 'bg-green-100 border-green-500 dark:bg-green-900/30 dark:border-green-500 ring-2 ring-green-200 dark:ring-green-700'
-                  : isSelected && !isCurrentlyActive && !reorderMode && !mergeMode
+                  : isClickMergeSource
+                  ? 'bg-amber-100 border-amber-500 dark:bg-amber-900/40 dark:border-amber-400 ring-2 ring-amber-300 dark:ring-amber-600 shadow-md'
+                  : isSelected && !isCurrentlyActive
                   ? 'bg-blue-100 border-blue-600 dark:bg-blue-900/30 dark:border-blue-500 shadow-md'
                   : hasError
                   ? errorClasses[highestSeverity!]
                   : 'bg-slate-50 border-blue-500 dark:bg-slate-700/50 dark:border-blue-500'
-              } ${!isCurrentlyActive && !reorderMode && !mergeMode ? 'hover:bg-blue-50 dark:hover:bg-slate-700' : ''} ${mergeMode && clickMergeSource !== null && clickMergeSource !== index ? 'hover:ring-2 hover:ring-green-500 hover:border-green-500 cursor-pointer' : ''} ${isDraggingThis ? 'opacity-50 bg-slate-200 dark:bg-slate-600' : ''} ${reorderMode ? 'cursor-grab' : ''} ${mergeMode ? 'cursor-pointer' : ''}`}
-              role={(reorderMode || mergeMode) ? 'listitem' : 'button'}
+              } ${!isCurrentlyActive && !(reorderMode || mergeMode) ? 'hover:bg-blue-50 dark:hover:bg-slate-700' : ''} ${isDraggingThis ? 'opacity-50 bg-slate-200 dark:bg-slate-600' : ''}`}
+              role="button"
               aria-pressed={isSelected && !isCurrentlyActive}
               tabIndex={isCurrentlyActive ? -1 : 0}
               onClick={
-                reorderMode || isCurrentlyActive
+                isCurrentlyActive
                   ? undefined
                   : mergeMode
                   ? () => handleMergeItemClick(index)
+                  : reorderMode
+                  ? undefined
                   : () => handleFindingClick(index)
               }
               onKeyDown={
-                reorderMode || isCurrentlyActive
+                isCurrentlyActive
                   ? undefined
-                  : mergeMode
-                  ? (e) => (e.key === ' ' || e.key === 'Enter') && handleMergeItemClick(index)
-                  : (e) => (e.key === ' ' || e.key === 'Enter') && handleFindingClick(index)
+                  : (e) => {
+                      if (e.key === ' ' || e.key === 'Enter') {
+                        if (mergeMode) handleMergeItemClick(index);
+                        else if (!reorderMode) handleFindingClick(index);
+                      }
+                    }
               }
             >
-              {(reorderMode || mergeMode) ? (
-                  <div className="absolute left-0 top-0 bottom-0 w-10 flex items-center justify-center" aria-label="Drag to reorder or merge">
+              {(reorderMode || mergeMode) && (
+                  <div 
+                    className="absolute left-1.5 top-0 bottom-0 w-6 flex items-center justify-center cursor-grab active:cursor-grabbing text-slate-400 hover:text-blue-600 dark:text-slate-500 dark:hover:text-blue-400 select-none z-10 pointer-events-none" 
+                    aria-hidden="true"
+                  >
                       {reorderMode && <ReorderIcon />}
                       {mergeMode && (
-                        isMergeSource ? (
-                          <div className="w-5 h-5 rounded-full bg-blue-600 text-white flex items-center justify-center text-[10px] font-bold shadow-xs animate-pulse">
-                            1
-                          </div>
-                        ) : (
-                          <MergeIcon className={`w-5 h-5 ${dragOverIndex === index ? 'text-green-600 dark:text-green-400 scale-110' : 'text-slate-500 dark:text-slate-400'} transition-all`} />
-                        )
+                        <MergeIcon className={`w-4 h-4 ${dragOverIndex === index ? 'text-green-600 dark:text-green-400 scale-125' : isClickMergeSource ? 'text-amber-600 dark:text-amber-400 scale-110' : ''} transition-all`} />
                       )}
                   </div>
-              ) : (
-                <div
-                    onClick={(e) => !isCurrentlyActive && handleSelectionHandleClick(e, index)}
-                    className={`absolute left-0 top-0 bottom-0 w-10 flex items-center justify-center touch-manipulation ${isCurrentlyActive ? 'cursor-not-allowed' : 'cursor-pointer'}`}
-                    role="checkbox"
-                    aria-checked={isSelected}
-                    aria-disabled={isCurrentlyActive}
-                    aria-label="Toggle selection for this finding"
-                >
-                    <div className={`w-5 h-5 rounded-full border-2 transition-colors flex items-center justify-center text-[10px] font-bold ${isSelected && !isCurrentlyActive ? 'bg-blue-600 border-blue-600 dark:bg-blue-500 dark:border-blue-500 text-white' : 'border-slate-400 bg-white group-hover:border-blue-500 dark:border-slate-500 dark:bg-slate-600 dark:group-hover:border-blue-400'}`}>
-                        {isSelected && !isCurrentlyActive && '✓'}
-                    </div>
-                </div>
               )}
+
+              <div
+                  onClick={(e) => { e.stopPropagation(); !isCurrentlyActive && handleSelectionHandleClick(e, index); }}
+                  className={`absolute ${(reorderMode || mergeMode) ? 'left-8' : 'left-0'} top-0 bottom-0 w-8 flex items-center justify-center touch-manipulation z-20 ${isCurrentlyActive ? 'cursor-not-allowed' : 'cursor-pointer'}`}
+                  role="checkbox"
+                  aria-checked={isSelected}
+                  aria-disabled={isCurrentlyActive}
+                  aria-label="Toggle selection for this finding"
+                  title="Click to select for multi-select copy"
+              >
+                  <div className={`w-5 h-5 rounded-full border-2 transition-colors flex items-center justify-center text-[10px] font-bold ${isSelected && !isCurrentlyActive ? 'bg-blue-600 border-blue-600 dark:bg-blue-500 dark:border-blue-500 text-white' : 'border-slate-400 bg-white group-hover:border-blue-500 dark:border-slate-500 dark:bg-slate-600 dark:group-hover:border-blue-400'}`}>
+                      {isSelected && !isCurrentlyActive && '✓'}
+                  </div>
+              </div>
 
               {isEditingThis ? (
                 <div className="flex flex-col gap-2">
@@ -2064,7 +2241,13 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
               ) : (
                 <>
                   <div
-                    className={`text-slate-700 dark:text-slate-200 whitespace-pre-wrap ${!isCurrentlyActive && !reorderMode && !mergeMode ? 'cursor-pointer' : 'cursor-default'} ${textContainerClasses}`}
+                    className={`text-slate-700 dark:text-slate-200 whitespace-pre-wrap ${
+                      (reorderMode || mergeMode)
+                        ? 'select-none pointer-events-none'
+                        : !isCurrentlyActive
+                        ? 'cursor-pointer'
+                        : 'cursor-default'
+                    } ${textContainerClasses}`}
                   >
                     {isTable ? (
                       renderTableFinding(tableLines)
@@ -2546,10 +2729,13 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
       )}
 
       {multiSelectMode && (
-          <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-40 bg-slate-800 text-white rounded-full shadow-lg flex items-center gap-4 px-5 py-2 transition-all duration-300 ease-in-out">
-            <p className="text-sm font-semibold">Multi-select Mode</p>
-            <label htmlFor="multi-select-toggle-single" className="flex items-center cursor-pointer">
-              <span className="mr-2 text-sm font-medium text-slate-300">OFF</span>
+          <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-40 bg-slate-900/95 dark:bg-slate-800/95 text-white rounded-full shadow-2xl border border-slate-700/80 flex items-center gap-3.5 px-5 py-2 transition-all duration-300 ease-in-out backdrop-blur-xs">
+            <div className="flex items-center gap-2">
+              <CheckSquare className="w-4 h-4 text-blue-400" />
+              <p className="text-sm font-semibold whitespace-nowrap">Multi-select Mode</p>
+            </div>
+            <label htmlFor="multi-select-toggle-single" className="flex items-center cursor-pointer select-none">
+              <span className="mr-2 text-xs font-semibold text-slate-400">OFF</span>
               <div className="relative">
                 <input 
                   type="checkbox" 
@@ -2562,10 +2748,10 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                     setSelectionSnippets({});
                   }}
                 />
-                <div className="w-12 h-6 bg-slate-600 rounded-full peer-checked:bg-blue-600"></div>
-                <div className="absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform peer-checked:translate-x-6"></div>
+                <div className="w-11 h-6 bg-slate-700 rounded-full peer-checked:bg-blue-600 transition-colors border border-slate-600"></div>
+                <div className="absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform peer-checked:translate-x-5 shadow-xs"></div>
               </div>
-              <span className="ml-2 text-sm font-medium">ON</span>
+              <span className="ml-2 text-xs font-bold text-blue-400">ON</span>
             </label>
           </div>
       )}

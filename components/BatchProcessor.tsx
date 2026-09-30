@@ -3,7 +3,7 @@ import { useAudioRecorder } from '../hooks/useAudioRecorder';
 import { processAudio, createChat, blobToBase64, continueAudioDictation, base64ToBlob, modifyFindingWithAudio, modifyReportWithAudio, identifyPotentialErrors, runComplexImpressionGeneration, transcribeAudioForPrompt, detectAndExtractTemplate, mergeDictatedFindingsWithTemplate } from '../services/geminiService';
 import { saveAudioBlob, getAudioBlob, clearUnusedAudioBlobs } from '../services/audioStorage';
 import { mergeMultipleAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
-import { ClipboardPaste, X } from 'lucide-react';
+import { ClipboardPaste, X, CheckSquare } from 'lucide-react';
 import PasteTextModal from './PasteTextModal';
 import RichTextReportEditor from './RichTextReportEditor';
 import TemplateSelectionModal from './ui/TemplateSelectionModal';
@@ -247,7 +247,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     const [mergingBatchId, setMergingBatchId] = useState<string | null>(null);
     const [mergingTemplateName, setMergingTemplateName] = useState<string | null>(null);
 
-    const handleSelectBatchTemplateToMerge = async (template: ReportTemplate) => {
+    const handleSelectBatchTemplateToMerge = async (template: ReportTemplate | ReportTemplate[]) => {
         const batchId = templateModalBatchId;
         if (!batchId) return;
         setTemplateModalBatchId(null);
@@ -255,26 +255,68 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         const targetBatch = batches.find(b => b.id === batchId);
         if (!targetBatch || !targetBatch.findings) return;
 
+        const templates = Array.isArray(template) ? template : [template];
+        const isMulti = templates.length > 1;
+        const templateName = templates.map(t => t.name).join(' + ');
+
         setMergingBatchId(batchId);
-        setMergingTemplateName(template.name);
+        setMergingTemplateName(templateName);
         setUndoStates(prev => ({ ...prev, [batchId]: [...targetBatch.findings!] }));
 
-        let docx = template.docxBase64;
-        if (!docx && template.id) {
-            try {
-                docx = await getTemplateDocxBase64(template.id);
-            } catch (err) {
-                console.warn('Error loading docx for template:', err);
+        let docxData: DocxTemplateData;
+        let promptText: string;
+
+        if (isMulti) {
+            const ids = templates.map(t => t.id).filter(Boolean).join(', ');
+            const names = templates.map(t => `"${t.name}"`).join(' and ');
+            promptText = `[TEMPLATE_ID: ${ids}] Use combined report templates: ${names}. Integrate my dictation into a unified multi-region report with findings properly placed in their respective anatomical sections and generate a synthesized impression.`;
+
+            const combinedExtractedText = templates.map(t => {
+                const content = t.lines ? t.lines.join('\n') : (t.content || '');
+                return `=== TEMPLATE: ${t.name} ===\n${content}`;
+            }).join('\n\n');
+
+            let firstDocx = '';
+            for (const t of templates) {
+                if (t.docxBase64) {
+                    firstDocx = t.docxBase64;
+                    break;
+                } else if (t.id) {
+                    try {
+                        const d = await getTemplateDocxBase64(t.id);
+                        if (d) {
+                            firstDocx = d;
+                            break;
+                        }
+                    } catch (e) {}
+                }
             }
+
+            docxData = {
+                name: `${templateName}.docx`,
+                data: firstDocx,
+                size: firstDocx ? Math.round(firstDocx.length * 0.75) : 0,
+                extractedText: combinedExtractedText,
+            };
+        } else {
+            const singleT = templates[0];
+            let docx = singleT.docxBase64;
+            if (!docx && singleT.id) {
+                try {
+                    docx = await getTemplateDocxBase64(singleT.id);
+                } catch (err) {
+                    console.warn('Error loading docx for template:', err);
+                }
+            }
+            const extractedText = singleT.lines ? singleT.lines.join('\n') : singleT.content;
+            docxData = {
+                name: singleT.fileName || `${singleT.name}.docx`,
+                data: docx || '',
+                size: docx ? Math.round(docx.length * 0.75) : 0,
+                extractedText,
+            };
+            promptText = `[TEMPLATE_ID: ${singleT.id}] Use the normal "${singleT.name}" report template. Integrate my dictation and generate a new impression.`;
         }
-        const extractedText = template.lines ? template.lines.join('\n') : template.content;
-        const docxData: DocxTemplateData = {
-            name: template.fileName || `${template.name}.docx`,
-            data: docx || '',
-            size: docx ? Math.round(docx.length * 0.75) : 0,
-            extractedText,
-        };
-        const promptText = `[TEMPLATE_ID: ${template.id}] Use the normal "${template.name}" report template. Integrate my dictation and generate a new impression.`;
 
         // Update batch configuration with template
         setBatches(prev => prev.map(b => b.id === batchId ? {
@@ -286,7 +328,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         try {
             const mergedFindings = await mergeDictatedFindingsWithTemplate(
                 targetBatch.findings,
-                template,
+                templates,
                 targetBatch.selectedModel || selectedModel,
                 targetBatch.audioBlobs,
                 promptText,
@@ -298,7 +340,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                 findings: mergedFindings,
             } : b));
 
-            showNotification(`Merged ${targetBatch.name} with ${template.name}!`);
+            showNotification(`Merged ${targetBatch.name} with ${templateName}!`);
 
             // Auto-save to Google Drive
             setTimeout(() => {
@@ -3117,6 +3159,28 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                                     </button>
                                                                 )}
                                                                 <button
+                                                                    type="button"
+                                                                    onClick={() => {
+                                                                        setMultiSelectMode(prev => {
+                                                                            const next = !prev;
+                                                                            if (!next) {
+                                                                                setSelections({});
+                                                                                setSelectionSnippets({});
+                                                                            }
+                                                                            return next;
+                                                                        });
+                                                                    }}
+                                                                    className={`text-sm font-semibold py-1 px-3 rounded-lg transition-colors flex items-center gap-1.5 ${
+                                                                        multiSelectMode 
+                                                                          ? 'bg-blue-600 text-white hover:bg-blue-700' 
+                                                                          : 'bg-slate-200 text-slate-700 hover:bg-slate-300 dark:bg-slate-700 dark:text-slate-300 dark:hover:bg-slate-600'
+                                                                    }`}
+                                                                    title="Toggle Multi-select Mode to select and copy multiple findings"
+                                                                >
+                                                                    <CheckSquare className={`w-4 h-4 ${multiSelectMode ? 'text-white' : 'text-slate-600 dark:text-slate-400'}`} />
+                                                                    {multiSelectMode ? 'Done Selecting' : 'Multi-select'}
+                                                                </button>
+                                                                <button
                                                                     onClick={() => handleToggleMergeMode(batch.id)}
                                                                     className={`text-sm font-semibold py-1 px-3 rounded-lg transition-colors flex items-center gap-1.5 ${mergeBatchId === batch.id ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-slate-200 text-slate-700 hover:bg-slate-300 dark:bg-slate-700 dark:text-slate-300 dark:hover:bg-slate-600'}`}
                                                                 >
@@ -3274,78 +3338,72 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                                 key={`${batch.id}-${index}`}
                                                                 data-batch-id={batch.id}
                                                                 data-finding-index={index}
-                                                                draggable={isReorderingThisBatch || isMergingThisBatch}
-                                                                onDragStart={
-                                                                    isReorderingThisBatch ? () => handleReorderDragStart(batch.id, index) :
-                                                                    isMergingThisBatch ? (e) => handleMergeDragStart(e, batch.id, index) :
-                                                                    undefined
-                                                                }
-                                                                onDragEnd={
-                                                                    isReorderingThisBatch ? handleReorderDragEnd :
-                                                                    isMergingThisBatch ? () => { setDraggedState(null); setDragOverState(null); } :
-                                                                    undefined
-                                                                }
                                                                 onDragEnter={isReorderingThisBatch ? () => (dragOverItem.current = { batchId: batch.id, index }) : undefined}
                                                                 onDrop={isMergingThisBatch ? (e) => handleMergeDrop(e, batch.id, index) : undefined}
                                                                 onDragOver={(isReorderingThisBatch || isMergingThisBatch) ? (e) => e.preventDefault() : undefined}
                                                                 onDragEnterCapture={isMergingThisBatch ? (e) => { e.preventDefault(); setDragOverState({ batchId: batch.id, index }); } : undefined}
                                                                 onDragLeaveCapture={isMergingThisBatch ? (e) => { e.preventDefault(); setDragOverState(null); } : undefined}
-                                                                className={`finding-item relative group p-3 pl-11 pr-28 sm:pr-24 border-l-4 rounded-r-lg transition-all duration-200 ${
-                                                                    isMergeSource
-                                                                    ? 'bg-blue-100 border-blue-600 dark:bg-blue-900/50 dark:border-blue-400 ring-2 ring-blue-500 shadow-md'
-                                                                    : isDragOverTarget
+                                                                className={`finding-item relative group p-3 ${(isReorderingThisBatch || isMergingThisBatch) ? 'pl-16' : 'pl-11'} pr-28 sm:pr-24 border-l-4 rounded-r-lg transition-all duration-200 cursor-pointer ${
+                                                                    isDragOverTarget
                                                                     ? 'bg-green-100 border-green-500 dark:bg-green-900/30 dark:border-green-500 ring-2 ring-green-200 dark:ring-green-700'
-                                                                    : isSelected && !isCurrentlyActive && !isReorderingThisBatch && !isMergingThisBatch
+                                                                    : isSelected && !isCurrentlyActive
                                                                     ? 'bg-blue-100 border-blue-600 dark:bg-blue-900/30 dark:border-blue-500 shadow-md'
                                                                     : hasError
                                                                     ? errorClasses[highestSeverity!]
                                                                     : 'bg-slate-50 border-blue-500 dark:bg-slate-700/50 dark:border-blue-500'
-                                                                } ${!isCurrentlyActive && !isReorderingThisBatch && !isMergingThisBatch ? 'hover:bg-blue-50 dark:hover:bg-slate-700' : ''} ${isMergingThisBatch && clickMergeBatchState?.batchId === batch.id && clickMergeBatchState?.index !== index ? 'hover:ring-2 hover:ring-green-500 hover:border-green-500 cursor-pointer' : ''} ${isDraggingThis ? 'opacity-50 bg-slate-200 dark:bg-slate-600' : ''} ${isReorderingThisBatch ? 'cursor-grab' : ''} ${isMergingThisBatch ? 'cursor-pointer' : ''}`}
-                                                                role={(isReorderingThisBatch || isMergingThisBatch) ? 'listitem' : 'button'}
+                                                                } ${!isCurrentlyActive ? 'hover:bg-blue-50 dark:hover:bg-slate-700' : ''} ${isDraggingThis ? 'opacity-50 bg-slate-200 dark:bg-slate-600' : ''}`}
+                                                                role="button"
                                                                 aria-pressed={isSelected && !isCurrentlyActive}
                                                                 tabIndex={isCurrentlyActive ? -1 : 0}
                                                                 onClick={
-                                                                    isReorderingThisBatch || isCurrentlyActive
+                                                                    isCurrentlyActive
                                                                         ? undefined
-                                                                        : isMergingThisBatch
-                                                                        ? () => handleMergeItemClickForBatch(batch.id, index)
                                                                         : () => handleFindingClickForBatch(batch.id, index)
                                                                 }
                                                                 onKeyDown={
-                                                                    isReorderingThisBatch || isCurrentlyActive
+                                                                    isCurrentlyActive
                                                                         ? undefined
-                                                                        : isMergingThisBatch
-                                                                        ? (e) => (e.key === ' ' || e.key === 'Enter') && handleMergeItemClickForBatch(batch.id, index)
                                                                         : (e) => (e.key === ' ' || e.key === 'Enter') && handleFindingClickForBatch(batch.id, index)
                                                                 }
                                                             >
-                                                                {(isReorderingThisBatch || isMergingThisBatch) ? (
-                                                                    <div className="absolute left-0 top-0 bottom-0 w-10 flex items-center justify-center" aria-label="Drag to reorder or merge">
+                                                                {(isReorderingThisBatch || isMergingThisBatch) && (
+                                                                    <div 
+                                                                        draggable
+                                                                        onDragStart={
+                                                                            isReorderingThisBatch ? () => handleReorderDragStart(batch.id, index) :
+                                                                            isMergingThisBatch ? (e) => handleMergeDragStart(e, batch.id, index) :
+                                                                            undefined
+                                                                        }
+                                                                        onDragEnd={
+                                                                            isReorderingThisBatch ? handleReorderDragEnd :
+                                                                            isMergingThisBatch ? () => { setDraggedState(null); setDragOverState(null); } :
+                                                                            undefined
+                                                                        }
+                                                                        onClick={(e) => e.stopPropagation()}
+                                                                        className="absolute left-1.5 top-0 bottom-0 w-6 flex items-center justify-center cursor-grab active:cursor-grabbing text-slate-400 hover:text-blue-600 dark:text-slate-500 dark:hover:text-blue-400 select-none z-10" 
+                                                                        aria-label={isReorderingThisBatch ? "Drag to reorder" : "Drag to merge"}
+                                                                        title={isReorderingThisBatch ? "Drag to reorder" : "Drag onto another finding to merge"}
+                                                                    >
                                                                         {isReorderingThisBatch && <ReorderIcon />}
                                                                         {isMergingThisBatch && (
-                                                                            isMergeSource ? (
-                                                                                <div className="w-5 h-5 rounded-full bg-blue-600 text-white flex items-center justify-center text-[10px] font-bold shadow-xs animate-pulse">
-                                                                                    1
-                                                                                </div>
-                                                                            ) : (
-                                                                                <MergeIcon className={`w-5 h-5 ${dragOverState?.batchId === batch.id && dragOverState?.index === index ? 'text-green-600 dark:text-green-400 scale-110' : 'text-slate-500 dark:text-slate-400'} transition-all`} />
-                                                                            )
+                                                                            <MergeIcon className={`w-4 h-4 ${dragOverState?.batchId === batch.id && dragOverState?.index === index ? 'text-green-600 dark:text-green-400 scale-125' : ''} transition-all`} />
                                                                         )}
                                                                     </div>
-                                                                ) : (
-                                                                    <div
-                                                                        onClick={(e) => !isCurrentlyActive && handleSelectionHandleClickForBatch(e, batch.id, index)}
-                                                                        className={`absolute left-0 top-0 bottom-0 w-10 flex items-center justify-center touch-manipulation ${isCurrentlyActive ? 'cursor-not-allowed' : 'cursor-pointer'}`}
-                                                                        role="checkbox"
-                                                                        aria-checked={isSelected}
-                                                                        aria-disabled={isCurrentlyActive}
-                                                                        aria-label="Toggle selection for this finding"
-                                                                    >
-                                                                        <div className={`w-5 h-5 rounded-full border-2 transition-colors flex items-center justify-center text-[10px] font-bold ${isSelected && !isCurrentlyActive ? 'bg-blue-600 border-blue-600 dark:bg-blue-500 dark:border-blue-500 text-white' : 'border-slate-400 bg-white group-hover:border-blue-500 dark:border-slate-500 dark:bg-slate-600 dark:group-hover:border-blue-400'}`}>
-                                                                            {isSelected && !isCurrentlyActive && '✓'}
-                                                                        </div>
-                                                                    </div>
                                                                 )}
+
+                                                                <div
+                                                                    onClick={(e) => !isCurrentlyActive && handleSelectionHandleClickForBatch(e, batch.id, index)}
+                                                                    className={`absolute ${(isReorderingThisBatch || isMergingThisBatch) ? 'left-8' : 'left-0'} top-0 bottom-0 w-8 flex items-center justify-center touch-manipulation ${isCurrentlyActive ? 'cursor-not-allowed' : 'cursor-pointer'}`}
+                                                                    role="checkbox"
+                                                                    aria-checked={isSelected}
+                                                                    aria-disabled={isCurrentlyActive}
+                                                                    aria-label="Toggle selection for this finding"
+                                                                    title="Click to select for multi-select copy"
+                                                                >
+                                                                    <div className={`w-5 h-5 rounded-full border-2 transition-colors flex items-center justify-center text-[10px] font-bold ${isSelected && !isCurrentlyActive ? 'bg-blue-600 border-blue-600 dark:bg-blue-500 dark:border-blue-500 text-white' : 'border-slate-400 bg-white group-hover:border-blue-500 dark:border-slate-500 dark:bg-slate-600 dark:group-hover:border-blue-400'}`}>
+                                                                        {isSelected && !isCurrentlyActive && '✓'}
+                                                                    </div>
+                                                                </div>
                                                                  
                                                                   {isEditingThis ? (
                                                                     <div className="flex flex-col gap-2">
@@ -3375,7 +3433,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                                 ) : (
                                                                     <>
                                                                         <div
-                                                                            className={`text-slate-700 dark:text-slate-200 whitespace-pre-wrap ${!isCurrentlyActive && !isReorderingThisBatch && !isMergingThisBatch ? 'cursor-pointer' : 'cursor-default'} ${textContainerClasses}`}
+                                                                            className={`text-slate-700 dark:text-slate-200 whitespace-pre-wrap ${!isCurrentlyActive ? 'cursor-pointer' : 'cursor-default'} ${textContainerClasses}`}
                                                                         >
                                                                             {isImpression ? (
                                                                                 <>
@@ -3731,10 +3789,13 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             </div>
 
             {multiSelectMode && (
-                <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-40 bg-slate-800 text-white rounded-full shadow-lg flex items-center gap-4 px-5 py-2 transition-all duration-300 ease-in-out">
-                  <p className="text-sm font-semibold">Multi-select Mode</p>
-                  <label htmlFor="multi-select-toggle-batch" className="flex items-center cursor-pointer">
-                    <span className="mr-2 text-sm font-medium text-slate-300">OFF</span>
+                <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-40 bg-slate-900/95 dark:bg-slate-800/95 text-white rounded-full shadow-2xl border border-slate-700/80 flex items-center gap-3.5 px-5 py-2 transition-all duration-300 ease-in-out backdrop-blur-xs">
+                  <div className="flex items-center gap-2">
+                    <CheckSquare className="w-4 h-4 text-blue-400" />
+                    <p className="text-sm font-semibold whitespace-nowrap">Multi-select Mode</p>
+                  </div>
+                  <label htmlFor="multi-select-toggle-batch" className="flex items-center cursor-pointer select-none">
+                    <span className="mr-2 text-xs font-semibold text-slate-400">OFF</span>
                     <div className="relative">
                       <input 
                         type="checkbox" 
@@ -3747,10 +3808,10 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                           setSelectionSnippets({});
                         }}
                       />
-                      <div className="w-12 h-6 bg-slate-600 rounded-full peer-checked:bg-blue-600"></div>
-                      <div className="absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform peer-checked:translate-x-6"></div>
+                      <div className="w-11 h-6 bg-slate-700 rounded-full peer-checked:bg-blue-600 transition-colors border border-slate-600"></div>
+                      <div className="absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform peer-checked:translate-x-5 shadow-xs"></div>
                     </div>
-                    <span className="ml-2 text-sm font-medium">ON</span>
+                    <span className="ml-2 text-xs font-bold text-blue-400">ON</span>
                   </label>
                 </div>
             )}
