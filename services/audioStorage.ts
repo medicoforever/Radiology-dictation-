@@ -369,4 +369,92 @@ export async function clearLastCompletedRecording(): Promise<void> {
   }
 }
 
+export const DICTATE_CHANGES_AUDIO_KEY = 'dictate_changes_stored_audio';
+export const DICTATE_CHANGES_META_KEY = 'dictate_changes_audio_meta';
+
+export interface DictateChangesAudioRecord {
+  blob: Blob;
+  meta: {
+    timestamp: number;
+    size: number;
+    mimeType: string;
+    name?: string;
+  } | null;
+}
+
+/**
+ * Saves the dictate changes audio recording into IndexedDB and stores metadata.
+ */
+export async function saveDictateChangesAudio(blob: Blob, name?: string): Promise<void> {
+  try {
+    await saveAudioBlob(DICTATE_CHANGES_AUDIO_KEY, blob);
+    const meta = {
+      timestamp: Date.now(),
+      size: blob.size,
+      mimeType: blob.type || 'audio/webm',
+      name: name || 'Recorded Voice Changes'
+    };
+    try {
+      localStorage.setItem(DICTATE_CHANGES_META_KEY, JSON.stringify(meta));
+    } catch {}
+  } catch (err) {
+    console.debug('Failed to save dictate changes audio to IndexedDB:', err);
+  }
+}
+
+/**
+ * Retrieves the stored dictate changes audio and its metadata from IndexedDB.
+ */
+export async function getDictateChangesAudio(): Promise<DictateChangesAudioRecord | null> {
+  try {
+    const blob = await getAudioBlob(DICTATE_CHANGES_AUDIO_KEY);
+    if (!blob || blob.size === 0) return null;
+
+    let meta: { timestamp: number; size: number; mimeType: string; name?: string } | null = null;
+    try {
+      const raw = localStorage.getItem(DICTATE_CHANGES_META_KEY);
+      if (raw) meta = JSON.parse(raw);
+    } catch {}
+
+    return {
+      blob,
+      meta: meta || {
+        timestamp: Date.now(),
+        size: blob.size,
+        mimeType: blob.type || 'audio/webm',
+        name: 'Stored Changes Audio'
+      }
+    };
+  } catch (err) {
+    console.debug('Failed to retrieve dictate changes audio:', err);
+    return null;
+  }
+}
+
+/**
+ * Checks whether a dictate changes audio recording is currently stored in browser.
+ */
+export function hasStoredDictateChangesAudio(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return Boolean(localStorage.getItem(DICTATE_CHANGES_META_KEY));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Deletes the stored dictate changes audio from IndexedDB and clears metadata.
+ */
+export async function deleteDictateChangesAudio(): Promise<void> {
+  try {
+    await deleteAudioBlob(DICTATE_CHANGES_AUDIO_KEY);
+    try {
+      localStorage.removeItem(DICTATE_CHANGES_META_KEY);
+    } catch {}
+  } catch (err) {
+    console.debug('Failed to delete dictate changes audio:', err);
+  }
+}
+
 

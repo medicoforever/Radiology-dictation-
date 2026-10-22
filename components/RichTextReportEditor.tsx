@@ -3,17 +3,20 @@ import { findingsToRichHtml, generateRtfDocument, generateWordHtmlDoc, generateD
 import CopyIcon from './icons/CopyIcon';
 import DownloadIcon from './icons/DownloadIcon';
 import SparklesIcon from './icons/SparklesIcon';
+import QuickMacroInsertPopover from './QuickMacroInsertPopover';
 
 interface RichTextReportEditorProps {
   findings: string[];
   templateName?: string | null;
   onUpdateFindings?: (newFindings: string[]) => void;
+  onOpenMacrosModal?: () => void;
 }
 
 export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
   findings,
   templateName,
   onUpdateFindings,
+  onOpenMacrosModal,
 }) => {
   const editorRef = useRef<HTMLDivElement>(null);
   const [contentHtml, setContentHtml] = useState<string>('');
@@ -440,6 +443,24 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
             <span className="text-sm">⊞</span> Table
           </button>
         </div>
+
+        <QuickMacroInsertPopover
+          compact
+          buttonLabel="Macro"
+          onOpenManagerModal={onOpenMacrosModal}
+          onInsertMacroFindings={(expandedLines) => {
+            if (onUpdateFindings) {
+              onUpdateFindings([...findings, ...expandedLines]);
+            } else if (editorRef.current) {
+              const htmlSnippet = expandedLines
+                .map(line => `<p><strong>${line.replace(/^BOLD::/i, '')}</strong></p>`)
+                .join('');
+              editorRef.current.focus();
+              document.execCommand('insertHTML', false, htmlSnippet);
+              handleInput();
+            }
+          }}
+        />
 
         <div className="h-5 w-px bg-slate-300 dark:bg-slate-600 mx-1 hidden sm:block" />
 

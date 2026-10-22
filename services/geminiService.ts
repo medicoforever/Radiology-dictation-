@@ -2,6 +2,7 @@ import { GoogleGenAI, Type, GenerateContentResponse, Chat } from "@google/genai"
 import { DEFAULT_GEMINI_PROMPT, REPROCESS_GEMINI_PROMPT, TEMPLATE_GEMINI_PROMPT, REPORT_TEMPLATES, ERROR_IDENTIFIER_PROMPT, INITIAL_AGENT_PROMPT, REFINEMENT_AGENT_PROMPT, SYNTHESIZER_AGENT_PROMPT, VISUAL_TEMPLATE_GEMINI_PROMPT, getLiveModelFallbackChain, DEFAULT_SELECTED_MODEL, ReportTemplate } from '../constants';
 import { IdentifiedError } from "../types";
 import { isTableRowFinding } from "./docxService";
+import { expandMacrosInFindings, getMacroPromptContext } from "./macroDictionaryService";
 
 let aiClient: GoogleGenAI | null = null;
 export const getAI = (): GoogleGenAI => {
@@ -112,10 +113,15 @@ const responseSchema = {
  * Prevents routing audio/template structured JSON requests to raw-transcribe models which lack JSON mode.
  */
 export function resolveApiTargetModel(model?: string): string {
-  if (!model) return 'gemini-3.7-flash';
-  // If legacy gemini-2.5-flash is passed, map to gemini-3.7-flash to prevent 403 permission errors
-  if (model === 'gemini-2.5-flash') {
-    return 'gemini-3.7-flash';
+  if (!model) return 'gemini-3.8-flash';
+  // If legacy or removed models are passed, map directly to gemini-3.8-flash
+  if (
+    model === 'gemini-3.7-flash' ||
+    model === 'gemini-3.5-flash' ||
+    model === 'gemini-2.5-pro' ||
+    model === 'gemini-2.5-flash'
+  ) {
+    return 'gemini-3.8-flash';
   }
   // Map gemini-3.5-flash-lite / flash-lite aliases
   if (model === 'gemini-3.5-flash-lite') {
@@ -123,7 +129,7 @@ export function resolveApiTargetModel(model?: string): string {
   }
   // Audio-only transcription models do not support JSON mode / structured schema reasoning
   if (model === 'gemini-3.5-transcribe' || model === 'gemini-3.5-transcribe-live') {
-    return 'gemini-3.7-flash';
+    return 'gemini-3.8-flash';
   }
   return model;
 }
@@ -229,7 +235,7 @@ export function sanitizeReportFindings(findings: string[]): string[] {
     }
   }
 
-  return groupedResult;
+  return expandMacrosInFindings(groupedResult);
 }
 
 /**
@@ -368,12 +374,12 @@ export async function generateContentWithJsonFallback(
       console.warn(`[Gemini API] Prompt-only retry on ${resolvedModel} failed:`, retryErr);
     }
 
-    // Strategy 3: Failover to gemini-3.7-flash
-    if (resolvedModel !== 'gemini-3.7-flash') {
+    // Strategy 3: Failover to gemini-3.8-flash
+    if (resolvedModel !== 'gemini-3.8-flash') {
       try {
-        console.info(`[Gemini API] Failing over to gemini-3.7-flash with JSON mode...`);
+        console.info(`[Gemini API] Failing over to gemini-3.8-flash with JSON mode...`);
         const flashResponse: GenerateContentResponse = await getAI().models.generateContent({
-          model: 'gemini-3.7-flash',
+          model: 'gemini-3.8-flash',
           contents: { parts },
           config: {
             responseMimeType: "application/json",
@@ -384,7 +390,7 @@ export async function generateContentWithJsonFallback(
         const flashText = flashResponse.text?.trim() || '';
         if (flashText) return flashText;
       } catch (flashErr) {
-        console.warn(`[Gemini API] gemini-3.7-flash failover notice:`, flashErr);
+        console.warn(`[Gemini API] gemini-3.8-flash failover notice:`, flashErr);
       }
     }
 
@@ -732,9 +738,13 @@ export const processAudio = async (
     basePrompt = DEFAULT_GEMINI_PROMPT;
   }
   
-  const prompt = customPrompt 
-    ? `${basePrompt}\n\nCustom Instructions (Reminder):\n${customPrompt}` 
-    : basePrompt;
+  const macroContext = getMacroPromptContext();
+  const prompt = [
+    customPrompt 
+      ? `${basePrompt}\n\nCustom Instructions (Reminder):\n${customPrompt}` 
+      : basePrompt,
+    macroContext
+  ].filter(Boolean).join('\n\n');
 
   const parts: any[] = [];
 
@@ -813,7 +823,7 @@ export const processAudio = async (
   }
   
   // For merge mode alone or non-audio inputs: transcribe-only models do not support non-audio formats or template reasoning.
-  // Route to multimodal reasoning models (defaulting to gemini-3.7-flash).
+  // Route to multimodal reasoning models (defaulting to gemini-3.8-flash).
   const hasNonAudio = audioBlobs.some(b => {
     const mime = getCleanMimeType(b);
     return !mime.startsWith('audio/');
@@ -833,10 +843,10 @@ export const processAudio = async (
   } catch (error: any) {
     console.warn("Gemini API call returned error, evaluating fallback:", error);
 
-    // In MERGE MODE ALONE: If error is JSON mode unsupported or schema failure, retry cleanly with Gemini 3.7 Flash & raw JSON prompt
+    // In MERGE MODE ALONE: If error is JSON mode unsupported or schema failure, retry cleanly with Gemini 3.8 Flash & raw JSON prompt
     if (templateInfo.isTemplateMode) {
       try {
-        const fallbackModel = 'gemini-3.7-flash';
+        const fallbackModel = 'gemini-3.8-flash';
         const retryResponse: GenerateContentResponse = await getAI().models.generateContent({
           model: fallbackModel,
           contents: {
@@ -1062,7 +1072,7 @@ Carefully integrate these dictated findings into the "${templateName}" baseline 
 
     // Direct JSON prompt fallback using text-only parts to guarantee payload fits
     try {
-      const fallbackModel = 'gemini-3.7-flash';
+      const fallbackModel = 'gemini-3.8-flash';
       const textOnlyParts = parts.filter(p => !p.inlineData);
       const retryResponse = await getAI().models.generateContent({
         model: fallbackModel,
@@ -1238,27 +1248,42 @@ Now, listen to the audio and provide the single, updated finding text.`;
 
 export const modifyReportWithAudio = async (
   currentFindings: string[], 
-  audioBlob: Blob, 
+  audioBlob: Blob | Blob[], 
   model: string, 
   customPrompt?: string,
   customImages?: Array<{ data: string; mimeType: string }> | null,
   customDocx?: CustomDocxInput
 ): Promise<string[]> => {
-  let audioPart: any;
-  if (audioBlob.type && (audioBlob.type.startsWith('text/') || audioBlob.type === 'application/json')) {
-    const textContent = await audioBlob.text();
-    audioPart = { text: `New instructions or clinical text to modify/append to the report:\n"""\n${textContent}\n"""` };
-  } else {
-    const base64Audio = await blobToBase64(audioBlob);
-    audioPart = {
-      inlineData: {
-        mimeType: getCleanMimeType(audioBlob),
-        data: base64Audio,
-      },
-    };
+  const blobs: Blob[] = Array.isArray(audioBlob) ? audioBlob : [audioBlob];
+  const inputParts: any[] = [];
+
+  for (let i = 0; i < blobs.length; i++) {
+    const b = blobs[i];
+    const cleanMime = getCleanMimeType(b);
+    const fileName = (b as any).name ? `"${(b as any).name}"` : `Input #${i + 1}`;
+
+    if (cleanMime.startsWith('text/') || cleanMime === 'application/json' || b.type?.startsWith('text/')) {
+      try {
+        const textContent = await b.text();
+        inputParts.push({ text: `New clinical text / instructions to modify or update the report from ${fileName}:\n"""\n${textContent}\n"""` });
+      } catch (e) {
+        console.warn('Could not read blob as text:', e);
+      }
+    } else {
+      const base64Data = await blobToBase64(b);
+      inputParts.push({
+        inlineData: {
+          mimeType: cleanMime,
+          data: base64Data,
+        },
+      });
+      if (!cleanMime.startsWith('audio/')) {
+        inputParts.push({ text: `[Attached Input Document/File ${fileName} (${cleanMime})]: Analyze and incorporate all clinical instructions, findings, and modifications from this file.` });
+      }
+    }
   }
 
-  let prompt = `You are an expert medical transcriptionist assistant. You are given an existing medical report in JSON format and an audio recording containing instructions to modify it. Your task is to intelligently interpret the audio instructions and return a single, updated report in the exact same JSON format.
+  let prompt = `You are an expert medical transcriptionist assistant. You are given an existing medical report in JSON format and an audio recording or input file(s)/text containing instructions to modify it. Your task is to intelligently interpret the audio instructions and any attached text/files and return a single, updated report in the exact same JSON format.
 
 **Core Instructions:**
 
@@ -1355,7 +1380,7 @@ ${JSON.stringify({ findings: currentFindings })}
   }
 
   parts.push({ text: prompt });
-  parts.push(audioPart);
+  parts.push(...inputParts);
   
   const targetModel = resolveApiTargetModel(model);
 
@@ -1399,7 +1424,6 @@ export const transcribeAudioForPrompt = async (
   // Dynamic failover chain: starts with user's selected model, followed by fast, authorized Gemini models
   const candidateModels = [
     primaryModel,
-    'gemini-3.7-flash',
     'gemini-3.8-flash',
     'gemini-3.5-flash-lite'
   ].filter((m, i, arr) => arr.indexOf(m) === i);
@@ -1605,7 +1629,6 @@ export const identifyPotentialErrors = async (findings: string[], model: string)
 
 // --- Complex Impression Generation Constants & Pipeline ---
 const COMPLEX_IMPRESSION_DEFAULT_MODEL = 'gemini-3.8-flash';
-const COMPLEX_IMPRESSION_FALLBACK_MODEL = 'gemini-3.7-flash';
 
 /**
  * Detects if an API error is a rate-limit (429 / resource exhausted / quota) error.
@@ -1634,9 +1657,8 @@ interface StepExecutionResult {
 /**
  * Executes a single task in the complex impression workflow with:
  * 1. gemini-3.8-flash with Google search grounding alone as default.
- * 2. When rate limit error occurs, automatically falls back to gemini-3.7-flash with Google search grounding.
- * 3. If both hit rate limit error, counts down live in the app ("retrying in x seconds...") and retries.
- * 4. Only the errored item is retried; once an item succeeds, its result is preserved.
+ * 2. When rate limit error occurs, counts down live in the app ("retrying in x seconds...") and retries with gemini-3.8-flash.
+ * 3. Only the errored item is retried; once an item succeeds, its result is preserved.
  */
 async function executeAgentStepWithFallbackAndRetry(
     taskName: string,
@@ -1648,7 +1670,7 @@ async function executeAgentStepWithFallbackAndRetry(
     while (cycle < maxRetryCycles) {
         cycle++;
 
-        // 1. Try default model: gemini-3.8-flash with Google search grounding alone
+        // Try default model: gemini-3.8-flash with Google search grounding alone
         try {
             onProgress?.(`${taskName}: Analyzing with ${COMPLEX_IMPRESSION_DEFAULT_MODEL} (Google Search grounded)...`);
             const response = await getAI().models.generateContent({
@@ -1667,38 +1689,15 @@ async function executeAgentStepWithFallbackAndRetry(
                 throw primaryErr;
             }
 
-            console.warn(`${taskName}: Rate limit on ${COMPLEX_IMPRESSION_DEFAULT_MODEL}. Switching to ${COMPLEX_IMPRESSION_FALLBACK_MODEL}...`);
-            onProgress?.(`${taskName}: Rate limit on ${COMPLEX_IMPRESSION_DEFAULT_MODEL}. Switching to ${COMPLEX_IMPRESSION_FALLBACK_MODEL}...`);
+            // Rate limit hit: Wait with live countdown and retry gemini-3.8-flash
+            const waitSeconds = Math.min(15, 5 + (cycle - 1) * 2); // 5s, 7s, 9s, 11s, 13s, 15s
+            console.warn(`${taskName}: Rate limit on ${COMPLEX_IMPRESSION_DEFAULT_MODEL}. Retrying in ${waitSeconds}s...`);
 
-            // 2. Try fallback model: gemini-3.7-flash with Google search grounding alone
-            try {
-                const fallbackResponse = await getAI().models.generateContent({
-                    model: COMPLEX_IMPRESSION_FALLBACK_MODEL,
-                    contents: prompt,
-                    config: {
-                        tools: [{ googleSearch: {} }]
-                    }
-                });
-                const text = fallbackResponse.text || '';
-                const groundingChunks = fallbackResponse.candidates?.[0]?.groundingMetadata?.groundingChunks;
-                return { text, groundingChunks };
-            } catch (fallbackErr: any) {
-                if (!isRateLimitError(fallbackErr)) {
-                    console.error(`${taskName}: Fatal error on ${COMPLEX_IMPRESSION_FALLBACK_MODEL}:`, fallbackErr);
-                    throw fallbackErr;
-                }
-
-                // Both models hit rate limit! Wait with live countdown
-                const waitSeconds = Math.min(15, 5 + (cycle - 1) * 2); // 5s, 7s, 9s, 11s, 13s, 15s
-                console.warn(`${taskName}: Rate limit on both models. Retrying in ${waitSeconds}s...`);
-
-                for (let sec = waitSeconds; sec > 0; sec--) {
-                    onProgress?.(`${taskName}: Rate limit reached on both models. Retrying in ${sec} second${sec > 1 ? 's' : ''}...`);
-                    await new Promise(res => setTimeout(res, 1000));
-                }
-                onProgress?.(`${taskName}: Retrying with ${COMPLEX_IMPRESSION_DEFAULT_MODEL}...`);
-                // Loop continues to attempt gemini-3.8-flash again
+            for (let sec = waitSeconds; sec > 0; sec--) {
+                onProgress?.(`${taskName}: Rate limit reached on ${COMPLEX_IMPRESSION_DEFAULT_MODEL}. Retrying in ${sec} second${sec > 1 ? 's' : ''}...`);
+                await new Promise(res => setTimeout(res, 1000));
             }
+            onProgress?.(`${taskName}: Retrying with ${COMPLEX_IMPRESSION_DEFAULT_MODEL}...`);
         }
     }
     throw new Error(`${taskName}: Rate limit persisted after ${maxRetryCycles} retry cycles.`);
@@ -1982,7 +1981,7 @@ export interface LiveChunkResult {
  */
 export const processLiveAudioChunk = async (
   audioBlob: Blob,
-  model: string = 'gemini-3.7-flash',
+  model: string = 'gemini-3.8-flash',
   previousFindings: string[] = [],
   chunkIndex: number = 0,
   customPrompt?: string,
@@ -2049,6 +2048,7 @@ Your task is to transcribe this live audio segment into clean, structured radiol
 
 ${templateContext}
 ${instructionsText}
+${getMacroPromptContext()}
 ${boundaryStitchingText}
 ${historySectionText}
 
@@ -2111,8 +2111,8 @@ INSTRUCTIONS FOR THIS AUDIO SEGMENT:
 - Return the COMPLETE, FINAL, UPDATED array of findings for the whole report in JSON format.
 `;
 
-  // Multi-model fallback chain: selected model + subsequent next 2 models
-  const fallbackChain = getLiveModelFallbackChain(model || 'gemini-3.7-flash');
+  // Multi-model fallback chain: selected model + subsequent next model
+  const fallbackChain = getLiveModelFallbackChain(model || 'gemini-3.8-flash');
   let lastError: any = null;
   const failedModels: string[] = [];
 
@@ -2181,7 +2181,7 @@ INSTRUCTIONS FOR THIS AUDIO SEGMENT:
     attempts: fallbackChain.length,
     failoverOccurred: true,
     failedModels,
-    error: `Rate limit or service error across all 3 models (${fallbackChain.join(', ')}).`,
+    error: `Rate limit or service error across all 2 models (${fallbackChain.join(', ')}).`,
   };
 };
 
@@ -2193,7 +2193,7 @@ INSTRUCTIONS FOR THIS AUDIO SEGMENT:
  */
 export const synthesizeLiveReport = async (
   rawFindings: string[],
-  model: string = 'gemini-3.7-flash',
+  model: string = 'gemini-3.8-flash',
   customPrompt?: string,
   customImages?: Array<{ data: string; mimeType: string }> | null,
   customDocx?: CustomDocxInput
@@ -2234,7 +2234,7 @@ Perform a comprehensive, holistic review pass over the draft to generate the fin
 
 Output MUST be a JSON object with a single "findings" array of strings.`;
 
-  const fallbackChain = getLiveModelFallbackChain(model || 'gemini-3.7-flash');
+  const fallbackChain = getLiveModelFallbackChain(model || 'gemini-3.8-flash');
 
   for (let attempt = 0; attempt < fallbackChain.length; attempt++) {
     const currentModel = fallbackChain[attempt];

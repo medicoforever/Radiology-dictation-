@@ -29,12 +29,14 @@ import { autoSaveSingleDictation, autoSaveLiveDictation, SaveResult, syncPending
 import { DriveStatusBadge } from './components/DriveStatusBadge';
 import { DriveAutoSaveToast } from './components/DriveAutoSaveToast';
 import { DriveReportsModal } from './components/DriveReportsModal';
-import { RotateCcw, X, ExternalLink, Power, Sparkles, Trash2, Download, Settings, ShieldCheck } from 'lucide-react';
+import { RotateCcw, X, ExternalLink, Power, Sparkles, Trash2, Download, Settings, ShieldCheck, BookOpen } from 'lucide-react';
 import WorkstationSyncModal from './components/WorkstationSyncModal';
 import { checkAndAutoSyncReport } from './services/workstationSync';
 import { OwnershipModal } from './components/ui/OwnershipModal';
 import ThemeSelector from './components/ThemeSelector';
 import { getUpcomingTemplate, clearUpcomingTemplate, subscribeToUpcomingTemplate, UpcomingTemplateConfig } from './services/upcomingTemplateService';
+import MacrosAndDictionaryModal from './components/MacrosAndDictionaryModal';
+import { subscribeToMacroDictionary, syncMacrosWithGoogleDrive, expandMacrosInFindings } from './services/macroDictionaryService';
 
 interface ChatMessage {
   author: 'You' | 'AI';
@@ -147,6 +149,15 @@ const App: React.FC = () => {
   const [isReportsModalOpen, setIsReportsModalOpen] = useState<boolean>(false);
   const [isWorkstationSyncModalOpen, setIsWorkstationSyncModalOpen] = useState<boolean>(false);
   const [isOwnershipModalOpen, setIsOwnershipModalOpen] = useState<boolean>(false);
+  const [isMacrosModalOpen, setIsMacrosModalOpen] = useState<boolean>(false);
+  const [activeMacrosCount, setActiveMacrosCount] = useState<number>(0);
+
+  useEffect(() => {
+    const unsubscribe = subscribeToMacroDictionary(store => {
+      setActiveMacrosCount((store.macros || []).length);
+    });
+    return unsubscribe;
+  }, []);
   const [syncToastMessage, setSyncToastMessage] = useState<string | null>(null);
   const syncToastTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
@@ -195,12 +206,17 @@ const App: React.FC = () => {
   } | null>(null);
 
   useEffect(() => {
-    const allThemeClasses = ['theme-light', 'theme-dark', 'theme-colourful', 'theme-magical', 'theme-creative', 'theme-soothing', 'theme-sunset', 'theme-ocean'];
+    const allThemeClasses = [
+      'theme-light', 'theme-dark', 'theme-colourful', 'theme-magical', 
+      'theme-creative', 'theme-soothing', 'theme-sunset', 'theme-ocean',
+      'theme-aurora', 'theme-cyberpunk', 'theme-velvet', 'theme-nordic',
+      'theme-solar', 'theme-sakura', 'theme-lavender', 'theme-espresso'
+    ];
     document.documentElement.classList.remove(...allThemeClasses);
     document.documentElement.classList.add(`theme-${theme}`);
     document.documentElement.setAttribute('data-theme', theme);
 
-    const isDarkVariant = ['dark', 'magical', 'sunset', 'ocean'].includes(theme);
+    const isDarkVariant = ['dark', 'magical', 'sunset', 'ocean', 'aurora', 'cyberpunk', 'velvet', 'espresso'].includes(theme);
     if (isDarkVariant) {
       document.documentElement.classList.add('dark');
     } else {
@@ -254,7 +270,10 @@ const App: React.FC = () => {
           setChatHistory(savedState.chatHistory || []);
           setStatus(AppStatus.Success);
           
-          setSelectedModel(savedState.selectedModel || DEFAULT_SELECTED_MODEL);
+          const validModel = AVAILABLE_MODELS.some(m => m.value === savedState.selectedModel)
+            ? savedState.selectedModel
+            : DEFAULT_SELECTED_MODEL;
+          setSelectedModel(validModel);
           setCustomPrompt(savedState.customPrompt || '');
           setCustomImages(savedState.customImages || []);
           if (savedState.customDocx) {
@@ -273,8 +292,8 @@ const App: React.FC = () => {
 
           // Recreate chat session asynchronously
           const chatPromise = blob 
-              ? createChat(blob, savedState.findings || [], savedState.customPrompt || '', savedState.customImages || [], savedState.selectedModel || DEFAULT_SELECTED_MODEL)
-              : createChatFromText(savedState.findings || [], savedState.customPrompt || '', savedState.customImages || [], savedState.selectedModel || DEFAULT_SELECTED_MODEL);
+              ? createChat(blob, savedState.findings || [], savedState.customPrompt || '', savedState.customImages || [], validModel)
+              : createChatFromText(savedState.findings || [], savedState.customPrompt || '', savedState.customImages || [], validModel);
 
           chatPromise
             .then(setChat)
@@ -350,13 +369,17 @@ const App: React.FC = () => {
     saveState();
   }, [status, findings, audioBlob, chatHistory, selectedModel, customPrompt, customImages, isRestored]);
 
-  // Listen for Google Drive auth reconnection to sync offline/pending dictations
+  // Listen for Google Drive auth reconnection to sync offline/pending dictations & macros dictionary
   useEffect(() => {
     let wasConnected = isDriveConnected();
+    if (wasConnected) {
+      syncMacrosWithGoogleDrive().catch(() => {});
+    }
     const unsubscribe = subscribeToAuth(async (user, token) => {
       const isNowConnected = Boolean(user && token && isDriveConnected());
       if (isNowConnected && !wasConnected) {
         wasConnected = true;
+        syncMacrosWithGoogleDrive().catch(() => {});
         try {
           const syncResults = await syncPendingLocalDictationsToDrive();
           if (syncResults.singleResult && syncResults.singleResult.success) {
@@ -692,8 +715,9 @@ const App: React.FC = () => {
   };
 
   const handleAllFindingsUpdate = useCallback((newFindings: string[]) => {
-    setFindings(newFindings);
-    checkAndAutoSyncReport(400, { findings: newFindings, timestamp: activeDictationTimestampRef.current || Date.now() });
+    const expanded = expandMacrosInFindings(newFindings);
+    setFindings(expanded);
+    checkAndAutoSyncReport(400, { findings: expanded, timestamp: activeDictationTimestampRef.current || Date.now() });
   }, []);
 
   const handleAudioBlobUpdate = useCallback((newBlob: Blob) => {
@@ -911,7 +935,10 @@ const App: React.FC = () => {
     setCustomPrompt(prev.customPrompt);
     setCustomImages(prev.customImages);
     setCustomDocx(prev.customDocx || null);
-    setSelectedModel(prev.selectedModel);
+    const restoredModel = AVAILABLE_MODELS.some(m => m.value === prev.selectedModel)
+      ? prev.selectedModel
+      : DEFAULT_SELECTED_MODEL;
+    setSelectedModel(restoredModel);
     setIdentifiedErrors(prev.identifiedErrors);
     setErrorCheckStatus(prev.errorCheckStatus);
     activeDictationTimestampRef.current = prev.timestamp;
@@ -923,7 +950,7 @@ const App: React.FC = () => {
       const stateToSave = {
         findings: prev.findings,
         chatHistory: prev.chatHistory,
-        selectedModel: prev.selectedModel,
+        selectedModel: restoredModel,
         customPrompt: prev.customPrompt,
         customImages: prev.customImages,
         customDocx: prev.customDocx || null,
@@ -942,10 +969,10 @@ const App: React.FC = () => {
     // Recreate chat session
     try {
       if (prev.audioBlob) {
-        const chatSession = await createChat(prev.audioBlob, prev.findings, prev.customPrompt, prev.customImages, prev.selectedModel || DEFAULT_SELECTED_MODEL);
+        const chatSession = await createChat(prev.audioBlob, prev.findings, prev.customPrompt, prev.customImages, restoredModel);
         setChat(chatSession);
       } else {
-        const chatSession = await createChatFromText(prev.findings, prev.customPrompt, prev.customImages, prev.selectedModel || DEFAULT_SELECTED_MODEL);
+        const chatSession = await createChatFromText(prev.findings, prev.customPrompt, prev.customImages, restoredModel);
         setChat(chatSession);
       }
     } catch (err) {
@@ -1079,6 +1106,7 @@ const App: React.FC = () => {
             onCustomDocxChange={setCustomDocx}
             identifiedErrors={identifiedErrors}
             errorCheckStatus={errorCheckStatus}
+            onOpenMacrosModal={() => setIsMacrosModalOpen(true)}
           />
         );
       case AppStatus.Error:
@@ -1181,7 +1209,7 @@ const App: React.FC = () => {
                     }} 
                 />;
       case 'live':
-        return <LiveDictation onComplete={handleLiveDictationComplete} onBack={() => setMode('single')} />;
+        return <LiveDictation onComplete={handleLiveDictationComplete} onBack={() => setMode('single')} onOpenMacrosModal={() => setIsMacrosModalOpen(true)} />;
       default:
         return renderSingleModeContent();
     }
@@ -1242,6 +1270,18 @@ const App: React.FC = () => {
               </h1>
             </div>
             <div className="justify-self-end flex items-center gap-1.5 sm:gap-2">
+              <button
+                id="macros-header-btn"
+                onClick={() => setIsMacrosModalOpen(true)}
+                className="p-2 sm:p-2.5 rounded-xl text-indigo-600 dark:text-indigo-400 bg-indigo-50/80 dark:bg-indigo-950/40 hover:bg-indigo-100 dark:hover:bg-indigo-900/60 transition-colors shrink-0 shadow-sm border border-indigo-200/70 dark:border-indigo-800/60 cursor-pointer min-h-[36px] min-w-[36px] flex items-center justify-center gap-1.5"
+                aria-label="Macros"
+                title="Macros — Manage custom text shortcuts"
+              >
+                <BookOpen className="w-5 h-5 shrink-0" />
+                <span className="text-xs font-semibold hidden md:inline whitespace-nowrap">
+                  Macros {activeMacrosCount > 0 ? `(${activeMacrosCount})` : ''}
+                </span>
+              </button>
               <button
                 id="workstation-sync-header-btn"
                 onClick={() => setIsWorkstationSyncModalOpen(true)}
@@ -1743,6 +1783,18 @@ const App: React.FC = () => {
         <OwnershipModal
           isOpen={isOwnershipModalOpen}
           onClose={() => setIsOwnershipModalOpen(false)}
+        />
+
+        {/* Voice Macros & Autotext Dictionary Modal */}
+        <MacrosAndDictionaryModal
+          isOpen={isMacrosModalOpen}
+          onClose={() => setIsMacrosModalOpen(false)}
+          hasActiveReport={status === AppStatus.Success && mode === 'single'}
+          onInsertMacroIntoActiveReport={(expandedLines) => {
+            if (status === AppStatus.Success && mode === 'single') {
+              handleAllFindingsUpdate([...findings, ...expandedLines]);
+            }
+          }}
         />
 
         {/* Workstation Sync Saved Toast */}

@@ -20,7 +20,7 @@ const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack }) => 
     const [customPrompt, setCustomPrompt] = useState('');
     const [customImages, setCustomImages] = useState<Array<{ data: string; mimeType: string }>>([]);
     const [customDocx, setCustomDocx] = useState<DocxTemplateData | null>(null);
-    const [selectedModel, setSelectedModel] = useState<string>(DEFAULT_LIVE_MODEL || 'gemini-3.7-flash');
+    const [selectedModel, setSelectedModel] = useState<string>(DEFAULT_LIVE_MODEL || 'gemini-3.8-flash');
     const [interruptedSession, setInterruptedSession] = useState<{ sessionId: string; createdAt: number; totalChunks: number } | null>(null);
     const [isRecovering, setIsRecovering] = useState(false);
 
@@ -196,7 +196,7 @@ const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack }) => 
                     Live Dictation Mode
                 </h2>
                 <p className="text-slate-500 dark:text-slate-400 mb-6 text-center max-w-lg text-sm sm:text-base">
-                    Real-time speech recognition and continuous medical transcription powered by <strong className="text-emerald-700 dark:text-emerald-400">{selectedModel}</strong>. Features smart acoustic voice detection, custom instruction & template enforcement, and automatic 3-model failover protection against rate limits.
+                    Real-time speech recognition and continuous medical transcription powered by <strong className="text-emerald-700 dark:text-emerald-400">{selectedModel}</strong>. Features smart acoustic voice detection, custom instruction & template enforcement, and automatic 2-model failover protection against rate limits.
                 </p>
 
                 {/* Model Selector Card */}
@@ -223,7 +223,7 @@ const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack }) => 
                         </p>
                     </div>
                     <span className="inline-flex items-center self-start sm:self-center px-2.5 py-1 rounded-full text-xs font-medium bg-emerald-100 text-emerald-800 dark:bg-emerald-800/50 dark:text-emerald-200 whitespace-nowrap">
-                        🛡️ 3-Model Failover Safe
+                        🛡️ 2-Model Failover Safe
                     </span>
                 </div>
 

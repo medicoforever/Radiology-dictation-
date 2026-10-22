@@ -2,6 +2,7 @@
  * Smart Dictation & Medical Vocabulary Biasing Engine
  * Inspired by Gemini 3.5 Transcribe Smart Dictation & Custom Vocabulary Biasing
  */
+import { applyCustomVocabularyRules, matchSpokenVoiceMacro } from './macroDictionaryService';
 
 // Comprehensive medical & radiology terminology phonetic biasing map
 export const MEDICAL_VOCABULARY_BIASING_RULES: Array<{ pattern: RegExp; replacement: string }> = [
@@ -74,6 +75,7 @@ export function applyMedicalBiasing(text: string): string {
   for (const rule of MEDICAL_VOCABULARY_BIASING_RULES) {
     result = result.replace(rule.pattern, rule.replacement);
   }
+  result = applyCustomVocabularyRules(result);
   return formatMedicalAbbreviations(result);
 }
 
@@ -109,11 +111,12 @@ export function applyVoicePunctuation(text: string): string {
 }
 
 export interface VoiceCommandExecutionResult {
-  action: 'DELIMITER_NEW_LINE' | 'DELIMITER_IMPRESSION' | 'DELIMITER_CLINICAL_PROFILE' | 'DELIMITER_TECHNIQUE' | 'DELETE_LAST_FINDING' | 'DELETE_LAST_WORD' | 'CLEAR_ALL' | 'SELF_CORRECTION' | 'MARK_BOLD' | 'NONE';
+  action: 'DELIMITER_NEW_LINE' | 'DELIMITER_IMPRESSION' | 'DELIMITER_CLINICAL_PROFILE' | 'DELIMITER_TECHNIQUE' | 'DELETE_LAST_FINDING' | 'DELETE_LAST_WORD' | 'CLEAR_ALL' | 'SELF_CORRECTION' | 'MARK_BOLD' | 'INSERT_MACRO' | 'NONE';
   remainingText: string;
   description?: string;
   target?: string;
   replacement?: string;
+  expandedFindings?: string[];
 }
 
 /**
@@ -123,6 +126,17 @@ export function evaluateVoiceCommand(utterance: string): VoiceCommandExecutionRe
   const trimmed = utterance.trim();
   if (!trimmed) {
     return { action: 'NONE', remainingText: '' };
+  }
+
+  // 0. SPOKEN VOICE MACRO TRIGGER
+  const macroMatch = matchSpokenVoiceMacro(trimmed);
+  if (macroMatch) {
+    return {
+      action: 'INSERT_MACRO',
+      remainingText: macroMatch.expandedFindings.join('\n'),
+      expandedFindings: macroMatch.expandedFindings,
+      description: `Inserted macro "${macroMatch.matchedMacro.name}"`,
+    };
   }
 
   // 1. DELETE / CLEAR COMMANDS

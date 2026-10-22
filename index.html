@@ -19,7 +19,7 @@
         const storedTheme = localStorage.getItem('theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
         document.documentElement.setAttribute('data-theme', storedTheme);
         document.documentElement.classList.add('theme-' + storedTheme);
-        if (['dark', 'magical', 'sunset', 'ocean'].includes(storedTheme)) {
+        if (['dark', 'magical', 'sunset', 'ocean', 'aurora', 'cyberpunk', 'velvet', 'espresso'].includes(storedTheme)) {
           document.documentElement.classList.add('dark');
         } else {
           document.documentElement.classList.remove('dark');

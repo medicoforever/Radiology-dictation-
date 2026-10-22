@@ -10,6 +10,7 @@ import {
   cacheAudioChunk,
   clearSessionAudioCache,
 } from '../services/audioCacheService';
+import { expandMacrosInFindings } from '../services/macroDictionaryService';
 
 interface LiveHistorySnapshot {
   findings: string[];
@@ -210,7 +211,7 @@ export const useLiveSession = () => {
   const currentChunkIndexRef = useRef<number>(0);
   const isProcessingChunkRef = useRef<boolean>(false);
   const schedulerIntervalRef = useRef<any>(null);
-  const selectedModelRef = useRef<string>('gemini-3.7-flash');
+  const selectedModelRef = useRef<string>('gemini-3.8-flash');
   const customPromptRef = useRef<string>('');
   const customImagesRef = useRef<Array<{ data: string; mimeType: string }> | null>(null);
   const customDocxRef = useRef<CustomDocxInput>(null);
@@ -319,11 +320,13 @@ export const useLiveSession = () => {
 
   const emitFindings = useCallback(() => {
     if (!onTranscriptUpdateRef.current) return;
-    onTranscriptUpdateRef.current([...committedFindingsRef.current]);
+    const expanded = expandMacrosInFindings([...committedFindingsRef.current]);
+    committedFindingsRef.current = expanded;
+    onTranscriptUpdateRef.current(expanded);
   }, []);
 
   /**
-   * Dispatches a slice of recorded audio to Gemini Flash model (e.g. gemini-3.7-flash)
+   * Dispatches a slice of recorded audio to Gemini Flash model (e.g. gemini-3.8-flash)
    * with complete medical prompt and previous dictation text for seamless context continuation.
    * Performs local VAD validation to ensure silence/noise is never sent to the model.
    */
@@ -342,7 +345,7 @@ export const useLiveSession = () => {
 
     isProcessingChunkRef.current = true;
 
-    const modelName = selectedModelRef.current || 'gemini-3.7-flash';
+    const modelName = selectedModelRef.current || 'gemini-3.8-flash';
     const timeLabel = chunkIdx === 0 ? '0s-5s' : chunkIdx === 1 ? '0s-10s' : `${Math.round(startSample / 16000)}s-${Math.round(endSample / 16000)}s`;
     setStatus(`⚡ Transcribing [${timeLabel}] with ${modelName}...`);
 
@@ -480,7 +483,7 @@ export const useLiveSession = () => {
   const startSession = useCallback(async (
     onTranscriptUpdate: (lines: string[]) => void,
     customPrompt?: string,
-    model: string = 'gemini-3.7-flash',
+    model: string = 'gemini-3.8-flash',
     customImages?: Array<{ data: string; mimeType: string }> | null,
     customDocx?: CustomDocxInput
   ) => {
@@ -504,7 +507,7 @@ export const useLiveSession = () => {
     sessionStartTimeRef.current = Date.now();
     accumulatedPauseDurationRef.current = 0;
     pauseStartTimeRef.current = 0;
-    selectedModelRef.current = model || 'gemini-3.7-flash';
+    selectedModelRef.current = model || 'gemini-3.8-flash';
     customPromptRef.current = customPrompt || '';
     customImagesRef.current = customImages || null;
     customDocxRef.current = customDocx || null;
@@ -807,7 +810,7 @@ export const useLiveSession = () => {
       const vadMetrics = analyzePcmEnergy(recordedPcmChunksRef.current, startSample, endSample);
 
       if (vadMetrics.hasSpeech) {
-        setStatus(`Finalizing remaining clinical speech with ${selectedModelRef.current || 'gemini-3.7-flash'}...`);
+        setStatus(`Finalizing remaining clinical speech with ${selectedModelRef.current || 'gemini-3.8-flash'}...`);
         const finalChunkBlob = pcmRangeToWavBlob(recordedPcmChunksRef.current, startSample, endSample, 16000);
 
         const historyContext: LiveHistoryContext = {
@@ -820,7 +823,7 @@ export const useLiveSession = () => {
         try {
           const finalResult = await processLiveAudioChunk(
             finalChunkBlob,
-            selectedModelRef.current || 'gemini-3.7-flash',
+            selectedModelRef.current || 'gemini-3.8-flash',
             committedFindingsRef.current,
             currentChunkIndexRef.current,
             customPromptRef.current,
@@ -849,7 +852,7 @@ export const useLiveSession = () => {
       try {
         const synthesizedReport = await synthesizeLiveReport(
           committedFindingsRef.current,
-          selectedModelRef.current || 'gemini-3.7-flash',
+          selectedModelRef.current || 'gemini-3.8-flash',
           customPromptRef.current,
           customImagesRef.current,
           customDocxRef.current

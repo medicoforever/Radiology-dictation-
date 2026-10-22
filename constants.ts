@@ -1,8 +1,8 @@
-export const DEFAULT_LIVE_MODEL = 'gemini-3.7-flash';
-export const GEMINI_TRANSCRIBE_LIVE_MODEL = 'gemini-3.7-flash';
-export const LIVE_DICTATION_MODEL = 'gemini-3.7-flash';
+export const DEFAULT_LIVE_MODEL = 'gemini-3.8-flash';
+export const GEMINI_TRANSCRIBE_LIVE_MODEL = 'gemini-3.8-flash';
+export const LIVE_DICTATION_MODEL = 'gemini-3.8-flash';
 export const GEMINI_FLASH_LITE_MODEL = 'gemini-3.5-flash-lite';
-export const DEFAULT_SELECTED_MODEL = 'gemini-3.7-flash';
+export const DEFAULT_SELECTED_MODEL = 'gemini-3.8-flash';
 
 export interface AIModelOption {
   value: string;
@@ -10,28 +10,20 @@ export interface AIModelOption {
 }
 
 export const LIVE_DICTATION_MODELS: AIModelOption[] = [
-  { value: 'gemini-3.7-flash', label: 'gemini-3.7-flash (Default)' },
-  { value: 'gemini-3.8-flash', label: 'gemini-3.8-flash' },
+  { value: 'gemini-3.8-flash', label: 'gemini-3.8-flash (Default)' },
   { value: 'gemini-3.5-flash-lite', label: 'gemini-3.5-flash-lite' },
 ];
 
 export const LIVE_DICTATION_CYCLE_ORDER = [
-  'gemini-3.7-flash',
   'gemini-3.8-flash',
   'gemini-3.5-flash-lite',
 ];
 
 /**
- * Returns the candidate model chain: the selected primary model plus the subsequent 2 fallback models,
- * cycling strictly across the 3 permitted live dictation models:
- * 1. gemini-3.7-flash
- * 2. gemini-3.8-flash
- * 3. gemini-3.5-flash-lite
- *
- * For example:
- * - Selected 'gemini-3.7-flash'     => ['gemini-3.7-flash', 'gemini-3.8-flash', 'gemini-3.5-flash-lite']
- * - Selected 'gemini-3.8-flash'     => ['gemini-3.8-flash', 'gemini-3.5-flash-lite', 'gemini-3.7-flash']
- * - Selected 'gemini-3.5-flash-lite'=> ['gemini-3.5-flash-lite', 'gemini-3.7-flash', 'gemini-3.8-flash']
+ * Returns the candidate model chain: the selected primary model plus subsequent fallback model,
+ * cycling across permitted live dictation models:
+ * 1. gemini-3.8-flash (Default)
+ * 2. gemini-3.5-flash-lite
  */
 export function getLiveModelFallbackChain(selectedModel: string): string[] {
   const modelOrder = LIVE_DICTATION_CYCLE_ORDER;
@@ -40,8 +32,7 @@ export function getLiveModelFallbackChain(selectedModel: string): string[] {
   if (idx !== -1) {
     return [
       modelOrder[idx],
-      modelOrder[(idx + 1) % modelOrder.length],
-      modelOrder[(idx + 2) % modelOrder.length],
+      ...modelOrder.filter((_, i) => i !== idx),
     ];
   }
 
@@ -49,14 +40,11 @@ export function getLiveModelFallbackChain(selectedModel: string): string[] {
 }
 
 export const AVAILABLE_MODELS: AIModelOption[] = [
-  { value: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash' },
-  { value: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash' },
-  { value: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro' },
-  { value: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
+  { value: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash (Default)' },
   { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash' },
   { value: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash' },
-  { value: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro' },
   { value: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash Lite' },
+  { value: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro' },
 ];
 
 export const RADIOLOGY_CUSTOM_VOCABULARY = [

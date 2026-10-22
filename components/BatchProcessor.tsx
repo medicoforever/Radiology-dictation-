@@ -235,6 +235,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     const [dragOverState, setDragOverState] = useState<{ batchId: string; index: number } | null>(null);
     const dragItem = useRef<{ batchId: string; index: number } | null>(null);
     const dragOverItem = useRef<{ batchId: string; index: number } | null>(null);
+    const touchDragRef = useRef<{ batchId: string; sourceIndex: number; startX: number; startY: number; isDragging: boolean } | null>(null);
     const [undoStates, setUndoStates] = useState<Record<string, string[]>>({});
     const [batchRtfViewIds, setBatchRtfViewIds] = useState<Record<string, boolean>>({});
 
@@ -1559,8 +1560,13 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
       const htmlText = html.join('');
       
       const success = await copyToClipboard(plainText, htmlText);
+      const validCount = (batch.findings || []).filter(f => f && f.trim() !== '').length;
+      const isSubset = selection.size > 0 && selection.size < validCount;
+      const deselectedCount = validCount - selection.size;
       const notificationText = success
-        ? `Copied ${selection.size} finding${selection.size > 1 ? 's' : ''} for ${batch.name}!`
+        ? isSubset
+          ? `Copied ${selection.size} finding${selection.size > 1 ? 's' : ''} for ${batch.name} (${deselectedCount} deselected)!`
+          : `Copied ${selection.size} finding${selection.size > 1 ? 's' : ''} for ${batch.name}!`
         : 'Copy failed!';
       showNotification(notificationText);
     };
@@ -1741,7 +1747,13 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         if (success) {
           setAllCopiedId(batch.id);
           setTimeout(() => setAllCopiedId(null), 2000);
-          showNotification('Copied all!');
+          const allIndices = new Set<number>();
+          batch.findings.forEach((f, i) => {
+            if (f && f.trim() !== '') allIndices.add(i);
+          });
+          setSelections(prev => ({ ...prev, [batch.id]: allIndices }));
+          setMultiSelectMode(true);
+          showNotification(`Copied all for ${batch.name}! Tap any finding or checkbox to deselect.`);
         } else {
           showNotification('Copy failed!');
         }
@@ -2185,6 +2197,11 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     // --- Drag and Drop Handlers for Findings ---
     const handleToggleReorderMode = (batchId: string) => {
         clearUndoStateForBatch(batchId);
+        setClickMergeBatchState(null);
+        setDragOverState(null);
+        setDraggedState(null);
+        dragItem.current = null;
+        dragOverItem.current = null;
         setReorderBatchId(prev => (prev === batchId ? null : batchId));
         setMergeBatchId(null);
     };
@@ -2194,41 +2211,163 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         setDragOverState(null);
         setDraggedState(null);
         dragItem.current = null;
+        dragOverItem.current = null;
         setMergeBatchId(prev => (prev === batchId ? null : batchId));
         setReorderBatchId(null);
     };
 
-    // Reorder
-    const handleReorderDragStart = (batchId: string, index: number) => {
+    // Reorder Handlers for Findings in Batch
+    const handleReorderDragStart = (e: React.DragEvent | undefined, batchId: string, index: number) => {
         dragItem.current = { batchId, index };
         setDraggedState({ batchId, index });
+        if (e) {
+            e.stopPropagation();
+            if (e.dataTransfer) {
+                try {
+                    e.dataTransfer.setData("text/plain", JSON.stringify({ batchId, index }));
+                    e.dataTransfer.effectAllowed = "move";
+                } catch (_) {}
+            }
+        }
     };
-    const handleReorderDragEnd = () => {
+
+    const handleReorderDrop = (e: React.DragEvent, targetBatchId: string, targetIndex: number) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (dragItem.current && dragItem.current.batchId === targetBatchId) {
+            dragOverItem.current = { batchId: targetBatchId, index: targetIndex };
+        } else {
+            try {
+                const text = e.dataTransfer.getData("text/plain");
+                if (text) {
+                    const parsed = JSON.parse(text);
+                    if (parsed && parsed.batchId === targetBatchId && typeof parsed.index === 'number') {
+                        dragItem.current = { batchId: targetBatchId, index: parsed.index };
+                        dragOverItem.current = { batchId: targetBatchId, index: targetIndex };
+                    }
+                }
+            } catch (_) {}
+        }
+        handleReorderDragEnd();
+    };
+
+    const handleReorderDragEnd = (e?: React.DragEvent) => {
+        if (e) {
+            e.stopPropagation();
+        }
         if (dragItem.current && dragOverItem.current && dragItem.current.batchId === dragOverItem.current.batchId && dragItem.current.index !== dragOverItem.current.index) {
             const { batchId, index: dragIndex } = dragItem.current;
             const { index: dragOverIndex } = dragOverItem.current;
             
             const batch = batches.find(b => b.id === batchId);
-            if(batch && batch.findings) {
+            if (batch && batch.findings) {
                 setUndoStates(prev => ({ ...prev, [batchId]: [...batch.findings!] }));
             }
 
             setBatches(prevBatches => {
-                const batchIndex = prevBatches.findIndex(b => b.id === batchId);
-                if (batchIndex === -1 || !prevBatches[batchIndex].findings) return prevBatches;
-
-                let newFindings = [...prevBatches[batchIndex].findings!];
-                const draggedItemContent = newFindings.splice(dragIndex, 1)[0];
-                newFindings.splice(dragOverIndex, 0, draggedItemContent);
-                
-                const newBatches = [...prevBatches];
-                newBatches[batchIndex].findings = newFindings;
-                return newBatches;
+                return prevBatches.map(b => {
+                    if (b.id !== batchId || !b.findings) return b;
+                    const newFindings = [...b.findings];
+                    const [draggedItemContent] = newFindings.splice(dragIndex, 1);
+                    newFindings.splice(dragOverIndex, 0, draggedItemContent);
+                    return { ...b, findings: newFindings };
+                });
             });
         }
         dragItem.current = null;
         dragOverItem.current = null;
         setDraggedState(null);
+    };
+
+    const handleMoveFinding = (batchId: string, index: number, direction: 'up' | 'down') => {
+        const targetIndex = direction === 'up' ? index - 1 : index + 1;
+        const batch = batches.find(b => b.id === batchId);
+        if (!batch || !batch.findings || targetIndex < 0 || targetIndex >= batch.findings.length) return;
+
+        setUndoStates(prev => ({ ...prev, [batchId]: [...batch.findings!] }));
+
+        setBatches(prev => prev.map(b => {
+            if (b.id !== batchId || !b.findings) return b;
+            const newFindings = [...b.findings];
+            const [item] = newFindings.splice(index, 1);
+            newFindings.splice(targetIndex, 0, item);
+            return { ...b, findings: newFindings };
+        }));
+    };
+
+    // Touch Drag Support for Mobile & Tablets in Batch Findings
+    const handleRowTouchStart = (e: React.TouchEvent, batchId: string, index: number) => {
+        if (reorderBatchId !== batchId && mergeBatchId !== batchId) return;
+        const touch = e.touches[0];
+        touchDragRef.current = {
+            batchId,
+            sourceIndex: index,
+            startX: touch.clientX,
+            startY: touch.clientY,
+            isDragging: false,
+        };
+    };
+
+    const handleRowTouchMove = (e: React.TouchEvent, batchId: string) => {
+        if (reorderBatchId !== batchId && mergeBatchId !== batchId) return;
+        if (!touchDragRef.current || touchDragRef.current.batchId !== batchId) return;
+        const touch = e.touches[0];
+        const deltaX = Math.abs(touch.clientX - touchDragRef.current.startX);
+        const deltaY = Math.abs(touch.clientY - touchDragRef.current.startY);
+
+        if (!touchDragRef.current.isDragging && (deltaX > 6 || deltaY > 6)) {
+            touchDragRef.current.isDragging = true;
+            const src = touchDragRef.current.sourceIndex;
+            dragItem.current = { batchId, index: src };
+            setDraggedState({ batchId, index: src });
+        }
+
+        if (touchDragRef.current.isDragging) {
+            if (e.cancelable) {
+                e.preventDefault();
+            }
+            const el = document.elementFromPoint(touch.clientX, touch.clientY);
+            const targetItem = el?.closest(`.finding-item[data-batch-id="${batchId}"]`);
+            if (targetItem) {
+                const targetIdxStr = targetItem.getAttribute('data-finding-index');
+                if (targetIdxStr !== null) {
+                    const targetIdx = parseInt(targetIdxStr, 10);
+                    if (!isNaN(targetIdx)) {
+                        if (reorderBatchId === batchId) {
+                            dragOverItem.current = { batchId, index: targetIdx };
+                        } else if (mergeBatchId === batchId) {
+                            setDragOverState({ batchId, index: targetIdx });
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    const handleRowTouchEnd = (batchId: string) => {
+        if (reorderBatchId !== batchId && mergeBatchId !== batchId) return;
+        const state = touchDragRef.current;
+        touchDragRef.current = null;
+        if (!state || state.batchId !== batchId) return;
+
+        if (state.isDragging) {
+            if (reorderBatchId === batchId) {
+                handleReorderDragEnd();
+            } else if (mergeBatchId === batchId) {
+                if (dragOverState && dragOverState.batchId === batchId && state.sourceIndex !== dragOverState.index) {
+                    executeBatchMerge(batchId, state.sourceIndex, dragOverState.index);
+                } else {
+                    setDraggedState(null);
+                    setDragOverState(null);
+                    dragItem.current = null;
+                }
+            }
+        } else {
+            // Tap without dragging in mergeMode: tap-to-merge
+            if (mergeBatchId === batchId) {
+                handleMergeItemClickForBatch(batchId, state.sourceIndex);
+            }
+        }
     };
 
     // Safely execute batch merge
@@ -2290,15 +2429,17 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     };
 
     // Merge Drag Handlers
-    const handleMergeDragStart = (e: React.DragEvent, batchId: string, index: number) => {
+    const handleMergeDragStart = (e: React.DragEvent | undefined, batchId: string, index: number) => {
         dragItem.current = { batchId, index };
         setDraggedState({ batchId, index });
-        try {
-            e.dataTransfer.setData("text/plain", JSON.stringify({ batchId, index }));
-            e.dataTransfer.setData("sourceInfo", JSON.stringify({ batchId, index }));
-            e.dataTransfer.effectAllowed = "copyMove";
-        } catch {
-            // Ignore dataTransfer errors in sandboxed environments
+        if (e && e.dataTransfer) {
+            try {
+                e.dataTransfer.setData("text/plain", JSON.stringify({ batchId, index }));
+                e.dataTransfer.setData("sourceInfo", JSON.stringify({ batchId, index }));
+                e.dataTransfer.effectAllowed = "copyMove";
+            } catch {
+                // Ignore dataTransfer errors in sandboxed environments
+            }
         }
     };
 
@@ -2364,19 +2505,41 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     // --- Drag and Drop Handlers for Batches ---
     const handleBatchDragStart = (e: React.DragEvent, index: number) => {
         batchDragItem.current = index;
+        if (e && e.dataTransfer) {
+            try {
+                e.dataTransfer.setData("text/plain", `batch-${index}`);
+                e.dataTransfer.effectAllowed = "move";
+            } catch (_) {}
+        }
     };
 
     const handleBatchDragOver = (e: React.DragEvent) => {
         e.preventDefault();
+        if (e.dataTransfer) {
+            e.dataTransfer.dropEffect = "move";
+        }
     };
 
     const handleBatchDrop = (e: React.DragEvent, index: number) => {
         e.preventDefault();
-        if (batchDragItem.current !== null && batchDragItem.current !== index) {
-            const newBatches = [...batches];
-            const [draggedItem] = newBatches.splice(batchDragItem.current, 1);
-            newBatches.splice(index, 0, draggedItem);
-            setBatches(newBatches);
+        e.stopPropagation();
+        let sourceIndex = batchDragItem.current;
+        if (sourceIndex === null) {
+            try {
+                const text = e.dataTransfer.getData("text/plain");
+                if (text && text.startsWith("batch-")) {
+                    const parsed = parseInt(text.replace("batch-", ""), 10);
+                    if (!isNaN(parsed)) sourceIndex = parsed;
+                }
+            } catch (_) {}
+        }
+        if (sourceIndex !== null && sourceIndex !== index) {
+            setBatches(prev => {
+                const newBatches = [...prev];
+                const [draggedItem] = newBatches.splice(sourceIndex!, 1);
+                newBatches.splice(index, 0, draggedItem);
+                return newBatches;
+            });
         }
         batchDragItem.current = null;
         setDragOverBatchIndex(null);
@@ -2385,6 +2548,18 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     const handleBatchDragEnd = () => {
         batchDragItem.current = null;
         setDragOverBatchIndex(null);
+    };
+
+    const handleMoveBatch = (index: number, direction: 'up' | 'down') => {
+        const targetIndex = direction === 'up' ? index - 1 : index + 1;
+        if (targetIndex < 0 || targetIndex >= batches.length) return;
+
+        setBatches(prev => {
+            const newBatches = [...prev];
+            const [item] = newBatches.splice(index, 1);
+            newBatches.splice(targetIndex, 0, item);
+            return newBatches;
+        });
     };
 
     const ErrorLegend = () => (
@@ -2548,27 +2723,27 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                             onDragOver={e => {
                                 if (e.dataTransfer.types.includes("Files")) {
                                     handleCardDragOver(e, batch.id);
-                                } else {
+                                } else if (isBatchReorderMode) {
                                     handleBatchDragOver(e);
                                 }
                             }}
                             onDrop={e => {
                                 if (e.dataTransfer.types.includes("Files")) {
                                     handleCardDrop(e, batch.id);
-                                } else {
+                                } else if (isBatchReorderMode) {
                                     handleBatchDrop(e, index);
                                 }
                             }}
                             onDragEnd={handleBatchDragEnd}
                             onDragEnter={e => {
-                                if (!e.dataTransfer.types.includes("Files") && batchDragItem.current !== index) {
+                                if (!e.dataTransfer.types.includes("Files") && isBatchReorderMode && batchDragItem.current !== index) {
                                     setDragOverBatchIndex(index);
                                 }
                             }}
                             onDragLeave={e => {
                                 if (e.dataTransfer.types.includes("Files")) {
                                     handleCardDragLeave(e);
-                                } else {
+                                } else if (isBatchReorderMode) {
                                     setDragOverBatchIndex(null);
                                 }
                             }}
@@ -2598,6 +2773,28 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                             aria-label={`Batch name for ${batch.name}`}
                                             disabled={true}
                                         />
+                                    </div>
+                                    <div className="flex items-center gap-1 shrink-0" onClick={e => e.stopPropagation()}>
+                                        <button
+                                            type="button"
+                                            disabled={index === 0}
+                                            onClick={() => handleMoveBatch(index, 'up')}
+                                            className="p-1.5 rounded-lg bg-white dark:bg-slate-700 border border-slate-300 dark:border-slate-600 hover:bg-blue-50 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 disabled:opacity-30 disabled:cursor-not-allowed shadow-xs transition-colors"
+                                            title="Move batch up"
+                                            aria-label="Move batch up"
+                                        >
+                                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M5 15l7-7 7 7" /></svg>
+                                        </button>
+                                        <button
+                                            type="button"
+                                            disabled={index === batches.length - 1}
+                                            onClick={() => handleMoveBatch(index, 'down')}
+                                            className="p-1.5 rounded-lg bg-white dark:bg-slate-700 border border-slate-300 dark:border-slate-600 hover:bg-blue-50 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 disabled:opacity-30 disabled:cursor-not-allowed shadow-xs transition-colors"
+                                            title="Move batch down"
+                                            aria-label="Move batch down"
+                                        >
+                                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M19 9l-7 7-7-7" /></svg>
+                                        </button>
                                     </div>
                                 </>
                             ) : (
@@ -3158,7 +3355,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                                         Undo
                                                                     </button>
                                                                 )}
-                                                                <button
+                                                                 <button
                                                                     type="button"
                                                                     onClick={() => {
                                                                         setMultiSelectMode(prev => {
@@ -3180,6 +3377,33 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                                     <CheckSquare className={`w-4 h-4 ${multiSelectMode ? 'text-white' : 'text-slate-600 dark:text-slate-400'}`} />
                                                                     {multiSelectMode ? 'Done Selecting' : 'Multi-select'}
                                                                 </button>
+                                                                {multiSelectMode && (
+                                                                  <button
+                                                                    type="button"
+                                                                    onClick={() => {
+                                                                      const currentSelected = selections[batch.id] || new Set();
+                                                                      const allValid = new Set<number>();
+                                                                      batch.findings?.forEach((f, i) => {
+                                                                        if (f && f.trim() !== '') allValid.add(i);
+                                                                      });
+                                                                      if (currentSelected.size === allValid.size) {
+                                                                        const next = { ...selections };
+                                                                        delete next[batch.id];
+                                                                        setSelections(next);
+                                                                        showNotification(`All findings deselected for ${batch.name}`);
+                                                                      } else {
+                                                                        const next = { ...selections, [batch.id]: allValid };
+                                                                        setSelections(next);
+                                                                        copyBatchSelection(batch.id, allValid);
+                                                                        showNotification(`Selected & copied all findings for ${batch.name}! Tap any to deselect.`);
+                                                                      }
+                                                                    }}
+                                                                    className="text-xs sm:text-sm font-semibold py-1 px-3 rounded-lg transition-colors bg-blue-100 hover:bg-blue-200 text-blue-800 dark:bg-blue-900/50 dark:text-blue-200 border border-blue-300/80 dark:border-blue-700/80 shadow-sm"
+                                                                    title={(selections[batch.id]?.size || 0) === (batch.findings?.filter(f => f && f.trim() !== '').length || 0) ? `Deselect all findings for ${batch.name}` : `Select all findings for ${batch.name}`}
+                                                                  >
+                                                                    {(selections[batch.id]?.size || 0) === (batch.findings?.filter(f => f && f.trim() !== '').length || 0) ? 'Deselect All' : 'Select All'}
+                                                                  </button>
+                                                                )}
                                                                 <button
                                                                     onClick={() => handleToggleMergeMode(batch.id)}
                                                                     className={`text-sm font-semibold py-1 px-3 rounded-lg transition-colors flex items-center gap-1.5 ${mergeBatchId === batch.id ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-slate-200 text-slate-700 hover:bg-slate-300 dark:bg-slate-700 dark:text-slate-300 dark:hover:bg-slate-600'}`}
@@ -3266,6 +3490,16 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                     </div>
                                                 )}
 
+                                                {/* Reorder Mode Guidance Banner for Batch */}
+                                                {reorderBatchId === batch.id && (
+                                                    <div className="mb-3 p-2.5 sm:p-3 bg-blue-50/90 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800/60 rounded-xl flex items-center gap-2 text-xs sm:text-sm text-blue-900 dark:text-blue-200 animate-fade-in shadow-xs">
+                                                        <ReorderIcon className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0" />
+                                                        <span>
+                                                            <strong>Reorder Mode:</strong> Drag any row from anywhere on the card up or down to change its position in the report.
+                                                        </span>
+                                                    </div>
+                                                )}
+
                                                 <div className="space-y-3">
                                                     {batch.findings.map((finding, index) => {
                                                         const isBold = finding.includes('BOLD::');
@@ -3338,55 +3572,77 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                                 key={`${batch.id}-${index}`}
                                                                 data-batch-id={batch.id}
                                                                 data-finding-index={index}
-                                                                onDragEnter={isReorderingThisBatch ? () => (dragOverItem.current = { batchId: batch.id, index }) : undefined}
-                                                                onDrop={isMergingThisBatch ? (e) => handleMergeDrop(e, batch.id, index) : undefined}
-                                                                onDragOver={(isReorderingThisBatch || isMergingThisBatch) ? (e) => e.preventDefault() : undefined}
+                                                                draggable={!isCurrentlyActive && (isReorderingThisBatch || isMergingThisBatch)}
+                                                                onDragStart={
+                                                                    !isCurrentlyActive && isReorderingThisBatch ? (e) => handleReorderDragStart(e, batch.id, index) :
+                                                                    !isCurrentlyActive && isMergingThisBatch ? (e) => handleMergeDragStart(e, batch.id, index) :
+                                                                    undefined
+                                                                }
+                                                                onDragEnd={
+                                                                    isReorderingThisBatch ? (e) => handleReorderDragEnd(e) :
+                                                                    isMergingThisBatch ? () => { setDraggedState(null); setDragOverState(null); dragItem.current = null; } :
+                                                                    undefined
+                                                                }
+                                                                onDragEnter={isReorderingThisBatch ? (e) => { e.stopPropagation(); dragOverItem.current = { batchId: batch.id, index }; } : undefined}
+                                                                onDrop={
+                                                                    isReorderingThisBatch ? (e) => handleReorderDrop(e, batch.id, index) :
+                                                                    isMergingThisBatch ? (e) => handleMergeDrop(e, batch.id, index) :
+                                                                    undefined
+                                                                }
+                                                                onDragOver={(isReorderingThisBatch || isMergingThisBatch) ? (e) => {
+                                                                    e.preventDefault();
+                                                                    e.stopPropagation();
+                                                                    if (e.dataTransfer) {
+                                                                        e.dataTransfer.dropEffect = 'move';
+                                                                    }
+                                                                } : undefined}
                                                                 onDragEnterCapture={isMergingThisBatch ? (e) => { e.preventDefault(); setDragOverState({ batchId: batch.id, index }); } : undefined}
                                                                 onDragLeaveCapture={isMergingThisBatch ? (e) => { e.preventDefault(); setDragOverState(null); } : undefined}
-                                                                className={`finding-item relative group p-3 ${(isReorderingThisBatch || isMergingThisBatch) ? 'pl-16' : 'pl-11'} pr-28 sm:pr-24 border-l-4 rounded-r-lg transition-all duration-200 cursor-pointer ${
+                                                                onTouchStart={!isCurrentlyActive ? (e) => handleRowTouchStart(e, batch.id, index) : undefined}
+                                                                onTouchMove={!isCurrentlyActive ? (e) => handleRowTouchMove(e, batch.id) : undefined}
+                                                                onTouchEnd={!isCurrentlyActive ? () => handleRowTouchEnd(batch.id) : undefined}
+                                                                className={`finding-item relative group p-3 ${(isReorderingThisBatch || isMergingThisBatch) ? 'pl-16 select-none cursor-grab active:cursor-grabbing' : 'pl-11 cursor-pointer'} pr-28 sm:pr-24 border-l-4 rounded-r-lg transition-all duration-200 ${
                                                                     isDragOverTarget
                                                                     ? 'bg-green-100 border-green-500 dark:bg-green-900/30 dark:border-green-500 ring-2 ring-green-200 dark:ring-green-700'
+                                                                    : isMergeSource
+                                                                    ? 'bg-amber-100 border-amber-500 dark:bg-amber-900/40 dark:border-amber-400 ring-2 ring-amber-300 dark:ring-amber-600 shadow-md'
                                                                     : isSelected && !isCurrentlyActive
                                                                     ? 'bg-blue-100 border-blue-600 dark:bg-blue-900/30 dark:border-blue-500 shadow-md'
                                                                     : hasError
                                                                     ? errorClasses[highestSeverity!]
                                                                     : 'bg-slate-50 border-blue-500 dark:bg-slate-700/50 dark:border-blue-500'
-                                                                } ${!isCurrentlyActive ? 'hover:bg-blue-50 dark:hover:bg-slate-700' : ''} ${isDraggingThis ? 'opacity-50 bg-slate-200 dark:bg-slate-600' : ''}`}
+                                                                } ${!isCurrentlyActive && !(isReorderingThisBatch || isMergingThisBatch) ? 'hover:bg-blue-50 dark:hover:bg-slate-700' : ''} ${isDraggingThis ? 'opacity-50 bg-slate-200 dark:bg-slate-600' : ''}`}
                                                                 role="button"
                                                                 aria-pressed={isSelected && !isCurrentlyActive}
                                                                 tabIndex={isCurrentlyActive ? -1 : 0}
                                                                 onClick={
                                                                     isCurrentlyActive
                                                                         ? undefined
+                                                                        : isMergingThisBatch
+                                                                        ? () => handleMergeItemClickForBatch(batch.id, index)
+                                                                        : isReorderingThisBatch
+                                                                        ? undefined
                                                                         : () => handleFindingClickForBatch(batch.id, index)
                                                                 }
                                                                 onKeyDown={
                                                                     isCurrentlyActive
                                                                         ? undefined
-                                                                        : (e) => (e.key === ' ' || e.key === 'Enter') && handleFindingClickForBatch(batch.id, index)
+                                                                        : (e) => {
+                                                                            if (e.key === ' ' || e.key === 'Enter') {
+                                                                                if (isMergingThisBatch) handleMergeItemClickForBatch(batch.id, index);
+                                                                                else if (!isReorderingThisBatch) handleFindingClickForBatch(batch.id, index);
+                                                                            }
+                                                                        }
                                                                 }
                                                             >
                                                                 {(isReorderingThisBatch || isMergingThisBatch) && (
                                                                     <div 
-                                                                        draggable
-                                                                        onDragStart={
-                                                                            isReorderingThisBatch ? () => handleReorderDragStart(batch.id, index) :
-                                                                            isMergingThisBatch ? (e) => handleMergeDragStart(e, batch.id, index) :
-                                                                            undefined
-                                                                        }
-                                                                        onDragEnd={
-                                                                            isReorderingThisBatch ? handleReorderDragEnd :
-                                                                            isMergingThisBatch ? () => { setDraggedState(null); setDragOverState(null); } :
-                                                                            undefined
-                                                                        }
-                                                                        onClick={(e) => e.stopPropagation()}
-                                                                        className="absolute left-1.5 top-0 bottom-0 w-6 flex items-center justify-center cursor-grab active:cursor-grabbing text-slate-400 hover:text-blue-600 dark:text-slate-500 dark:hover:text-blue-400 select-none z-10" 
-                                                                        aria-label={isReorderingThisBatch ? "Drag to reorder" : "Drag to merge"}
-                                                                        title={isReorderingThisBatch ? "Drag to reorder" : "Drag onto another finding to merge"}
+                                                                        className="absolute left-1.5 top-0 bottom-0 w-6 flex items-center justify-center cursor-grab active:cursor-grabbing text-slate-400 hover:text-blue-600 dark:text-slate-500 dark:hover:text-blue-400 select-none z-10 pointer-events-none" 
+                                                                        aria-hidden="true"
                                                                     >
                                                                         {isReorderingThisBatch && <ReorderIcon />}
                                                                         {isMergingThisBatch && (
-                                                                            <MergeIcon className={`w-4 h-4 ${dragOverState?.batchId === batch.id && dragOverState?.index === index ? 'text-green-600 dark:text-green-400 scale-125' : ''} transition-all`} />
+                                                                            <MergeIcon className={`w-4 h-4 ${dragOverState?.batchId === batch.id && dragOverState?.index === index ? 'text-green-600 dark:text-green-400 scale-125' : isMergeSource ? 'text-amber-600 dark:text-amber-400 scale-110' : ''} transition-all`} />
                                                                         )}
                                                                     </div>
                                                                 )}
@@ -3506,6 +3762,37 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                                                     className="p-1.5 sm:p-1 text-slate-600 dark:text-slate-300 hover:text-red-600 dark:hover:text-red-400 rounded-full hover:bg-red-100 dark:hover:bg-red-900/40 transition-colors touch-manipulation"
                                                                                 >
                                                                                     <TrashIcon className="w-5 h-5" />
+                                                                                </button>
+                                                                            </div>
+                                                                        )}
+                                                                        {isReorderingThisBatch && (
+                                                                            <div 
+                                                                                onClick={(e) => e.stopPropagation()} 
+                                                                                className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1.5 z-20"
+                                                                            >
+                                                                                <button
+                                                                                    type="button"
+                                                                                    disabled={index === 0}
+                                                                                    onClick={() => handleMoveFinding(batch.id, index, 'up')}
+                                                                                    className="p-1.5 rounded-lg bg-white dark:bg-slate-700 border border-slate-300 dark:border-slate-600 hover:bg-blue-50 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 disabled:opacity-30 disabled:cursor-not-allowed shadow-xs transition-colors cursor-pointer"
+                                                                                    title="Move finding up"
+                                                                                    aria-label="Move finding up"
+                                                                                >
+                                                                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M5 15l7-7 7 7" />
+                                                                                    </svg>
+                                                                                </button>
+                                                                                <button
+                                                                                    type="button"
+                                                                                    disabled={index === batch.findings.length - 1}
+                                                                                    onClick={() => handleMoveFinding(batch.id, index, 'down')}
+                                                                                    className="p-1.5 rounded-lg bg-white dark:bg-slate-700 border border-slate-300 dark:border-slate-600 hover:bg-blue-50 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 disabled:opacity-30 disabled:cursor-not-allowed shadow-xs transition-colors cursor-pointer"
+                                                                                    title="Move finding down"
+                                                                                    aria-label="Move finding down"
+                                                                                >
+                                                                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M19 9l-7 7-7-7" />
+                                                                                    </svg>
                                                                                 </button>
                                                                             </div>
                                                                         )}
@@ -3789,13 +4076,14 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             </div>
 
             {multiSelectMode && (
-                <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-40 bg-slate-900/95 dark:bg-slate-800/95 text-white rounded-full shadow-2xl border border-slate-700/80 flex items-center gap-3.5 px-5 py-2 transition-all duration-300 ease-in-out backdrop-blur-xs">
-                  <div className="flex items-center gap-2">
-                    <CheckSquare className="w-4 h-4 text-blue-400" />
-                    <p className="text-sm font-semibold whitespace-nowrap">Multi-select Mode</p>
+                <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-40 bg-slate-900/95 dark:bg-slate-800/95 text-white rounded-full shadow-2xl border border-slate-700/80 flex items-center gap-2.5 sm:gap-3 px-3.5 sm:px-4 py-2 transition-all duration-300 ease-in-out backdrop-blur-xs">
+                  <div className="flex items-center gap-1.5">
+                    <CheckSquare className="w-4 h-4 text-blue-400 shrink-0" />
+                    <p className="text-xs sm:text-sm font-semibold whitespace-nowrap">Multi-select Active</p>
                   </div>
+                  <div className="h-4 w-[1px] bg-slate-700"></div>
                   <label htmlFor="multi-select-toggle-batch" className="flex items-center cursor-pointer select-none">
-                    <span className="mr-2 text-xs font-semibold text-slate-400">OFF</span>
+                    <span className="mr-2 text-xs font-semibold text-slate-400">Done</span>
                     <div className="relative">
                       <input 
                         type="checkbox" 
@@ -3808,10 +4096,9 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                           setSelectionSnippets({});
                         }}
                       />
-                      <div className="w-11 h-6 bg-slate-700 rounded-full peer-checked:bg-blue-600 transition-colors border border-slate-600"></div>
-                      <div className="absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform peer-checked:translate-x-5 shadow-xs"></div>
+                      <div className="w-9 h-5 bg-blue-600 rounded-full transition-colors border border-blue-500"></div>
+                      <div className="absolute left-1 top-0.5 bg-white w-4 h-4 rounded-full transition-transform translate-x-4 shadow-xs"></div>
                     </div>
-                    <span className="ml-2 text-xs font-bold text-blue-400">ON</span>
                   </label>
                 </div>
             )}

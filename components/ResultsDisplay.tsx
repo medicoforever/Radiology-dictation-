@@ -32,7 +32,15 @@ import { generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRo
 import { stopRepeatingInterruptedAlert } from '../services/soundService';
 import RichTextReportEditor from './RichTextReportEditor';
 import type { DocxTemplateData } from './ui/CustomPromptInput';
-import { CheckSquare } from 'lucide-react';
+import { CheckSquare, CheckCircle2, FileAudio, FolderDown, RotateCcw, ClipboardPaste, FileText, Trash2, Plus } from 'lucide-react';
+import QuickMacroInsertPopover from './QuickMacroInsertPopover';
+import PasteTextModal from './PasteTextModal';
+import { 
+  saveDictateChangesAudio, 
+  getDictateChangesAudio, 
+  deleteDictateChangesAudio, 
+  hasStoredDictateChangesAudio 
+} from '../services/audioStorage';
 
 interface ChatMessage {
   author: 'You' | 'AI';
@@ -70,9 +78,14 @@ interface ResultsDisplayProps {
   isPausedLive?: boolean;
   identifiedErrors?: IdentifiedError[];
   errorCheckStatus?: 'idle' | 'checking' | 'complete';
+  onOpenMacrosModal?: () => void;
 }
 
-
+const formatAudioDuration = (totalSeconds: number): string => {
+  const mins = Math.floor(totalSeconds / 60);
+  const secs = totalSeconds % 60;
+  return `${mins}:${secs.toString().padStart(2, '0')}`;
+};
 
 const parseStructuredFinding = (finding: string) => {
   const parts = finding.split('###');
@@ -210,6 +223,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   isPausedLive = false,
   identifiedErrors = [],
   errorCheckStatus = 'idle',
+  onOpenMacrosModal,
 }) => {
   const [isAllCopied, setIsAllCopied] = useState<boolean>(false);
   const [selectedIndices, setSelectedIndices] = useState<Set<number>>(new Set<number>());
@@ -372,12 +386,56 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   const {
     startRecording: startGlobalModificationRecording,
     stopRecording: stopGlobalModificationRecording,
+    pauseRecording: pauseGlobalModificationRecording,
+    resumeRecording: resumeGlobalModificationRecording,
+    isPaused: isModificationPaused,
+    recordingDuration: modificationDuration,
     unsavedSession: modifyUnsavedSession,
     recoverUnsavedSession: recoverModifySession,
     discardUnsavedSession: discardModifySession,
     getUnsavedSessionBlob: getModifyRecoveredBlob,
   } = modificationRecorder;
   const [isRecoveringModify, setIsRecoveringModify] = useState(false);
+
+  // Stored and Retrieved Changes Audio
+  const [storedModificationBlob, setStoredModificationBlob] = useState<Blob | null>(null);
+  const [storedModificationMeta, setStoredModificationMeta] = useState<{ timestamp: number; size: number; mimeType: string; name?: string } | null>(null);
+  const [storedModificationAudioUrl, setStoredModificationAudioUrl] = useState<string | null>(null);
+  const [hasPersistedChangesAudio, setHasPersistedChangesAudio] = useState<boolean>(() => hasStoredDictateChangesAudio());
+  const [isRetrievingChangesAudio, setIsRetrievingChangesAudio] = useState(false);
+  const [isApplyingStoredChanges, setIsApplyingStoredChanges] = useState(false);
+  const modificationFileInputRef = useRef<HTMLInputElement>(null);
+
+  // Staged files / pasted text for Dictate Report Changes
+  const [stagedModificationFiles, setStagedModificationFiles] = useState<File[]>([]);
+  const [isModificationPasteModalOpen, setIsModificationPasteModalOpen] = useState(false);
+  const [modificationClipboardPastedText, setModificationClipboardPastedText] = useState('');
+
+  // Synchronize object URL for stored changes audio preview and playback
+  useEffect(() => {
+    if (storedModificationBlob) {
+      const url = URL.createObjectURL(storedModificationBlob);
+      setStoredModificationAudioUrl(url);
+      return () => URL.revokeObjectURL(url);
+    } else {
+      setStoredModificationAudioUrl(null);
+    }
+  }, [storedModificationBlob]);
+
+  // Check and retrieve any previously stored dictate changes audio on mount
+  useEffect(() => {
+    getDictateChangesAudio().then((record) => {
+      if (record && record.blob && record.blob.size > 0) {
+        setHasPersistedChangesAudio(true);
+        setStoredModificationBlob(record.blob);
+        setStoredModificationMeta(record.meta);
+      } else {
+        setHasPersistedChangesAudio(false);
+      }
+    }).catch(err => {
+      console.debug('Notice checking stored changes audio:', err);
+    });
+  }, []);
 
   // State for 'Complex Impression Generation' feature
   const [isComplexGeneratorVisible, setIsComplexGeneratorVisible] = useState(false);
@@ -612,6 +670,16 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     }
   };
 
+  const getValidFindingIndices = useCallback((): Set<number> => {
+    const valid = new Set<number>();
+    findings.forEach((f, i) => {
+      if (f && f.trim() !== '') {
+        valid.add(i);
+      }
+    });
+    return valid;
+  }, [findings]);
+
   const copySelection = async (indices: Set<number>) => {
     if (indices.size === 0) {
       showNotification('Selection cleared.');
@@ -672,8 +740,13 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     const htmlText = html.join('');
 
     const success = await copyToClipboard(plainText, htmlText);
+    const totalValid = getValidFindingIndices().size;
+    const isSubset = indices.size > 0 && indices.size < totalValid;
+    const deselectedCount = totalValid - indices.size;
     const notificationText = success
-      ? `Copied ${indices.size} finding${indices.size > 1 ? 's' : ''}!`
+      ? isSubset
+        ? `Copied ${indices.size} finding${indices.size > 1 ? 's' : ''} (${deselectedCount} deselected)!`
+        : `Copied ${indices.size} finding${indices.size > 1 ? 's' : ''}!`
       : 'Copy failed!';
     showNotification(notificationText);
   };
@@ -858,10 +931,28 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     if (success) {
         setIsAllCopied(true);
         setTimeout(() => setIsAllCopied(false), 2000);
-        showNotification('Copied all!');
+        const allValid = getValidFindingIndices();
+        setSelectedIndices(allValid);
+        setMultiSelectMode(true);
+        showNotification('Copied all! Click any finding or checkbox to deselect.');
     } else {
         showNotification('Copy failed!');
     }
+  };
+
+  const handleSelectAll = async () => {
+    const allValid = getValidFindingIndices();
+    if (allValid.size === 0) return;
+    setSelectedIndices(allValid);
+    setMultiSelectMode(true);
+    await copySelection(allValid);
+    showNotification(`Selected & copied all ${allValid.size} findings! Click any to deselect.`);
+  };
+
+  const handleDeselectAll = () => {
+    setSelectedIndices(new Set<number>());
+    setSelectionSnippets({});
+    showNotification('All findings deselected.');
   };
 
   const handleDownload = () => {
@@ -1133,7 +1224,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     if (isLive) onPauseLive?.();
     setModificationError(null);
     try {
-      await modificationRecorder.startRecording();
+      await startGlobalModificationRecording();
       setModificationState('recording');
     } catch (err) {
       console.warn("Failed to start modification recording:", err);
@@ -1142,23 +1233,185 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   };
 
   const handleStopModification = async () => {
-      const audioBlob = await modificationRecorder.stopRecording();
+    try {
+      const audioBlob = await stopGlobalModificationRecording();
       if (audioBlob && audioBlob.size > 0) {
-          setModificationState('processing');
-          try {
-              setUndoState(findings);
-              const newFindings = await modifyReportWithAudio(findings, audioBlob, selectedModel, customPrompt, customImages);
-              onAllFindingsUpdate(newFindings);
-              setModificationState('idle');
-          } catch (err) {
-              const message = err instanceof Error ? err.message : 'An unknown error occurred.';
-              setModificationError(message);
-              setModificationState('idle');
-          }
-      } else {
+        // Automatically persist changes audio to IndexedDB
+        await saveDictateChangesAudio(audioBlob, 'Voice Changes Dictation');
+        setStoredModificationBlob(audioBlob);
+        setStoredModificationMeta({
+          timestamp: Date.now(),
+          size: audioBlob.size,
+          mimeType: audioBlob.type || 'audio/webm',
+          name: 'Voice Changes Dictation'
+        });
+        setHasPersistedChangesAudio(true);
+
+        // If audio dictate given then without using other file, we can apply it like how at the start.
+        // If there are also staged files, combine them; otherwise apply just audio only!
+        const allItems: Blob[] = [audioBlob, ...stagedModificationFiles];
+
+        setModificationState('processing');
+        try {
+          setUndoState(findings);
+          const newFindings = await modifyReportWithAudio(
+            findings, 
+            allItems.length === 1 ? allItems[0] : allItems, 
+            selectedModel, 
+            customPrompt, 
+            customImages
+          );
+          onAllFindingsUpdate(newFindings);
+          setStagedModificationFiles([]);
+          showNotification('Changes applied and voice dictation stored in browser!');
+        } catch (err) {
+          const message = err instanceof Error ? err.message : 'An unknown error occurred.';
+          setModificationError(message);
+        } finally {
           setModificationState('idle');
+        }
+      } else {
+        setModificationState('idle');
       }
-      if (isLive) onResumeLive?.();
+    } catch (err) {
+      console.warn('Error stopping modification recording:', err);
+      setModificationState('idle');
+    }
+    if (isLive) onResumeLive?.();
+  };
+
+  const handleRetrieveStoredChangesAudio = async () => {
+    setIsRetrievingChangesAudio(true);
+    setModificationError(null);
+    try {
+      const record = await getDictateChangesAudio();
+      if (record && record.blob && record.blob.size > 0) {
+        setStoredModificationBlob(record.blob);
+        setStoredModificationMeta(record.meta);
+        setHasPersistedChangesAudio(true);
+        showNotification('Retrieved stored dictation changes audio from browser!');
+      } else {
+        setHasPersistedChangesAudio(false);
+        showNotification('No stored changes audio found in database.');
+      }
+    } catch (err) {
+      console.error('Failed to retrieve stored changes audio:', err);
+      setModificationError('Failed to retrieve stored audio.');
+    } finally {
+      setIsRetrievingChangesAudio(false);
+    }
+  };
+
+  const handleSaveCurrentChangesAudio = async () => {
+    if (!storedModificationBlob) return;
+    try {
+      await saveDictateChangesAudio(storedModificationBlob, storedModificationMeta?.name || 'Voice Changes Dictation');
+      setHasPersistedChangesAudio(true);
+      showNotification('Audio successfully stored in browser storage (IndexedDB)!');
+    } catch (err) {
+      console.error('Failed to store changes audio:', err);
+      showNotification('Failed to store audio in browser.');
+    }
+  };
+
+  const handleDiscardStoredChangesAudio = async () => {
+    try {
+      await deleteDictateChangesAudio();
+      setStoredModificationBlob(null);
+      setStoredModificationMeta(null);
+      setHasPersistedChangesAudio(false);
+      showNotification('Stored changes audio deleted from browser.');
+    } catch (err) {
+      console.error('Failed to delete stored changes audio:', err);
+    }
+  };
+
+  const handleApplyStoredChangesAudio = async () => {
+    const allItems: Blob[] = [];
+    if (storedModificationBlob && storedModificationBlob.size > 0) {
+      allItems.push(storedModificationBlob);
+    }
+    allItems.push(...stagedModificationFiles);
+
+    if (allItems.length === 0) return;
+    setIsApplyingStoredChanges(true);
+    setModificationError(null);
+    try {
+      setUndoState(findings);
+      const newFindings = await modifyReportWithAudio(
+        findings, 
+        allItems.length === 1 ? allItems[0] : allItems, 
+        selectedModel, 
+        customPrompt, 
+        customImages
+      );
+      onAllFindingsUpdate(newFindings);
+      setStagedModificationFiles([]);
+      showNotification('Changes applied using stored audio/files!');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'An unknown error occurred.';
+      setModificationError(message);
+    } finally {
+      setIsApplyingStoredChanges(false);
+    }
+  };
+
+  const handleDownloadChangesAudio = () => {
+    if (!storedModificationBlob) return;
+    triggerAudioDownload(storedModificationBlob, `dictate-changes-${new Date().toISOString().slice(0, 10)}`);
+  };
+
+  const handleUploadChangesFiles = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files: File[] = Array.from(e.target.files || []);
+    if (files.length > 0) {
+      setStagedModificationFiles(prev => [...prev, ...files]);
+      const audioFile: File | undefined = files.find((f: File) => f.type.startsWith('audio/'));
+      if (audioFile && !storedModificationBlob) {
+        saveDictateChangesAudio(audioFile, audioFile.name).then(() => {
+          setStoredModificationBlob(audioFile);
+          setStoredModificationMeta({
+            timestamp: Date.now(),
+            size: audioFile.size,
+            mimeType: audioFile.type || 'audio/webm',
+            name: audioFile.name
+          });
+          setHasPersistedChangesAudio(true);
+        }).catch(() => {});
+      }
+      showNotification(`Added ${files.length} file(s) for report changes`);
+    }
+    if (e.target) e.target.value = '';
+  };
+
+  const handleApplyStagedModification = async () => {
+    const allItems: Blob[] = [];
+    if (storedModificationBlob) {
+      allItems.push(storedModificationBlob);
+    }
+    allItems.push(...stagedModificationFiles);
+
+    if (allItems.length === 0) return;
+
+    setModificationState('processing');
+    setModificationError(null);
+    try {
+      setUndoState(findings);
+      const newFindings = await modifyReportWithAudio(
+        findings,
+        allItems.length === 1 ? allItems[0] : allItems,
+        selectedModel,
+        customPrompt,
+        customImages
+      );
+      onAllFindingsUpdate(newFindings);
+      setStagedModificationFiles([]);
+      showNotification('Changes applied to report!');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'An unknown error occurred.';
+      setModificationError(message);
+    } finally {
+      setModificationState('idle');
+    }
   };
 
   const handleDownloadRecoveredContinue = async () => {
@@ -1227,10 +1480,21 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     try {
       const recoveredBlob = await recoverModifySession();
       if (recoveredBlob && recoveredBlob.size > 0) {
+        await saveDictateChangesAudio(recoveredBlob, 'Recovered Voice Changes');
+        setStoredModificationBlob(recoveredBlob);
+        setStoredModificationMeta({
+          timestamp: Date.now(),
+          size: recoveredBlob.size,
+          mimeType: recoveredBlob.type || 'audio/webm',
+          name: 'Recovered Voice Changes'
+        });
+        setHasPersistedChangesAudio(true);
+
         setModificationState('processing');
         const modifiedFindings = await modifyReportWithAudio(findings, recoveredBlob, selectedModel, customPrompt, customImages);
         onAllFindingsUpdate(modifiedFindings);
         setModificationState('idle');
+        showNotification('Restored and stored voice changes audio!');
       }
     } catch (err) {
       console.error('Failed to restore and apply modification:', err);
@@ -1921,6 +2185,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                 findings={findings}
                 templateName={activeTemplateName}
                 onUpdateFindings={onAllFindingsUpdate}
+                onOpenMacrosModal={onOpenMacrosModal}
               />
             </div>
           )}
@@ -1962,6 +2227,11 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
               <span className="text-xs sm:text-sm font-semibold text-slate-600 dark:text-slate-300">
                 {findings.filter(f => f && f.trim()).length} findings
               </span>
+              {multiSelectMode && (
+                <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-blue-100 text-blue-700 dark:bg-blue-900/60 dark:text-blue-300">
+                  {selectedIndices.size} selected
+                </span>
+              )}
             </div>
             <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
               {undoState && (
@@ -1973,6 +2243,18 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                   Undo
                 </button>
               )}
+              <QuickMacroInsertPopover
+                onOpenManagerModal={onOpenMacrosModal}
+                onInsertMacroFindings={(expandedLines, macro) => {
+                  setUndoState(findings);
+                  onAllFindingsUpdate([...findings, ...expandedLines]);
+                  setCopyNotification({
+                    text: `Inserted macro: ${macro.name}`,
+                    visible: true,
+                  });
+                  setTimeout(() => setCopyNotification({ text: '', visible: false }), 2500);
+                }}
+              />
               <button
                 type="button"
                 onClick={() => {
@@ -1995,6 +2277,16 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                 <CheckSquare className={`w-4 h-4 ${multiSelectMode ? 'text-white' : 'text-slate-600 dark:text-slate-400'}`} />
                 {multiSelectMode ? 'Done Selecting' : 'Multi-select'}
               </button>
+              {multiSelectMode && (
+                <button
+                  type="button"
+                  onClick={selectedIndices.size === getValidFindingIndices().size ? handleDeselectAll : handleSelectAll}
+                  className="text-xs sm:text-sm font-semibold py-1.5 px-3 rounded-lg transition-colors bg-blue-100 hover:bg-blue-200 text-blue-800 dark:bg-blue-900/50 dark:text-blue-200 dark:hover:bg-blue-900/80 border border-blue-300/80 dark:border-blue-700/80 shadow-sm"
+                  title={selectedIndices.size === getValidFindingIndices().size ? "Deselect all findings" : "Select all findings and copy"}
+                >
+                  {selectedIndices.size === getValidFindingIndices().size ? 'Deselect All' : 'Select All'}
+                </button>
+              )}
               <button
                   onClick={handleToggleMergeMode}
                   className={`text-xs sm:text-sm font-semibold py-1.5 px-3 rounded-lg transition-colors flex items-center gap-1.5 shadow-sm ${mergeMode ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-white text-slate-700 hover:bg-slate-200 border border-slate-200 dark:border-slate-600 dark:bg-slate-700 dark:text-slate-200 dark:hover:bg-slate-600'}`}
@@ -2012,10 +2304,32 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
               <button
                 onClick={handleCopyAll}
                 className={`text-xs sm:text-sm font-semibold py-1.5 px-3.5 rounded-lg transition-colors shadow-sm flex items-center gap-1.5 ${isAllCopied ? 'bg-green-600 text-white' : 'bg-blue-600 text-white hover:bg-blue-700'}`}
+                title="Copy all findings to clipboard with instant deselect option"
               >
                 {isAllCopied ? 'Copied!' : 'Copy All'}
               </button>
             </div>
+        </div>
+      )}
+
+      {/* Multi-Select Mode Guidance Banner */}
+      {multiSelectMode && (
+        <div className="mb-3 p-2.5 sm:p-3 bg-blue-50/90 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800/60 rounded-xl flex flex-wrap items-center justify-between gap-2 text-xs sm:text-sm text-blue-900 dark:text-blue-200 animate-fade-in shadow-xs">
+          <div className="flex items-center gap-2">
+            <CheckSquare className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0" />
+            <span>
+              <strong>Multi-select Active:</strong> {selectedIndices.size} of {getValidFindingIndices().size} findings selected. Tap any finding or checkbox to {selectedIndices.size === getValidFindingIndices().size ? 'deselect one or few' : 'toggle'}. Clipboard updates instantly!
+            </span>
+          </div>
+          {selectedIndices.size > 0 && (
+            <button
+              type="button"
+              onClick={handleDeselectAll}
+              className="text-xs text-blue-600 hover:text-blue-800 dark:text-blue-400 underline font-semibold"
+            >
+              Clear All Selection
+            </button>
+          )}
         </div>
       )}
 
@@ -2417,39 +2731,313 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
             </div>
           </div>
         )}
-        <div className="flex items-start sm:items-center gap-3 flex-col sm:flex-row">
-            <MicScribbleIcon className="w-8 h-8 text-slate-600 dark:text-slate-300 flex-shrink-0" />
-            <div className="flex-grow">
-                <h4 className="font-semibold text-slate-800 dark:text-slate-200">Dictate Report Changes</h4>
-                <p className="text-sm text-slate-600 dark:text-slate-400">
-                    Use this to dictate global changes to the entire report, like 'remove all measurements' or 'rephrase the conclusion to be more concise'.
+        <input
+          type="file"
+          ref={modificationFileInputRef}
+          onChange={handleUploadChangesFiles}
+          className="hidden"
+          accept="audio/*,video/*,image/*,.pdf,.doc,.docx,.txt,.csv,.rtf,.webm,.mp4,.mp3,.wav,.m4a,.png,.jpg,.jpeg"
+          multiple
+          aria-hidden="true"
+        />
+
+        <div className="flex flex-col gap-3">
+          <div className="flex items-start sm:items-center gap-3 flex-col sm:flex-row justify-between">
+            <div className="flex items-start sm:items-center gap-3">
+              <MicScribbleIcon className="w-8 h-8 text-slate-600 dark:text-slate-300 flex-shrink-0" />
+              <div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <h4 className="font-semibold text-slate-800 dark:text-slate-200">Dictate Report Changes</h4>
+                  {hasPersistedChangesAudio && (
+                    <span className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800">
+                      <CheckCircle2 className="w-3 h-3 text-emerald-600 dark:text-emerald-400" />
+                      Audio Stored
+                    </span>
+                  )}
+                  {stagedModificationFiles.length > 0 && (
+                    <span className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-blue-50 dark:bg-blue-950/60 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800">
+                      <FileText className="w-3 h-3 text-blue-600 dark:text-blue-400" />
+                      {stagedModificationFiles.length} file{stagedModificationFiles.length > 1 ? 's' : ''} staged
+                    </span>
+                  )}
+                </div>
+                <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-400 mt-0.5">
+                  Dictate changes, upload any file (audio, text, PDF, images), or paste notes to modify the report. Stored changes audio is preserved in browser.
                 </p>
+              </div>
             </div>
-            <div className="sm:ml-4 flex-shrink-0 w-full sm:w-auto">
-                {modificationState === 'idle' && (
-                    <button onClick={handleStartModification} className="w-full bg-blue-100 text-blue-800 font-bold py-2 px-4 rounded-lg hover:bg-blue-200 dark:bg-blue-900/50 dark:text-blue-300 dark:hover:bg-blue-900/80 transition-colors">
-                        Start Dictating Changes
+
+            <div className="flex-shrink-0 w-full sm:w-auto">
+              {modificationState === 'recording' ? (
+                <div className="flex items-center justify-between sm:justify-end gap-2 bg-red-50 dark:bg-red-950/40 p-1.5 sm:p-2 rounded-xl border border-red-200 dark:border-red-900">
+                  <div className="flex items-center gap-2 px-2.5 py-1 rounded-lg bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300 font-mono text-xs font-bold">
+                    <span className={`w-2.5 h-2.5 rounded-full ${isModificationPaused ? 'bg-yellow-400' : 'bg-red-600 animate-ping'}`}></span>
+                    <span>{formatAudioDuration(modificationDuration)}</span>
+                    {isModificationPaused && <span className="text-[10px] font-sans text-yellow-600 dark:text-yellow-400 font-medium">(Paused)</span>}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={isModificationPaused ? resumeGlobalModificationRecording : pauseGlobalModificationRecording}
+                    className="px-2.5 py-1 text-xs font-semibold rounded-lg bg-amber-100 hover:bg-amber-200 dark:bg-amber-900/50 text-amber-800 dark:text-amber-300 transition-colors cursor-pointer"
+                  >
+                    {isModificationPaused ? 'Resume' : 'Pause'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleStopModification}
+                    className="flex items-center gap-1.5 bg-red-600 hover:bg-red-700 text-white font-bold py-1.5 px-3 rounded-lg text-xs shadow-sm transition-colors cursor-pointer"
+                  >
+                    <StopIcon className="w-4 h-4" />
+                    <span>Stop & Apply</span>
+                  </button>
+                </div>
+              ) : modificationState === 'processing' || isApplyingStoredChanges ? (
+                <div className="flex items-center justify-center gap-2 bg-slate-200 dark:bg-slate-700 px-4 py-2 rounded-xl text-slate-800 dark:text-slate-200 text-xs font-semibold">
+                  <Spinner className="w-4 h-4" />
+                  <span>Applying Changes to Report...</span>
+                </div>
+              ) : (
+                <div className="flex items-center gap-2 flex-wrap justify-start sm:justify-end">
+                  <button
+                    type="button"
+                    onClick={handleStartModification}
+                    className="inline-flex items-center gap-1.5 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-bold py-2 px-4 rounded-xl text-xs sm:text-sm shadow-sm transition-all hover:scale-[1.02] cursor-pointer"
+                    title="Click to start dictating changes with your microphone"
+                  >
+                    <MicIcon className="w-4 h-4" />
+                    <span>Start Dictating Changes</span>
+                  </button>
+
+                  {/* Retrieve Stored Audio button */}
+                  {hasPersistedChangesAudio && !storedModificationBlob && (
+                    <button
+                      type="button"
+                      onClick={handleRetrieveStoredChangesAudio}
+                      disabled={isRetrievingChangesAudio}
+                      className="inline-flex items-center gap-1.5 bg-indigo-50 hover:bg-indigo-100 dark:bg-indigo-950/60 dark:hover:bg-indigo-900/80 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800 font-bold py-2 px-3.5 rounded-xl text-xs sm:text-sm shadow-xs transition-colors cursor-pointer"
+                      title="Retrieve previously stored changes audio from browser IndexedDB"
+                    >
+                      <FolderDown className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
+                      <span>{isRetrievingChangesAudio ? 'Retrieving...' : 'Retrieve Stored Audio'}</span>
                     </button>
-                )}
-                {modificationState === 'recording' && (
-                    <div className="w-full flex items-center justify-center gap-4 bg-red-100 dark:bg-red-900/20 p-2 rounded-lg">
-                        <div className="flex items-center gap-2">
-                            <div className="w-3 h-3 bg-red-500 rounded-full animate-ping"></div>
-                            <span className="font-semibold text-red-700 dark:text-red-300">Recording...</span>
-                        </div>
-                        <button onClick={handleStopModification} className="flex items-center justify-center gap-1 bg-red-600 text-white font-bold py-1 px-3 rounded-lg hover:bg-red-700">
-                            <StopIcon className="w-5 h-5"/>
-                            Stop
-                        </button>
-                    </div>
-                )}
-                {modificationState === 'processing' && (
-                    <div className="w-full flex items-center justify-center gap-2 bg-slate-100 dark:bg-slate-700 p-2 rounded-lg">
-                        <Spinner className="w-6 h-6"/>
-                        <span className="font-semibold text-slate-700 dark:text-slate-300">Applying Changes...</span>
-                    </div>
-                )}
+                  )}
+
+                  {/* Upload any kind of file(s) */}
+                  <button
+                    type="button"
+                    onClick={() => modificationFileInputRef.current?.click()}
+                    className="inline-flex items-center gap-1.5 bg-slate-200 hover:bg-slate-300 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 font-bold py-2 px-3 rounded-xl text-xs sm:text-sm shadow-xs transition-colors cursor-pointer"
+                    title="Upload any file (audio, text, PDF, image, document) to dictate or apply changes"
+                  >
+                    <UploadIcon className="w-4 h-4" />
+                    <span>Upload File(s)</span>
+                  </button>
+
+                  {/* Paste Text button */}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setModificationClipboardPastedText('');
+                      setIsModificationPasteModalOpen(true);
+                    }}
+                    className="inline-flex items-center gap-1.5 bg-slate-200 hover:bg-slate-300 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 font-bold py-2 px-3 rounded-xl text-xs sm:text-sm shadow-xs transition-colors cursor-pointer"
+                    title="Paste text notes, dictation snippets, or EHR text to apply changes"
+                  >
+                    <ClipboardPaste className="w-4 h-4 text-blue-600 dark:text-blue-400" />
+                    <span>Paste Text</span>
+                  </button>
+                </div>
+              )}
             </div>
+          </div>
+
+          {/* Staged Files for Report Changes */}
+          {stagedModificationFiles.length > 0 && modificationState !== 'recording' && (
+            <div className="mt-1 p-3 bg-blue-50/70 dark:bg-blue-950/30 rounded-xl border border-blue-200 dark:border-blue-900/60 shadow-xs flex flex-col gap-2.5 animate-in fade-in duration-150">
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-bold text-slate-800 dark:text-slate-200">
+                    Staged Changes ({stagedModificationFiles.length} item{stagedModificationFiles.length > 1 ? 's' : ''})
+                  </span>
+                  <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                    Ready to apply alone or dictate voice instructions with "Start Dictating Changes" above.
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => modificationFileInputRef.current?.click()}
+                    className="inline-flex items-center gap-1 text-xs font-semibold px-2 py-1 rounded-md bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-750 transition-colors cursor-pointer"
+                  >
+                    <Plus className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+                    <span>Add Files</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setModificationClipboardPastedText('');
+                      setIsModificationPasteModalOpen(true);
+                    }}
+                    className="inline-flex items-center gap-1 text-xs font-semibold px-2 py-1 rounded-md bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-750 transition-colors cursor-pointer"
+                  >
+                    <ClipboardPaste className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+                    <span>Paste Text</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setStagedModificationFiles([])}
+                    className="text-xs font-medium text-slate-500 hover:text-red-600 dark:text-slate-400 dark:hover:text-red-400 px-2 py-1 transition-colors cursor-pointer"
+                  >
+                    Clear All
+                  </button>
+                </div>
+              </div>
+
+              {/* List of staged files */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2">
+                {stagedModificationFiles.map((file, idx) => {
+                  const isAudio = file.type.startsWith('audio/') || /\.(webm|wav|mp3|m4a|ogg|aac)$/i.test(file.name);
+                  const isText = file.type.startsWith('text/') || /\.(txt|csv|md|rtf)$/i.test(file.name);
+                  return (
+                    <div
+                      key={`${file.name}-${idx}`}
+                      className="flex items-center justify-between p-2 rounded-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs shadow-2xs"
+                    >
+                      <div className="flex items-center gap-2 min-w-0">
+                        {isAudio ? (
+                          <FileAudio className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                        ) : isText ? (
+                          <FileText className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0" />
+                        ) : (
+                          <UploadIcon className="w-4 h-4 text-purple-600 dark:text-purple-400 shrink-0" />
+                        )}
+                        <span className="truncate font-medium text-slate-800 dark:text-slate-200 max-w-[140px]" title={file.name}>
+                          {file.name}
+                        </span>
+                        <span className="text-[10px] text-slate-400 shrink-0">
+                          {(file.size / 1024).toFixed(0)} KB
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setStagedModificationFiles(prev => prev.filter((_, i) => i !== idx))}
+                        className="p-1 text-slate-400 hover:text-red-600 dark:hover:text-red-400 rounded transition-colors cursor-pointer ml-1"
+                        title="Remove file"
+                        aria-label="Remove file"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Action bar to apply staged modification */}
+              <div className="flex items-center justify-end pt-1 border-t border-blue-200/60 dark:border-blue-900/40">
+                <button
+                  type="button"
+                  onClick={handleApplyStagedModification}
+                  disabled={modificationState === 'processing' || isApplyingStoredChanges}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-bold rounded-lg bg-blue-600 hover:bg-blue-700 text-white shadow-xs transition-colors disabled:opacity-50 cursor-pointer"
+                >
+                  <SparklesIcon className="w-3.5 h-3.5" />
+                  <span>Apply Changes Now</span>
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Stored / Retrieved Changes Audio Player & Controls */}
+          {storedModificationBlob && modificationState !== 'recording' && (
+            <div className="mt-2 p-3 bg-white dark:bg-slate-800/90 rounded-xl border border-blue-200 dark:border-blue-900/60 shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-3 animate-in fade-in duration-150">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <div className="w-9 h-9 rounded-lg bg-blue-100 dark:bg-blue-900/50 text-blue-600 dark:text-blue-400 flex items-center justify-center shrink-0">
+                  <FileAudio className="w-5 h-5" />
+                </div>
+                <div className="min-w-0 truncate">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-bold text-slate-800 dark:text-slate-100 truncate max-w-[220px]" title={storedModificationMeta?.name || 'Voice Changes Dictation'}>
+                      {storedModificationMeta?.name || 'Voice Changes Dictation'}
+                    </span>
+                    <span className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800">
+                      <CheckCircle2 className="w-3 h-3 text-emerald-600 dark:text-emerald-400" />
+                      Stored in Browser
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-slate-400 dark:text-slate-500 mt-0.5">
+                    {storedModificationMeta?.size ? `${(storedModificationMeta.size / 1024).toFixed(1)} KB` : `${(storedModificationBlob.size / 1024).toFixed(1)} KB`}
+                    {storedModificationMeta?.timestamp ? ` • ${new Date(storedModificationMeta.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}` : ''}
+                  </p>
+                </div>
+              </div>
+
+              {/* Audio playback & action buttons */}
+              <div className="flex items-center gap-2 flex-wrap justify-end">
+                {storedModificationAudioUrl && (
+                  <audio src={storedModificationAudioUrl} controls className="h-7 w-44 sm:w-56" />
+                )}
+
+                <button
+                  type="button"
+                  onClick={handleDownloadChangesAudio}
+                  className="p-1.5 text-slate-500 hover:text-blue-600 dark:text-slate-400 dark:hover:text-blue-400 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors cursor-pointer"
+                  title="Download stored changes audio file"
+                  aria-label="Download stored changes audio"
+                >
+                  <DownloadIcon className="w-4 h-4" />
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleSaveCurrentChangesAudio}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded-lg bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/40 dark:hover:bg-emerald-900/60 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800 transition-colors cursor-pointer"
+                  title="Store audio into browser IndexedDB"
+                >
+                  <span>Store Audio</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleApplyStoredChangesAudio}
+                  disabled={isApplyingStoredChanges || modificationState === 'processing'}
+                  className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-bold rounded-lg bg-blue-600 hover:bg-blue-700 text-white shadow-xs transition-colors disabled:opacity-50 cursor-pointer"
+                  title="Re-apply or apply changes to report with this audio"
+                >
+                  <RotateCcw className={`w-3.5 h-3.5 ${isApplyingStoredChanges ? 'animate-spin' : ''}`} />
+                  <span>{isApplyingStoredChanges ? 'Applying...' : 'Apply Changes'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleDiscardStoredChangesAudio}
+                  className="p-1.5 text-slate-400 hover:text-red-600 dark:hover:text-red-400 rounded-lg hover:bg-red-50 dark:hover:bg-red-950/40 transition-colors cursor-pointer"
+                  title="Discard and delete stored changes audio"
+                  aria-label="Discard stored changes audio"
+                >
+                  <TrashIcon className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Banner when audio is stored in database but not yet loaded into active state */}
+          {hasPersistedChangesAudio && !storedModificationBlob && modificationState !== 'recording' && (
+            <div className="mt-1 p-2.5 bg-indigo-50/80 dark:bg-indigo-950/40 border border-indigo-200 dark:border-indigo-800 rounded-xl flex items-center justify-between gap-2 text-xs text-indigo-900 dark:text-indigo-200 animate-in fade-in">
+              <div className="flex items-center gap-2">
+                <FolderDown className="w-4 h-4 text-indigo-600 dark:text-indigo-400 shrink-0" />
+                <span>Previously recorded changes audio is preserved in browser storage.</span>
+              </div>
+              <button
+                type="button"
+                onClick={handleRetrieveStoredChangesAudio}
+                disabled={isRetrievingChangesAudio}
+                className="font-bold text-indigo-600 dark:text-indigo-400 hover:underline flex items-center gap-1 cursor-pointer"
+              >
+                <span>{isRetrievingChangesAudio ? 'Retrieving...' : 'Retrieve Stored Audio'}</span>
+                <span>→</span>
+              </button>
+            </div>
+          )}
         </div>
         {modificationError && <p className="text-red-500 dark:text-red-400 text-sm mt-2">{modificationError}</p>}
       </div>
@@ -2729,13 +3317,23 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
       )}
 
       {multiSelectMode && (
-          <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-40 bg-slate-900/95 dark:bg-slate-800/95 text-white rounded-full shadow-2xl border border-slate-700/80 flex items-center gap-3.5 px-5 py-2 transition-all duration-300 ease-in-out backdrop-blur-xs">
-            <div className="flex items-center gap-2">
-              <CheckSquare className="w-4 h-4 text-blue-400" />
-              <p className="text-sm font-semibold whitespace-nowrap">Multi-select Mode</p>
+          <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-40 bg-slate-900/95 dark:bg-slate-800/95 text-white rounded-full shadow-2xl border border-slate-700/80 flex items-center gap-2.5 sm:gap-3 px-3.5 sm:px-4 py-2 transition-all duration-300 ease-in-out backdrop-blur-xs">
+            <div className="flex items-center gap-1.5">
+              <CheckSquare className="w-4 h-4 text-blue-400 shrink-0" />
+              <p className="text-xs sm:text-sm font-semibold whitespace-nowrap">
+                {selectedIndices.size}/{getValidFindingIndices().size} selected
+              </p>
             </div>
+            <button
+              type="button"
+              onClick={selectedIndices.size === getValidFindingIndices().size ? handleDeselectAll : handleSelectAll}
+              className="text-xs bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200 px-2.5 py-1 rounded-full font-medium transition-colors cursor-pointer whitespace-nowrap"
+            >
+              {selectedIndices.size === getValidFindingIndices().size ? 'Deselect All' : 'Select All'}
+            </button>
+            <div className="h-4 w-[1px] bg-slate-700"></div>
             <label htmlFor="multi-select-toggle-single" className="flex items-center cursor-pointer select-none">
-              <span className="mr-2 text-xs font-semibold text-slate-400">OFF</span>
+              <span className="mr-2 text-xs font-semibold text-slate-400">Done</span>
               <div className="relative">
                 <input 
                   type="checkbox" 
@@ -2751,10 +3349,23 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                 <div className="w-11 h-6 bg-slate-700 rounded-full peer-checked:bg-blue-600 transition-colors border border-slate-600"></div>
                 <div className="absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform peer-checked:translate-x-5 shadow-xs"></div>
               </div>
-              <span className="ml-2 text-xs font-bold text-blue-400">ON</span>
             </label>
           </div>
       )}
+
+      {/* Paste Text Modal for Dictating Changes */}
+      <PasteTextModal
+        isOpen={isModificationPasteModalOpen}
+        onClose={() => setIsModificationPasteModalOpen(false)}
+        initialText={modificationClipboardPastedText}
+        onProcessSingle={(files: File[]) => {
+          setStagedModificationFiles(prev => [...prev, ...files]);
+          setIsModificationPasteModalOpen(false);
+          setModificationClipboardPastedText('');
+          showNotification(`Added ${files.length} text/file item(s) for report changes`);
+        }}
+        mode="single"
+      />
     </div>
   );
 };

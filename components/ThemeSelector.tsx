@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { 
   Sun, 
   Moon, 
@@ -8,6 +8,14 @@ import {
   Leaf, 
   Sunset, 
   Waves, 
+  Compass, 
+  Terminal, 
+  Crown, 
+  Snowflake, 
+  Flame, 
+  Flower2, 
+  Feather, 
+  Coffee, 
   Check, 
   ChevronDown 
 } from 'lucide-react';
@@ -20,7 +28,15 @@ export type AppTheme =
   | 'creative'
   | 'soothing'
   | 'sunset'
-  | 'ocean';
+  | 'ocean'
+  | 'aurora'
+  | 'cyberpunk'
+  | 'velvet'
+  | 'nordic'
+  | 'solar'
+  | 'sakura'
+  | 'lavender'
+  | 'espresso';
 
 export interface ThemeOption {
   id: AppTheme;
@@ -104,6 +120,78 @@ export const THEME_OPTIONS: ThemeOption[] = [
     icon: Waves,
     isDark: true,
     swatchGradient: 'linear-gradient(135deg, #081326 0%, #0369a1 40%, #06b6d4 70%, #14b8a6 100%)'
+  },
+  {
+    id: 'aurora',
+    name: 'Aurora Borealis',
+    subtitle: 'Cosmic polar ribbons, teal & boreal green',
+    badge: 'Boreal',
+    icon: Compass,
+    isDark: true,
+    swatchGradient: 'linear-gradient(135deg, #042f2e 0%, #0d9488 35%, #10b981 70%, #a7f3d0 100%)'
+  },
+  {
+    id: 'cyberpunk',
+    name: 'Cyber Neon',
+    subtitle: 'High-voltage phosphor lime & terminal noir',
+    badge: 'High-Tech',
+    icon: Terminal,
+    isDark: true,
+    swatchGradient: 'linear-gradient(135deg, #022c22 0%, #15803d 40%, #22c55e 75%, #a3e635 100%)'
+  },
+  {
+    id: 'velvet',
+    name: 'Midnight Velvet',
+    subtitle: 'Imperial royal plum, amethyst & rich wine',
+    badge: 'Regal',
+    icon: Crown,
+    isDark: true,
+    swatchGradient: 'linear-gradient(135deg, #2e0854 0%, #6b21a8 40%, #a21caf 75%, #f472b6 100%)'
+  },
+  {
+    id: 'nordic',
+    name: 'Nordic Frost',
+    subtitle: 'Scandinavian fjord, polar ice & glacial slate',
+    badge: 'Minimal',
+    icon: Snowflake,
+    isDark: false,
+    swatchGradient: 'linear-gradient(135deg, #f0f9ff 0%, #bae6fd 40%, #38bdf8 75%, #0284c7 100%)'
+  },
+  {
+    id: 'solar',
+    name: 'Solar Amber',
+    subtitle: 'Radiant golden dawn, roasted honey & amber',
+    badge: 'Radiant',
+    icon: Flame,
+    isDark: false,
+    swatchGradient: 'linear-gradient(135deg, #fffbeb 0%, #fde68a 35%, #f59e0b 70%, #b45309 100%)'
+  },
+  {
+    id: 'sakura',
+    name: 'Cherry Blossom',
+    subtitle: 'Kyoto spring petals, soft blush & sakura rose',
+    badge: 'Elegant',
+    icon: Flower2,
+    isDark: false,
+    swatchGradient: 'linear-gradient(135deg, #fff1f2 0%, #fecdd3 35%, #fb7185 70%, #e11d48 100%)'
+  },
+  {
+    id: 'lavender',
+    name: 'Lavender Mist',
+    subtitle: 'Soft Provençal lilac, dreamy violet & silk calm',
+    badge: 'Serene',
+    icon: Feather,
+    isDark: false,
+    swatchGradient: 'linear-gradient(135deg, #faf5ff 0%, #e9d5ff 40%, #c084fc 75%, #9333ea 100%)'
+  },
+  {
+    id: 'espresso',
+    name: 'Warm Espresso',
+    subtitle: 'Artisan dark roast, caramel cream & bronze',
+    badge: 'Artisan',
+    icon: Coffee,
+    isDark: true,
+    swatchGradient: 'linear-gradient(135deg, #1c140e 0%, #451a03 40%, #78350f 75%, #d97706 100%)'
   }
 ];
 
@@ -114,10 +202,21 @@ interface ThemeSelectorProps {
 
 export const ThemeSelector: React.FC<ThemeSelectorProps> = ({ currentTheme, onThemeChange }) => {
   const [isOpen, setIsOpen] = useState(false);
+  const [filterMode, setFilterMode] = useState<'all' | 'light' | 'dark'>('all');
   const dropdownRef = useRef<HTMLDivElement>(null);
 
   const activeOption = THEME_OPTIONS.find(t => t.id === currentTheme) || THEME_OPTIONS[0];
   const ActiveIcon = activeOption.icon;
+
+  const filteredOptions = useMemo(() => {
+    if (filterMode === 'light') {
+      return THEME_OPTIONS.filter(t => !t.isDark);
+    }
+    if (filterMode === 'dark') {
+      return THEME_OPTIONS.filter(t => t.isDark);
+    }
+    return THEME_OPTIONS;
+  }, [filterMode]);
 
   // Close when clicking outside
   useEffect(() => {
@@ -167,7 +266,7 @@ export const ThemeSelector: React.FC<ThemeSelectorProps> = ({ currentTheme, onTh
           aria-hidden="true"
         />
         <ActiveIcon className="w-4 h-4 sm:w-4.5 sm:h-4.5 text-current" />
-        <span className="text-xs font-semibold hidden lg:inline max-w-[85px] truncate">
+        <span className="text-xs font-semibold hidden lg:inline max-w-[95px] truncate">
           {activeOption.name.split('/')[0].trim()}
         </span>
         <ChevronDown className={`w-3 h-3 text-slate-400 transition-transform duration-200 ${isOpen ? 'rotate-180' : ''}`} />
@@ -176,21 +275,60 @@ export const ThemeSelector: React.FC<ThemeSelectorProps> = ({ currentTheme, onTh
       {/* Popover Menu */}
       {isOpen && (
         <div 
-          className="absolute right-0 mt-2 w-72 sm:w-80 rounded-2xl bg-white/95 dark:bg-slate-900/95 backdrop-blur-xl border border-slate-200/80 dark:border-slate-700/80 shadow-2xl p-2 z-50 animate-fadeIn"
+          className="absolute right-0 mt-2 w-80 sm:w-96 rounded-2xl bg-white/95 dark:bg-slate-900/95 backdrop-blur-xl border border-slate-200/80 dark:border-slate-700/80 shadow-2xl p-2.5 z-50 animate-fadeIn"
           role="listbox"
           aria-label="Theme choices"
         >
-          <div className="px-3 py-2 border-b border-slate-100 dark:border-slate-800/80 mb-1 flex items-center justify-between">
+          {/* Header */}
+          <div className="px-2.5 py-1.5 border-b border-slate-100 dark:border-slate-800/80 mb-2 flex items-center justify-between">
             <span className="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
               Appearance & Modes
             </span>
-            <span className="text-[11px] font-medium text-slate-400 dark:text-slate-500">
-              8 Themes
+            <span className="text-[11px] font-semibold text-slate-400 dark:text-slate-500">
+              {THEME_OPTIONS.length} Themes
             </span>
           </div>
 
-          <div className="max-h-[360px] overflow-y-auto space-y-1 pr-0.5">
-            {THEME_OPTIONS.map((themeOption) => {
+          {/* Quick Filter Tabs */}
+          <div className="flex items-center gap-1 p-1 bg-slate-100 dark:bg-slate-800/80 rounded-xl mb-2">
+            <button
+              type="button"
+              onClick={() => setFilterMode('all')}
+              className={`flex-1 py-1 px-2 text-xs font-medium rounded-lg transition-colors cursor-pointer text-center ${
+                filterMode === 'all'
+                  ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-xs font-semibold'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+              }`}
+            >
+              All ({THEME_OPTIONS.length})
+            </button>
+            <button
+              type="button"
+              onClick={() => setFilterMode('light')}
+              className={`flex-1 py-1 px-2 text-xs font-medium rounded-lg transition-colors cursor-pointer text-center ${
+                filterMode === 'light'
+                  ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-xs font-semibold'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+              }`}
+            >
+              Light ({THEME_OPTIONS.filter(t => !t.isDark).length})
+            </button>
+            <button
+              type="button"
+              onClick={() => setFilterMode('dark')}
+              className={`flex-1 py-1 px-2 text-xs font-medium rounded-lg transition-colors cursor-pointer text-center ${
+                filterMode === 'dark'
+                  ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-xs font-semibold'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+              }`}
+            >
+              Dark ({THEME_OPTIONS.filter(t => t.isDark).length})
+            </button>
+          </div>
+
+          {/* List of Themes */}
+          <div className="max-h-[380px] overflow-y-auto space-y-1 pr-0.5">
+            {filteredOptions.map((themeOption) => {
               const isSelected = themeOption.id === currentTheme;
               const Icon = themeOption.icon;
 
@@ -202,7 +340,7 @@ export const ThemeSelector: React.FC<ThemeSelectorProps> = ({ currentTheme, onTh
                     onThemeChange(themeOption.id);
                     setIsOpen(false);
                   }}
-                  className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-left transition-all cursor-pointer group ${
+                  className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl text-left transition-all cursor-pointer group ${
                     isSelected
                       ? 'bg-blue-50/90 dark:bg-blue-950/60 text-blue-900 dark:text-blue-100 border border-blue-200 dark:border-blue-700/60 shadow-xs'
                       : 'hover:bg-slate-100/80 dark:hover:bg-slate-800/70 text-slate-700 dark:text-slate-200 border border-transparent'
@@ -231,6 +369,14 @@ export const ThemeSelector: React.FC<ThemeSelectorProps> = ({ currentTheme, onTh
                         themeOption.id === 'soothing' ? 'bg-emerald-100 dark:bg-emerald-900/50 text-emerald-700 dark:text-emerald-300' :
                         themeOption.id === 'sunset' ? 'bg-rose-100 dark:bg-rose-900/50 text-rose-700 dark:text-rose-300' :
                         themeOption.id === 'ocean' ? 'bg-cyan-100 dark:bg-cyan-900/50 text-cyan-700 dark:text-cyan-300' :
+                        themeOption.id === 'aurora' ? 'bg-teal-100 dark:bg-teal-900/50 text-teal-700 dark:text-teal-300' :
+                        themeOption.id === 'cyberpunk' ? 'bg-lime-100 dark:bg-lime-900/50 text-lime-700 dark:text-lime-300' :
+                        themeOption.id === 'velvet' ? 'bg-fuchsia-100 dark:bg-fuchsia-900/50 text-fuchsia-700 dark:text-fuchsia-300' :
+                        themeOption.id === 'nordic' ? 'bg-sky-100 dark:bg-sky-900/50 text-sky-700 dark:text-sky-300' :
+                        themeOption.id === 'solar' ? 'bg-amber-100 dark:bg-amber-900/50 text-amber-700 dark:text-amber-300' :
+                        themeOption.id === 'sakura' ? 'bg-rose-100 dark:bg-rose-900/50 text-rose-700 dark:text-rose-300' :
+                        themeOption.id === 'lavender' ? 'bg-violet-100 dark:bg-violet-900/50 text-violet-700 dark:text-violet-300' :
+                        themeOption.id === 'espresso' ? 'bg-amber-100 dark:bg-amber-950/60 text-amber-800 dark:text-amber-200' :
                         'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400'
                       }`}>
                         {themeOption.badge}

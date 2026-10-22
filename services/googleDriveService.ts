@@ -1036,3 +1036,101 @@ export function extractFindingsFromHtml(html: string): string[] {
   }
   return [];
 }
+
+/**
+ * Loads a JSON configuration file (e.g. macros and dictionary) from the root "Radiology Dictations" folder in Google Drive.
+ */
+export async function loadJsonFileFromRootFolder<T = any>(fileName: string): Promise<T | null> {
+  if (!isDriveConnected()) return null;
+  try {
+    const rootId = await getOrCreateRootFolder();
+    const existing = await findFileInFolder(fileName, rootId);
+    if (!existing) return null;
+
+    const res = await driveFetch(`https://www.googleapis.com/drive/v3/files/${existing.id}?alt=media`);
+    if (!res.ok) return null;
+    const text = await res.text();
+    return JSON.parse(text) as T;
+  } catch (err) {
+    console.warn(`Failed to load JSON file "${fileName}" from Google Drive:`, err);
+    return null;
+  }
+}
+
+/**
+ * Saves or updates a JSON configuration file inside the root "Radiology Dictations" folder in Google Drive.
+ */
+export async function saveJsonFileToRootFolder(fileName: string, data: any): Promise<boolean> {
+  if (!isDriveConnected()) return false;
+  const mutexKey = `json_root:${fileName}`;
+  const prevLock = fileSaveMutexes.get(mutexKey) || Promise.resolve();
+
+  const nextPromise = prevLock
+    .catch(() => {})
+    .then(async () => {
+      try {
+        const rootId = await getOrCreateRootFolder();
+        const existing = await findFileInFolder(fileName, rootId);
+        const jsonContent = JSON.stringify(data, null, 2);
+
+        if (existing) {
+          await driveFetch(
+            `https://www.googleapis.com/upload/drive/v3/files/${existing.id}?uploadType=media&fields=id,name`,
+            {
+              method: 'PATCH',
+              headers: {
+                'Content-Type': 'application/json; charset=UTF-8',
+              },
+              body: jsonContent,
+            }
+          );
+          return true;
+        }
+
+        const metadata = {
+          name: fileName,
+          parents: [rootId],
+          mimeType: 'application/json',
+          description: 'RADDOC Dictation App - Synced Voice Macros and Autotext Dictionary',
+        };
+
+        const boundary = '-------314159265358979323846JsonSync';
+        const delimiter = `\r\n--${boundary}\r\n`;
+        const closeDelimiter = `\r\n--${boundary}--`;
+
+        const multipartRequestBody =
+          delimiter +
+          'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
+          JSON.stringify(metadata) +
+          delimiter +
+          'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
+          jsonContent +
+          closeDelimiter;
+
+        await driveFetch(
+          'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name',
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': `multipart/related; boundary=${boundary}`,
+            },
+            body: multipartRequestBody,
+          }
+        );
+        return true;
+      } catch (err) {
+        console.warn(`Failed to save JSON file "${fileName}" to Google Drive:`, err);
+        return false;
+      }
+    });
+
+  fileSaveMutexes.set(mutexKey, nextPromise);
+  try {
+    return await nextPromise;
+  } finally {
+    if (fileSaveMutexes.get(mutexKey) === nextPromise) {
+      fileSaveMutexes.delete(mutexKey);
+    }
+  }
+}
+
