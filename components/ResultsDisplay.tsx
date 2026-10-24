@@ -2222,22 +2222,17 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         </div>
       </div>
       {findings.length > 0 && (
-        <div className="flex flex-wrap justify-between items-center gap-2 mb-4 p-2 bg-slate-100/70 dark:bg-slate-800/70 rounded-xl border border-slate-200/80 dark:border-slate-700/80">
-            <div className="flex items-center gap-2">
+        <div className="flex items-center justify-between gap-2 mb-4 p-2 bg-slate-100/70 dark:bg-slate-800/70 rounded-xl border border-slate-200/80 dark:border-slate-700/80 min-h-[46px]">
+            <div className="flex items-center gap-2 shrink-0">
               <span className="text-xs sm:text-sm font-semibold text-slate-600 dark:text-slate-300">
-                {findings.filter(f => f && f.trim()).length} findings
+                {findings.filter(f => f && f.trim()).length} findings{multiSelectMode ? ` (${selectedIndices.size} selected)` : ''}
               </span>
-              {multiSelectMode && (
-                <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-blue-100 text-blue-700 dark:bg-blue-900/60 dark:text-blue-300">
-                  {selectedIndices.size} selected
-                </span>
-              )}
             </div>
-            <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
+            <div className="flex items-center gap-1.5 sm:gap-2 flex-nowrap overflow-x-auto no-scrollbar shrink-0">
               {undoState && (
                 <button
                   onClick={handleUndo}
-                  className="text-xs sm:text-sm font-semibold py-1.5 px-3 rounded-lg bg-yellow-400 text-yellow-900 hover:bg-yellow-500 transition-colors shadow-sm"
+                  className="text-xs sm:text-sm font-semibold py-1.5 px-3 rounded-lg bg-yellow-400 text-yellow-900 hover:bg-yellow-500 transition-colors shadow-sm shrink-0"
                   aria-label="Undo last modification"
                 >
                   Undo
@@ -2267,7 +2262,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                     return next;
                   });
                 }}
-                className={`text-xs sm:text-sm font-semibold py-1.5 px-3 rounded-lg transition-colors flex items-center gap-1.5 shadow-sm ${
+                className={`text-xs sm:text-sm font-semibold py-1.5 px-3 rounded-lg transition-colors flex items-center gap-1.5 shadow-sm shrink-0 ${
                   multiSelectMode
                     ? 'bg-blue-600 text-white hover:bg-blue-700'
                     : 'bg-white text-slate-700 hover:bg-slate-200 border border-slate-200 dark:border-slate-600 dark:bg-slate-700 dark:text-slate-200 dark:hover:bg-slate-600'
@@ -2275,63 +2270,44 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                 title="Toggle Multi-select Mode to select and copy multiple findings"
               >
                 <CheckSquare className={`w-4 h-4 ${multiSelectMode ? 'text-white' : 'text-slate-600 dark:text-slate-400'}`} />
-                {multiSelectMode ? 'Done Selecting' : 'Multi-select'}
+                {multiSelectMode ? 'Done' : 'Multi-select'}
               </button>
-              {multiSelectMode && (
-                <button
-                  type="button"
-                  onClick={selectedIndices.size === getValidFindingIndices().size ? handleDeselectAll : handleSelectAll}
-                  className="text-xs sm:text-sm font-semibold py-1.5 px-3 rounded-lg transition-colors bg-blue-100 hover:bg-blue-200 text-blue-800 dark:bg-blue-900/50 dark:text-blue-200 dark:hover:bg-blue-900/80 border border-blue-300/80 dark:border-blue-700/80 shadow-sm"
-                  title={selectedIndices.size === getValidFindingIndices().size ? "Deselect all findings" : "Select all findings and copy"}
-                >
-                  {selectedIndices.size === getValidFindingIndices().size ? 'Deselect All' : 'Select All'}
-                </button>
-              )}
               <button
                   onClick={handleToggleMergeMode}
-                  className={`text-xs sm:text-sm font-semibold py-1.5 px-3 rounded-lg transition-colors flex items-center gap-1.5 shadow-sm ${mergeMode ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-white text-slate-700 hover:bg-slate-200 border border-slate-200 dark:border-slate-600 dark:bg-slate-700 dark:text-slate-200 dark:hover:bg-slate-600'}`}
+                  className={`text-xs sm:text-sm font-semibold py-1.5 px-3 rounded-lg transition-colors flex items-center gap-1.5 shadow-sm shrink-0 ${mergeMode ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-white text-slate-700 hover:bg-slate-200 border border-slate-200 dark:border-slate-600 dark:bg-slate-700 dark:text-slate-200 dark:hover:bg-slate-600'}`}
                 >
                 <MergeIcon className={`w-4 h-4 ${mergeMode ? 'text-white' : 'text-slate-600 dark:text-slate-400'}`} />
                 {mergeMode ? 'Done' : 'Merge'}
               </button>
               <button
                   onClick={handleToggleReorderMode}
-                  className={`text-xs sm:text-sm font-semibold py-1.5 px-3 rounded-lg transition-colors flex items-center gap-1.5 shadow-sm ${reorderMode ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-white text-slate-700 hover:bg-slate-200 border border-slate-200 dark:border-slate-600 dark:bg-slate-700 dark:text-slate-200 dark:hover:bg-slate-600'}`}
+                  className={`text-xs sm:text-sm font-semibold py-1.5 px-3 rounded-lg transition-colors flex items-center gap-1.5 shadow-sm shrink-0 ${reorderMode ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-white text-slate-700 hover:bg-slate-200 border border-slate-200 dark:border-slate-600 dark:bg-slate-700 dark:text-slate-200 dark:hover:bg-slate-600'}`}
                 >
                 <ReorderIcon className={`w-4 h-4 ${reorderMode ? 'text-white' : 'text-slate-600 dark:text-slate-400'}`} />
                 {reorderMode ? 'Done' : 'Reorder'}
               </button>
-              <button
-                onClick={handleCopyAll}
-                className={`text-xs sm:text-sm font-semibold py-1.5 px-3.5 rounded-lg transition-colors shadow-sm flex items-center gap-1.5 ${isAllCopied ? 'bg-green-600 text-white' : 'bg-blue-600 text-white hover:bg-blue-700'}`}
-                title="Copy all findings to clipboard with instant deselect option"
-              >
-                {isAllCopied ? 'Copied!' : 'Copy All'}
-              </button>
+              {multiSelectMode ? (
+                <button
+                  type="button"
+                  onClick={selectedIndices.size === getValidFindingIndices().size ? handleDeselectAll : handleSelectAll}
+                  className="text-xs sm:text-sm font-semibold py-1.5 px-3 rounded-lg transition-colors bg-blue-100 hover:bg-blue-200 text-blue-800 dark:bg-blue-900/50 dark:text-blue-200 dark:hover:bg-blue-900/80 border border-blue-300/80 dark:border-blue-700/80 shadow-sm shrink-0"
+                  title={selectedIndices.size === getValidFindingIndices().size ? "Deselect all findings" : "Select all findings and copy"}
+                >
+                  {selectedIndices.size === getValidFindingIndices().size ? 'Deselect All' : 'Select All'}
+                </button>
+              ) : (
+                <button
+                  onClick={handleCopyAll}
+                  className={`text-xs sm:text-sm font-semibold py-1.5 px-3.5 rounded-lg transition-colors shadow-sm flex items-center gap-1.5 shrink-0 ${isAllCopied ? 'bg-green-600 text-white' : 'bg-blue-600 text-white hover:bg-blue-700'}`}
+                  title="Copy all findings to clipboard with instant deselect option"
+                >
+                  {isAllCopied ? 'Copied!' : 'Copy All'}
+                </button>
+              )}
             </div>
         </div>
       )}
 
-      {/* Multi-Select Mode Guidance Banner */}
-      {multiSelectMode && (
-        <div className="mb-3 p-2.5 sm:p-3 bg-blue-50/90 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800/60 rounded-xl flex flex-wrap items-center justify-between gap-2 text-xs sm:text-sm text-blue-900 dark:text-blue-200 animate-fade-in shadow-xs">
-          <div className="flex items-center gap-2">
-            <CheckSquare className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0" />
-            <span>
-              <strong>Multi-select Active:</strong> {selectedIndices.size} of {getValidFindingIndices().size} findings selected. Tap any finding or checkbox to {selectedIndices.size === getValidFindingIndices().size ? 'deselect one or few' : 'toggle'}. Clipboard updates instantly!
-            </span>
-          </div>
-          {selectedIndices.size > 0 && (
-            <button
-              type="button"
-              onClick={handleDeselectAll}
-              className="text-xs text-blue-600 hover:text-blue-800 dark:text-blue-400 underline font-semibold"
-            >
-              Clear All Selection
-            </button>
-          )}
-        </div>
-      )}
 
       {/* Merge Mode Guidance Banner */}
       {mergeMode && (
@@ -3331,6 +3307,16 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
             >
               {selectedIndices.size === getValidFindingIndices().size ? 'Deselect All' : 'Select All'}
             </button>
+            {selectedIndices.size > 0 && selectedIndices.size < getValidFindingIndices().size && (
+              <button
+                type="button"
+                onClick={handleDeselectAll}
+                className="text-xs bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200 px-2.5 py-1 rounded-full font-medium transition-colors cursor-pointer whitespace-nowrap"
+                title="Clear selected findings"
+              >
+                Clear
+              </button>
+            )}
             <div className="h-4 w-[1px] bg-slate-700"></div>
             <label htmlFor="multi-select-toggle-single" className="flex items-center cursor-pointer select-none">
               <span className="mr-2 text-xs font-semibold text-slate-400">Done</span>
