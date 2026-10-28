@@ -7,6 +7,7 @@ import { VitePWA } from 'vite-plugin-pwa';
 export default defineConfig(({ mode }) => {
     const env = loadEnv(mode, '.', '');
     return {
+      base: './',
       server: {
         port: 3000,
         host: '0.0.0.0',
@@ -18,30 +19,30 @@ export default defineConfig(({ mode }) => {
           registerType: 'autoUpdate',
           includeAssets: ['apple-touch-icon.png', 'pwa-192x192.png', 'pwa-512x512.png', 'yinyang-mic.svg'],
           manifest: {
-            id: '/',
+            id: './',
             name: "RADDOC's Dictation app",
             short_name: 'RADDOC',
             description: 'AI-powered radiology dictation and reporting assistant.',
             theme_color: '#0f172a',
             background_color: '#f8fafc',
             display: 'standalone',
-            start_url: '/',
-            scope: '/',
+            start_url: './',
+            scope: './',
             icons: [
               {
-                src: '/pwa-192x192.png',
+                src: 'pwa-192x192.png',
                 sizes: '192x192',
                 type: 'image/png',
                 purpose: 'any',
               },
               {
-                src: '/pwa-512x512.png',
+                src: 'pwa-512x512.png',
                 sizes: '512x512',
                 type: 'image/png',
                 purpose: 'any',
               },
               {
-                src: '/pwa-512x512.png',
+                src: 'pwa-512x512.png',
                 sizes: '512x512',
                 type: 'image/png',
                 purpose: 'maskable',

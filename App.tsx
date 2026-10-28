@@ -29,10 +29,12 @@ import { autoSaveSingleDictation, autoSaveLiveDictation, SaveResult, syncPending
 import { DriveStatusBadge } from './components/DriveStatusBadge';
 import { DriveAutoSaveToast } from './components/DriveAutoSaveToast';
 import { DriveReportsModal } from './components/DriveReportsModal';
-import { RotateCcw, X, ExternalLink, Power, Sparkles, Trash2, Download, Settings, ShieldCheck, BookOpen } from 'lucide-react';
+import { RotateCcw, X, ExternalLink, Power, Sparkles, Trash2, Download, Settings, ShieldCheck, BookOpen, Key } from 'lucide-react';
 import WorkstationSyncModal from './components/WorkstationSyncModal';
 import { checkAndAutoSyncReport } from './services/workstationSync';
 import { OwnershipModal } from './components/ui/OwnershipModal';
+import { ApiKeyModal } from './components/ApiKeyModal';
+import { getUserApiKeys, API_KEYS_UPDATED_EVENT } from './services/apiKeyService';
 import ThemeSelector from './components/ThemeSelector';
 import { getUpcomingTemplate, clearUpcomingTemplate, subscribeToUpcomingTemplate, UpcomingTemplateConfig } from './services/upcomingTemplateService';
 import MacrosAndDictionaryModal from './components/MacrosAndDictionaryModal';
@@ -150,7 +152,15 @@ const App: React.FC = () => {
   const [isWorkstationSyncModalOpen, setIsWorkstationSyncModalOpen] = useState<boolean>(false);
   const [isOwnershipModalOpen, setIsOwnershipModalOpen] = useState<boolean>(false);
   const [isMacrosModalOpen, setIsMacrosModalOpen] = useState<boolean>(false);
+  const [isApiKeyModalOpen, setIsApiKeyModalOpen] = useState<boolean>(false);
   const [activeMacrosCount, setActiveMacrosCount] = useState<number>(0);
+  const [customKeysCount, setCustomKeysCount] = useState<number>(() => getUserApiKeys().length);
+
+  useEffect(() => {
+    const handleKeyUpdate = () => setCustomKeysCount(getUserApiKeys().length);
+    window.addEventListener(API_KEYS_UPDATED_EVENT, handleKeyUpdate);
+    return () => window.removeEventListener(API_KEYS_UPDATED_EVENT, handleKeyUpdate);
+  }, []);
 
   useEffect(() => {
     const unsubscribe = subscribeToMacroDictionary(store => {
@@ -1293,6 +1303,27 @@ const App: React.FC = () => {
                 <span className="text-xs font-semibold text-slate-700 dark:text-slate-200 hidden md:inline">Workstation Sync</span>
               </button>
               <button
+                id="api-keys-header-btn"
+                onClick={() => setIsApiKeyModalOpen(true)}
+                className={`p-2 sm:p-2.5 rounded-xl transition-colors shrink-0 shadow-sm border cursor-pointer min-h-[36px] min-w-[36px] flex items-center justify-center gap-1.5 relative ${
+                  customKeysCount > 0
+                    ? 'text-emerald-700 dark:text-emerald-300 bg-emerald-50 dark:bg-emerald-950/40 border-emerald-300 dark:border-emerald-700/60 hover:bg-emerald-100 dark:hover:bg-emerald-900/60'
+                    : 'text-slate-600 dark:text-slate-400 bg-slate-50 dark:bg-slate-800/60 border-slate-200/80 dark:border-slate-700/60 hover:bg-slate-200 dark:hover:bg-slate-700'
+                }`}
+                aria-label="Gemini API Keys & Failover"
+                title={customKeysCount > 0 ? `API Keys (${customKeysCount} custom keys active)` : 'API Keys (Default rotating pool active)'}
+              >
+                <Key className={`w-5 h-5 shrink-0 ${customKeysCount > 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-600 dark:text-slate-300'}`} />
+                <span className="text-xs font-semibold hidden md:inline">
+                  {customKeysCount > 0 ? `Custom Keys (${customKeysCount})` : 'API Keys'}
+                </span>
+                {customKeysCount > 0 && (
+                  <span className="md:hidden absolute -top-1 -right-1 w-4 h-4 bg-emerald-500 text-white rounded-full text-[10px] font-bold flex items-center justify-center shadow-sm">
+                    {customKeysCount}
+                  </span>
+                )}
+              </button>
+              <button
                 onClick={() => setIsPowerMode(prev => !prev)}
                 className={`p-2 sm:p-2.5 rounded-xl transition-all shrink-0 shadow-sm border cursor-pointer min-h-[36px] min-w-[36px] flex items-center justify-center ${
                   isPowerMode
@@ -1795,6 +1826,13 @@ const App: React.FC = () => {
               handleAllFindingsUpdate([...findings, ...expandedLines]);
             }
           }}
+        />
+
+        {/* Gemini API Keys & Failover Modal */}
+        <ApiKeyModal
+          isOpen={isApiKeyModalOpen}
+          onClose={() => setIsApiKeyModalOpen(false)}
+          selectedModel={selectedModel}
         />
 
         {/* Workstation Sync Saved Toast */}

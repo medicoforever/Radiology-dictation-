@@ -3,21 +3,10 @@ import { DEFAULT_GEMINI_PROMPT, REPROCESS_GEMINI_PROMPT, TEMPLATE_GEMINI_PROMPT,
 import { IdentifiedError } from "../types";
 import { isTableRowFinding } from "./docxService";
 import { expandMacrosInFindings, getMacroPromptContext } from "./macroDictionaryService";
+import { executeWithApiKeyFailover, getRandomAIClient, getClientForApiKey } from "./apiKeyService";
 
-let aiClient: GoogleGenAI | null = null;
 export const getAI = (): GoogleGenAI => {
-  if (!aiClient) {
-    const key = (typeof process !== 'undefined' && (process.env?.GEMINI_API_KEY || process.env?.API_KEY)) || '';
-    aiClient = new GoogleGenAI({
-      apiKey: key,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        },
-      },
-    });
-  }
-  return aiClient;
+  return getRandomAIClient();
 };
 
 export const blobToBase64 = (blob: Blob): Promise<string> => {
@@ -110,26 +99,13 @@ const responseSchema = {
 
 /**
  * Resolves user/system model aliases to valid, robust Gemini API endpoints.
- * Prevents routing audio/template structured JSON requests to raw-transcribe models which lack JSON mode.
+ * Ensures the exact selected model is strictly preserved.
  */
 export function resolveApiTargetModel(model?: string): string {
-  if (!model) return 'gemini-3.8-flash';
-  // If legacy or removed models are passed, map directly to gemini-3.8-flash
-  if (
-    model === 'gemini-3.7-flash' ||
-    model === 'gemini-3.5-flash' ||
-    model === 'gemini-2.5-pro' ||
-    model === 'gemini-2.5-flash'
-  ) {
-    return 'gemini-3.8-flash';
-  }
-  // Map gemini-3.5-flash-lite / flash-lite aliases
-  if (model === 'gemini-3.5-flash-lite') {
-    return 'gemini-3.1-flash-lite';
-  }
+  if (!model) return DEFAULT_SELECTED_MODEL;
   // Audio-only transcription models do not support JSON mode / structured schema reasoning
   if (model === 'gemini-3.5-transcribe' || model === 'gemini-3.5-transcribe-live') {
-    return 'gemini-3.8-flash';
+    return DEFAULT_SELECTED_MODEL;
   }
   return model;
 }
@@ -336,50 +312,12 @@ export async function generateContentWithJsonFallback(
 ): Promise<string> {
   const resolvedModel = resolveApiTargetModel(model);
 
-  // Strategy 1: Primary attempt with structured JSON schema
-  try {
-    const response: GenerateContentResponse = await getAI().models.generateContent({
-      model: resolvedModel,
-      contents: { parts },
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: schema,
-        temperature,
-      }
-    });
-
-    const text = response.text?.trim() || '';
-    if (text) return text;
-  } catch (err: any) {
-    console.warn(`[Gemini API] Primary JSON mode call failed on model ${resolvedModel} (${err?.message || err}). Attempting fallback without schema config...`);
-
-    // Strategy 2: If JSON mode unsupported or schema error, retry the model without responseMimeType/responseSchema and explicit JSON instructions
-    try {
-      const partsWithJsonInstruction = [
-        ...parts,
-        { text: '\n\nCRITICAL OUTPUT REQUIREMENT: Output ONLY a valid JSON object in the exact format: {"findings": ["finding 1", "finding 2", ...]}. Do NOT output any markdown wrappers or conversational text.' }
-      ];
-
-      const retryResponse: GenerateContentResponse = await getAI().models.generateContent({
-        model: resolvedModel,
-        contents: { parts: partsWithJsonInstruction },
-        config: {
-          temperature,
-        }
-      });
-
-      const retryText = retryResponse.text?.trim() || '';
-      if (retryText) return retryText;
-    } catch (retryErr: any) {
-      console.warn(`[Gemini API] Prompt-only retry on ${resolvedModel} failed:`, retryErr);
-    }
-
-    // Strategy 3: Failover to gemini-3.8-flash
-    if (resolvedModel !== 'gemini-3.8-flash') {
+  return await executeWithApiKeyFailover(
+    async (client) => {
+      // Strategy 1: Primary attempt with structured JSON schema on the selected model
       try {
-        console.info(`[Gemini API] Failing over to gemini-3.8-flash with JSON mode...`);
-        const flashResponse: GenerateContentResponse = await getAI().models.generateContent({
-          model: 'gemini-3.8-flash',
+        const response: GenerateContentResponse = await client.models.generateContent({
+          model: resolvedModel,
           contents: { parts },
           config: {
             responseMimeType: "application/json",
@@ -387,17 +325,43 @@ export async function generateContentWithJsonFallback(
             temperature,
           }
         });
-        const flashText = flashResponse.text?.trim() || '';
-        if (flashText) return flashText;
-      } catch (flashErr) {
-        console.warn(`[Gemini API] gemini-3.8-flash failover notice:`, flashErr);
+
+        const text = response.text?.trim() || '';
+        if (text) return text;
+      } catch (err: any) {
+        // Strategy 2: If JSON mode unsupported or schema error, retry prompt-only on the SAME selected model
+        if (isJsonModeUnsupportedError(err) || (err?.message && err.message.toLowerCase().includes('schema'))) {
+          console.warn(`[Gemini API] Primary JSON mode call failed on model ${resolvedModel} (${err?.message || err}). Attempting prompt-only fallback without schema config on SAME model...`);
+          try {
+            const partsWithJsonInstruction = [
+              ...parts,
+              { text: '\n\nCRITICAL OUTPUT REQUIREMENT: Output ONLY a valid JSON object in the exact format: {"findings": ["finding 1", "finding 2", ...]}. Do NOT output any markdown wrappers or conversational text.' }
+            ];
+
+            const retryResponse: GenerateContentResponse = await client.models.generateContent({
+              model: resolvedModel,
+              contents: { parts: partsWithJsonInstruction },
+              config: {
+                temperature,
+              }
+            });
+
+            const retryText = retryResponse.text?.trim() || '';
+            if (retryText) return retryText;
+          } catch (retryErr: any) {
+            console.warn(`[Gemini API] Prompt-only retry on ${resolvedModel} failed:`, retryErr);
+          }
+        }
+
+        // Re-throw so executeWithApiKeyFailover immediately retries with another random API key
+        // strictly preserving the selected model!
+        throw err;
       }
-    }
 
-    throw err;
-  }
-
-  return '';
+      return '';
+    },
+    { selectedModel: resolvedModel }
+  );
 }
 
 export interface DetectedTemplateInfo {
@@ -843,21 +807,10 @@ export const processAudio = async (
   } catch (error: any) {
     console.warn("Gemini API call returned error, evaluating fallback:", error);
 
-    // In MERGE MODE ALONE: If error is JSON mode unsupported or schema failure, retry cleanly with Gemini 3.8 Flash & raw JSON prompt
+    // In MERGE MODE ALONE: If error is JSON mode unsupported or schema failure, retry cleanly with target model & raw JSON prompt
     if (templateInfo.isTemplateMode) {
       try {
-        const fallbackModel = 'gemini-3.8-flash';
-        const retryResponse: GenerateContentResponse = await getAI().models.generateContent({
-          model: fallbackModel,
-          contents: {
-            parts: [
-              ...parts,
-              { text: "\n\nCRITICAL OUTPUT REQUIREMENT: Output ONLY a valid JSON object in the exact format: {\"findings\": [\"finding 1\", \"finding 2\", ...]}" }
-            ]
-          }
-        });
-
-        const retryText = retryResponse.text?.trim() || '';
+        const retryText = await generateContentWithJsonFallback(targetModel, parts, responseSchema, 0.1);
         const parsedFindings = extractFindingsFromResponse(retryText);
         if (parsedFindings && parsedFindings.length > 0) {
           return parsedFindings;
@@ -1072,17 +1025,21 @@ Carefully integrate these dictated findings into the "${templateName}" baseline 
 
     // Direct JSON prompt fallback using text-only parts to guarantee payload fits
     try {
-      const fallbackModel = 'gemini-3.8-flash';
       const textOnlyParts = parts.filter(p => !p.inlineData);
-      const retryResponse = await getAI().models.generateContent({
-        model: fallbackModel,
-        contents: {
-          parts: [
-            ...textOnlyParts,
-            { text: "\n\nCRITICAL OUTPUT REQUIREMENT: Output ONLY a valid JSON object in the exact format: {\"findings\": [\"finding 1\", \"finding 2\", ...]}" }
-          ]
-        }
-      });
+      const retryResponse = await executeWithApiKeyFailover(
+        async (client) => {
+          return await client.models.generateContent({
+            model: targetModel,
+            contents: {
+              parts: [
+                ...textOnlyParts,
+                { text: "\n\nCRITICAL OUTPUT REQUIREMENT: Output ONLY a valid JSON object in the exact format: {\"findings\": [\"finding 1\", \"finding 2\", ...]}" }
+              ]
+            }
+          });
+        },
+        { selectedModel: targetModel }
+      );
       const retryText = retryResponse.text?.trim() || '';
       const parsed = extractFindingsFromResponse(retryText);
       if (parsed && parsed.length > 0) {
@@ -1165,16 +1122,20 @@ Follow these strict instructions to produce a clean and accurate continuation:
 
   try {
     const targetModel = resolveApiTargetModel(model || DEFAULT_SELECTED_MODEL);
-    const response: GenerateContentResponse = await getAI().models.generateContent({
-      model: targetModel,
-      contents: { parts: [textPart, audioPart] },
-    });
-
-    const resultText = response.text?.trim();
-    if (!resultText) {
-      throw new Error("API returned an empty response for audio continuation.");
-    }
-    return resultText;
+    return await executeWithApiKeyFailover(
+      async (client) => {
+        const response: GenerateContentResponse = await client.models.generateContent({
+          model: targetModel,
+          contents: { parts: [textPart, audioPart] },
+        });
+        const resultText = response.text?.trim();
+        if (!resultText) {
+          throw new Error("API returned an empty response for audio continuation.");
+        }
+        return resultText;
+      },
+      { selectedModel: targetModel }
+    );
   } catch (error) {
     console.error("Error calling Gemini API for audio continuation:", error);
     if (error instanceof Error) {
@@ -1227,16 +1188,20 @@ Now, listen to the audio and provide the single, updated finding text.`;
 
   try {
     const targetModel = resolveApiTargetModel(model || DEFAULT_SELECTED_MODEL);
-    const response: GenerateContentResponse = await getAI().models.generateContent({
-      model: targetModel,
-      contents: { parts: [textPart, audioPart] },
-    });
-
-    const resultText = response.text?.trim();
-    if (!resultText) {
-      throw new Error("API returned an empty response for finding modification.");
-    }
-    return resultText;
+    return await executeWithApiKeyFailover(
+      async (client) => {
+        const response: GenerateContentResponse = await client.models.generateContent({
+          model: targetModel,
+          contents: { parts: [textPart, audioPart] },
+        });
+        const resultText = response.text?.trim();
+        if (!resultText) {
+          throw new Error("API returned an empty response for finding modification.");
+        }
+        return resultText;
+      },
+      { selectedModel: targetModel }
+    );
   } catch (error) {
     console.error("Error calling Gemini API for finding modification:", error);
     if (error instanceof Error) {
@@ -1421,38 +1386,26 @@ export const transcribeAudioForPrompt = async (
   // Primary model respects the user's selected model from main interface
   const primaryModel = resolveApiTargetModel(model || DEFAULT_SELECTED_MODEL);
 
-  // Dynamic failover chain: starts with user's selected model, followed by fast, authorized Gemini models
-  const candidateModels = [
-    primaryModel,
-    'gemini-3.8-flash',
-    'gemini-3.5-flash-lite'
-  ].filter((m, i, arr) => arr.indexOf(m) === i);
+  try {
+    return await executeWithApiKeyFailover(
+      async (client) => {
+        const response: GenerateContentResponse = await client.models.generateContent({
+          model: primaryModel,
+          contents: { parts: [textPart, audioPart] },
+        });
 
-  let lastError: any = null;
-
-  for (const candidateModel of candidateModels) {
-    try {
-      const response: GenerateContentResponse = await getAI().models.generateContent({
-        model: candidateModel,
-        contents: { parts: [textPart, audioPart] },
-      });
-
-      const resultText = response.text?.trim();
-      if (!resultText) {
-        return ""; // Return empty string if no transcription
-      }
-      return resultText;
-    } catch (error: any) {
-      console.warn(`Transcription attempt with model "${candidateModel}" failed, checking failover:`, error);
-      lastError = error;
+        const resultText = response.text?.trim();
+        return resultText || "";
+      },
+      { selectedModel: primaryModel }
+    );
+  } catch (lastError: any) {
+    console.error("Transcription failed across API keys for model:", primaryModel, lastError);
+    if (lastError instanceof Error) {
+      throw new Error(`Failed to transcribe audio: ${lastError.message}`);
     }
+    throw new Error("An unknown error occurred while communicating with the API for transcription.");
   }
-
-  console.error("All candidate Gemini models failed for transcription:", lastError);
-  if (lastError instanceof Error) {
-    throw new Error(`Failed to transcribe audio: ${lastError.message}`);
-  }
-  throw new Error("An unknown error occurred while communicating with the API for transcription.");
 };
 
 
@@ -1673,13 +1626,18 @@ async function executeAgentStepWithFallbackAndRetry(
         // Try default model: gemini-3.8-flash with Google search grounding alone
         try {
             onProgress?.(`${taskName}: Analyzing with ${COMPLEX_IMPRESSION_DEFAULT_MODEL} (Google Search grounded)...`);
-            const response = await getAI().models.generateContent({
-                model: COMPLEX_IMPRESSION_DEFAULT_MODEL,
-                contents: prompt,
-                config: {
-                    tools: [{ googleSearch: {} }]
-                }
-            });
+            const response = await executeWithApiKeyFailover(
+                async (client) => {
+                    return await client.models.generateContent({
+                        model: COMPLEX_IMPRESSION_DEFAULT_MODEL,
+                        contents: prompt,
+                        config: {
+                            tools: [{ googleSearch: {} }]
+                        }
+                    });
+                },
+                { selectedModel: COMPLEX_IMPRESSION_DEFAULT_MODEL }
+            );
             const text = response.text || '';
             const groundingChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks;
             return { text, groundingChunks };
