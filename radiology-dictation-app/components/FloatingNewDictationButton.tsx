@@ -102,7 +102,8 @@ export const FloatingNewDictationButton: React.FC<FloatingNewDictationButtonProp
       style={{
         position: 'fixed',
         bottom: 'max(1.25rem, calc(1rem + env(safe-area-inset-bottom, 0px)))',
-        right: 'max(1.25rem, calc(1rem + env(safe-area-inset-right, 0px)))',
+        right: 'max(1rem, calc(0.75rem + env(safe-area-inset-right, 0px)))',
+        maxWidth: 'calc(100vw - 2rem)',
         zIndex: 9999,
         WebkitTransform: 'translate3d(0, 0, 0)',
         transform: 'translate3d(0, 0, 0)',

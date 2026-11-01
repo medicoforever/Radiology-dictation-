@@ -1249,7 +1249,7 @@ const App: React.FC = () => {
   };
 
   return (
-    <div className={`min-h-screen bg-gray-50 dark:bg-slate-900 flex flex-col items-center justify-start sm:justify-center p-2 sm:p-4 md:p-6 font-sans transition-colors duration-300 ${!isPowerMode ? 'low-power-active' : ''}`}>
+    <div className={`min-h-screen max-w-full overflow-x-hidden bg-gray-50 dark:bg-slate-900 flex flex-col items-center justify-start sm:justify-center p-2 sm:p-4 md:p-6 font-sans transition-colors duration-300 ${!isPowerMode ? 'low-power-active' : ''}`}>
       {!isPowerMode && (
         <style>{`
           .low-power-mode *, .low-power-mode *::before, .low-power-mode *::after {
@@ -1262,11 +1262,86 @@ const App: React.FC = () => {
           }
         `}</style>
       )}
-      <div className={`w-full mx-auto transition-all duration-200 ${isWideView ? 'max-w-4xl lg:max-w-5xl xl:max-w-6xl' : 'max-w-3xl'}`}>
+      <div className={`w-full max-w-full overflow-x-hidden mx-auto transition-all duration-200 ${isWideView ? 'max-w-4xl lg:max-w-5xl xl:max-w-6xl' : 'max-w-3xl'}`}>
         
         {/* Top Header */}
-        <header className="mb-6 relative">
-          <div className="grid grid-cols-[auto_1fr_auto] items-center gap-2 sm:gap-4 mb-2 w-full">
+        <header className="mb-6 relative w-full max-w-full overflow-hidden">
+          {/* Mobile Header: Row 1 = Utility Bar (Drive on left, Action buttons on right); Row 2 = App Title centered */}
+          <div className="flex flex-col gap-2 mb-2 w-full max-w-full sm:hidden">
+            <div className="flex items-center justify-between gap-1 w-full max-w-full">
+              <div className="shrink-0">
+                <DriveStatusBadge 
+                  lastSaveResult={driveSaveResult} 
+                  onClearLastSave={() => setDriveSaveResult(null)} 
+                  onOpenReportsModal={() => setIsReportsModalOpen(true)}
+                />
+              </div>
+              <div className="flex items-center gap-1 shrink-0 overflow-x-auto no-scrollbar py-0.5">
+                <button
+                  id="macros-header-btn-mobile"
+                  onClick={() => setIsMacrosModalOpen(true)}
+                  className="p-1.5 rounded-lg text-indigo-600 dark:text-indigo-400 bg-indigo-50/80 dark:bg-indigo-950/40 border border-indigo-200/70 dark:border-indigo-800/60 min-h-[34px] min-w-[34px] flex items-center justify-center cursor-pointer shadow-xs"
+                  aria-label="Macros"
+                  title="Macros — Manage custom text shortcuts"
+                >
+                  <BookOpen className="w-4 h-4" />
+                </button>
+                <button
+                  id="workstation-sync-header-btn-mobile"
+                  onClick={() => setIsWorkstationSyncModalOpen(true)}
+                  className="p-1.5 rounded-lg text-slate-500 dark:text-slate-400 bg-slate-100 dark:bg-slate-800 border border-slate-200/60 dark:border-slate-700/60 min-h-[34px] min-w-[34px] flex items-center justify-center cursor-pointer shadow-xs"
+                  aria-label="Workstation Sync"
+                  title="Workstation Sync"
+                >
+                  <Settings className="w-4 h-4 text-slate-600 dark:text-slate-300" />
+                </button>
+                <button
+                  id="api-keys-header-btn-mobile"
+                  onClick={() => setIsApiKeyModalOpen(true)}
+                  className={`p-1.5 rounded-lg border min-h-[34px] min-w-[34px] flex items-center justify-center relative cursor-pointer shadow-xs ${
+                    customKeysCount > 0
+                      ? 'text-emerald-700 bg-emerald-50 dark:bg-emerald-950/40 border-emerald-300 dark:border-emerald-700/60'
+                      : 'text-slate-600 bg-slate-100 dark:bg-slate-800 border-slate-200/80 dark:border-slate-700/60'
+                  }`}
+                  aria-label="Gemini API Keys"
+                  title="Gemini API Keys"
+                >
+                  <Key className="w-4 h-4" />
+                  {customKeysCount > 0 && (
+                    <span className="absolute -top-1 -right-1 w-3.5 h-3.5 bg-emerald-500 text-white rounded-full text-[9px] font-bold flex items-center justify-center">
+                      {customKeysCount}
+                    </span>
+                  )}
+                </button>
+                <button
+                  onClick={() => setIsPowerMode(prev => !prev)}
+                  className={`p-1.5 rounded-lg border min-h-[34px] min-w-[34px] flex items-center justify-center cursor-pointer shadow-xs ${
+                    isPowerMode
+                      ? 'text-emerald-600 bg-emerald-50 dark:bg-emerald-950/40 border-emerald-300 dark:border-emerald-700/60'
+                      : 'text-amber-600 bg-amber-50 dark:bg-amber-950/40 border-amber-300 dark:border-amber-700/60'
+                  }`}
+                  aria-label="Power Mode"
+                  title="Toggle Low Power Mode"
+                >
+                  <Power className="w-4 h-4" />
+                </button>
+                <ThemeSelector 
+                  currentTheme={theme} 
+                  onThemeChange={(newTheme) => setTheme(newTheme)} 
+                />
+              </div>
+            </div>
+
+            <div className="text-center py-0.5 w-full">
+              <h1 className="text-lg font-extrabold text-slate-800 dark:text-slate-100 tracking-tight flex items-center justify-center gap-1.5">
+                <YinYangMicIcon className="w-6 h-6 shrink-0 rounded-full shadow-xs inline-block" />
+                <span>RADDOC's Dictation app</span>
+              </h1>
+            </div>
+          </div>
+
+          {/* Desktop/Tablet Header: 3-column Grid (sm: and above) */}
+          <div className="hidden sm:grid sm:grid-cols-[auto_1fr_auto] items-center gap-2 sm:gap-4 mb-2 w-full max-w-full">
             <div className="justify-self-start flex items-center">
               <DriveStatusBadge 
                 lastSaveResult={driveSaveResult} 

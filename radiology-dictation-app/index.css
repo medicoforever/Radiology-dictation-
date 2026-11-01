@@ -1,0 +1,729 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fadeIn {
+  animation: fadeIn 0.18s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* ==========================================================================
+   MULTI-MODE THEMES
+   Supported Modes: light, dark, colourful, magical, creative, soothing, sunset, ocean,
+                    aurora, cyberpunk, velvet, nordic, solar, sakura, lavender, espresso
+   Provides rich, vibrant, distinct visual themes while keeping all cards, modals,
+   and controls 100% solid, fully legible, and functional.
+   ========================================================================== */
+
+/* Global Mobile Viewport & Horizontal Overflow Prevention */
+html {
+  overflow-x: hidden;
+  max-width: 100vw;
+  width: 100%;
+}
+
+body {
+  overflow-x: hidden;
+  max-width: 100vw;
+  width: 100%;
+  position: relative;
+  -webkit-overflow-scrolling: touch;
+}
+
+#root {
+  overflow-x: hidden;
+  max-width: 100vw;
+  width: 100%;
+}
+
+/* Base transition for smooth theme switching */
+body, #root, #root > div, main {
+  transition: background-color 0.25s ease, color 0.25s ease, border-color 0.25s ease;
+}
+
+/* --------------------------------------------------------------------------
+   1. COLOURFUL MODE (Vibrant candy rose, pastel prism & radiance)
+   -------------------------------------------------------------------------- */
+html[data-theme="colourful"] body,
+html[data-theme="colourful"] #root > div:first-child {
+  background: 
+    radial-gradient(circle at 10% 20%, rgba(254, 205, 211, 0.65) 0%, transparent 40%),
+    radial-gradient(circle at 90% 10%, rgba(254, 240, 138, 0.55) 0%, transparent 40%),
+    radial-gradient(circle at 85% 85%, rgba(187, 247, 208, 0.5) 0%, transparent 45%),
+    radial-gradient(circle at 15% 85%, rgba(199, 210, 254, 0.6) 0%, transparent 45%),
+    #fff0f5 !important;
+  background-attachment: fixed !important;
+}
+
+html[data-theme="colourful"] main {
+  background-color: #ffffff !important;
+  border-color: #fbcfe8 !important;
+  box-shadow: 0 10px 30px -5px rgba(236, 72, 153, 0.15) !important;
+}
+
+html[data-theme="colourful"] .finding-item {
+  background-color: #fff9fb !important;
+  border-left-color: #ec4899 !important;
+}
+
+html[data-theme="colourful"] .finding-item:hover {
+  background-color: #fff1f6 !important;
+}
+
+html[data-theme="colourful"] header h1 span {
+  color: #db2777 !important;
+}
+
+html[data-theme="colourful"] .bg-blue-600 {
+  background-color: #ec4899 !important;
+  border-color: #db2777 !important;
+}
+
+html[data-theme="colourful"] .bg-blue-600:hover {
+  background-color: #db2777 !important;
+}
+
+html[data-theme="colourful"] .text-blue-600 {
+  color: #db2777 !important;
+}
+
+/* --------------------------------------------------------------------------
+   2. MAGICAL MODE (Enchanted cosmic violet night & glowing amethyst)
+   -------------------------------------------------------------------------- */
+html[data-theme="magical"] body,
+html[data-theme="magical"] #root > div:first-child {
+  background: 
+    radial-gradient(circle at 80% 15%, rgba(168, 85, 247, 0.35) 0%, transparent 50%),
+    radial-gradient(circle at 15% 85%, rgba(236, 72, 153, 0.28) 0%, transparent 50%),
+    radial-gradient(circle at 50% 50%, rgba(99, 102, 241, 0.25) 0%, transparent 50%),
+    #0c061d !important;
+  background-attachment: fixed !important;
+}
+
+html[data-theme="magical"] main {
+  background-color: #170d33 !important;
+  border-color: rgba(168, 85, 247, 0.35) !important;
+  box-shadow: 0 10px 30px -5px rgba(147, 51, 234, 0.25) !important;
+}
+
+html[data-theme="magical"] .finding-item {
+  background-color: #1f1144 !important;
+  border-left-color: #a855f7 !important;
+}
+
+html[data-theme="magical"] .finding-item:hover {
+  background-color: #271654 !important;
+}
+
+html[data-theme="magical"] .dark\:bg-slate-800,
+html[data-theme="magical"] .dark\:bg-slate-900\/50,
+html[data-theme="magical"] .bg-slate-800 {
+  background-color: #170d33 !important;
+  border-color: rgba(168, 85, 247, 0.35) !important;
+}
+
+html[data-theme="magical"] header h1 span {
+  color: #c084fc !important;
+}
+
+html[data-theme="magical"] .bg-blue-600 {
+  background-color: #9333ea !important;
+  border-color: #7e22ce !important;
+}
+
+html[data-theme="magical"] .bg-blue-600:hover {
+  background-color: #7e22ce !important;
+}
+
+html[data-theme="magical"] .text-blue-600,
+html[data-theme="magical"] .dark\:text-blue-400 {
+  color: #c084fc !important;
+}
+
+/* --------------------------------------------------------------------------
+   3. CREATIVE MODE (Art studio, warm sunlit terracotta, coral & amber)
+   -------------------------------------------------------------------------- */
+html[data-theme="creative"] body,
+html[data-theme="creative"] #root > div:first-child {
+  background: 
+    radial-gradient(circle at 90% 10%, rgba(253, 186, 116, 0.55) 0%, transparent 45%),
+    radial-gradient(circle at 10% 90%, rgba(254, 205, 211, 0.45) 0%, transparent 45%),
+    #fff7ed !important;
+  background-attachment: fixed !important;
+}
+
+html[data-theme="creative"] main {
+  background-color: #ffffff !important;
+  border-color: #fed7aa !important;
+  box-shadow: 0 10px 30px -5px rgba(234, 88, 12, 0.12) !important;
+}
+
+html[data-theme="creative"] .finding-item {
+  background-color: #fffaf5 !important;
+  border-left-color: #ea580c !important;
+}
+
+html[data-theme="creative"] .finding-item:hover {
+  background-color: #ffedd5 !important;
+}
+
+html[data-theme="creative"] header h1 span {
+  color: #ea580c !important;
+}
+
+html[data-theme="creative"] .bg-blue-600 {
+  background-color: #ea580c !important;
+  border-color: #c2410c !important;
+}
+
+html[data-theme="creative"] .bg-blue-600:hover {
+  background-color: #c2410c !important;
+}
+
+html[data-theme="creative"] .text-blue-600 {
+  color: #ea580c !important;
+}
+
+/* --------------------------------------------------------------------------
+   4. SOOTHING MODE (Zen eucalyptus, tranquil jade sage & calming mint)
+   -------------------------------------------------------------------------- */
+html[data-theme="soothing"] body,
+html[data-theme="soothing"] #root > div:first-child {
+  background: 
+    radial-gradient(circle at 20% 20%, rgba(209, 250, 229, 0.7) 0%, transparent 50%),
+    radial-gradient(circle at 80% 80%, rgba(204, 251, 241, 0.6) 0%, transparent 50%),
+    #f0fdf4 !important;
+  background-attachment: fixed !important;
+}
+
+html[data-theme="soothing"] main {
+  background-color: #ffffff !important;
+  border-color: #bbf7d0 !important;
+  box-shadow: 0 10px 30px -5px rgba(5, 150, 105, 0.12) !important;
+}
+
+html[data-theme="soothing"] .finding-item {
+  background-color: #f7fee7 !important;
+  border-left-color: #059669 !important;
+}
+
+html[data-theme="soothing"] .finding-item:hover {
+  background-color: #ecfdf5 !important;
+}
+
+html[data-theme="soothing"] header h1 span {
+  color: #059669 !important;
+}
+
+html[data-theme="soothing"] .bg-blue-600 {
+  background-color: #059669 !important;
+  border-color: #047857 !important;
+}
+
+html[data-theme="soothing"] .bg-blue-600:hover {
+  background-color: #047857 !important;
+}
+
+html[data-theme="soothing"] .text-blue-600 {
+  color: #059669 !important;
+}
+
+/* --------------------------------------------------------------------------
+   5. SUNSET GLOW MODE (Warm twilight, golden peach & deep rose dusk)
+   -------------------------------------------------------------------------- */
+html[data-theme="sunset"] body,
+html[data-theme="sunset"] #root > div:first-child {
+  background: 
+    radial-gradient(circle at 15% 20%, rgba(244, 63, 94, 0.35) 0%, transparent 50%),
+    radial-gradient(circle at 85% 80%, rgba(249, 115, 22, 0.3) 0%, transparent 50%),
+    #180a1e !important;
+  background-attachment: fixed !important;
+}
+
+html[data-theme="sunset"] main {
+  background-color: #240f2e !important;
+  border-color: rgba(244, 63, 94, 0.4) !important;
+  box-shadow: 0 10px 30px -5px rgba(225, 29, 72, 0.25) !important;
+}
+
+html[data-theme="sunset"] .finding-item {
+  background-color: #2f143c !important;
+  border-left-color: #f43f5e !important;
+}
+
+html[data-theme="sunset"] .finding-item:hover {
+  background-color: #3d1a4e !important;
+}
+
+html[data-theme="sunset"] .dark\:bg-slate-800,
+html[data-theme="sunset"] .dark\:bg-slate-900\/50,
+html[data-theme="sunset"] .bg-slate-800 {
+  background-color: #240f2e !important;
+  border-color: rgba(244, 63, 94, 0.35) !important;
+}
+
+html[data-theme="sunset"] header h1 span {
+  color: #fb7185 !important;
+}
+
+html[data-theme="sunset"] .bg-blue-600 {
+  background-color: #e11d48 !important;
+  border-color: #be123c !important;
+}
+
+html[data-theme="sunset"] .bg-blue-600:hover {
+  background-color: #be123c !important;
+}
+
+html[data-theme="sunset"] .text-blue-600,
+html[data-theme="sunset"] .dark\:text-blue-400 {
+  color: #fb7185 !important;
+}
+
+/* --------------------------------------------------------------------------
+   6. OCEAN BREEZE MODE (Deep marine sapphire & tidal cyan)
+   -------------------------------------------------------------------------- */
+html[data-theme="ocean"] body,
+html[data-theme="ocean"] #root > div:first-child {
+  background: 
+    radial-gradient(circle at 80% 20%, rgba(14, 165, 233, 0.35) 0%, transparent 50%),
+    radial-gradient(circle at 20% 80%, rgba(20, 184, 166, 0.3) 0%, transparent 50%),
+    #071426 !important;
+  background-attachment: fixed !important;
+}
+
+html[data-theme="ocean"] main {
+  background-color: #0b1f3b !important;
+  border-color: rgba(56, 189, 248, 0.35) !important;
+  box-shadow: 0 10px 30px -5px rgba(2, 132, 199, 0.25) !important;
+}
+
+html[data-theme="ocean"] .finding-item {
+  background-color: #102a4e !important;
+  border-left-color: #0284c7 !important;
+}
+
+html[data-theme="ocean"] .finding-item:hover {
+  background-color: #163663 !important;
+}
+
+html[data-theme="ocean"] .dark\:bg-slate-800,
+html[data-theme="ocean"] .dark\:bg-slate-900\/50,
+html[data-theme="ocean"] .bg-slate-800 {
+  background-color: #0b1f3b !important;
+  border-color: rgba(56, 189, 248, 0.35) !important;
+}
+
+html[data-theme="ocean"] header h1 span {
+  color: #38bdf8 !important;
+}
+
+html[data-theme="ocean"] .bg-blue-600 {
+  background-color: #0284c7 !important;
+  border-color: #0369a1 !important;
+}
+
+html[data-theme="ocean"] .bg-blue-600:hover {
+  background-color: #0369a1 !important;
+}
+
+html[data-theme="ocean"] .text-blue-600,
+html[data-theme="ocean"] .dark\:text-blue-400 {
+  color: #38bdf8 !important;
+}
+
+/* --------------------------------------------------------------------------
+   7. AURORA BOREALIS (Cosmic polar teal, vivid emerald ribbons & boreal night)
+   -------------------------------------------------------------------------- */
+html[data-theme="aurora"] body,
+html[data-theme="aurora"] #root > div:first-child {
+  background: 
+    radial-gradient(circle at 15% 15%, rgba(13, 148, 136, 0.38) 0%, transparent 45%),
+    radial-gradient(circle at 85% 20%, rgba(16, 185, 129, 0.32) 0%, transparent 45%),
+    radial-gradient(circle at 50% 85%, rgba(99, 102, 241, 0.22) 0%, transparent 50%),
+    #031417 !important;
+  background-attachment: fixed !important;
+}
+
+html[data-theme="aurora"] main {
+  background-color: #072126 !important;
+  border-color: rgba(45, 212, 191, 0.35) !important;
+  box-shadow: 0 10px 30px -5px rgba(20, 184, 166, 0.25) !important;
+}
+
+html[data-theme="aurora"] .finding-item {
+  background-color: #0c2b31 !important;
+  border-left-color: #14b8a6 !important;
+}
+
+html[data-theme="aurora"] .finding-item:hover {
+  background-color: #113942 !important;
+}
+
+html[data-theme="aurora"] .dark\:bg-slate-800,
+html[data-theme="aurora"] .dark\:bg-slate-900\/50,
+html[data-theme="aurora"] .bg-slate-800 {
+  background-color: #072126 !important;
+  border-color: rgba(45, 212, 191, 0.3) !important;
+}
+
+html[data-theme="aurora"] header h1 span {
+  color: #2dd4bf !important;
+}
+
+html[data-theme="aurora"] .bg-blue-600 {
+  background-color: #0d9488 !important;
+  border-color: #0f766e !important;
+}
+
+html[data-theme="aurora"] .bg-blue-600:hover {
+  background-color: #0f766e !important;
+}
+
+html[data-theme="aurora"] .text-blue-600,
+html[data-theme="aurora"] .dark\:text-blue-400 {
+  color: #2dd4bf !important;
+}
+
+/* --------------------------------------------------------------------------
+   8. CYBER NEON (High-voltage phosphor lime, matrix glow & terminal noir)
+   -------------------------------------------------------------------------- */
+html[data-theme="cyberpunk"] body,
+html[data-theme="cyberpunk"] #root > div:first-child {
+  background: 
+    radial-gradient(circle at 85% 15%, rgba(34, 197, 94, 0.28) 0%, transparent 45%),
+    radial-gradient(circle at 15% 85%, rgba(163, 230, 53, 0.22) 0%, transparent 50%),
+    radial-gradient(circle at 50% 50%, rgba(20, 83, 45, 0.25) 0%, transparent 50%),
+    #040a06 !important;
+  background-attachment: fixed !important;
+}
+
+html[data-theme="cyberpunk"] main {
+  background-color: #09180f !important;
+  border-color: rgba(34, 197, 94, 0.4) !important;
+  box-shadow: 0 10px 30px -5px rgba(34, 197, 94, 0.22) !important;
+}
+
+html[data-theme="cyberpunk"] .finding-item {
+  background-color: #0f2418 !important;
+  border-left-color: #22c55e !important;
+}
+
+html[data-theme="cyberpunk"] .finding-item:hover {
+  background-color: #143321 !important;
+}
+
+html[data-theme="cyberpunk"] .dark\:bg-slate-800,
+html[data-theme="cyberpunk"] .dark\:bg-slate-900\/50,
+html[data-theme="cyberpunk"] .bg-slate-800 {
+  background-color: #09180f !important;
+  border-color: rgba(34, 197, 94, 0.35) !important;
+}
+
+html[data-theme="cyberpunk"] header h1 span {
+  color: #4ade80 !important;
+}
+
+html[data-theme="cyberpunk"] .bg-blue-600 {
+  background-color: #16a34a !important;
+  border-color: #15803d !important;
+}
+
+html[data-theme="cyberpunk"] .bg-blue-600:hover {
+  background-color: #15803d !important;
+}
+
+html[data-theme="cyberpunk"] .text-blue-600,
+html[data-theme="cyberpunk"] .dark\:text-blue-400 {
+  color: #4ade80 !important;
+}
+
+/* --------------------------------------------------------------------------
+   9. MIDNIGHT VELVET (Imperial royal plum, amethyst & rich wine velvet)
+   -------------------------------------------------------------------------- */
+html[data-theme="velvet"] body,
+html[data-theme="velvet"] #root > div:first-child {
+  background: 
+    radial-gradient(circle at 20% 20%, rgba(168, 85, 247, 0.35) 0%, transparent 50%),
+    radial-gradient(circle at 80% 80%, rgba(217, 70, 239, 0.28) 0%, transparent 50%),
+    #130526 !important;
+  background-attachment: fixed !important;
+}
+
+html[data-theme="velvet"] main {
+  background-color: #1f0b3b !important;
+  border-color: rgba(192, 132, 252, 0.38) !important;
+  box-shadow: 0 10px 30px -5px rgba(168, 85, 247, 0.25) !important;
+}
+
+html[data-theme="velvet"] .finding-item {
+  background-color: #29104c !important;
+  border-left-color: #c084fc !important;
+}
+
+html[data-theme="velvet"] .finding-item:hover {
+  background-color: #351563 !important;
+}
+
+html[data-theme="velvet"] .dark\:bg-slate-800,
+html[data-theme="velvet"] .dark\:bg-slate-900\/50,
+html[data-theme="velvet"] .bg-slate-800 {
+  background-color: #1f0b3b !important;
+  border-color: rgba(192, 132, 252, 0.32) !important;
+}
+
+html[data-theme="velvet"] header h1 span {
+  color: #e879f9 !important;
+}
+
+html[data-theme="velvet"] .bg-blue-600 {
+  background-color: #9333ea !important;
+  border-color: #7e22ce !important;
+}
+
+html[data-theme="velvet"] .bg-blue-600:hover {
+  background-color: #7e22ce !important;
+}
+
+html[data-theme="velvet"] .text-blue-600,
+html[data-theme="velvet"] .dark\:text-blue-400 {
+  color: #e879f9 !important;
+}
+
+/* --------------------------------------------------------------------------
+   10. NORDIC FROST (Scandinavian fjord, crisp polar ice & glacial stone)
+   -------------------------------------------------------------------------- */
+html[data-theme="nordic"] body,
+html[data-theme="nordic"] #root > div:first-child {
+  background: 
+    radial-gradient(circle at 85% 15%, rgba(186, 230, 253, 0.55) 0%, transparent 45%),
+    radial-gradient(circle at 15% 85%, rgba(224, 242, 254, 0.65) 0%, transparent 50%),
+    #f2f8fc !important;
+  background-attachment: fixed !important;
+}
+
+html[data-theme="nordic"] main {
+  background-color: #ffffff !important;
+  border-color: #bae6fd !important;
+  box-shadow: 0 10px 30px -5px rgba(2, 132, 199, 0.12) !important;
+}
+
+html[data-theme="nordic"] .finding-item {
+  background-color: #f7fbff !important;
+  border-left-color: #0284c7 !important;
+}
+
+html[data-theme="nordic"] .finding-item:hover {
+  background-color: #edf6fd !important;
+}
+
+html[data-theme="nordic"] header h1 span {
+  color: #0284c7 !important;
+}
+
+html[data-theme="nordic"] .bg-blue-600 {
+  background-color: #0284c7 !important;
+  border-color: #0369a1 !important;
+}
+
+html[data-theme="nordic"] .bg-blue-600:hover {
+  background-color: #0369a1 !important;
+}
+
+html[data-theme="nordic"] .text-blue-600 {
+  color: #0284c7 !important;
+}
+
+/* --------------------------------------------------------------------------
+   11. SOLAR AMBER (Radiant golden dawn, roasted honey & warm amber glow)
+   -------------------------------------------------------------------------- */
+html[data-theme="solar"] body,
+html[data-theme="solar"] #root > div:first-child {
+  background: 
+    radial-gradient(circle at 85% 15%, rgba(253, 230, 138, 0.6) 0%, transparent 45%),
+    radial-gradient(circle at 15% 85%, rgba(254, 215, 170, 0.5) 0%, transparent 45%),
+    #fffdf5 !important;
+  background-attachment: fixed !important;
+}
+
+html[data-theme="solar"] main {
+  background-color: #ffffff !important;
+  border-color: #fde68a !important;
+  box-shadow: 0 10px 30px -5px rgba(217, 119, 6, 0.14) !important;
+}
+
+html[data-theme="solar"] .finding-item {
+  background-color: #fffdf5 !important;
+  border-left-color: #d97706 !important;
+}
+
+html[data-theme="solar"] .finding-item:hover {
+  background-color: #fef8e7 !important;
+}
+
+html[data-theme="solar"] header h1 span {
+  color: #b45309 !important;
+}
+
+html[data-theme="solar"] .bg-blue-600 {
+  background-color: #d97706 !important;
+  border-color: #b45309 !important;
+}
+
+html[data-theme="solar"] .bg-blue-600:hover {
+  background-color: #b45309 !important;
+}
+
+html[data-theme="solar"] .text-blue-600 {
+  color: #d97706 !important;
+}
+
+/* --------------------------------------------------------------------------
+   12. CHERRY BLOSSOM (Kyoto spring petals, soft blush & serene sakura rose)
+   -------------------------------------------------------------------------- */
+html[data-theme="sakura"] body,
+html[data-theme="sakura"] #root > div:first-child {
+  background: 
+    radial-gradient(circle at 20% 20%, rgba(254, 205, 211, 0.7) 0%, transparent 45%),
+    radial-gradient(circle at 80% 80%, rgba(255, 228, 230, 0.7) 0%, transparent 45%),
+    #fff5f7 !important;
+  background-attachment: fixed !important;
+}
+
+html[data-theme="sakura"] main {
+  background-color: #ffffff !important;
+  border-color: #fecdd3 !important;
+  box-shadow: 0 10px 30px -5px rgba(244, 63, 94, 0.14) !important;
+}
+
+html[data-theme="sakura"] .finding-item {
+  background-color: #fff8f9 !important;
+  border-left-color: #f43f5e !important;
+}
+
+html[data-theme="sakura"] .finding-item:hover {
+  background-color: #ffeef1 !important;
+}
+
+html[data-theme="sakura"] header h1 span {
+  color: #e11d48 !important;
+}
+
+html[data-theme="sakura"] .bg-blue-600 {
+  background-color: #f43f5e !important;
+  border-color: #e11d48 !important;
+}
+
+html[data-theme="sakura"] .bg-blue-600:hover {
+  background-color: #e11d48 !important;
+}
+
+html[data-theme="sakura"] .text-blue-600 {
+  color: #e11d48 !important;
+}
+
+/* --------------------------------------------------------------------------
+   13. LAVENDER MIST (Soft Provençal lilac, dreamy violet & silk calm)
+   -------------------------------------------------------------------------- */
+html[data-theme="lavender"] body,
+html[data-theme="lavender"] #root > div:first-child {
+  background: 
+    radial-gradient(circle at 15% 20%, rgba(233, 213, 255, 0.7) 0%, transparent 45%),
+    radial-gradient(circle at 85% 80%, rgba(243, 232, 255, 0.7) 0%, transparent 50%),
+    #faf6fe !important;
+  background-attachment: fixed !important;
+}
+
+html[data-theme="lavender"] main {
+  background-color: #ffffff !important;
+  border-color: #e9d5ff !important;
+  box-shadow: 0 10px 30px -5px rgba(147, 51, 234, 0.12) !important;
+}
+
+html[data-theme="lavender"] .finding-item {
+  background-color: #fcfaff !important;
+  border-left-color: #9333ea !important;
+}
+
+html[data-theme="lavender"] .finding-item:hover {
+  background-color: #f4ecfe !important;
+}
+
+html[data-theme="lavender"] header h1 span {
+  color: #7e22ce !important;
+}
+
+html[data-theme="lavender"] .bg-blue-600 {
+  background-color: #9333ea !important;
+  border-color: #7e22ce !important;
+}
+
+html[data-theme="lavender"] .bg-blue-600:hover {
+  background-color: #7e22ce !important;
+}
+
+html[data-theme="lavender"] .text-blue-600 {
+  color: #9333ea !important;
+}
+
+/* --------------------------------------------------------------------------
+   14. WARM ESPRESSO (Artisan dark roast, roasted caramel & deep bronze)
+   -------------------------------------------------------------------------- */
+html[data-theme="espresso"] body,
+html[data-theme="espresso"] #root > div:first-child {
+  background: 
+    radial-gradient(circle at 20% 20%, rgba(180, 83, 9, 0.3) 0%, transparent 45%),
+    radial-gradient(circle at 80% 80%, rgba(120, 53, 15, 0.35) 0%, transparent 50%),
+    #140c07 !important;
+  background-attachment: fixed !important;
+}
+
+html[data-theme="espresso"] main {
+  background-color: #21130b !important;
+  border-color: rgba(217, 119, 6, 0.38) !important;
+  box-shadow: 0 10px 30px -5px rgba(180, 83, 9, 0.25) !important;
+}
+
+html[data-theme="espresso"] .finding-item {
+  background-color: #2c1a0f !important;
+  border-left-color: #d97706 !important;
+}
+
+html[data-theme="espresso"] .finding-item:hover {
+  background-color: #3b2214 !important;
+}
+
+html[data-theme="espresso"] .dark\:bg-slate-800,
+html[data-theme="espresso"] .dark\:bg-slate-900\/50,
+html[data-theme="espresso"] .bg-slate-800 {
+  background-color: #21130b !important;
+  border-color: rgba(217, 119, 6, 0.32) !important;
+}
+
+html[data-theme="espresso"] header h1 span {
+  color: #fbbf24 !important;
+}
+
+html[data-theme="espresso"] .bg-blue-600 {
+  background-color: #b45309 !important;
+  border-color: #92400e !important;
+}
+
+html[data-theme="espresso"] .bg-blue-600:hover {
+  background-color: #92400e !important;
+}
+
+html[data-theme="espresso"] .text-blue-600,
+html[data-theme="espresso"] .dark\:text-blue-400 {
+  color: #fbbf24 !important;
+}

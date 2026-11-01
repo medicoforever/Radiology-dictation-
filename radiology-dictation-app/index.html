@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="./yinyang-mic.svg" />
+    <link rel="apple-touch-icon" href="./apple-touch-icon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#0f172a" />
+    <title>☯️RADDOC's Dictation app</title>
+    <meta name="author" content="medicoforever002@gmail.com" />
+    <meta name="copyright" content="Copyright (c) 2024-2026 RADDOC. All Rights Reserved. Author: medicoforever002@gmail.com. Canonical Applet: 3f0807e3-2494-4289-a3a6-c12032da731c" />
+    <meta name="identifier" content="3f0807e3-2494-4289-a3a6-c12032da731c" />
+    <meta name="description" content="An AI-powered tool for radiologists to record audio dictations and receive corrected, clean text transcripts with smart voice commands and impression generation." />
+    <meta property="og:title" content="☯️RADDOC's Dictation app" />
+    <meta property="og:description" content="An AI-powered tool for radiologists to record audio dictations and receive corrected, clean text transcripts with smart voice commands and impression generation." />
+    <script>
+      // Apply theme from localStorage before page load to prevent flash of unstyled content.
+      try {
+        const storedTheme = localStorage.getItem('theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+        document.documentElement.setAttribute('data-theme', storedTheme);
+        document.documentElement.classList.add('theme-' + storedTheme);
+        if (['dark', 'magical', 'sunset', 'ocean', 'aurora', 'cyberpunk', 'velvet', 'espresso'].includes(storedTheme)) {
+          document.documentElement.classList.add('dark');
+        } else {
+          document.documentElement.classList.remove('dark');
+        }
+      } catch (_) {}
+    </script>
+  </head>
+  <body class="bg-gray-50 dark:bg-slate-900">
+    <div id="root"></div>
+    <script type="module" src="./index.tsx"></script>
+  </body>
+</html>
