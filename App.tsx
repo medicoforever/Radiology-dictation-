@@ -1226,8 +1226,9 @@ const App: React.FC = () => {
         return (
           <AutonomousModeView
             selectedModel={selectedModel}
-            onApplySingleReport={(loadedFindings, patientName, loadedAudio, loadedImages, loadedFiles) => {
-              handleLoadReportFindings(loadedFindings, patientName, loadedAudio, loadedImages, loadedFiles);
+            singleFindingsCount={findings.length}
+            onApplySingleReport={(loadedFindings, patientName, loadedAudio, loadedImages, loadedFiles, loadedPrompt, loadedDocx, templateUsed) => {
+              handleLoadReportFindings(loadedFindings, patientName, loadedAudio, loadedImages, loadedFiles, loadedPrompt, loadedDocx, templateUsed);
             }}
             onApplyBatchReports={async (newBatches) => {
               try {
@@ -1259,6 +1260,7 @@ const App: React.FC = () => {
                     status: 'complete',
                     selectedModel: b.selectedModel || selectedModel,
                     customPrompt: b.customPrompt || '',
+                    customDocx: b.customDocx || null,
                     customImages: b.customImages || [],
                     extraFiles: b.extraFiles || []
                   };
@@ -1283,7 +1285,7 @@ const App: React.FC = () => {
   };
 
   const getPageDescription = () => {
-    if (mode === 'autonomous') return 'Autonomous superapp mode: Speak naturally across multiple patients, templates, macros, and commands.';
+    if (mode === 'autonomous') return 'Dictate naturally to orchestrate Single Mode, Batch Mode, Templates, File Handovers, and Exports in one step.';
     if (mode === 'batch') return 'Manage and transcribe multiple dictations efficiently.';
     if (mode === 'live') return 'Dictate in real-time and get an instant, corrected transcript.';
     return 'Record your findings, and let AI provide a clean, corrected transcript.';
@@ -1296,7 +1298,10 @@ const App: React.FC = () => {
     reportName: string, 
     loadedAudioBlob?: Blob | null,
     loadedImages?: Array<{ data: string; mimeType: string }>,
-    loadedExtraFiles?: File[]
+    loadedExtraFiles?: File[],
+    loadedPrompt?: string,
+    loadedDocx?: DocxTemplateData | null,
+    templateUsed?: string
   ) => {
     setFindings(loadedFindings);
     setStatus(AppStatus.Success);
@@ -1313,6 +1318,14 @@ const App: React.FC = () => {
     }
     if (loadedImages && loadedImages.length > 0) {
       setCustomImages(loadedImages);
+    }
+    if (loadedPrompt) {
+      setCustomPrompt(loadedPrompt);
+    } else if (templateUsed) {
+      setCustomPrompt(`[TEMPLATE_ID: ${templateUsed}] Merged with template: ${templateUsed}`);
+    }
+    if (loadedDocx) {
+      setCustomDocx(loadedDocx);
     }
     setError(null);
     setDriveSaveResult({

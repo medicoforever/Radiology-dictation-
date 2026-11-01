@@ -7,25 +7,29 @@ import {
   AutonomousExecutionPlan,
   AutonomousAttachedFile
 } from '../services/autonomousAgentService';
+import type { DocxTemplateData } from './ui/CustomPromptInput';
 import { SaveResult } from '../services/googleDriveService';
 import { triggerAudioDownload } from '../services/audioMerger';
 import MicIcon from './icons/MicIcon';
 import StopIcon from './icons/StopIcon';
 import SparklesIcon from './icons/SparklesIcon';
-import BrainIcon from './icons/BrainIcon';
 import WarningIcon from './icons/WarningIcon';
 import DownloadIcon from './icons/DownloadIcon';
 import UploadIcon from './icons/UploadIcon';
-import ImageIcon from './icons/ImageIcon';
+import CopyIcon from './icons/CopyIcon';
 
 interface AutonomousModeViewProps {
   selectedModel: string;
+  singleFindingsCount?: number;
   onApplySingleReport: (
     findings: string[], 
     patientName: string, 
     audioBlob?: Blob | null,
     customImages?: Array<{ data: string; mimeType: string }>,
-    extraFiles?: File[]
+    extraFiles?: File[],
+    customPrompt?: string,
+    customDocx?: DocxTemplateData | null,
+    templateUsed?: string
   ) => void;
   onApplyBatchReports: (batches: Array<{
     name: string;
@@ -33,6 +37,7 @@ interface AutonomousModeViewProps {
     audioBlobs: Blob[];
     selectedModel: string;
     customPrompt?: string;
+    customDocx?: DocxTemplateData | null;
     customImages?: Array<{ data: string; mimeType: string }>;
     extraFiles?: File[];
   }>) => void;
@@ -43,6 +48,7 @@ interface AutonomousModeViewProps {
 
 export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
   selectedModel,
+  singleFindingsCount = 0,
   onApplySingleReport,
   onApplyBatchReports,
   onNavigateToSingle,
@@ -54,7 +60,6 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
     recordingDuration,
     startRecording,
     stopRecording,
-    error: recorderError,
   } = useAudioRecorder();
 
   const [recordedBlob, setRecordedBlob] = useState<Blob | null>(null);
@@ -62,12 +67,58 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
   const [isProcessing, setIsProcessing] = useState(false);
   const [executionStep, setExecutionStep] = useState<string>('');
   const [executionResult, setExecutionResult] = useState<AutonomousExecutionResult | null>(null);
+  const [lastPlan, setLastPlan] = useState<AutonomousExecutionPlan | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [showExamples, setShowExamples] = useState(false);
+
+  // Agent State modal
+  const [showAgentStateModal, setShowAgentStateModal] = useState(false);
+  const [activeModalTab, setActiveModalTab] = useState<'json' | 'markdown'>('json');
+  const [copiedState, setCopiedState] = useState(false);
+
+  // Workspace context stats
+  const [batchCount, setBatchCount] = useState<number>(0);
+  const [singleModeStatus, setSingleModeStatus] = useState<'Empty' | 'Active'>('Empty');
+  const templateCount = 72;
 
   // Staged files attached to the autonomous session
   const [attachedFiles, setAttachedFiles] = useState<AutonomousAttachedFile[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const audioUploadInputRef = useRef<HTMLInputElement>(null);
+
+  // Sync workspace stats from localStorage
+  useEffect(() => {
+    try {
+      const rawBatches = localStorage.getItem('radiologyDictationBatchMode');
+      if (rawBatches) {
+        const parsed = JSON.parse(rawBatches);
+        if (Array.isArray(parsed)) {
+          setBatchCount(parsed.length);
+        }
+      } else {
+        setBatchCount(0);
+      }
+    } catch {
+      setBatchCount(0);
+    }
+
+    try {
+      const rawSingle = localStorage.getItem('radiologyDictationSingleMode');
+      if (rawSingle) {
+        const parsed = JSON.parse(rawSingle);
+        if (parsed && ((parsed.findings && parsed.findings.length > 0) || parsed.patientName || (parsed.impression && parsed.impression.length > 0))) {
+          setSingleModeStatus('Active');
+        } else {
+          setSingleModeStatus(singleFindingsCount > 0 ? 'Active' : 'Empty');
+        }
+      } else if (singleFindingsCount > 0) {
+        setSingleModeStatus('Active');
+      } else {
+        setSingleModeStatus('Empty');
+      }
+    } catch {
+      setSingleModeStatus(singleFindingsCount > 0 ? 'Active' : 'Empty');
+    }
+  }, [singleFindingsCount, executionResult]);
 
   // Format recording timer: mm:ss
   const formatTime = (seconds: number) => {
@@ -135,6 +186,24 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
     }
   };
 
+  const handleAudioUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      setRecordedBlob(file);
+      setExecutionResult(null);
+      setErrorMessage(null);
+    }
+    if (e.target) e.target.value = '';
+  };
+
+  const handleDownloadLastAudio = () => {
+    if (recordedBlob) {
+      triggerAudioDownload(recordedBlob, 'autonomous-dictation');
+    } else {
+      setErrorMessage('No voice audio captured yet in this session. Start dictation or upload an audio file first.');
+    }
+  };
+
   const handleExecuteAutonomousSession = async () => {
     if (!recordedBlob) return;
 
@@ -143,12 +212,13 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
     setExecutionResult(null);
 
     try {
-      setExecutionStep('Analyzing spoken audio with ' + selectedModel + '...');
+      setExecutionStep(`Analyzing spoken audio with ${selectedModel}...`);
       const plan: AutonomousExecutionPlan = await parseAutonomousAudioDictation(
         recordedBlob,
         selectedModel,
         attachedFiles
       );
+      setLastPlan(plan);
 
       setExecutionStep('Correlating patients, handing over files & merging templates...');
       const result = await executeAutonomousPlan(plan, {
@@ -179,257 +249,274 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
     setErrorMessage(null);
   };
 
+  // Riley Brown Agent-Readable State generators (Plain JSON & Markdown)
+  const generateStateJson = (): string => {
+    if (lastPlan) {
+      return JSON.stringify(lastPlan, null, 2);
+    }
+
+    return JSON.stringify({
+      superapp: "Radiology Autonomous Superapp",
+      architecture: "Riley Brown Superapp Blueprint (Shell + Slices, Agent-Readable State)",
+      activeModel: selectedModel,
+      workspace: {
+        singleMode: {
+          status: singleModeStatus,
+        },
+        batchQueue: {
+          count: batchCount,
+        },
+        templatesAvailable: templateCount,
+        stagedHandoverFiles: attachedFiles.map(f => ({
+          index: f.index,
+          fileName: f.file.name,
+          sizeKB: Math.round(f.file.size / 1024),
+          type: f.file.type || 'document',
+          spokenAlias: f.alias || `File #${f.index}`
+        })),
+        audioCaptured: Boolean(recordedBlob),
+        lastExecution: executionResult ? {
+          success: executionResult.success,
+          totalPatients: executionResult.totalPatients,
+          summary: executionResult.summary,
+          driveSaved: executionResult.driveSaved,
+          htmlDownloaded: executionResult.htmlDownloaded,
+          workstationSynced: executionResult.workstationSynced
+        } : null
+      }
+    }, null, 2);
+  };
+
+  const generateStateMarkdown = (): string => {
+    if (lastPlan) {
+      let md = `# Autonomous Execution Manifest\n\n`;
+      md += `- **Generated At:** ${new Date().toLocaleString()}\n`;
+      md += `- **Model Used:** \`${selectedModel}\`\n`;
+      md += `- **Global Summary:** ${lastPlan.summary}\n`;
+      md += `- **Drive Save Requested:** ${lastPlan.globalDirectives.saveToDrive ? 'Yes' : 'No'}\n`;
+      md += `- **HTML Export Requested:** ${lastPlan.globalDirectives.downloadAllHtml ? 'Yes' : 'No'}\n`;
+      md += `- **Workstation Sync Requested:** ${lastPlan.globalDirectives.syncToWorkstation ? 'Yes' : 'No'}\n\n`;
+      
+      md += `## Patients Dispatched (${lastPlan.patients.length})\n\n`;
+      lastPlan.patients.forEach((p, idx) => {
+        md += `### ${idx + 1}. ${p.patientName} (${p.targetMode === 'batch' ? 'Batch Queue' : 'Single Dictation'})\n`;
+        if (p.templateName) {
+          md += `- **Template:** ${p.templateName}\n`;
+        }
+        if (p.mergeInstructions) {
+          md += `- **Merge Instructions:** ${p.mergeInstructions}\n`;
+        }
+        if (p.attachedFileIndices && p.attachedFileIndices.length > 0) {
+          md += `- **Attached Files Handed Over:** ${p.attachedFileIndices.map(i => `File #${i}`).join(', ')}\n`;
+        }
+        md += `- **Transcribed Findings (${p.findings.length}):**\n`;
+        p.findings.forEach(f => {
+          md += `  - ${f}\n`;
+        });
+        md += `\n`;
+      });
+
+      if (lastPlan.macrosToCreate && lastPlan.macrosToCreate.length > 0) {
+        md += `## Spoken Macros Created\n\n`;
+        lastPlan.macrosToCreate.forEach(m => {
+          md += `- **Trigger:** \`${m.trigger}\` → **Expansion:** "${m.expansion}"\n`;
+        });
+        md += `\n`;
+      }
+
+      if (lastPlan.vocabularyCorrections && lastPlan.vocabularyCorrections.length > 0) {
+        md += `## Vocabulary Corrections\n\n`;
+        lastPlan.vocabularyCorrections.forEach(v => {
+          md += `- **Replace:** "${v.spokenWord}" → **With:** "${v.replacementWord}"\n`;
+        });
+        md += `\n`;
+      }
+
+      return md;
+    }
+
+    let md = `# Radiology Superapp Workspace State\n\n`;
+    md += `*Riley Brown Architecture: Rule 1 — Agent-Readable State (Everything is JSON or Markdown)*\n\n`;
+    md += `- **Active AI Model:** \`${selectedModel}\`\n`;
+    md += `- **Single Mode Status:** ${singleModeStatus}\n`;
+    md += `- **Batch Queue:** ${batchCount} cases queued\n`;
+    md += `- **Available Templates:** ${templateCount}\n`;
+    md += `- **Staged Handover Files:** ${attachedFiles.length}\n`;
+    md += `- **Audio Recording Captured:** ${recordedBlob ? 'Yes' : 'No'}\n\n`;
+    
+    if (attachedFiles.length > 0) {
+      md += `## Staged Handover Files\n`;
+      attachedFiles.forEach(f => {
+        md += `- **#${f.index}:** \`${f.file.name}\` (${(f.file.size / 1024).toFixed(0)} KB) — *Spoken Alias:* "${f.alias || `File #${f.index}`}"\n`;
+      });
+      md += `\n`;
+    }
+    
+    md += `## Slices Overview\n`;
+    md += `- **Slice 1 (Single Mode):** Active instant dictation with RTF format support\n`;
+    md += `- **Slice 2 (Batch Queue):** Multi-patient queuing and parallel dispatch\n`;
+    md += `- **Slice 3 (Template System):** 72 built-in docx templates and variable injection\n`;
+    md += `- **Slice 4 (Agent Bridge):** Zero-Read file router, spoken macro creator, and auto-export\n`;
+
+    return md;
+  };
+
   return (
-    <div className="w-full max-w-4xl mx-auto space-y-6 animate-fadeIn pb-12">
-      {/* Superapp Director Banner */}
-      <div className="bg-gradient-to-r from-blue-900/90 via-indigo-900/90 to-purple-900/90 text-white rounded-2xl p-4 sm:p-6 shadow-xl border border-blue-700/50 relative overflow-hidden">
-        <div className="relative z-10 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+    <div className="w-full max-w-5xl mx-auto space-y-6 animate-fadeIn pb-12">
+      {/* Main Autonomous Director Card matching dark slate aesthetic */}
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 sm:p-7 shadow-2xl text-slate-100 space-y-6">
+        
+        {/* Top Header: Title, Description, and Action Buttons */}
+        <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
           <div>
-            <div className="flex items-center gap-2 mb-1.5">
-              <div className="p-2 rounded-xl bg-blue-500/30 border border-blue-400/40">
-                <BrainIcon className="w-6 h-6 text-blue-300" />
-              </div>
-              <h2 className="text-xl sm:text-2xl font-black tracking-tight text-white flex items-center gap-2">
-                Autonomous Superapp Director
-                <span className="text-xs bg-amber-400 text-slate-900 font-extrabold px-2 py-0.5 rounded-full uppercase tracking-wider">
-                  Agentic
-                </span>
+            <div className="flex items-center gap-2.5">
+              <SparklesIcon className="w-6 h-6 text-indigo-400 shrink-0" />
+              <h2 className="text-xl sm:text-2xl font-bold tracking-tight text-white">
+                Autonomous Voice &amp; File Orchestrator
               </h2>
             </div>
-            <p className="text-xs sm:text-sm text-blue-200/90 max-w-xl">
-              Dictate naturally in human language. The autonomous agent dissects multiple patients, consolidates fragmented addenda across turns, hands over attached files, routes cases between Single &amp; Batch modes, applies templates, merges instructions, and triggers Google Drive auto-saves &amp; HTML exports behind the scenes.
+            <p className="text-xs sm:text-sm text-slate-400 mt-1.5 max-w-2xl leading-relaxed">
+              Dictate naturally to control Single Mode, Batch Mode, Templates, Macros, File Handovers, HTML Exports, and Google Drive in one go.
             </p>
           </div>
 
-          <div className="shrink-0 self-start sm:self-center">
-            <div className="px-3 py-1.5 rounded-xl bg-black/40 backdrop-blur-md border border-white/20 text-xs font-mono text-blue-200 flex items-center gap-2">
-              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-              <span>Model: <strong>{selectedModel}</strong></span>
-            </div>
+          <div className="flex items-center gap-2.5 shrink-0 self-start sm:self-center">
+            <button
+              type="button"
+              onClick={handleDownloadLastAudio}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold text-slate-200 transition-colors cursor-pointer shadow-sm disabled:opacity-50"
+              title="Download the last recorded or uploaded voice audio"
+            >
+              <DownloadIcon className="w-4 h-4 text-slate-300" />
+              <span>Download Last Audio</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setShowAgentStateModal(true)}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold text-slate-200 transition-colors cursor-pointer shadow-sm"
+              title="Inspect Riley Brown's Agent-Readable State (Manifest & Markdown)"
+            >
+              <span className="font-mono text-indigo-400 font-bold">&lt;/&gt;</span>
+              <span>Agent State (.md / .json)</span>
+            </button>
           </div>
         </div>
-      </div>
 
-      {/* Spoken Examples Accordion */}
-      <div className="bg-white/80 dark:bg-slate-800/80 backdrop-blur-sm rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden shadow-xs">
-        <button
-          type="button"
-          onClick={() => setShowExamples(!showExamples)}
-          className="w-full p-3.5 flex items-center justify-between text-left hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-colors"
-        >
-          <div className="flex items-center gap-2 text-xs sm:text-sm font-bold text-slate-700 dark:text-slate-200">
-            <SparklesIcon className="w-4 h-4 text-indigo-500" />
-            <span>How to speak to the Autonomous Director (Examples &amp; Natural Commands)</span>
-          </div>
-          <span className="text-xs text-indigo-600 dark:text-indigo-400 font-semibold">
-            {showExamples ? 'Hide Tips ▲' : 'Show Tips ▼'}
-          </span>
-        </button>
-
-        {showExamples && (
-          <div className="p-4 bg-slate-50/70 dark:bg-slate-900/40 border-t border-slate-200/60 dark:border-slate-700/60 space-y-3 text-xs sm:text-sm text-slate-600 dark:text-slate-300">
-            <div className="p-3 bg-blue-50/80 dark:bg-blue-950/40 border border-blue-200/70 dark:border-blue-800/50 rounded-lg">
-              <p className="font-semibold text-blue-900 dark:text-blue-200 mb-1">
-                🗣️ Multi-Patient + Interleaved Dictation + File Reference Example:
-              </p>
-              <p className="italic text-slate-700 dark:text-slate-300">
-                &quot;Patient 1 is John Doe, 45 male, CT Brain. In single dictation mode with the CT Brain Plain template. Attach the first uploaded file to this patient. Serial axial sections normal, no hemorrhage... Next patient is Patient 2, Chest X-Ray, put this in batch mode with normal chest template, and hand over the chest scan file to it... Oh, and going back to Patient 1, also note mild mucosal thickening in the right maxillary sinus... Save all reports to Google Drive and download all HTMLs.&quot;
-              </p>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2 text-xs">
-              <div className="p-2.5 rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-200/70 dark:border-slate-700">
-                <strong>Routing:</strong> &quot;Use single dictation for this&quot;, &quot;Add the next 3 patients to batch mode&quot;.
-              </div>
-              <div className="p-2.5 rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-200/70 dark:border-slate-700">
-                <strong>Templates &amp; Merging:</strong> &quot;Apply CT Trauma template and merge focusing on rib fractures&quot;.
-              </div>
-              <div className="p-2.5 rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-200/70 dark:border-slate-700">
-                <strong>Attached Files Handover:</strong> &quot;Attach the first uploaded file to Patient 1&quot;, &quot;Hand over the brain scan to Patient 2&quot;.
-              </div>
-              <div className="p-2.5 rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-200/70 dark:border-slate-700">
-                <strong>Cloud &amp; Storage:</strong> &quot;Save this to Google Drive&quot;, &quot;Auto-save to drive&quot;.
-              </div>
-              <div className="p-2.5 rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-200/70 dark:border-slate-700">
-                <strong>Spoken Macros:</strong> &quot;Create macro normal-cxr with text Clear lung fields...&quot;, &quot;Insert macro age-related&quot;.
-              </div>
-              <div className="p-2.5 rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-200/70 dark:border-slate-700">
-                <strong>Sync &amp; Dictionary:</strong> &quot;Sync to workstation&quot;, &quot;Add word choledocholithiasis to dictionary&quot;.
-              </div>
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* Attached Files Input Station (Upload anytime before, during live, or after dictation) */}
-      <div className="bg-white dark:bg-slate-800 rounded-2xl p-4 sm:p-5 shadow-sm border border-slate-200 dark:border-slate-700 space-y-3">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-          <div>
-            <h3 className="text-sm font-bold text-slate-800 dark:text-slate-100 flex items-center gap-1.5">
-              <span>📎 Attached Files for Handover</span>
-              {attachedFiles.length > 0 && (
-                <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-blue-100 dark:bg-blue-900/60 text-blue-700 dark:text-blue-300">
-                  {attachedFiles.length} file{attachedFiles.length > 1 ? 's' : ''} staged
-                </span>
-              )}
-            </h3>
-            <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              Upload scans, prior reports, or documents anytime — even while recording! The main AI routes them to the right report based on your speech without reading them.
-            </p>
+        {/* Live Workspace Context Bar */}
+        <div className="bg-slate-950/60 border border-slate-800 rounded-xl px-4 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-slate-300">
+            <span className="font-bold text-white">Live Workspace Context:</span>
+            <span>Single Mode: <strong className={singleModeStatus === 'Active' ? 'text-emerald-400 font-semibold' : 'text-slate-200 font-semibold'}>{singleModeStatus}</strong></span>
+            <span className="text-slate-600">·</span>
+            <span>Batch Queue: <strong className="text-slate-200 font-semibold">{batchCount} {batchCount === 1 ? 'batch' : 'batches'}</strong></span>
+            <span className="text-slate-600">·</span>
+            <span>Templates: <strong className="text-slate-200 font-semibold">{templateCount}</strong></span>
+            <span className="text-slate-600">·</span>
+            <span>Model: <strong className="text-indigo-400 font-mono font-semibold">{selectedModel}</strong></span>
           </div>
 
-          <input
-            type="file"
-            ref={fileInputRef}
-            onChange={handleFilesSelected}
-            multiple
-            className="hidden"
-            aria-hidden="true"
-          />
-          <button
-            type="button"
-            onClick={() => fileInputRef.current?.click()}
-            className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-bold bg-slate-100 hover:bg-slate-200 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-600 transition-colors shadow-xs cursor-pointer shrink-0"
-          >
-            <UploadIcon className="w-4 h-4 text-blue-600 dark:text-blue-400" />
-            <span>+ Add File(s) / Scan</span>
-          </button>
+          <div className="flex items-center gap-2 text-xs shrink-0">
+            <button
+              type="button"
+              onClick={onNavigateToSingle}
+              className="text-indigo-400 hover:text-indigo-300 font-semibold transition-colors cursor-pointer"
+            >
+              View Single
+            </button>
+            <span className="text-slate-600">·</span>
+            <button
+              type="button"
+              onClick={onNavigateToBatch}
+              className="text-indigo-400 hover:text-indigo-300 font-semibold transition-colors cursor-pointer"
+            >
+              View Batches
+            </button>
+          </div>
         </div>
 
-        {/* Attached Files Staging List */}
-        {attachedFiles.length > 0 && (
-          <div className="space-y-2 pt-2 border-t border-slate-200/70 dark:border-slate-700/70">
-            {attachedFiles.map((item) => (
-              <div
-                key={item.id}
-                className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 p-2.5 rounded-xl bg-slate-50 dark:bg-slate-900/50 border border-slate-200 dark:border-slate-700/80 text-xs"
-              >
-                <div className="flex items-center gap-2 min-w-0">
-                  <span className="px-2 py-0.5 rounded-md font-mono font-bold bg-blue-100 dark:bg-blue-900/60 text-blue-700 dark:text-blue-300 shrink-0">
-                    File #{item.index}
-                  </span>
-                  <div className="truncate">
-                    <span className="font-semibold text-slate-800 dark:text-slate-200 truncate block" title={item.file.name}>
-                      {item.file.name}
-                    </span>
-                    <span className="text-[11px] text-slate-500 dark:text-slate-400">
-                      {(item.file.size / 1024).toFixed(0)} KB • {item.file.type || 'file'}
-                    </span>
-                  </div>
-                </div>
-
-                <div className="flex items-center gap-2 shrink-0">
-                  <input
-                    type="text"
-                    placeholder={`Spoken alias (e.g. "Brain MRI" or "Prior Report")`}
-                    value={item.alias || ''}
-                    onChange={(e) => handleUpdateAlias(item.id, e.target.value)}
-                    className="text-xs px-2.5 py-1.5 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-100 placeholder-slate-400 w-48 sm:w-64 focus:ring-1 focus:ring-blue-500 focus:outline-none"
-                    title="Give this file a spoken recognition name so you can refer to it easily in your dictation"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => handleRemoveFile(item.id)}
-                    className="p-1.5 text-slate-400 hover:text-red-600 dark:hover:text-red-400 rounded-lg hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors"
-                    title="Remove file"
-                  >
-                    ✕
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-
-      {/* Recording Console */}
-      <div className="bg-white dark:bg-slate-800 rounded-2xl p-6 sm:p-8 shadow-md border border-slate-200 dark:border-slate-700 text-center flex flex-col items-center justify-center space-y-6">
-        {/* Mic Button & Pulse Effect */}
-        <div className="relative">
-          {isRecording && (
-            <span className="absolute -inset-3 rounded-full bg-red-500/20 animate-ping pointer-events-none"></span>
-          )}
+        {/* Primary Action Buttons: Start Dictation & Upload Voice Audio */}
+        <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-2">
+          {/* Record / Stop Button */}
           <button
             type="button"
             onClick={isRecording ? handleStopRecording : handleStartRecording}
             disabled={isProcessing}
-            className={`w-24 h-24 sm:w-28 sm:h-28 rounded-full flex flex-col items-center justify-center transition-all duration-300 shadow-xl cursor-pointer ${
+            className={`w-full sm:w-auto px-7 py-3.5 rounded-xl font-bold text-sm sm:text-base flex items-center justify-center gap-2.5 transition-all shadow-lg cursor-pointer ${
               isRecording
-                ? 'bg-red-600 hover:bg-red-700 text-white ring-8 ring-red-500/30 scale-105'
-                : 'bg-gradient-to-tr from-blue-600 via-indigo-600 to-purple-600 hover:scale-105 text-white ring-8 ring-blue-500/20'
-            } disabled:opacity-50 disabled:pointer-events-none`}
-            aria-label={isRecording ? 'Stop Recording' : 'Start Autonomous Recording'}
+                ? 'bg-red-600 hover:bg-red-700 text-white ring-4 ring-red-500/30 animate-pulse'
+                : 'bg-gradient-to-r from-blue-600 via-indigo-600 to-indigo-700 hover:from-blue-500 hover:to-indigo-600 text-white ring-2 ring-indigo-500/20 active:scale-95'
+            } disabled:opacity-50`}
           >
             {isRecording ? (
-              <StopIcon className="w-10 h-10" />
+              <>
+                <StopIcon className="w-5 h-5" />
+                <span>Stop Recording ({formatTime(recordingDuration)})</span>
+              </>
             ) : (
-              <MicIcon className="w-10 h-10" />
+              <>
+                <MicIcon className="w-5 h-5 text-indigo-200" />
+                <span>Start Autonomous Dictation</span>
+              </>
             )}
-            <span className="text-[11px] font-bold uppercase tracking-wider mt-1">
-              {isRecording ? 'Stop' : 'Dictate'}
-            </span>
+          </button>
+
+          {/* Upload Voice Audio */}
+          <input
+            type="file"
+            ref={audioUploadInputRef}
+            onChange={handleAudioUpload}
+            accept="audio/*,.webm,.wav,.mp3,.m4a,.ogg"
+            className="hidden"
+          />
+          <button
+            type="button"
+            onClick={() => audioUploadInputRef.current?.click()}
+            disabled={isRecording || isProcessing}
+            className="w-full sm:w-auto px-6 py-3.5 rounded-xl bg-slate-800 hover:bg-slate-700/90 border border-slate-700 text-slate-200 font-semibold text-sm sm:text-base flex items-center justify-center gap-2.5 transition-colors cursor-pointer shadow-md disabled:opacity-50"
+          >
+            <UploadIcon className="w-5 h-5 text-slate-400" />
+            <span>Upload Voice Audio</span>
           </button>
         </div>
 
-        {/* Recording Timer & Status */}
-        <div>
-          {isRecording ? (
-            <div className="space-y-1">
-              <div className="text-3xl sm:text-4xl font-mono font-black text-red-600 dark:text-red-400">
-                {formatTime(recordingDuration)}
-              </div>
-              <p className="text-xs sm:text-sm font-semibold text-slate-500 dark:text-slate-400 animate-pulse">
-                🎙️ Listening... Speak naturally across multiple patients, templates, and commands.
-              </p>
+        {/* Audio Player & Execute Console (when audio is captured) */}
+        {recordedBlob && !isRecording && (
+          <div className="bg-slate-950/70 border border-indigo-900/50 rounded-xl p-4 flex flex-col items-center gap-3 animate-fadeIn">
+            <div className="flex items-center justify-between w-full text-xs text-slate-300">
+              <span className="font-semibold text-emerald-400 flex items-center gap-1.5">
+                <span>✓ Voice Audio Ready</span>
+                <span className="text-slate-400 font-mono">({(recordedBlob.size / 1024 / 1024).toFixed(2)} MB)</span>
+              </span>
+              <span className="text-slate-400">Target Model: <strong className="text-indigo-300 font-mono">{selectedModel}</strong></span>
             </div>
-          ) : recordedBlob ? (
-            <div className="space-y-1">
-              <div className="text-sm font-bold text-emerald-600 dark:text-emerald-400 flex items-center justify-center gap-1.5">
-                <span>✓ Audio captured successfully</span>
-                <span>({(recordedBlob.size / 1024 / 1024).toFixed(2)} MB)</span>
-              </div>
-              <p className="text-xs text-slate-500 dark:text-slate-400">
-                Ready to analyze and orchestrate across your application slices.
-              </p>
-            </div>
-          ) : (
-            <div className="space-y-1">
-              <div className="text-base sm:text-lg font-bold text-slate-700 dark:text-slate-200">
-                Tap the microphone to begin autonomous dictation
-              </div>
-              <p className="text-xs sm:text-sm text-slate-500 dark:text-slate-400 max-w-md mx-auto">
-                No complex forms or tool calling required. Speak everything in one continuous voice stream.
-              </p>
-            </div>
-          )}
-        </div>
 
-        {/* Audio Player Preview & Download Button (if recorded and idle) */}
-        {audioUrl && !isRecording && !isProcessing && (
-          <div className="w-full max-w-md pt-2 flex flex-col items-center gap-3">
-            <audio controls src={audioUrl} className="w-full h-10 rounded-lg shadow-xs" />
+            {audioUrl && (
+              <audio controls src={audioUrl} className="w-full h-10 rounded-lg" />
+            )}
+
             <div className="flex flex-wrap items-center gap-2.5 w-full">
               <button
                 type="button"
                 onClick={handleExecuteAutonomousSession}
-                className="flex-1 py-3 px-4 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white font-bold text-sm shadow-md hover:shadow-lg active:scale-95 transition-all flex items-center justify-center gap-2 cursor-pointer"
+                disabled={isProcessing}
+                className="flex-1 py-3 px-4 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold text-sm shadow-md hover:shadow-lg active:scale-95 transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
               >
-                <SparklesIcon className="w-4 h-4" />
+                <SparklesIcon className="w-4 h-4 text-emerald-100" />
                 <span>Execute Autonomous Plan</span>
               </button>
               <button
                 type="button"
-                onClick={() => recordedBlob && triggerAudioDownload(recordedBlob, 'autonomous-dictation')}
-                className="py-3 px-3.5 rounded-xl bg-slate-200 hover:bg-slate-300 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 font-bold text-xs transition-colors cursor-pointer flex items-center justify-center gap-1.5"
-                title="Download this audio recording to your device"
+                onClick={handleDownloadLastAudio}
+                className="py-3 px-3.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 font-semibold text-xs transition-colors cursor-pointer flex items-center justify-center gap-1.5"
+                title="Download this audio recording"
               >
-                <DownloadIcon className="w-4 h-4" />
+                <DownloadIcon className="w-4 h-4 text-slate-400" />
                 <span>Save Audio</span>
               </button>
               <button
                 type="button"
                 onClick={handleResetSession}
-                className="py-3 px-3.5 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 font-semibold text-xs transition-colors cursor-pointer"
+                className="py-3 px-3.5 rounded-xl bg-slate-800/80 hover:bg-slate-700/80 text-slate-400 hover:text-slate-200 text-xs transition-colors cursor-pointer"
               >
                 Discard
               </button>
@@ -439,193 +526,385 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
 
         {/* Processing Indicator */}
         {isProcessing && (
-          <div className="w-full max-w-md p-4 rounded-xl bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 space-y-3 animate-pulse">
-            <div className="flex items-center justify-center gap-2 text-blue-700 dark:text-blue-300 font-bold text-sm">
-              <div className="w-4 h-4 border-2 border-blue-600 border-t-transparent rounded-full animate-spin"></div>
+          <div className="p-4 rounded-xl bg-indigo-950/40 border border-indigo-800/70 space-y-3 animate-pulse text-center">
+            <div className="flex items-center justify-center gap-2 text-indigo-300 font-bold text-sm">
+              <div className="w-4 h-4 border-2 border-indigo-400 border-t-transparent rounded-full animate-spin"></div>
               <span>{executionStep || 'Orchestrating autonomous actions...'}</span>
             </div>
-            <p className="text-xs text-blue-600/80 dark:text-blue-400/80 text-center">
-              Using model <strong>{selectedModel}</strong> to transcribe, resolve patient addenda, and dispatch reports.
+            <p className="text-xs text-slate-400">
+              Using model <strong className="text-indigo-300 font-mono">{selectedModel}</strong> to transcribe, resolve patient addenda, and dispatch reports.
             </p>
           </div>
         )}
-      </div>
 
-      {/* Error Banner with Acoustic Alert */}
-      {errorMessage && (
-        <div className="p-4 rounded-xl bg-red-50 dark:bg-red-950/40 border-2 border-red-300 dark:border-red-800 text-red-900 dark:text-red-200 flex items-start gap-3 shadow-md animate-fadeIn">
-          <WarningIcon className="w-5 h-5 text-red-600 dark:text-red-400 shrink-0 mt-0.5" />
-          <div className="flex-1 text-xs sm:text-sm space-y-1">
-            <p className="font-bold">Autonomous Execution Notice</p>
-            <p>{errorMessage}</p>
+        {/* Error Alert with Dismissal */}
+        {errorMessage && (
+          <div className="p-4 rounded-xl bg-red-950/50 border border-red-800 text-red-200 flex items-start gap-3 shadow-md animate-fadeIn">
+            <WarningIcon className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
+            <div className="flex-1 text-xs sm:text-sm space-y-1">
+              <p className="font-bold">Autonomous Execution Notice</p>
+              <p>{errorMessage}</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setErrorMessage(null)}
+              className="text-xs font-semibold text-red-400 hover:text-red-300 underline shrink-0 cursor-pointer"
+            >
+              Dismiss
+            </button>
           </div>
-          <button
-            type="button"
-            onClick={() => setErrorMessage(null)}
-            className="text-xs font-semibold text-red-700 dark:text-red-300 underline shrink-0 cursor-pointer"
-          >
-            Dismiss
-          </button>
-        </div>
-      )}
+        )}
 
-      {/* Execution Results Dashboard (Riley Brown Superapp Card) */}
-      {executionResult && executionResult.success && (
-        <div className="bg-white dark:bg-slate-800 rounded-2xl p-6 shadow-xl border-2 border-emerald-500/40 dark:border-emerald-500/30 space-y-6 animate-fadeIn">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-200 dark:border-slate-700">
+        {/* Attached Files for Handover Section */}
+        <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-4 sm:p-5 space-y-3">
+          <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
             <div>
-              <span className="text-xs font-bold uppercase tracking-wider text-emerald-600 dark:text-emerald-400">
-                ✓ Plan Executed Successfully
-              </span>
-              <h3 className="text-lg sm:text-xl font-black text-slate-800 dark:text-slate-100">
-                Autonomous Dispatch Summary
-              </h3>
+              <div className="flex items-center gap-2">
+                <span className="text-base text-indigo-400">📚</span>
+                <h3 className="text-sm font-bold text-white">
+                  Attached Files for Handover ({attachedFiles.length})
+                </h3>
+              </div>
+              <p className="text-xs text-slate-400 mt-1 max-w-2xl leading-relaxed">
+                Add files anytime (even while recording). Give a file a custom name or refer to it as &quot;first uploaded file&quot;, &quot;second file&quot;, etc. Main AI only hands them over based on your voice instructions.
+              </p>
             </div>
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="px-2.5 py-1 rounded-full text-xs font-bold bg-blue-100 text-blue-800 dark:bg-blue-900/50 dark:text-blue-200">
-                {executionResult.totalPatients} Patients Processed
-              </span>
-              {executionResult.driveSaved && (
-                <span className="px-2.5 py-1 rounded-full text-xs font-bold bg-emerald-100 text-emerald-800 dark:bg-emerald-900/50 dark:text-emerald-200">
-                  Drive Saved ✓
-                </span>
-              )}
-              {executionResult.htmlDownloaded && (
-                <span className="px-2.5 py-1 rounded-full text-xs font-bold bg-indigo-100 text-indigo-800 dark:bg-indigo-900/50 dark:text-indigo-200">
-                  HTML Downloaded ✓
-                </span>
-              )}
-              {executionResult.workstationSynced && (
-                <span className="px-2.5 py-1 rounded-full text-xs font-bold bg-amber-100 text-amber-800 dark:bg-amber-900/50 dark:text-amber-200">
-                  Workstation Synced ✓
-                </span>
-              )}
-              {recordedBlob && (
-                <button
-                  type="button"
-                  onClick={() => triggerAudioDownload(recordedBlob, 'autonomous-dictation')}
-                  className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold bg-slate-100 hover:bg-slate-200 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-600 transition-colors cursor-pointer"
-                  title="Download the full audio recording to your device"
-                >
-                  <DownloadIcon className="w-3.5 h-3.5" />
-                  <span>Download Audio</span>
-                </button>
-              )}
-            </div>
+
+            <input
+              type="file"
+              ref={fileInputRef}
+              onChange={handleFilesSelected}
+              multiple
+              className="hidden"
+            />
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-semibold bg-indigo-950/70 hover:bg-indigo-900 border border-indigo-700/60 text-indigo-300 transition-colors cursor-pointer shrink-0"
+            >
+              <span>+ Add Files to Context</span>
+            </button>
           </div>
 
-          <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-300 bg-slate-50 dark:bg-slate-900/50 p-3 rounded-xl border border-slate-200/60 dark:border-slate-700/60 italic">
-            &quot;{executionResult.summary}&quot;
-          </p>
+          {/* Staged Attached Files Cards */}
+          {attachedFiles.length > 0 && (
+            <div className="space-y-2 pt-2 border-t border-slate-800">
+              {attachedFiles.map((item) => (
+                <div
+                  key={item.id}
+                  className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 p-2.5 rounded-lg bg-slate-900/90 border border-slate-800 text-xs"
+                >
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <span className="px-2 py-0.5 rounded-md font-mono font-bold bg-indigo-950 border border-indigo-700/50 text-indigo-300 shrink-0">
+                      #{item.index}
+                    </span>
+                    <div className="truncate">
+                      <span className="font-medium text-slate-200 truncate block" title={item.file.name}>
+                        {item.file.name}
+                      </span>
+                      <span className="text-[11px] text-slate-500">
+                        {(item.file.size / 1024).toFixed(0)} KB • {item.file.type || 'document'}
+                      </span>
+                    </div>
+                  </div>
 
-          {/* Handed Over Files Notification */}
-          {executionResult.handedOverFilesSummary && executionResult.handedOverFilesSummary.length > 0 && (
-            <div className="p-3.5 rounded-xl bg-indigo-50/80 dark:bg-indigo-950/40 border border-indigo-200 dark:border-indigo-800/60 text-xs space-y-1.5">
-              <p className="font-bold text-indigo-900 dark:text-indigo-200 flex items-center gap-1.5">
-                <span>📎 Handed Over Files (Zero-Read Principle):</span>
-              </p>
-              {executionResult.handedOverFilesSummary.map((item, idx) => (
-                <p key={idx} className="text-slate-700 dark:text-slate-300 pl-2">
-                  • <strong>{item.patientName}:</strong> {item.fileNames.join(', ')}
-                </p>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <input
+                      type="text"
+                      placeholder={`Spoken alias (e.g. "Brain MRI" or "Prior Report")`}
+                      value={item.alias || ''}
+                      onChange={(e) => handleUpdateAlias(item.id, e.target.value)}
+                      className="text-xs px-2.5 py-1.5 rounded-md border border-slate-700 bg-slate-950 text-slate-100 placeholder-slate-500 w-48 sm:w-64 focus:ring-1 focus:ring-indigo-500 focus:outline-none"
+                      title="Give this file a spoken recognition name so you can refer to it easily in your dictation"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => handleRemoveFile(item.id)}
+                      className="p-1.5 text-slate-400 hover:text-red-400 rounded-md hover:bg-slate-800 transition-colors cursor-pointer"
+                      title="Remove file"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                </div>
               ))}
             </div>
           )}
+        </div>
 
-          {/* Spoken Macros & Vocabulary Created Notice */}
-          {((executionResult.macrosCreated && executionResult.macrosCreated.length > 0) || 
-            (executionResult.vocabularyCreated && executionResult.vocabularyCreated.length > 0)) && (
-            <div className="p-3.5 rounded-xl bg-purple-50/80 dark:bg-purple-950/40 border border-purple-200 dark:border-purple-800/60 text-xs space-y-1">
-              {executionResult.macrosCreated && executionResult.macrosCreated.length > 0 && (
-                <p className="text-purple-900 dark:text-purple-200 font-semibold">
-                  ✨ <strong>Spoken Macros Created:</strong> {executionResult.macrosCreated.join(', ')}
-                </p>
-              )}
-              {executionResult.vocabularyCreated && executionResult.vocabularyCreated.length > 0 && (
-                <p className="text-purple-900 dark:text-purple-200 font-semibold">
-                  📖 <strong>Dictionary Rules Added:</strong> {executionResult.vocabularyCreated.join(', ')}
-                </p>
-              )}
-            </div>
-          )}
-
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {/* Single Dictation Slice Card */}
-            {executionResult.singlePatient && (
-              <div className="p-4 rounded-xl border border-blue-200 dark:border-blue-800/60 bg-blue-50/50 dark:bg-blue-950/20 space-y-3">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2 font-bold text-sm text-blue-900 dark:text-blue-200">
-                    <MicIcon className="w-4 h-4 text-blue-600" />
-                    <span>Single Dictation Slice</span>
-                  </div>
-                  <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-blue-200/60 dark:bg-blue-800 text-blue-900 dark:text-blue-200">
-                    Active Report
-                  </span>
-                </div>
-                <div className="text-xs space-y-1 text-slate-700 dark:text-slate-300">
-                  <p><strong>Patient:</strong> {executionResult.singlePatient.name}</p>
-                  <p><strong>Findings:</strong> {executionResult.singlePatient.findings.length} findings transcribed &amp; merged</p>
-                  {executionResult.singlePatient.templateUsed && (
-                    <p><strong>Template:</strong> {executionResult.singlePatient.templateUsed}</p>
-                  )}
-                  {executionResult.singlePatient.attachedFilesCount ? (
-                    <p><strong>Attached Files:</strong> {executionResult.singlePatient.attachedFilesCount} handed over</p>
-                  ) : null}
-                </div>
-                <button
-                  type="button"
-                  onClick={onNavigateToSingle}
-                  className="w-full py-2 px-3 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs shadow-xs transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
-                >
-                  <span>Open Active Single Report</span>
-                  <span>→</span>
-                </button>
-              </div>
-            )}
-
-            {/* Batch Processing Slice Card */}
-            {executionResult.batchPatients && executionResult.batchPatients.length > 0 && (
-              <div className="p-4 rounded-xl border border-purple-200 dark:border-purple-800/60 bg-purple-50/50 dark:bg-purple-950/20 space-y-3">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2 font-bold text-sm text-purple-900 dark:text-purple-200">
-                    <span className="text-base">📑</span>
-                    <span>Batch Queue Slice</span>
-                  </div>
-                  <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-purple-200/60 dark:bg-purple-800 text-purple-900 dark:text-purple-200">
-                    {executionResult.batchPatients.length} Cases Queued
-                  </span>
-                </div>
-                <div className="text-xs space-y-1 text-slate-700 dark:text-slate-300 max-h-32 overflow-y-auto">
-                  {executionResult.batchPatients.map((bp, i) => (
-                    <div key={i} className="flex items-center justify-between py-0.5 border-b border-purple-100 dark:border-purple-900/40 last:border-none">
-                      <span className="font-medium truncate max-w-[180px]">{bp.name}</span>
-                      <span className="text-slate-500 dark:text-slate-400">
-                        {bp.findings.length} findings
-                        {bp.attachedFilesCount ? ` • ${bp.attachedFilesCount} file(s)` : ''}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-                <button
-                  type="button"
-                  onClick={onNavigateToBatch}
-                  className="w-full py-2 px-3 rounded-lg bg-purple-600 hover:bg-purple-700 text-white font-bold text-xs shadow-xs transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
-                >
-                  <span>View All in Batch Mode</span>
-                  <span>→</span>
-                </button>
-              </div>
-            )}
+        {/* Examples Section */}
+        <div className="space-y-2.5">
+          <div className="text-xs font-semibold text-slate-400">
+            Examples of what you can say in a single Autonomous Dictation:
           </div>
 
-          <div className="pt-2 flex justify-center">
-            <button
-              type="button"
-              onClick={handleResetSession}
-              className="py-2.5 px-6 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-800 dark:text-slate-200 font-bold text-xs transition-colors cursor-pointer"
-            >
-              Start Another Autonomous Session
-            </button>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+            {/* Card 1 */}
+            <div className="p-3.5 rounded-xl bg-slate-950/60 border border-slate-800 space-y-1.5">
+              <div className="font-bold text-white">
+                Non-Linear Single + Batch Dictation:
+              </div>
+              <p className="text-slate-400 italic leading-relaxed">
+                &quot;Use single dictation for Patient Ramesh: CT Brain shows right MCA infarct. Now use batch mode and create 5 patients... Oh, and back to Ramesh in single mode, add 4mm midline shift and merge with CT Brain Plain template.&quot;
+              </p>
+            </div>
+
+            {/* Card 2 */}
+            <div className="p-3.5 rounded-xl bg-slate-950/60 border border-slate-800 space-y-1.5">
+              <div className="font-bold text-white">
+                File Handover, Drive Save &amp; HTML Export:
+              </div>
+              <p className="text-slate-400 italic leading-relaxed">
+                &quot;Hand over the first uploaded file to Single Mode, put the 2nd and 3rd files into Batch Mode, save everything to Google Drive, and download all HTMLs of the batch.&quot;
+              </p>
+            </div>
+          </div>
+        </div>
+
+        {/* Execution Results Dashboard */}
+        {executionResult && executionResult.success && (
+          <div className="rounded-xl border border-emerald-500/30 bg-slate-950/80 p-5 space-y-5 animate-fadeIn">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-800">
+              <div>
+                <span className="text-xs font-bold uppercase tracking-wider text-emerald-400">
+                  ✓ Plan Executed Successfully
+                </span>
+                <h3 className="text-lg font-bold text-white">
+                  Autonomous Dispatch Summary
+                </h3>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="px-2.5 py-1 rounded-full text-xs font-semibold bg-indigo-950 border border-indigo-700/60 text-indigo-300">
+                  {executionResult.totalPatients} Patients Processed
+                </span>
+                {executionResult.driveSaved && (
+                  <span className="px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-950 border border-emerald-700/60 text-emerald-300">
+                    Drive Saved ✓
+                  </span>
+                )}
+                {executionResult.htmlDownloaded && (
+                  <span className="px-2.5 py-1 rounded-full text-xs font-semibold bg-blue-950 border border-blue-700/60 text-blue-300">
+                    HTML Downloaded ✓
+                  </span>
+                )}
+                {executionResult.workstationSynced && (
+                  <span className="px-2.5 py-1 rounded-full text-xs font-semibold bg-amber-950 border border-amber-700/60 text-amber-300">
+                    Workstation Synced ✓
+                  </span>
+                )}
+              </div>
+            </div>
+
+            <p className="text-xs sm:text-sm text-slate-300 bg-slate-900 p-3 rounded-lg border border-slate-800 italic">
+              &quot;{executionResult.summary}&quot;
+            </p>
+
+            {/* Handed Over Files Notification */}
+            {executionResult.handedOverFilesSummary && executionResult.handedOverFilesSummary.length > 0 && (
+              <div className="p-3.5 rounded-lg bg-indigo-950/40 border border-indigo-800/60 text-xs space-y-1">
+                <p className="font-bold text-indigo-300 flex items-center gap-1.5">
+                  <span>📎 Handed Over Files (Zero-Read Principle):</span>
+                </p>
+                {executionResult.handedOverFilesSummary.map((item, idx) => (
+                  <p key={idx} className="text-slate-300 pl-2">
+                    • <strong>{item.patientName}:</strong> {item.fileNames.join(', ')}
+                  </p>
+                ))}
+              </div>
+            )}
+
+            {/* Spoken Macros & Vocabulary Created Notice */}
+            {((executionResult.macrosCreated && executionResult.macrosCreated.length > 0) || 
+              (executionResult.vocabularyCreated && executionResult.vocabularyCreated.length > 0)) && (
+              <div className="p-3.5 rounded-lg bg-purple-950/40 border border-purple-800/60 text-xs space-y-1">
+                {executionResult.macrosCreated && executionResult.macrosCreated.length > 0 && (
+                  <p className="text-purple-300">
+                    ✨ <strong>Spoken Macros Created:</strong> {executionResult.macrosCreated.join(', ')}
+                  </p>
+                )}
+                {executionResult.vocabularyCreated && executionResult.vocabularyCreated.length > 0 && (
+                  <p className="text-purple-300">
+                    📖 <strong>Dictionary Rules Added:</strong> {executionResult.vocabularyCreated.join(', ')}
+                  </p>
+                )}
+              </div>
+            )}
+
+            {/* Slices Cards: Single Report & Batch Queue */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {/* Single Dictation Slice Card */}
+              {executionResult.singlePatient && (
+                <div className="p-4 rounded-xl border border-indigo-900/60 bg-slate-900/90 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2 font-bold text-sm text-indigo-300">
+                      <MicIcon className="w-4 h-4 text-indigo-400" />
+                      <span>Single Dictation Slice</span>
+                    </div>
+                    <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-indigo-950 border border-indigo-700/50 text-indigo-300">
+                      Active Report
+                    </span>
+                  </div>
+                  <div className="text-xs space-y-1 text-slate-300">
+                    <p><strong>Patient:</strong> {executionResult.singlePatient.name}</p>
+                    <p><strong>Findings:</strong> {executionResult.singlePatient.findings.length} findings transcribed &amp; merged</p>
+                    {executionResult.singlePatient.templateUsed && (
+                      <p><strong>Template (RTF Ready):</strong> {executionResult.singlePatient.templateUsed}</p>
+                    )}
+                    {executionResult.singlePatient.attachedFilesCount ? (
+                      <p><strong>Attached Files:</strong> {executionResult.singlePatient.attachedFilesCount} handed over</p>
+                    ) : null}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={onNavigateToSingle}
+                    className="w-full py-2.5 px-3 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs shadow-sm transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
+                  >
+                    <span>Open Active Single Report</span>
+                    <span>→</span>
+                  </button>
+                </div>
+              )}
+
+              {/* Batch Processing Slice Card */}
+              {executionResult.batchPatients && executionResult.batchPatients.length > 0 && (
+                <div className="p-4 rounded-xl border border-purple-900/60 bg-slate-900/90 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2 font-bold text-sm text-purple-300">
+                      <span className="text-base">📑</span>
+                      <span>Batch Queue Slice</span>
+                    </div>
+                    <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-purple-950 border border-purple-700/50 text-purple-300">
+                      {executionResult.batchPatients.length} Cases Queued
+                    </span>
+                  </div>
+                  <div className="text-xs space-y-1 text-slate-300 max-h-32 overflow-y-auto">
+                    {executionResult.batchPatients.map((bp, i) => (
+                      <div key={i} className="flex items-center justify-between py-1 border-b border-slate-800 last:border-none">
+                        <span className="font-medium truncate max-w-[180px]">{bp.name}</span>
+                        <span className="text-slate-400">
+                          {bp.findings.length} findings
+                          {bp.attachedFilesCount ? ` • ${bp.attachedFilesCount} file(s)` : ''}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={onNavigateToBatch}
+                    className="w-full py-2.5 px-3 rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-bold text-xs shadow-sm transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
+                  >
+                    <span>View All in Batch Mode</span>
+                    <span>→</span>
+                  </button>
+                </div>
+              )}
+            </div>
+
+            <div className="pt-2 flex justify-center">
+              <button
+                type="button"
+                onClick={handleResetSession}
+                className="py-2.5 px-6 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs transition-colors cursor-pointer"
+              >
+                Start Another Autonomous Session
+              </button>
+            </div>
+          </div>
+        )}
+
+      </div>
+
+      {/* Riley Brown Agent State Modal (JSON Manifest / Markdown) */}
+      {showAgentStateModal && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-xs z-50 flex items-center justify-center p-3 sm:p-5 animate-fadeIn">
+          <div className="bg-slate-900 border border-slate-700/80 rounded-2xl max-w-3xl w-full max-h-[85vh] flex flex-col shadow-2xl text-slate-100 overflow-hidden">
+            {/* Modal Header */}
+            <div className="p-4 sm:p-5 border-b border-slate-800 flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <span className="font-mono text-indigo-400 font-bold text-lg">&lt;/&gt;</span>
+                <div>
+                  <h3 className="text-base font-bold text-white">
+                    Agent-Readable State (.json / .md)
+                  </h3>
+                  <p className="text-xs text-slate-400">
+                    Riley Brown Architecture: Plain-text state allowing autonomous agents to inspect and manipulate slices.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowAgentStateModal(false)}
+                className="text-slate-400 hover:text-white p-1.5 rounded-lg hover:bg-slate-800 transition-colors"
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Modal Tabs & Actions */}
+            <div className="px-4 py-2.5 bg-slate-950/60 border-b border-slate-800 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5 bg-slate-900 p-1 rounded-lg border border-slate-800 text-xs">
+                <button
+                  type="button"
+                  onClick={() => setActiveModalTab('json')}
+                  className={`px-3 py-1 rounded-md font-semibold transition-colors cursor-pointer ${
+                    activeModalTab === 'json'
+                      ? 'bg-indigo-600 text-white shadow-xs'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  JSON Manifest
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setActiveModalTab('markdown')}
+                  className={`px-3 py-1 rounded-md font-semibold transition-colors cursor-pointer ${
+                    activeModalTab === 'markdown'
+                      ? 'bg-indigo-600 text-white shadow-xs'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  Markdown Summary
+                </button>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => {
+                  const content = activeModalTab === 'json' ? generateStateJson() : generateStateMarkdown();
+                  navigator.clipboard.writeText(content);
+                  setCopiedState(true);
+                  setTimeout(() => setCopiedState(false), 2000);
+                }}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold text-slate-200 transition-colors cursor-pointer"
+              >
+                {copiedState ? (
+                  <span className="text-emerald-400 font-bold">✓ Copied!</span>
+                ) : (
+                  <>
+                    <CopyIcon className="w-3.5 h-3.5" />
+                    <span>Copy {activeModalTab.toUpperCase()}</span>
+                  </>
+                )}
+              </button>
+            </div>
+
+            {/* Code Viewer Body */}
+            <div className="p-4 overflow-y-auto flex-1 font-mono text-xs bg-slate-950 text-slate-300 leading-relaxed selection:bg-indigo-600 selection:text-white">
+              <pre className="whitespace-pre-wrap break-words">
+                {activeModalTab === 'json' ? generateStateJson() : generateStateMarkdown()}
+              </pre>
+            </div>
+
+            {/* Modal Footer */}
+            <div className="p-3 bg-slate-900 border-t border-slate-800 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setShowAgentStateModal(false)}
+                className="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold transition-colors cursor-pointer"
+              >
+                Close
+              </button>
+            </div>
           </div>
         </div>
       )}

@@ -14,12 +14,13 @@
 
 import { Type } from "@google/genai";
 import { executeWithApiKeyFailover } from "./apiKeyService";
-import { ALL_RADNITO_TEMPLATES, BuiltInTemplateItem } from "./builtInTemplates";
+import { ALL_RADNITO_TEMPLATES, BuiltInTemplateItem, getTemplateDocxBase64 } from "./builtInTemplates";
 import { mergeDictatedFindingsWithTemplate, resolveApiTargetModel } from "./geminiService";
 import { autoSaveSingleDictation, autoSaveBatchDictations, isDriveConnected, SaveResult } from "./googleDriveService";
 import { generateSingleDictationHTML, generateBatchDictationHTML } from "./htmlGenerator";
 import { downloadFile } from "./docxService";
 import { playAutonomousSuccessSound, playAutonomousErrorSound } from "./soundService";
+import type { DocxTemplateData } from "../components/ui/CustomPromptInput";
 import { 
   addMacroFromAutonomous, 
   addVocabularyRuleFromAutonomous, 
@@ -349,7 +350,10 @@ export async function executeAutonomousPlan(
       patientName: string, 
       audioBlob?: Blob | null,
       customImages?: Array<{ data: string; mimeType: string }>,
-      extraFiles?: File[]
+      extraFiles?: File[],
+      customPrompt?: string,
+      customDocx?: DocxTemplateData | null,
+      templateUsed?: string
     ) => void;
     onApplyBatchReports: (batches: Array<{
       name: string;
@@ -357,6 +361,7 @@ export async function executeAutonomousPlan(
       audioBlobs: Blob[];
       selectedModel: string;
       customPrompt?: string;
+      customDocx?: DocxTemplateData | null;
       customImages?: Array<{ data: string; mimeType: string }>;
       extraFiles?: File[];
     }>) => void;
@@ -440,11 +445,28 @@ export async function executeAutonomousPlan(
       // Expand user voice macros into findings
       let finalFindings = expandMacrosInFindings([...singlePatientItem.findings]);
       let templateUsed: string | undefined = undefined;
+      let singleDocx: DocxTemplateData | null = null;
+      let singlePrompt = singlePatientItem.customPrompt || '';
 
       if (singlePatientItem.targetTemplateName) {
         const matched = findTemplateByFuzzyName(singlePatientItem.targetTemplateName);
         if (matched) {
           templateUsed = matched.name;
+          try {
+            const docxB64 = matched.docxBase64 || await getTemplateDocxBase64(matched.id);
+            if (docxB64) {
+              singleDocx = {
+                base64: docxB64,
+                name: `${matched.name}.docx`,
+                extractedText: matched.lines ? matched.lines.join('\n') : matched.name
+              };
+            }
+          } catch (e) {
+            console.warn('Could not load docx for single template:', e);
+          }
+
+          singlePrompt = `[TEMPLATE_ID: ${matched.id}] Merged with template: ${matched.name}. ${singlePatientItem.mergeDirectives || ''}`.trim();
+
           try {
             finalFindings = await mergeDictatedFindingsWithTemplate(
               finalFindings,
@@ -475,13 +497,16 @@ export async function executeAutonomousPlan(
         attachedFilesCount: singleFiles.fileNames.length
       };
 
-      // Dispatch to Single Dictation state with audioBlob and attached files
+      // Dispatch to Single Dictation state with audioBlob, attached files, and RTF template config
       context.onApplySingleReport(
         finalFindings, 
         singlePatientItem.patientName, 
         context.audioBlob, 
         singleFiles.images, 
-        singleFiles.otherFiles
+        singleFiles.otherFiles,
+        singlePrompt,
+        singleDocx,
+        templateUsed
       );
 
       // Handle Single Drive Save
@@ -516,11 +541,28 @@ export async function executeAutonomousPlan(
         // Expand user voice macros into findings
         let finalFindings = expandMacrosInFindings([...bp.findings]);
         let templateUsed: string | undefined = undefined;
+        let bpDocx: DocxTemplateData | null = null;
+        let bpPrompt = bp.customPrompt || '';
 
         if (bp.targetTemplateName) {
           const matched = findTemplateByFuzzyName(bp.targetTemplateName);
           if (matched) {
             templateUsed = matched.name;
+            try {
+              const docxB64 = matched.docxBase64 || await getTemplateDocxBase64(matched.id);
+              if (docxB64) {
+                bpDocx = {
+                  base64: docxB64,
+                  name: `${matched.name}.docx`,
+                  extractedText: matched.lines ? matched.lines.join('\n') : matched.name
+                };
+              }
+            } catch (e) {
+              console.warn('Could not load docx for batch template:', e);
+            }
+
+            bpPrompt = `[TEMPLATE_ID: ${matched.id}] Merged with template: ${matched.name}. ${bp.mergeDirectives || ''}`.trim();
+
             try {
               finalFindings = await mergeDictatedFindingsWithTemplate(
                 finalFindings,
@@ -548,14 +590,15 @@ export async function executeAutonomousPlan(
           name: bp.patientName,
           findings: finalFindings,
           templateUsed,
-          customPrompt: bp.customPrompt || bp.mergeDirectives || '',
+          customPrompt: bpPrompt || bp.mergeDirectives || '',
+          customDocx: bpDocx,
           customImages: bpFiles.images,
           extraFiles: bpFiles.otherFiles,
           attachedFilesCount: bpFiles.fileNames.length
         });
       }
 
-      // Dispatch to Batch Processor state with audioBlobs and handed-over files
+      // Dispatch to Batch Processor state with audioBlobs, RTF docx, and handed-over files
       context.onApplyBatchReports(
         processedBatches.map(b => ({
           name: b.name,
@@ -563,6 +606,7 @@ export async function executeAutonomousPlan(
           audioBlobs: context.audioBlob ? [context.audioBlob] : [],
           selectedModel: context.selectedModel,
           customPrompt: b.customPrompt,
+          customDocx: b.customDocx,
           customImages: b.customImages,
           extraFiles: b.extraFiles,
         }))

@@ -974,6 +974,14 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         handleAddNewBatch();
     };
 
+    useEffect(() => {
+        const handleTrigger = () => {
+            handleAddNewBatch();
+        };
+        window.addEventListener('app-trigger-new-batch-dictation', handleTrigger);
+        return () => window.removeEventListener('app-trigger-new-batch-dictation', handleTrigger);
+    }, [batches.length, selectedModel, globalCustomPrompt, globalCustomImages]);
+
     const handleAddNewBatch = () => {
         const newId = crypto.randomUUID();
         const nextBatchNumber = batches.length + 1;
@@ -3328,13 +3336,21 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                 {(() => {
                                                     const effectivePrompt = batch.customPrompt || globalCustomPrompt;
                                                     const effectiveImages = (batch.customImages && batch.customImages.length > 0) ? batch.customImages : globalCustomImages;
-                                                    const batchTemplate = detectAndExtractTemplate(effectivePrompt, effectiveImages, null);
-                                                    const isBatchTemplateMode = batchTemplate.isTemplateMode;
+                                                    const batchTemplate = detectAndExtractTemplate(effectivePrompt, effectiveImages, batch.customDocx || null);
+                                                    const isBatchTemplateMode = Boolean(
+                                                        batchTemplate.isTemplateMode || 
+                                                        batch.customDocx || 
+                                                        (batch.customPrompt && (
+                                                            batch.customPrompt.includes('[TEMPLATE_ID:') || 
+                                                            batch.customPrompt.toLowerCase().includes('template') || 
+                                                            batch.customPrompt.toLowerCase().includes('merge')
+                                                        ))
+                                                    );
                                                     const isRtfOpen = batchRtfViewIds[batch.id] !== undefined ? batchRtfViewIds[batch.id] : isBatchTemplateMode;
 
                                                     return (
                                                         <>
-                                                            <div className="flex flex-wrap justify-end items-center gap-2 mb-4">
+                                                            <div className="flex flex-wrap justify-start sm:justify-end items-center gap-2 mb-4 w-full overflow-x-auto py-1">
                                                                 <button
                                                                     onClick={() => setBatchRtfViewIds(prev => ({ ...prev, [batch.id]: !isRtfOpen }))}
                                                                     className={`text-sm font-semibold py-1 px-3 rounded-lg transition-colors flex items-center gap-1.5 ${isRtfOpen ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-slate-200 text-slate-700 hover:bg-slate-300 dark:bg-slate-700 dark:text-slate-300 dark:hover:bg-slate-600'}`}
@@ -4059,21 +4075,6 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                     handlePasteBatches(files);
                 }}
             />
-
-            {/* Floating Quick Action Button for Instant New Batch Dictation */}
-            <div className="fixed bottom-5 right-5 z-40 flex items-center gap-2 print:hidden">
-              <button
-                type="button"
-                onClick={handleAddNewBatch}
-                id="floating-new-batch-dictation-btn"
-                className="group flex items-center gap-2 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-bold py-2.5 px-4 rounded-full shadow-lg hover:shadow-xl transition-all duration-200 border border-blue-400/40 hover:scale-105 cursor-pointer text-xs sm:text-sm"
-                title="Add New Batch Dictation"
-                aria-label="Add New Batch Dictation"
-              >
-                <MicIcon className="w-4 h-4 shrink-0 text-white group-hover:scale-110 transition-transform" />
-                <span className="whitespace-nowrap font-bold">+ New Batch Dictation</span>
-              </button>
-            </div>
 
             {multiSelectMode && (
                 <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-40 bg-slate-900/95 dark:bg-slate-800/95 text-white rounded-full shadow-2xl border border-slate-700/80 flex items-center gap-2.5 sm:gap-3 px-3.5 sm:px-4 py-2 transition-all duration-300 ease-in-out backdrop-blur-xs">
