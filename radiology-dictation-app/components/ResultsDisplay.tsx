@@ -2222,13 +2222,13 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         </div>
       </div>
       {findings.length > 0 && (
-        <div className="flex items-center justify-between gap-2 mb-4 p-2 bg-slate-100/70 dark:bg-slate-800/70 rounded-xl border border-slate-200/80 dark:border-slate-700/80 min-h-[46px]">
+        <div className="flex flex-wrap sm:flex-nowrap items-center justify-between gap-2.5 mb-4 p-2.5 bg-slate-100/70 dark:bg-slate-800/70 rounded-xl border border-slate-200/80 dark:border-slate-700/80 min-h-[46px] w-full">
             <div className="flex items-center gap-2 shrink-0">
               <span className="text-xs sm:text-sm font-semibold text-slate-600 dark:text-slate-300">
                 {findings.filter(f => f && f.trim()).length} findings{multiSelectMode ? ` (${selectedIndices.size} selected)` : ''}
               </span>
             </div>
-            <div className="flex items-center gap-1.5 sm:gap-2 flex-nowrap overflow-x-auto no-scrollbar shrink-0">
+            <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap sm:flex-nowrap overflow-x-auto min-w-0 max-w-full py-0.5">
               {undoState && (
                 <button
                   onClick={handleUndo}

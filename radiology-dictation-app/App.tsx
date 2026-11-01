@@ -1249,7 +1249,7 @@ const App: React.FC = () => {
   };
 
   return (
-    <div className={`min-h-screen max-w-full overflow-x-hidden bg-gray-50 dark:bg-slate-900 flex flex-col items-center justify-start sm:justify-center p-2 sm:p-4 md:p-6 font-sans transition-colors duration-300 ${!isPowerMode ? 'low-power-active' : ''}`}>
+    <div className={`min-h-screen w-full bg-gray-50 dark:bg-slate-900 flex flex-col items-center justify-start sm:justify-center p-2 sm:p-4 md:p-6 font-sans transition-colors duration-300 ${!isPowerMode ? 'low-power-active' : ''}`}>
       {!isPowerMode && (
         <style>{`
           .low-power-mode *, .low-power-mode *::before, .low-power-mode *::after {
@@ -1262,13 +1262,13 @@ const App: React.FC = () => {
           }
         `}</style>
       )}
-      <div className={`w-full max-w-full overflow-x-hidden mx-auto transition-all duration-200 ${isWideView ? 'max-w-4xl lg:max-w-5xl xl:max-w-6xl' : 'max-w-3xl'}`}>
+      <div className={`w-full mx-auto transition-all duration-200 ${isWideView ? 'max-w-4xl lg:max-w-5xl xl:max-w-6xl' : 'max-w-3xl'}`}>
         
         {/* Top Header */}
-        <header className="mb-6 relative w-full max-w-full overflow-hidden">
+        <header className="mb-6 relative w-full">
           {/* Mobile Header: Row 1 = Utility Bar (Drive on left, Action buttons on right); Row 2 = App Title centered */}
-          <div className="flex flex-col gap-2 mb-2 w-full max-w-full sm:hidden">
-            <div className="flex items-center justify-between gap-1 w-full max-w-full">
+          <div className="flex flex-col gap-2 mb-2 w-full sm:hidden">
+            <div className="flex items-center justify-between gap-1 w-full">
               <div className="shrink-0">
                 <DriveStatusBadge 
                   lastSaveResult={driveSaveResult} 

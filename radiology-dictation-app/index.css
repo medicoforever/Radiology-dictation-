@@ -25,24 +25,22 @@
    and controls 100% solid, fully legible, and functional.
    ========================================================================== */
 
-/* Global Mobile Viewport & Horizontal Overflow Prevention */
+/* Global Mobile Viewport & Smooth Lateral Scrolling */
 html {
-  overflow-x: hidden;
-  max-width: 100vw;
+  overflow-x: auto;
   width: 100%;
+  -webkit-text-size-adjust: 100%;
 }
 
 body {
-  overflow-x: hidden;
-  max-width: 100vw;
+  overflow-x: auto;
   width: 100%;
   position: relative;
   -webkit-overflow-scrolling: touch;
 }
 
 #root {
-  overflow-x: hidden;
-  max-width: 100vw;
+  overflow-x: auto;
   width: 100%;
 }
 

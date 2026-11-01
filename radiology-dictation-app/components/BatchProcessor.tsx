@@ -3342,7 +3342,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
 
                                                     return (
                                                         <>
-                                                            <div className="flex flex-wrap justify-end items-center gap-2 mb-4">
+                                                            <div className="flex flex-wrap justify-start sm:justify-end items-center gap-2 mb-4 w-full overflow-x-auto py-1">
                                                                 <button
                                                                     onClick={() => setBatchRtfViewIds(prev => ({ ...prev, [batch.id]: !isRtfOpen }))}
                                                                     className={`text-sm font-semibold py-1 px-3 rounded-lg transition-colors flex items-center gap-1.5 ${isRtfOpen ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-slate-200 text-slate-700 hover:bg-slate-300 dark:bg-slate-700 dark:text-slate-300 dark:hover:bg-slate-600'}`}

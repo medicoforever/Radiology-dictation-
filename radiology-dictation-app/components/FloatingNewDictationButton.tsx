@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { Mic } from 'lucide-react';
 import { AppStatus } from '../types';
@@ -17,8 +17,8 @@ interface FloatingNewDictationButtonProps {
  * as well as iOS and desktop:
  * 1. Portaled directly to document.body so it is completely immune to ancestor CSS transforms,
  *    transitions, or overflow containers.
- * 2. Uses hardware-accelerated translate3d(0, 0, 0) and will-change to lock onto the GPU
- *    compositing overlay layer, preventing Android scroll jitter or decoupling.
+ * 2. Uses visualViewport and scroll offset tracking so it always stays anchored in the user's
+ *    working area (visible screen) even when the user scrolls laterally!
  * 3. Incorporates env(safe-area-inset-bottom) to guarantee it is NEVER obscured by the Android
  *    gesture bar, software navigation buttons, or mobile browser toolbars.
  * 4. touch-action: manipulation eliminates the 300ms mobile touch delay for instantaneous taps.
@@ -31,6 +31,7 @@ export const FloatingNewDictationButton: React.FC<FloatingNewDictationButtonProp
   onNewBatchDictation,
 }) => {
   const [mounted, setMounted] = useState(false);
+  const [rightPx, setRightPx] = useState<number>(16);
 
   useEffect(() => {
     setMounted(true);
@@ -54,6 +55,54 @@ export const FloatingNewDictationButton: React.FC<FloatingNewDictationButtonProp
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [status, mode]);
+
+  // Keep floating button anchored in the visible screen (visual viewport) during lateral scrolling
+  const updatePosition = useCallback(() => {
+    if (typeof window === 'undefined') return;
+
+    try {
+      const docWidth = Math.max(
+        document.documentElement.clientWidth || 0,
+        document.documentElement.scrollWidth || 0,
+        document.body.scrollWidth || 0,
+        window.innerWidth || 0
+      );
+
+      const scrollLeft = window.visualViewport
+        ? window.visualViewport.offsetLeft
+        : (window.pageXOffset || document.documentElement.scrollLeft || document.body.scrollLeft || 0);
+
+      const visibleWidth = window.visualViewport
+        ? window.visualViewport.width
+        : window.innerWidth;
+
+      const diff = docWidth - (scrollLeft + visibleWidth);
+      const computedRight = Math.max(16, Math.round(diff + 16));
+      setRightPx(computedRight);
+    } catch (_) {
+      setRightPx(16);
+    }
+  }, []);
+
+  useEffect(() => {
+    updatePosition();
+
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('scroll', updatePosition, { passive: true });
+      window.visualViewport.addEventListener('resize', updatePosition, { passive: true });
+    }
+    window.addEventListener('scroll', updatePosition, { passive: true });
+    window.addEventListener('resize', updatePosition, { passive: true });
+
+    return () => {
+      if (window.visualViewport) {
+        window.visualViewport.removeEventListener('scroll', updatePosition);
+        window.visualViewport.removeEventListener('resize', updatePosition);
+      }
+      window.removeEventListener('scroll', updatePosition);
+      window.removeEventListener('resize', updatePosition);
+    };
+  }, [updatePosition]);
 
   // Don't show while actively recording audio or waiting for AI processing
   if (status === AppStatus.Processing || status === AppStatus.Recording || mode === 'live') {
@@ -102,12 +151,12 @@ export const FloatingNewDictationButton: React.FC<FloatingNewDictationButtonProp
       style={{
         position: 'fixed',
         bottom: 'max(1.25rem, calc(1rem + env(safe-area-inset-bottom, 0px)))',
-        right: 'max(1rem, calc(0.75rem + env(safe-area-inset-right, 0px)))',
+        right: `${rightPx}px`,
         maxWidth: 'calc(100vw - 2rem)',
         zIndex: 9999,
         WebkitTransform: 'translate3d(0, 0, 0)',
         transform: 'translate3d(0, 0, 0)',
-        willChange: 'transform',
+        willChange: 'transform, right',
         pointerEvents: 'auto',
       }}
     >
