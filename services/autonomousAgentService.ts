@@ -34,6 +34,8 @@ export interface AutonomousAttachedFile {
   file: File;
   alias?: string;
   index: number;
+  textContent?: string;
+  isTextNote?: boolean;
 }
 
 export interface AutonomousPatientItem {
@@ -269,12 +271,16 @@ export async function parseAutonomousAudioDictation(
   let attachedFilesManifest = '';
   if (attachedFiles && attachedFiles.length > 0) {
     attachedFilesManifest = `\n================================================================================
-ATTACHED FILES MANIFEST (Available for handoff):
-The user has uploaded the following file(s) into this session.
-DO NOT read or parse the file contents yourself.
-Assign/hand over files to the appropriate patient report(s) based on what the doctor dictates in the audio (e.g., "attach the first uploaded file to Patient 1", "use the Brain MRI for Patient 2", "attach all files to batch").
-${attachedFiles.map(f => `- File #${f.index}: "${f.alias ? f.alias : f.file.name}" (Filename: ${f.file.name}, MIME: ${f.file.type || 'unknown'}, Size: ${(f.file.size / 1024).toFixed(0)} KB)`).join('\n')}
-If the doctor mentions assigning any of these files to a patient, set their 1-based file indices in "attachedFileIndices" for that patient.
+ATTACHED FILES & CLINICAL TEXT NOTES (Available for handoff):
+The user has attached the following file(s) and typed/pasted clinical text note(s) into this session.
+DO NOT read or parse large binary file contents yourself.
+Assign/hand over files or notes to the appropriate patient report(s) based on what the doctor dictates in the audio (e.g., "attach the first uploaded file to Patient 1", "use the prior report note for Patient 2", "attach all files to batch").
+${attachedFiles.map(f => {
+  const typeLabel = f.isTextNote ? 'Typed/Pasted Text Note' : (f.file.type || 'file');
+  const preview = f.textContent ? ` [Content Preview: "${f.textContent.slice(0, 150).replace(/\s+/g, ' ')}${f.textContent.length > 150 ? '...' : ''}"]` : '';
+  return `- File #${f.index}: "${f.alias ? f.alias : f.file.name}" (Filename: ${f.file.name}, Type: ${typeLabel}, Size: ${(f.file.size / 1024).toFixed(1)} KB)${preview}`;
+}).join('\n')}
+If the doctor mentions assigning any of these files or notes to a patient, set their 1-based file indices in "attachedFileIndices" for that patient.
 ================================================================================\n`;
   }
 
@@ -467,13 +473,24 @@ export async function executeAutonomousPlan(
 
           singlePrompt = `[TEMPLATE_ID: ${matched.id}] Merged with template: ${matched.name}. ${singlePatientItem.mergeDirectives || ''}`.trim();
 
+          let effectiveDirectives = singlePatientItem.mergeDirectives || '';
+          const handedOverNotes = context.attachedFiles?.filter(
+            f => (singlePatientItem.attachedFileIndices || []).includes(f.index) && f.textContent
+          );
+          if (handedOverNotes && handedOverNotes.length > 0) {
+            const notesText = handedOverNotes
+              .map(n => `[Attached Reference Note - "${n.alias || n.file.name}"]:\n${n.textContent}`)
+              .join('\n\n');
+            effectiveDirectives = `${effectiveDirectives}\n\nClinical Reference Notes for Context:\n${notesText}`.trim();
+          }
+
           try {
             finalFindings = await mergeDictatedFindingsWithTemplate(
               finalFindings,
               matched,
               context.selectedModel,
               context.audioBlob,
-              singlePatientItem.mergeDirectives || ''
+              effectiveDirectives
             );
           } catch (mergeErr) {
             console.warn(`Template merge for ${singlePatientItem.patientName} failed, using raw findings:`, mergeErr);
@@ -563,13 +580,24 @@ export async function executeAutonomousPlan(
 
             bpPrompt = `[TEMPLATE_ID: ${matched.id}] Merged with template: ${matched.name}. ${bp.mergeDirectives || ''}`.trim();
 
+            let effectiveBpDirectives = bp.mergeDirectives || '';
+            const handedOverBpNotes = context.attachedFiles?.filter(
+              f => (bp.attachedFileIndices || []).includes(f.index) && f.textContent
+            );
+            if (handedOverBpNotes && handedOverBpNotes.length > 0) {
+              const notesText = handedOverBpNotes
+                .map(n => `[Attached Reference Note - "${n.alias || n.file.name}"]:\n${n.textContent}`)
+                .join('\n\n');
+              effectiveBpDirectives = `${effectiveBpDirectives}\n\nClinical Reference Notes for Context:\n${notesText}`.trim();
+            }
+
             try {
               finalFindings = await mergeDictatedFindingsWithTemplate(
                 finalFindings,
                 matched,
                 context.selectedModel,
                 context.audioBlob,
-                bp.mergeDirectives || ''
+                effectiveBpDirectives
               );
             } catch (mergeErr) {
               console.warn(`Batch template merge for ${bp.patientName} failed:`, mergeErr);

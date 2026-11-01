@@ -79,6 +79,7 @@ interface ResultsDisplayProps {
   identifiedErrors?: IdentifiedError[];
   errorCheckStatus?: 'idle' | 'checking' | 'complete';
   onOpenMacrosModal?: () => void;
+  initialExtraFiles?: File[];
 }
 
 const formatAudioDuration = (totalSeconds: number): string => {
@@ -224,6 +225,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   identifiedErrors = [],
   errorCheckStatus = 'idle',
   onOpenMacrosModal,
+  initialExtraFiles,
 }) => {
   const [isAllCopied, setIsAllCopied] = useState<boolean>(false);
   const [selectedIndices, setSelectedIndices] = useState<Set<number>>(new Set<number>());
@@ -466,11 +468,18 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   const [isMakingSelection, setIsMakingSelection] = useState<boolean>(false);
 
   // States for extra file(s) / image(s) / text for Update Transcript
-  const [extraFiles, setExtraFiles] = useState<File[]>([]);
-  const [showExtraOptions, setShowExtraOptions] = useState<boolean>(false);
+  const [extraFiles, setExtraFiles] = useState<File[]>(initialExtraFiles || []);
+  const [showExtraOptions, setShowExtraOptions] = useState<boolean>(Boolean(initialExtraFiles && initialExtraFiles.length > 0));
   const [extraTextExpanded, setExtraTextExpanded] = useState<boolean>(false);
   const extraFileInputRef = useRef<HTMLInputElement>(null);
   const extraImageInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (initialExtraFiles && initialExtraFiles.length > 0) {
+      setExtraFiles(initialExtraFiles);
+      setShowExtraOptions(true);
+    }
+  }, [initialExtraFiles]);
 
   const handleExtraFilesSelected = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files: File[] = Array.from(e.target.files || []);
@@ -2222,13 +2231,13 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         </div>
       </div>
       {findings.length > 0 && (
-        <div className="flex items-center justify-between gap-2 mb-4 p-2 bg-slate-100/70 dark:bg-slate-800/70 rounded-xl border border-slate-200/80 dark:border-slate-700/80 min-h-[46px]">
+        <div className="flex flex-wrap sm:flex-nowrap items-center justify-between gap-2.5 mb-4 p-2.5 bg-slate-100/70 dark:bg-slate-800/70 rounded-xl border border-slate-200/80 dark:border-slate-700/80 min-h-[46px] w-full">
             <div className="flex items-center gap-2 shrink-0">
               <span className="text-xs sm:text-sm font-semibold text-slate-600 dark:text-slate-300">
                 {findings.filter(f => f && f.trim()).length} findings{multiSelectMode ? ` (${selectedIndices.size} selected)` : ''}
               </span>
             </div>
-            <div className="flex items-center gap-1.5 sm:gap-2 flex-nowrap overflow-x-auto no-scrollbar shrink-0">
+            <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap sm:flex-nowrap overflow-x-auto min-w-0 max-w-full py-0.5">
               {undoState && (
                 <button
                   onClick={handleUndo}
@@ -3273,24 +3282,6 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         </div>
       )}
       </div>
-
-      {/* Floating Quick Action Button for Instant Next Dictation */}
-      {!isLive && (
-        <div className="fixed bottom-5 right-5 z-40 flex items-center gap-2 print:hidden">
-          <button
-            type="button"
-            onClick={handleRecordNew}
-            id="floating-new-dictation-btn"
-            className="group flex items-center gap-2 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-bold py-2.5 px-4 rounded-full shadow-lg hover:shadow-xl transition-all duration-200 border border-blue-400/40 hover:scale-105 cursor-pointer text-xs sm:text-sm"
-            title="Start New Dictation (Alt+N)"
-            aria-label="Start New Dictation"
-          >
-            <MicIcon className="w-4 h-4 shrink-0 text-white group-hover:scale-110 transition-transform" />
-            <span className="whitespace-nowrap font-bold">+ New Dictation</span>
-            <span className="hidden md:inline-block text-[10px] bg-blue-800 text-blue-200 font-mono px-1.5 py-0.5 rounded-full">Alt+N</span>
-          </button>
-        </div>
-      )}
 
       {multiSelectMode && (
           <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-40 bg-slate-900/95 dark:bg-slate-800/95 text-white rounded-full shadow-2xl border border-slate-700/80 flex items-center gap-2.5 sm:gap-3 px-3.5 sm:px-4 py-2 transition-all duration-300 ease-in-out backdrop-blur-xs">

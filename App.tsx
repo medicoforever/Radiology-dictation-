@@ -110,6 +110,7 @@ const App: React.FC = () => {
   const [customPrompt, setCustomPrompt] = useState<string>('');
   const [customImages, setCustomImages] = useState<Array<{ data: string; mimeType: string }>>([]);
   const [customDocx, setCustomDocx] = useState<DocxTemplateData | null>(null);
+  const [singleExtraFiles, setSingleExtraFiles] = useState<File[]>([]);
   const [upcomingTemplate, setUpcomingTemplateState] = useState<UpcomingTemplateConfig | null>(() => getUpcomingTemplate());
 
   useEffect(() => {
@@ -922,6 +923,7 @@ const App: React.FC = () => {
       setCustomDocx(null);
     }
     setCustomImages([]);
+    setSingleExtraFiles([]);
     setIdentifiedErrors([]);
     setErrorCheckStatus('idle');
     activeDictationTimestampRef.current = null;
@@ -1116,6 +1118,7 @@ const App: React.FC = () => {
             onCustomImagesChange={setCustomImages}
             customDocx={customDocx}
             onCustomDocxChange={setCustomDocx}
+            initialExtraFiles={singleExtraFiles}
             identifiedErrors={identifiedErrors}
             errorCheckStatus={errorCheckStatus}
             onOpenMacrosModal={() => setIsMacrosModalOpen(true)}
@@ -1318,6 +1321,11 @@ const App: React.FC = () => {
     }
     if (loadedImages && loadedImages.length > 0) {
       setCustomImages(loadedImages);
+    }
+    if (loadedExtraFiles && loadedExtraFiles.length > 0) {
+      setSingleExtraFiles(loadedExtraFiles);
+    } else {
+      setSingleExtraFiles([]);
     }
     if (loadedPrompt) {
       setCustomPrompt(loadedPrompt);
