@@ -1581,7 +1581,7 @@ export const identifyPotentialErrors = async (findings: string[], model: string)
 };
 
 // --- Complex Impression Generation Constants & Pipeline ---
-const COMPLEX_IMPRESSION_DEFAULT_MODEL = 'gemini-3.8-flash';
+const COMPLEX_IMPRESSION_DEFAULT_MODEL = 'gemini-3.5-flash';
 
 /**
  * Detects if an API error is a rate-limit (429 / resource exhausted / quota) error.

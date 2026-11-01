@@ -144,7 +144,7 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
       if (res.valid) {
         setFailoverTestResult(
           isCustom
-            ? `Success! Custom key ${maskApiKey(firstKeyToTry)} verified in ${elapsed}ms. Active model: ${selectedModel || 'gemini-3.8-flash'}.`
+            ? `Success! Custom key ${maskApiKey(firstKeyToTry)} verified in ${elapsed}ms. Active model: ${selectedModel || 'gemini-3.5-flash'}.`
             : `Success! Default primary key ${maskApiKey(firstKeyToTry)} is active & verified in ${elapsed}ms. If it ever encounters quota limits, the system seamlessly failovers randomly across the backup pool.`
         );
       } else {

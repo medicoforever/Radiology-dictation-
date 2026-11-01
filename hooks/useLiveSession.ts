@@ -5,6 +5,7 @@ import {
   unlockAudioContext,
 } from '../services/soundService';
 import { processLiveAudioChunk, synthesizeLiveReport, LiveHistoryContext, CustomDocxInput } from '../services/geminiService';
+import { DEFAULT_SELECTED_MODEL } from '../constants';
 import {
   initLiveAudioSessionCache,
   cacheAudioChunk,
@@ -211,7 +212,7 @@ export const useLiveSession = () => {
   const currentChunkIndexRef = useRef<number>(0);
   const isProcessingChunkRef = useRef<boolean>(false);
   const schedulerIntervalRef = useRef<any>(null);
-  const selectedModelRef = useRef<string>('gemini-3.8-flash');
+  const selectedModelRef = useRef<string>(DEFAULT_SELECTED_MODEL);
   const customPromptRef = useRef<string>('');
   const customImagesRef = useRef<Array<{ data: string; mimeType: string }> | null>(null);
   const customDocxRef = useRef<CustomDocxInput>(null);
@@ -483,7 +484,7 @@ export const useLiveSession = () => {
   const startSession = useCallback(async (
     onTranscriptUpdate: (lines: string[]) => void,
     customPrompt?: string,
-    model: string = 'gemini-3.8-flash',
+    model: string = DEFAULT_SELECTED_MODEL,
     customImages?: Array<{ data: string; mimeType: string }> | null,
     customDocx?: CustomDocxInput
   ) => {
@@ -507,7 +508,7 @@ export const useLiveSession = () => {
     sessionStartTimeRef.current = Date.now();
     accumulatedPauseDurationRef.current = 0;
     pauseStartTimeRef.current = 0;
-    selectedModelRef.current = model || 'gemini-3.8-flash';
+    selectedModelRef.current = model || DEFAULT_SELECTED_MODEL;
     customPromptRef.current = customPrompt || '';
     customImagesRef.current = customImages || null;
     customDocxRef.current = customDocx || null;
@@ -810,7 +811,7 @@ export const useLiveSession = () => {
       const vadMetrics = analyzePcmEnergy(recordedPcmChunksRef.current, startSample, endSample);
 
       if (vadMetrics.hasSpeech) {
-        setStatus(`Finalizing remaining clinical speech with ${selectedModelRef.current || 'gemini-3.8-flash'}...`);
+        setStatus(`Finalizing remaining clinical speech with ${selectedModelRef.current || DEFAULT_SELECTED_MODEL}...`);
         const finalChunkBlob = pcmRangeToWavBlob(recordedPcmChunksRef.current, startSample, endSample, 16000);
 
         const historyContext: LiveHistoryContext = {
@@ -823,7 +824,7 @@ export const useLiveSession = () => {
         try {
           const finalResult = await processLiveAudioChunk(
             finalChunkBlob,
-            selectedModelRef.current || 'gemini-3.8-flash',
+            selectedModelRef.current || DEFAULT_SELECTED_MODEL,
             committedFindingsRef.current,
             currentChunkIndexRef.current,
             customPromptRef.current,
@@ -852,7 +853,7 @@ export const useLiveSession = () => {
       try {
         const synthesizedReport = await synthesizeLiveReport(
           committedFindingsRef.current,
-          selectedModelRef.current || 'gemini-3.8-flash',
+          selectedModelRef.current || DEFAULT_SELECTED_MODEL,
           customPromptRef.current,
           customImagesRef.current,
           customDocxRef.current
