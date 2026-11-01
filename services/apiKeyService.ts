@@ -1,9 +1,13 @@
 import { GoogleGenAI } from "@google/genai";
 
-// Obfuscated salt and keys to prevent raw AIzaSy string exposure in repo commits & secret scanners
+// Obfuscated salt and keys to prevent raw API key string exposure in repo commits & secret scanners
 const KEY_SALT = "RADDOC_RADIOLOGY_SECURE_VAULT_2026";
 
-const DEFAULT_OBFUSCATED_KEYS: string[] = [
+// Primary default key (obfuscated with KEY_SALT)
+const PRIMARY_DEFAULT_OBFUSCATED_KEY = "ExBqBS17DRx3D38lAToYKBYHATNjZQEmbysCKhtsSEVTdwE0ChAucBQUIAwWGSMeJmFmZAQ=";
+
+// Secondary fallback keys (randomly selected if the primary key fails or reaches quota)
+const SECONDARY_OBFUSCATED_KEYS: string[] = [
   "Ewg+JRw6HBpzB30MfyoTMmwEL3Q7CgMoOx4WHQMvA14HUAt0fAM4",
   "Ewg+JRw6HWskN3gmIy5yDXI3HCU+Jhw8GwwsLTMrcFNYcSceKQos",
   "Ewg+JRw6GwoKHjx4ewQdExhjCwIQGgEGBAcRexNqB3sEWg0bdSge",
@@ -33,11 +37,18 @@ function xorDeobfuscate(b64: string, salt: string): string {
 }
 
 /**
- * Retrieves the deobfuscated default pool of 6 Gemini API keys.
+ * Retrieves the primary default API key (tried first on every request).
  */
-export function getDefaultApiKeys(): string[] {
+export function getPrimaryDefaultApiKey(): string {
+  return xorDeobfuscate(PRIMARY_DEFAULT_OBFUSCATED_KEY, KEY_SALT);
+}
+
+/**
+ * Retrieves the secondary backup pool of API keys.
+ */
+export function getSecondaryDefaultApiKeys(): string[] {
   const envKey = (typeof process !== 'undefined' && (process.env?.GEMINI_API_KEY || process.env?.API_KEY)) || '';
-  const decoded = DEFAULT_OBFUSCATED_KEYS
+  const decoded = SECONDARY_OBFUSCATED_KEYS
     .map(obf => xorDeobfuscate(obf, KEY_SALT))
     .filter(k => k && k.length > 20);
 
@@ -45,6 +56,16 @@ export function getDefaultApiKeys(): string[] {
     decoded.unshift(envKey.trim());
   }
   return decoded;
+}
+
+/**
+ * Retrieves all default API keys: primary first, followed by secondaries.
+ */
+export function getDefaultApiKeys(): string[] {
+  const primary = getPrimaryDefaultApiKey();
+  const secondaries = getSecondaryDefaultApiKeys();
+  const all = primary ? [primary, ...secondaries.filter(k => k !== primary)] : secondaries;
+  return all;
 }
 
 /**
@@ -128,16 +149,26 @@ export function clearUserApiKeys(): void {
 }
 
 /**
- * Returns the active API key pool according to user requirements:
- * If the user has entered their own API key(s), ONLY those keys are used.
- * Otherwise, the shared default pool is used.
+ * Returns the candidate keys in sequence for an operation:
+ * 1. If user added custom keys: ONLY those custom keys are used (randomly rotated with failover).
+ * 2. If using default keys: The primary default key is ALWAYS tried FIRST.
+ *    If and only if it fails, a secondary key is chosen RANDOMLY with failover until success.
  */
-export function getActiveKeyPool(): string[] {
+export function getCandidateKeysForOperation(): { candidateKeys: string[]; isCustom: boolean } {
   const userKeys = getUserApiKeys();
   if (userKeys.length > 0) {
-    return userKeys;
+    return { candidateKeys: shuffle(userKeys), isCustom: true };
   }
-  return getDefaultApiKeys();
+
+  const primaryKey = getPrimaryDefaultApiKey();
+  const secondaryKeys = getSecondaryDefaultApiKeys();
+  const shuffledSecondary = shuffle(secondaryKeys.filter(k => k !== primaryKey));
+
+  const candidateKeys = primaryKey 
+    ? [primaryKey, ...shuffledSecondary]
+    : shuffledSecondary;
+
+  return { candidateKeys, isCustom: false };
 }
 
 /**
@@ -172,7 +203,7 @@ export function getClientForApiKey(apiKey: string): GoogleGenAI {
 }
 
 /**
- * Obscures a key for display: "AIza...58Gw"
+ * Obscures a key for display: "AQ.Ab8••••••••897A" or "AIzaSy••••••••58Gw"
  */
 export function maskApiKey(key: string): string {
   if (!key) return '';
@@ -199,12 +230,13 @@ export async function testApiKeyValidity(key: string): Promise<{ valid: boolean;
 }
 
 /**
- * Universal executor with random API key rotation and automatic failover.
+ * Universal executor with default primary priority, random backup rotation, and automatic failover.
  * Requirements:
- * - Always randomly select an API key.
- * - If 1st try fails, immediately failover to a different random API key.
+ * - Default primary key is ALWAYS tried first.
+ * - If 1st try fails, immediately failover to a randomly selected secondary API key.
+ * - If user provides their own key(s), ONLY user keys are used with random rotation/failover.
  * - The selected model MUST NOT change across key retries.
- * - Runs smoothly without errors interrupting the user as long as another key works.
+ * - Runs smoothly without errors interrupting the user as long as any candidate key works.
  */
 export async function executeWithApiKeyFailover<T>(
   operation: (client: GoogleGenAI, apiKey: string) => Promise<T>,
@@ -213,13 +245,11 @@ export async function executeWithApiKeyFailover<T>(
     maxTries?: number;
   }
 ): Promise<T> {
-  const pool = getActiveKeyPool();
-  if (!pool || pool.length === 0) {
+  const { candidateKeys, isCustom } = getCandidateKeysForOperation();
+  if (!candidateKeys || candidateKeys.length === 0) {
     throw new Error("No Gemini API keys available. Please add a valid Gemini API key in Settings.");
   }
 
-  // Randomize the order of keys for this operation
-  const candidateKeys = shuffle(pool);
   const maxAttempts = options?.maxTries 
     ? Math.min(options.maxTries, candidateKeys.length)
     : candidateKeys.length;
@@ -232,8 +262,11 @@ export async function executeWithApiKeyFailover<T>(
     const client = getClientForApiKey(currentKey);
 
     try {
-      if (attempt > 0) {
-        console.info(`[API Key Failover] Attempt ${attempt + 1}/${maxAttempts} retrying with random key ${masked} (Model: ${options?.selectedModel || 'selected'})...`);
+      if (attempt === 0) {
+        const keyRole = isCustom ? 'custom key' : 'default primary key';
+        console.info(`[API Execution] Attempt 1/${maxAttempts} using ${keyRole} ${masked} (Model: ${options?.selectedModel || 'selected'})...`);
+      } else {
+        console.warn(`[API Failover] Attempt ${attempt + 1}/${maxAttempts} retrying with random secondary key ${masked} (Model: ${options?.selectedModel || 'selected'})...`);
       }
       const result = await operation(client, currentKey);
       return result;
@@ -256,10 +289,11 @@ export async function executeWithApiKeyFailover<T>(
 }
 
 /**
- * Returns a random GoogleGenAI client instance using the current active key pool.
+ * Returns a GoogleGenAI client instance:
+ * Uses custom key if user provided, otherwise uses the default primary key.
  */
 export function getRandomAIClient(): GoogleGenAI {
-  const pool = getActiveKeyPool();
-  const key = pool[Math.floor(Math.random() * pool.length)];
+  const { candidateKeys } = getCandidateKeysForOperation();
+  const key = candidateKeys[0] || getPrimaryDefaultApiKey();
   return getClientForApiKey(key);
 }

@@ -19,6 +19,8 @@ import {
   removeUserApiKey,
   clearUserApiKeys,
   getDefaultApiKeys,
+  getPrimaryDefaultApiKey,
+  getCandidateKeysForOperation,
   maskApiKey,
   testApiKeyValidity,
   API_KEYS_UPDATED_EVENT,
@@ -131,18 +133,22 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
 
   const handleRunFailoverTest = async () => {
     setIsTestingFailover(true);
-    setFailoverTestResult('Initiating load-balanced request test...');
+    setFailoverTestResult('Initiating key priority & failover test...');
     try {
       const startTime = Date.now();
-      const activePool = isUsingCustomKeys ? userKeys : getDefaultApiKeys();
-      const randomSample = activePool[Math.floor(Math.random() * activePool.length)];
-      const res = await testApiKeyValidity(randomSample);
+      const { candidateKeys, isCustom } = getCandidateKeysForOperation();
+      const firstKeyToTry = candidateKeys[0];
+      const res = await testApiKeyValidity(firstKeyToTry);
       const elapsed = Date.now() - startTime;
       
       if (res.valid) {
-        setFailoverTestResult(`Success! Random key ${maskApiKey(randomSample)} verified in ${elapsed}ms. Active model: ${selectedModel || 'gemini-3.8-flash'}.`);
+        setFailoverTestResult(
+          isCustom
+            ? `Success! Custom key ${maskApiKey(firstKeyToTry)} verified in ${elapsed}ms. Active model: ${selectedModel || 'gemini-3.8-flash'}.`
+            : `Success! Default primary key ${maskApiKey(firstKeyToTry)} is active & verified in ${elapsed}ms. If it ever encounters quota limits, the system seamlessly failovers randomly across the backup pool.`
+        );
       } else {
-        setFailoverTestResult(`Key ${maskApiKey(randomSample)} responded: ${res.error}. Automatic failover will seamlessly redirect requests to next key.`);
+        setFailoverTestResult(`Primary key ${maskApiKey(firstKeyToTry)} responded: ${res.error}. Automatic failover will seamlessly redirect requests to next backup key.`);
       }
     } catch (e: any) {
       setFailoverTestResult(`Test encountered: ${e?.message || 'Error'}`);
@@ -241,7 +247,7 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
                 </>
               ) : (
                 <>
-                  The app is using the <strong>built-in rotating high-availability keys</strong>. All dictations randomly cycle through the pool with automatic instant failover. Add your own key below to use your personal quota exclusively.
+                  The app is configured to use the <strong>default primary API key ({maskApiKey(getPrimaryDefaultApiKey())}) first</strong> on every request. If it ever encounters quota limits or errors, it instantly failovers by randomly selecting from the backup API key pool.
                 </>
               )}
             </p>
