@@ -12,6 +12,7 @@ import { saveAudioBlob, getAudioBlob, deleteAudioBlob } from './services/audioSt
 // FIX: Changed import to a named import based on the error message.
 import { BatchProcessor } from './components/BatchProcessor';
 import LiveDictation from './components/LiveDictation';
+import AutonomousModeView from './components/AutonomousModeView';
 import MicIcon from './components/icons/MicIcon';
 import YinYangMicIcon from './components/icons/YinYangMicIcon';
 import WaveformIcon from './components/icons/WaveformIcon';
@@ -39,6 +40,7 @@ import ThemeSelector from './components/ThemeSelector';
 import { getUpcomingTemplate, clearUpcomingTemplate, subscribeToUpcomingTemplate, UpcomingTemplateConfig } from './services/upcomingTemplateService';
 import MacrosAndDictionaryModal from './components/MacrosAndDictionaryModal';
 import { subscribeToMacroDictionary, syncMacrosWithGoogleDrive, expandMacrosInFindings } from './services/macroDictionaryService';
+import { FloatingNewDictationButton } from './components/FloatingNewDictationButton';
 
 interface ChatMessage {
   author: 'You' | 'AI';
@@ -96,7 +98,7 @@ const getCleanMimeType = (blob: Blob): string => {
 };
 
 const App: React.FC = () => {
-  const [mode, setMode] = useState<'single' | 'batch' | 'live'>('single');
+  const [mode, setMode] = useState<'single' | 'batch' | 'live' | 'autonomous'>('single');
   const [status, setStatus] = useState<AppStatus>(AppStatus.Idle);
   const [findings, setFindings] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -1220,25 +1222,98 @@ const App: React.FC = () => {
                 />;
       case 'live':
         return <LiveDictation onComplete={handleLiveDictationComplete} onBack={() => setMode('single')} onOpenMacrosModal={() => setIsMacrosModalOpen(true)} />;
+      case 'autonomous':
+        return (
+          <AutonomousModeView
+            selectedModel={selectedModel}
+            onApplySingleReport={(loadedFindings, patientName, loadedAudio, loadedImages, loadedFiles) => {
+              handleLoadReportFindings(loadedFindings, patientName, loadedAudio, loadedImages, loadedFiles);
+            }}
+            onApplyBatchReports={async (newBatches) => {
+              try {
+                const currentBatchesRaw = localStorage.getItem('radiologyDictationBatchMode');
+                const currentBatches: any[] = currentBatchesRaw ? JSON.parse(currentBatchesRaw) : [];
+                
+                // Save audio blobs to IndexedDB so they can be retrieved and downloaded in Batch Mode
+                for (let idx = 0; idx < newBatches.length; idx++) {
+                  const b = newBatches[idx];
+                  const batchId = `batch-auto-${Date.now()}-${idx}`;
+                  if (b.audioBlobs && b.audioBlobs.length > 0) {
+                    for (let bIdx = 0; bIdx < b.audioBlobs.length; bIdx++) {
+                      try {
+                        await saveAudioBlob(`batch_audio_${batchId}_${bIdx}`, b.audioBlobs[bIdx]);
+                      } catch (e) {
+                        console.warn('Failed to save batch audio blob to IndexedDB:', e);
+                      }
+                    }
+                  }
+                }
+
+                const formattedBatches = newBatches.map((b, idx) => {
+                  const batchId = `batch-auto-${Date.now()}-${idx}`;
+                  return {
+                    id: batchId,
+                    name: b.name,
+                    audioCount: b.audioBlobs ? b.audioBlobs.length : 0,
+                    findings: b.findings,
+                    status: 'complete',
+                    selectedModel: b.selectedModel || selectedModel,
+                    customPrompt: b.customPrompt || '',
+                    customImages: b.customImages || [],
+                    extraFiles: b.extraFiles || []
+                  };
+                });
+                const updated = [...currentBatches, ...formattedBatches];
+                localStorage.setItem('radiologyDictationBatchMode', JSON.stringify(updated));
+              } catch (e) {
+                console.warn('Failed to append autonomous batches to localStorage:', e);
+              }
+            }}
+            onNavigateToSingle={() => setMode('single')}
+            onNavigateToBatch={() => setMode('batch')}
+            onSaveToDrive={(res) => {
+              setDriveSaveResult(res);
+              checkAndAutoSyncReport(300);
+            }}
+          />
+        );
       default:
         return renderSingleModeContent();
     }
-  }
+  };
 
   const getPageDescription = () => {
+    if (mode === 'autonomous') return 'Autonomous superapp mode: Speak naturally across multiple patients, templates, macros, and commands.';
     if (mode === 'batch') return 'Manage and transcribe multiple dictations efficiently.';
     if (mode === 'live') return 'Dictate in real-time and get an instant, corrected transcript.';
     return 'Record your findings, and let AI provide a clean, corrected transcript.';
   };
 
+  const isWideView = mode === 'batch' || mode === 'autonomous' || status === AppStatus.Success;
 
-  const isWideView = mode === 'batch' || status === AppStatus.Success;
-
-  const handleLoadReportFindings = (loadedFindings: string[], reportName: string) => {
+  const handleLoadReportFindings = (
+    loadedFindings: string[], 
+    reportName: string, 
+    loadedAudioBlob?: Blob | null,
+    loadedImages?: Array<{ data: string; mimeType: string }>,
+    loadedExtraFiles?: File[]
+  ) => {
     setFindings(loadedFindings);
     setStatus(AppStatus.Success);
     setMode('single');
-    setAudioBlob(null);
+    if (loadedAudioBlob) {
+      setAudioBlob(loadedAudioBlob);
+      try {
+        saveAudioBlob('single_audio_blob', loadedAudioBlob);
+      } catch (e) {
+        console.warn('Failed to save audio blob:', e);
+      }
+    } else {
+      setAudioBlob(null);
+    }
+    if (loadedImages && loadedImages.length > 0) {
+      setCustomImages(loadedImages);
+    }
     setError(null);
     setDriveSaveResult({
       success: true,
@@ -1248,7 +1323,7 @@ const App: React.FC = () => {
   };
 
   return (
-    <div className={`min-h-screen bg-gray-50 dark:bg-slate-900 flex flex-col items-center justify-start sm:justify-center p-2 sm:p-4 md:p-6 font-sans transition-colors duration-300 ${!isPowerMode ? 'low-power-active' : ''}`}>
+    <div className={`min-h-screen w-full bg-gray-50 dark:bg-slate-900 flex flex-col items-center justify-start sm:justify-center p-2 sm:p-4 md:p-6 font-sans transition-colors duration-300 ${!isPowerMode ? 'low-power-active' : ''}`}>
       {!isPowerMode && (
         <style>{`
           .low-power-mode *, .low-power-mode *::before, .low-power-mode *::after {
@@ -1264,8 +1339,83 @@ const App: React.FC = () => {
       <div className={`w-full mx-auto transition-all duration-200 ${isWideView ? 'max-w-4xl lg:max-w-5xl xl:max-w-6xl' : 'max-w-3xl'}`}>
         
         {/* Top Header */}
-        <header className="mb-6 relative">
-          <div className="grid grid-cols-[auto_1fr_auto] items-center gap-2 sm:gap-4 mb-2 w-full">
+        <header className="mb-6 relative w-full">
+          {/* Mobile Header: Row 1 = Utility Bar (Drive on left, Action buttons on right); Row 2 = App Title centered */}
+          <div className="flex flex-col gap-2 mb-2 w-full sm:hidden">
+            <div className="flex items-center justify-between gap-1 w-full">
+              <div className="shrink-0">
+                <DriveStatusBadge 
+                  lastSaveResult={driveSaveResult} 
+                  onClearLastSave={() => setDriveSaveResult(null)} 
+                  onOpenReportsModal={() => setIsReportsModalOpen(true)}
+                />
+              </div>
+              <div className="flex items-center gap-1 shrink-0 overflow-x-auto no-scrollbar py-0.5">
+                <button
+                  id="macros-header-btn-mobile"
+                  onClick={() => setIsMacrosModalOpen(true)}
+                  className="p-1.5 rounded-lg text-indigo-600 dark:text-indigo-400 bg-indigo-50/80 dark:bg-indigo-950/40 border border-indigo-200/70 dark:border-indigo-800/60 min-h-[34px] min-w-[34px] flex items-center justify-center cursor-pointer shadow-xs"
+                  aria-label="Macros"
+                  title="Macros — Manage custom text shortcuts"
+                >
+                  <BookOpen className="w-4 h-4" />
+                </button>
+                <button
+                  id="workstation-sync-header-btn-mobile"
+                  onClick={() => setIsWorkstationSyncModalOpen(true)}
+                  className="p-1.5 rounded-lg text-slate-500 dark:text-slate-400 bg-slate-100 dark:bg-slate-800 border border-slate-200/60 dark:border-slate-700/60 min-h-[34px] min-w-[34px] flex items-center justify-center cursor-pointer shadow-xs"
+                  aria-label="Workstation Sync"
+                  title="Workstation Sync"
+                >
+                  <Settings className="w-4 h-4 text-slate-600 dark:text-slate-300" />
+                </button>
+                <button
+                  id="api-keys-header-btn-mobile"
+                  onClick={() => setIsApiKeyModalOpen(true)}
+                  className={`p-1.5 rounded-lg border min-h-[34px] min-w-[34px] flex items-center justify-center relative cursor-pointer shadow-xs ${
+                    customKeysCount > 0
+                      ? 'text-emerald-700 bg-emerald-50 dark:bg-emerald-950/40 border-emerald-300 dark:border-emerald-700/60'
+                      : 'text-slate-600 bg-slate-100 dark:bg-slate-800 border-slate-200/80 dark:border-slate-700/60'
+                  }`}
+                  aria-label="Gemini API Keys"
+                  title="Gemini API Keys"
+                >
+                  <Key className="w-4 h-4" />
+                  {customKeysCount > 0 && (
+                    <span className="absolute -top-1 -right-1 w-3.5 h-3.5 bg-emerald-500 text-white rounded-full text-[9px] font-bold flex items-center justify-center">
+                      {customKeysCount}
+                    </span>
+                  )}
+                </button>
+                <button
+                  onClick={() => setIsPowerMode(prev => !prev)}
+                  className={`p-1.5 rounded-lg border min-h-[34px] min-w-[34px] flex items-center justify-center cursor-pointer shadow-xs ${
+                    isPowerMode
+                      ? 'text-emerald-600 bg-emerald-50 dark:bg-emerald-950/40 border-emerald-300 dark:border-emerald-700/60'
+                      : 'text-amber-600 bg-amber-50 dark:bg-amber-950/40 border-amber-300 dark:border-amber-700/60'
+                  }`}
+                  aria-label="Power Mode"
+                  title="Toggle Low Power Mode"
+                >
+                  <Power className="w-4 h-4" />
+                </button>
+                <ThemeSelector 
+                  currentTheme={theme} 
+                  onThemeChange={(newTheme) => setTheme(newTheme)} 
+                />
+              </div>
+            </div>
+
+            <div className="text-center py-0.5 w-full">
+              <h1 className="text-lg font-extrabold text-slate-800 dark:text-slate-100 tracking-tight flex items-center justify-center gap-1.5">
+                <YinYangMicIcon className="w-6 h-6 shrink-0 rounded-full shadow-xs inline-block" />
+                <span>RADDOC's Dictation app</span>
+              </h1>
+            </div>
+          </div>
+
+          {/* Desktop/Tablet Header: 3-column Grid (sm: and above) */}
+          <div className="hidden sm:grid sm:grid-cols-[auto_1fr_auto] items-center gap-2 sm:gap-4 mb-2 w-full max-w-full">
             <div className="justify-self-start flex items-center">
               <DriveStatusBadge 
                 lastSaveResult={driveSaveResult} 
@@ -1387,12 +1537,25 @@ const App: React.FC = () => {
                 <WaveformIcon className="w-4 h-4 shrink-0" />
                 <span className="whitespace-nowrap">Live Stream</span>
               </button>
+              <button
+                type="button"
+                onClick={() => setMode('autonomous')}
+                className={`flex-1 sm:flex-initial flex items-center justify-center gap-1.5 sm:gap-2 px-3 sm:px-5 py-2 rounded-lg text-xs sm:text-sm font-semibold transition-all min-h-[44px] ${
+                  mode === 'autonomous'
+                    ? 'bg-gradient-to-r from-blue-600 via-indigo-600 to-purple-600 text-white shadow-md'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+                }`}
+                aria-label="Autonomous Mode"
+              >
+                <span className="text-sm shrink-0">⚡</span>
+                <span className="whitespace-nowrap font-bold">Autonomous</span>
+              </button>
             </nav>
           </div>
 
           {/* Settings Bar */}
           <div className="mt-4 flex flex-col sm:flex-row justify-center items-center gap-3 sm:gap-6 bg-slate-100/80 dark:bg-slate-800/60 p-2.5 sm:p-2.5 rounded-xl border border-slate-200/70 dark:border-slate-700/60 max-w-xl mx-auto">
-              {status === AppStatus.Idle && (mode === 'single' || mode === 'batch') && (
+              {status === AppStatus.Idle && (mode === 'single' || mode === 'batch' || mode === 'autonomous') && (
                   <div className="flex items-center gap-2 w-full sm:w-auto justify-between sm:justify-start">
                       <label htmlFor="model-select" className="text-xs sm:text-sm font-semibold text-slate-700 dark:text-slate-300 whitespace-nowrap">AI Model:</label>
                       <select 
@@ -1833,6 +1996,13 @@ const App: React.FC = () => {
           isOpen={isApiKeyModalOpen}
           onClose={() => setIsApiKeyModalOpen(false)}
           selectedModel={selectedModel}
+        />
+
+        {/* Universal Floating "+ New Dictation" Button for Mobile & Desktop */}
+        <FloatingNewDictationButton
+          status={status}
+          mode={mode}
+          onResetSingleMode={resetSingleMode}
         />
 
         {/* Workstation Sync Saved Toast */}

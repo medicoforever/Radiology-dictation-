@@ -461,3 +461,66 @@ export async function syncMacrosWithGoogleDrive(): Promise<{ success: boolean; m
     };
   }
 }
+
+/**
+ * Adds or updates a macro from spoken voice dictation or automated agent.
+ */
+export function addMacroFromAutonomous(name: string, text: string): RadiologyMacro {
+  const store = getMacroDictionaryStore();
+  const trimmedName = name.trim();
+  const trimmedText = text.trim();
+  
+  const existingIdx = store.macros.findIndex(
+    m => m.name.toLowerCase() === trimmedName.toLowerCase()
+  );
+  
+  const macro: RadiologyMacro = {
+    id: existingIdx >= 0 ? store.macros[existingIdx].id : `macro_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    name: trimmedName,
+    text: trimmedText,
+    findings: trimmedText.split('\n').map(l => l.trim()).filter(Boolean),
+    triggerPhrases: [trimmedName.toLowerCase(), `macro ${trimmedName.toLowerCase()}`],
+    enabled: true,
+    updatedAt: Date.now(),
+  };
+
+  if (existingIdx >= 0) {
+    store.macros[existingIdx] = macro;
+  } else {
+    store.macros.unshift(macro);
+  }
+
+  saveMacroDictionaryStore(store);
+  return macro;
+}
+
+/**
+ * Adds or updates a vocabulary replacement rule from spoken voice dictation or automated agent.
+ */
+export function addVocabularyRuleFromAutonomous(pattern: string, replacement: string): VocabularyRule {
+  const store = getMacroDictionaryStore();
+  const trimmedPattern = pattern.trim();
+  const trimmedReplacement = replacement.trim();
+
+  const existingIdx = store.vocabularyRules.findIndex(
+    r => r.pattern.toLowerCase() === trimmedPattern.toLowerCase()
+  );
+
+  const rule: VocabularyRule = {
+    id: existingIdx >= 0 ? store.vocabularyRules[existingIdx].id : `vocab_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    pattern: trimmedPattern,
+    replacement: trimmedReplacement,
+    enabled: true,
+    updatedAt: Date.now(),
+  };
+
+  if (existingIdx >= 0) {
+    store.vocabularyRules[existingIdx] = rule;
+  } else {
+    store.vocabularyRules.unshift(rule);
+  }
+
+  saveMacroDictionaryStore(store);
+  return rule;
+}
+
