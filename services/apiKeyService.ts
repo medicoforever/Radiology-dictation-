@@ -155,18 +155,28 @@ export function clearUserApiKeys(): void {
  *    If and only if it fails, a secondary key is chosen RANDOMLY with failover until success.
  */
 export function getCandidateKeysForOperation(): { candidateKeys: string[]; isCustom: boolean } {
+  const specialKey = getPrimaryDefaultApiKey();
   const userKeys = getUserApiKeys();
+
   if (userKeys.length > 0) {
-    return { candidateKeys: shuffle(userKeys), isCustom: true };
+    const otherUserKeys = shuffle(userKeys.filter(k => k !== specialKey));
+    if (otherUserKeys.length > 0) {
+      // First try one of the other keys; secondly try specialKey when any one of other key fails; then the remaining keys
+      return {
+        candidateKeys: [otherUserKeys[0], specialKey, ...otherUserKeys.slice(1)],
+        isCustom: true
+      };
+    }
+    return { candidateKeys: [specialKey], isCustom: true };
   }
 
-  const primaryKey = getPrimaryDefaultApiKey();
-  const secondaryKeys = getSecondaryDefaultApiKeys();
-  const shuffledSecondary = shuffle(secondaryKeys.filter(k => k !== primaryKey));
+  const otherDefaultKeys = getSecondaryDefaultApiKeys().filter(k => k !== specialKey);
+  const shuffledOther = shuffle(otherDefaultKeys);
 
-  const candidateKeys = primaryKey 
-    ? [primaryKey, ...shuffledSecondary]
-    : shuffledSecondary;
+  // First try one of the other keys; secondly try specialKey when any one of other key fails; then the remaining keys
+  const candidateKeys = shuffledOther.length > 0
+    ? [shuffledOther[0], specialKey, ...shuffledOther.slice(1)]
+    : [specialKey];
 
   return { candidateKeys, isCustom: false };
 }
