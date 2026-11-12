@@ -1,6 +1,6 @@
-export const DEFAULT_LIVE_MODEL = 'gemini-3.5-flash';
-export const GEMINI_TRANSCRIBE_LIVE_MODEL = 'gemini-3.5-flash';
-export const LIVE_DICTATION_MODEL = 'gemini-3.5-flash';
+export const DEFAULT_LIVE_MODEL = 'gemini-4-hydrogen';
+export const GEMINI_TRANSCRIBE_LIVE_MODEL = 'gemini-4-hydrogen';
+export const LIVE_DICTATION_MODEL = 'gemini-4-hydrogen';
 export const GEMINI_FLASH_LITE_MODEL = 'gemini-3.5-flash-lite';
 export const DEFAULT_SELECTED_MODEL = 'gemini-3.5-flash';
 
@@ -10,12 +10,14 @@ export interface AIModelOption {
 }
 
 export const LIVE_DICTATION_MODELS: AIModelOption[] = [
+  { value: 'gemini-4-hydrogen', label: 'gemini-4-hydrogen (Default)' },
+  { value: 'gemini-3.5-flash', label: 'gemini-3.5-flash' },
   { value: 'gemini-3.8-flash', label: 'gemini-3.8-flash' },
-  { value: 'gemini-3.5-flash', label: 'gemini-3.5-flash (Default)' },
   { value: 'gemini-3.5-flash-lite', label: 'gemini-3.5-flash-lite' },
 ];
 
 export const LIVE_DICTATION_CYCLE_ORDER = [
+  'gemini-4-hydrogen',
   'gemini-3.5-flash',
   'gemini-3.8-flash',
   'gemini-3.5-flash-lite',
@@ -24,9 +26,10 @@ export const LIVE_DICTATION_CYCLE_ORDER = [
 /**
  * Returns the candidate model chain: the selected primary model plus subsequent fallback model,
  * cycling across permitted live dictation models:
- * 1. gemini-3.5-flash (Default)
- * 2. gemini-3.8-flash
- * 3. gemini-3.5-flash-lite
+ * 1. gemini-4-hydrogen (Default)
+ * 2. gemini-3.5-flash
+ * 3. gemini-3.8-flash
+ * 4. gemini-3.5-flash-lite
  */
 export function getLiveModelFallbackChain(selectedModel: string): string[] {
   const modelOrder = LIVE_DICTATION_CYCLE_ORDER;
@@ -43,6 +46,7 @@ export function getLiveModelFallbackChain(selectedModel: string): string[] {
 }
 
 export const AVAILABLE_MODELS: AIModelOption[] = [
+  { value: 'gemini-4-hydrogen', label: 'Gemini 4 Hydrogen' },
   { value: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash' },
   { value: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash (Default)' },
   { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash' },

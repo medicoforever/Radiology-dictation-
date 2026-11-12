@@ -5,7 +5,7 @@ import {
   unlockAudioContext,
 } from '../services/soundService';
 import { processLiveAudioChunk, synthesizeLiveReport, LiveHistoryContext, CustomDocxInput } from '../services/geminiService';
-import { DEFAULT_SELECTED_MODEL } from '../constants';
+import { DEFAULT_SELECTED_MODEL, DEFAULT_LIVE_MODEL } from '../constants';
 import {
   initLiveAudioSessionCache,
   cacheAudioChunk,
@@ -212,7 +212,7 @@ export const useLiveSession = () => {
   const currentChunkIndexRef = useRef<number>(0);
   const isProcessingChunkRef = useRef<boolean>(false);
   const schedulerIntervalRef = useRef<any>(null);
-  const selectedModelRef = useRef<string>(DEFAULT_SELECTED_MODEL);
+  const selectedModelRef = useRef<string>(DEFAULT_LIVE_MODEL);
   const customPromptRef = useRef<string>('');
   const customImagesRef = useRef<Array<{ data: string; mimeType: string }> | null>(null);
   const customDocxRef = useRef<CustomDocxInput>(null);
@@ -346,7 +346,7 @@ export const useLiveSession = () => {
 
     isProcessingChunkRef.current = true;
 
-    const modelName = selectedModelRef.current || 'gemini-3.8-flash';
+    const modelName = selectedModelRef.current || DEFAULT_LIVE_MODEL || 'gemini-4-hydrogen';
     const timeLabel = chunkIdx === 0 ? '0s-5s' : chunkIdx === 1 ? '0s-10s' : `${Math.round(startSample / 16000)}s-${Math.round(endSample / 16000)}s`;
     setStatus(`⚡ Transcribing [${timeLabel}] with ${modelName}...`);
 

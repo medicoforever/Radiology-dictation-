@@ -20,7 +20,7 @@ const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack }) => 
     const [customPrompt, setCustomPrompt] = useState('');
     const [customImages, setCustomImages] = useState<Array<{ data: string; mimeType: string }>>([]);
     const [customDocx, setCustomDocx] = useState<DocxTemplateData | null>(null);
-    const [selectedModel, setSelectedModel] = useState<string>(DEFAULT_LIVE_MODEL || 'gemini-3.8-flash');
+    const [selectedModel, setSelectedModel] = useState<string>(DEFAULT_LIVE_MODEL || 'gemini-4-hydrogen');
     const [interruptedSession, setInterruptedSession] = useState<{ sessionId: string; createdAt: number; totalChunks: number } | null>(null);
     const [isRecovering, setIsRecovering] = useState(false);
 

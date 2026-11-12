@@ -1,5 +1,5 @@
 import { GoogleGenAI, Type, GenerateContentResponse, Chat } from "@google/genai";
-import { DEFAULT_GEMINI_PROMPT, REPROCESS_GEMINI_PROMPT, TEMPLATE_GEMINI_PROMPT, REPORT_TEMPLATES, ERROR_IDENTIFIER_PROMPT, INITIAL_AGENT_PROMPT, REFINEMENT_AGENT_PROMPT, SYNTHESIZER_AGENT_PROMPT, VISUAL_TEMPLATE_GEMINI_PROMPT, getLiveModelFallbackChain, DEFAULT_SELECTED_MODEL, ReportTemplate } from '../constants';
+import { DEFAULT_LIVE_MODEL, DEFAULT_GEMINI_PROMPT, REPROCESS_GEMINI_PROMPT, TEMPLATE_GEMINI_PROMPT, REPORT_TEMPLATES, ERROR_IDENTIFIER_PROMPT, INITIAL_AGENT_PROMPT, REFINEMENT_AGENT_PROMPT, SYNTHESIZER_AGENT_PROMPT, VISUAL_TEMPLATE_GEMINI_PROMPT, getLiveModelFallbackChain, DEFAULT_SELECTED_MODEL, ReportTemplate } from '../constants';
 import { IdentifiedError } from "../types";
 import { isTableRowFinding } from "./docxService";
 import { expandMacrosInFindings, getMacroPromptContext } from "./macroDictionaryService";
@@ -1939,7 +1939,7 @@ export interface LiveChunkResult {
  */
 export const processLiveAudioChunk = async (
   audioBlob: Blob,
-  model: string = 'gemini-3.8-flash',
+  model: string = DEFAULT_LIVE_MODEL || 'gemini-4-hydrogen',
   previousFindings: string[] = [],
   chunkIndex: number = 0,
   customPrompt?: string,
@@ -2070,7 +2070,7 @@ INSTRUCTIONS FOR THIS AUDIO SEGMENT:
 `;
 
   // Multi-model fallback chain: selected model + subsequent next model
-  const fallbackChain = getLiveModelFallbackChain(model || 'gemini-3.8-flash');
+  const fallbackChain = getLiveModelFallbackChain(model || DEFAULT_LIVE_MODEL || 'gemini-4-hydrogen');
   let lastError: any = null;
   const failedModels: string[] = [];
 
@@ -2151,7 +2151,7 @@ INSTRUCTIONS FOR THIS AUDIO SEGMENT:
  */
 export const synthesizeLiveReport = async (
   rawFindings: string[],
-  model: string = 'gemini-3.8-flash',
+  model: string = DEFAULT_LIVE_MODEL || 'gemini-4-hydrogen',
   customPrompt?: string,
   customImages?: Array<{ data: string; mimeType: string }> | null,
   customDocx?: CustomDocxInput
@@ -2192,7 +2192,7 @@ Perform a comprehensive, holistic review pass over the draft to generate the fin
 
 Output MUST be a JSON object with a single "findings" array of strings.`;
 
-  const fallbackChain = getLiveModelFallbackChain(model || 'gemini-3.8-flash');
+  const fallbackChain = getLiveModelFallbackChain(model || DEFAULT_LIVE_MODEL || 'gemini-4-hydrogen');
 
   for (let attempt = 0; attempt < fallbackChain.length; attempt++) {
     const currentModel = fallbackChain[attempt];
