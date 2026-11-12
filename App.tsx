@@ -283,7 +283,7 @@ const App: React.FC = () => {
           setChatHistory(savedState.chatHistory || []);
           setStatus(AppStatus.Success);
           
-          const validModel = AVAILABLE_MODELS.some(m => m.value === savedState.selectedModel)
+          const validModel = (savedState.selectedModel && savedState.selectedModel !== 'gemini-3.5-flash' && AVAILABLE_MODELS.some(m => m.value === savedState.selectedModel))
             ? savedState.selectedModel
             : DEFAULT_SELECTED_MODEL;
           setSelectedModel(validModel);
@@ -949,7 +949,7 @@ const App: React.FC = () => {
     setCustomPrompt(prev.customPrompt);
     setCustomImages(prev.customImages);
     setCustomDocx(prev.customDocx || null);
-    const restoredModel = AVAILABLE_MODELS.some(m => m.value === prev.selectedModel)
+    const restoredModel = (prev.selectedModel && prev.selectedModel !== 'gemini-3.5-flash' && AVAILABLE_MODELS.some(m => m.value === prev.selectedModel))
       ? prev.selectedModel
       : DEFAULT_SELECTED_MODEL;
     setSelectedModel(restoredModel);
