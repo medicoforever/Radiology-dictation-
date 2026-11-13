@@ -25,6 +25,28 @@
           document.documentElement.classList.remove('dark');
         }
       } catch (_) {}
+
+      // Auto-migrate legacy default model from cached storage to gemini-4-hydrogen
+      try {
+        ['radiologyDictationSingleMode', 'radiologyDictationBatchMode'].forEach(function(k) {
+          var raw = localStorage.getItem(k);
+          if (raw && raw.indexOf('gemini-3.5-flash') !== -1) {
+            var updated = raw.replace(/"selectedModel"\s*:\s*"gemini-3\.5-flash"/g, '"selectedModel":"gemini-4-hydrogen"');
+            if (updated !== raw) {
+              localStorage.setItem(k, updated);
+            }
+          }
+        });
+      } catch (_) {}
+
+      // Auto-update service worker to guarantee immediate cache-refresh
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.getRegistrations().then(function(regs) {
+          for (var reg of regs) {
+            reg.update();
+          }
+        });
+      }
     </script>
   </head>
   <body class="bg-gray-50 dark:bg-slate-900">

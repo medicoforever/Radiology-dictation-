@@ -28,7 +28,7 @@ import TemplateSelectionModal from './ui/TemplateSelectionModal';
 import { getTemplateDocxBase64 } from '../services/builtInTemplates';
 import ImageIcon from './icons/ImageIcon';
 import { mergeAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
-import { generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText } from '../services/docxService';
+import { generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText, findingsToNeoRadHtml, sanitizeHtmlForNeoRad } from '../services/docxService';
 import { stopRepeatingInterruptedAlert } from '../services/soundService';
 import RichTextReportEditor from './RichTextReportEditor';
 import type { DocxTemplateData } from './ui/CustomPromptInput';
@@ -474,13 +474,6 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   const extraFileInputRef = useRef<HTMLInputElement>(null);
   const extraImageInputRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => {
-    if (initialExtraFiles && initialExtraFiles.length > 0) {
-      setExtraFiles(initialExtraFiles);
-      setShowExtraOptions(true);
-    }
-  }, [initialExtraFiles]);
-
   const handleExtraFilesSelected = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files: File[] = Array.from(e.target.files || []);
     if (files.length > 0) {
@@ -879,71 +872,17 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   const handleCopyAll = async () => {
     if (!findings || findings.length === 0) return;
 
-    const allTextPlain = findings.map((f, i) => {
-      const cleanFinding = f.replace(/BOLD::/g, '');
-      const isTitle = isReportTitle(cleanFinding, i);
-      const displayFinding = isTitle ? sanitizeTitleText(cleanFinding) : cleanFinding;
-      if (isClinicalProfileFinding(displayFinding)) {
-        return formatClinicalProfileText(displayFinding);
-      }
-      const { isStructured, isTable, title, points, tableLines } = parseStructuredFinding(displayFinding);
-      const isImpression = isStructured && !isTable && title.trim().toUpperCase() === 'IMPRESSION:';
+    // Use clean NeoRad PACS generator (zero CSS borders, zero w:pBdr boxes on approval)
+    const { html, plainText } = findingsToNeoRadHtml(findings);
 
-      if (isTable) {
-        return tableToPlainText(tableLines);
-      }
-      if (isImpression) {
-          return `${title.toUpperCase()}\n${points.map(p => `• ${p}`).join('\n')}`;
-      }
-      if (isStructured) {
-        return [title, ...points].join('\n');
-      }
-      if (displayFinding.startsWith('*') && displayFinding.endsWith('*')) {
-        return displayFinding.replace(/^\*+|\*+$/g, '').trim();
-      }
-      return displayFinding;
-    }).join('\n\n');
-
-    const allTextHtml = findings.map((f, i) => {
-      const isBold = f.includes('BOLD::');
-      const cleanFinding = f.replace(/BOLD::/g, '');
-      const isTitle = isReportTitle(cleanFinding, i);
-      const displayFinding = isTitle ? sanitizeTitleText(cleanFinding) : cleanFinding;
-      if (isClinicalProfileFinding(displayFinding)) {
-        const profText = formatClinicalProfileText(displayFinding);
-        return `<p><em>${profText}</em></p>`;
-      }
-      const { isStructured, isTable, title, points, tableLines } = parseStructuredFinding(displayFinding);
-      const isImpression = isStructured && !isTable && title.trim().toUpperCase() === 'IMPRESSION:';
-      
-      if (isTitle) {
-          return `<p style="text-align:center;"><strong><u>${displayFinding}</u></strong></p>`;
-      }
-      if (isTable) {
-          return parseMarkdownTable(tableLines);
-      }
-      if (isImpression) {
-          return `<p><strong style="text-decoration: underline;">${title.toUpperCase()}</strong></p><ul>${points.map(p => `<li><strong>${p}</strong></li>`).join('')}</ul>`;
-      }
-      if (isStructured) {
-        let htmlContent = isBold ? `<p><strong>${title}</strong></p>` : `<p>${title}</p>`;
-        htmlContent += points.map(p => isBold ? `<p><strong>${p}</strong></p>` : `<p>${p}</p>`).join('');
-        return htmlContent;
-      }
-      if (displayFinding.startsWith('*') && displayFinding.endsWith('*')) {
-        return `<p><em>${displayFinding.replace(/^\*+|\*+$/g, '').trim()}</em></p>`;
-      }
-      return isBold ? `<p><strong>${displayFinding}</strong></p>` : `<p>${displayFinding}</p>`;
-    }).join('');
-
-    const success = await copyToClipboard(allTextPlain, allTextHtml);
+    const success = await copyToClipboard(plainText, html);
     if (success) {
         setIsAllCopied(true);
         setTimeout(() => setIsAllCopied(false), 2000);
         const allValid = getValidFindingIndices();
         setSelectedIndices(allValid);
         setMultiSelectMode(true);
-        showNotification('Copied all! Click any finding or checkbox to deselect.');
+        showNotification('Full report copied for NeoRad PACS (No Boxes)!');
     } else {
         showNotification('Copy failed!');
     }

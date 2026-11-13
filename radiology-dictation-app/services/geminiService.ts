@@ -1,5 +1,5 @@
 import { GoogleGenAI, Type, GenerateContentResponse, Chat } from "@google/genai";
-import { DEFAULT_GEMINI_PROMPT, REPROCESS_GEMINI_PROMPT, TEMPLATE_GEMINI_PROMPT, REPORT_TEMPLATES, ERROR_IDENTIFIER_PROMPT, INITIAL_AGENT_PROMPT, REFINEMENT_AGENT_PROMPT, SYNTHESIZER_AGENT_PROMPT, VISUAL_TEMPLATE_GEMINI_PROMPT, getLiveModelFallbackChain, DEFAULT_SELECTED_MODEL, ReportTemplate } from '../constants';
+import { DEFAULT_LIVE_MODEL, DEFAULT_GEMINI_PROMPT, REPROCESS_GEMINI_PROMPT, TEMPLATE_GEMINI_PROMPT, REPORT_TEMPLATES, ERROR_IDENTIFIER_PROMPT, INITIAL_AGENT_PROMPT, REFINEMENT_AGENT_PROMPT, SYNTHESIZER_AGENT_PROMPT, VISUAL_TEMPLATE_GEMINI_PROMPT, getLiveModelFallbackChain, DEFAULT_SELECTED_MODEL, ReportTemplate } from '../constants';
 import { IdentifiedError } from "../types";
 import { isTableRowFinding } from "./docxService";
 import { expandMacrosInFindings, getMacroPromptContext } from "./macroDictionaryService";
@@ -192,6 +192,25 @@ export function sanitizeReportFindings(findings: string[]): string[] {
       continue;
     }
 
+    // Split multi-line strings or ### delimited findings into individual finding items (unless table or impression)
+    if (trimmed.includes('\n') && !trimmed.includes('|') && !trimmed.toUpperCase().startsWith('IMPRESSION:')) {
+      const subLines = trimmed.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+      for (const sl of subLines) {
+        const isB = trimmed.startsWith('BOLD::') && !sl.startsWith('BOLD::');
+        result.push(isB ? `BOLD::${sl}` : sl);
+      }
+      continue;
+    }
+
+    if (trimmed.includes('###') && !trimmed.includes('|') && !trimmed.toUpperCase().startsWith('IMPRESSION:')) {
+      const subLines = trimmed.split('###').map(l => l.trim()).filter(Boolean);
+      for (const sl of subLines) {
+        const isB = trimmed.startsWith('BOLD::') && !sl.startsWith('BOLD::');
+        result.push(isB ? `BOLD::${sl}` : sl);
+      }
+      continue;
+    }
+
     result.push(trimmed);
   }
 
@@ -302,35 +321,6 @@ export function extractErrorsFromResponse(rawText?: string | null): IdentifiedEr
 }
 
 /**
- * Adapts model configuration according to Gemini 3.8 and Gemini 3 conventions:
- * 1. For gemini-3.8-flash: strictly strips deprecated parameters (temperature, topP, topK,
- *    frequencyPenalty, presencePenalty, candidateCount) and injects thinkingLevel: 'LOW'
- *    for maximum interactive speed.
- * 2. Leaves other models configured normally.
- */
-export function adaptConfigForModel(model: string, baseConfig: Record<string, any> = {}): Record<string, any> {
-  const is38 = model.includes('gemini-3.8');
-  const config: Record<string, any> = { ...baseConfig };
-
-  if (is38) {
-    // Strip deprecated/unsupported parameters
-    delete config.temperature;
-    delete config.topP;
-    delete config.topK;
-    delete config.frequencyPenalty;
-    delete config.presencePenalty;
-    delete config.candidateCount;
-
-    // Set thinkingLevel to LOW for lowest latency
-    config.thinkingConfig = {
-      thinkingLevel: 'LOW'
-    };
-  }
-
-  return config;
-}
-
-/**
  * Universal safe caller for Gemini models that gracefully handles JSON mode incompatibilities across all models.
  */
 export async function generateContentWithJsonFallback(
@@ -345,16 +335,14 @@ export async function generateContentWithJsonFallback(
     async (client) => {
       // Strategy 1: Primary attempt with structured JSON schema on the selected model
       try {
-        const callConfig = adaptConfigForModel(resolvedModel, {
-          responseMimeType: "application/json",
-          responseSchema: schema,
-          temperature,
-        });
-
         const response: GenerateContentResponse = await client.models.generateContent({
           model: resolvedModel,
           contents: { parts },
-          config: callConfig as any
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: schema,
+            temperature,
+          }
         });
 
         const text = response.text?.trim() || '';
@@ -369,14 +357,12 @@ export async function generateContentWithJsonFallback(
               { text: '\n\nCRITICAL OUTPUT REQUIREMENT: Output ONLY a valid JSON object in the exact format: {"findings": ["finding 1", "finding 2", ...]}. Do NOT output any markdown wrappers or conversational text.' }
             ];
 
-            const retryConfig = adaptConfigForModel(resolvedModel, {
-              temperature,
-            });
-
             const retryResponse: GenerateContentResponse = await client.models.generateContent({
               model: resolvedModel,
               contents: { parts: partsWithJsonInstruction },
-              config: retryConfig as any
+              config: {
+                temperature,
+              }
             });
 
             const retryText = retryResponse.text?.trim() || '';
@@ -1061,7 +1047,6 @@ Carefully integrate these dictated findings into the "${templateName}" baseline 
       const textOnlyParts = parts.filter(p => !p.inlineData);
       const retryResponse = await executeWithApiKeyFailover(
         async (client) => {
-          const callConfig = adaptConfigForModel(targetModel);
           return await client.models.generateContent({
             model: targetModel,
             contents: {
@@ -1069,8 +1054,7 @@ Carefully integrate these dictated findings into the "${templateName}" baseline 
                 ...textOnlyParts,
                 { text: "\n\nCRITICAL OUTPUT REQUIREMENT: Output ONLY a valid JSON object in the exact format: {\"findings\": [\"finding 1\", \"finding 2\", ...]}" }
               ]
-            },
-            ...(Object.keys(callConfig).length > 0 ? { config: callConfig as any } : {})
+            }
           });
         },
         { selectedModel: targetModel }
@@ -1159,11 +1143,9 @@ Follow these strict instructions to produce a clean and accurate continuation:
     const targetModel = resolveApiTargetModel(model || DEFAULT_SELECTED_MODEL);
     return await executeWithApiKeyFailover(
       async (client) => {
-        const callConfig = adaptConfigForModel(targetModel);
         const response: GenerateContentResponse = await client.models.generateContent({
           model: targetModel,
           contents: { parts: [textPart, audioPart] },
-          ...(Object.keys(callConfig).length > 0 ? { config: callConfig as any } : {})
         });
         const resultText = response.text?.trim();
         if (!resultText) {
@@ -1227,11 +1209,9 @@ Now, listen to the audio and provide the single, updated finding text.`;
     const targetModel = resolveApiTargetModel(model || DEFAULT_SELECTED_MODEL);
     return await executeWithApiKeyFailover(
       async (client) => {
-        const callConfig = adaptConfigForModel(targetModel);
         const response: GenerateContentResponse = await client.models.generateContent({
           model: targetModel,
           contents: { parts: [textPart, audioPart] },
-          ...(Object.keys(callConfig).length > 0 ? { config: callConfig as any } : {})
         });
         const resultText = response.text?.trim();
         if (!resultText) {
@@ -1428,11 +1408,9 @@ export const transcribeAudioForPrompt = async (
   try {
     return await executeWithApiKeyFailover(
       async (client) => {
-        const callConfig = adaptConfigForModel(primaryModel);
         const response: GenerateContentResponse = await client.models.generateContent({
           model: primaryModel,
           contents: { parts: [textPart, audioPart] },
-          ...(Object.keys(callConfig).length > 0 ? { config: callConfig as any } : {})
         });
 
         const resultText = response.text?.trim();
@@ -1669,13 +1647,12 @@ async function executeAgentStepWithFallbackAndRetry(
             onProgress?.(`${taskName}: Analyzing with ${COMPLEX_IMPRESSION_DEFAULT_MODEL} (Google Search grounded)...`);
             const response = await executeWithApiKeyFailover(
                 async (client) => {
-                    const callConfig = adaptConfigForModel(COMPLEX_IMPRESSION_DEFAULT_MODEL, {
-                        tools: [{ googleSearch: {} }]
-                    });
                     return await client.models.generateContent({
                         model: COMPLEX_IMPRESSION_DEFAULT_MODEL,
                         contents: prompt,
-                        config: callConfig as any
+                        config: {
+                            tools: [{ googleSearch: {} }]
+                        }
                     });
                 },
                 { selectedModel: COMPLEX_IMPRESSION_DEFAULT_MODEL }
@@ -1981,7 +1958,7 @@ export interface LiveChunkResult {
  */
 export const processLiveAudioChunk = async (
   audioBlob: Blob,
-  model: string = 'gemini-3.8-flash',
+  model: string = DEFAULT_LIVE_MODEL || 'gemini-4-hydrogen',
   previousFindings: string[] = [],
   chunkIndex: number = 0,
   customPrompt?: string,
@@ -2112,7 +2089,7 @@ INSTRUCTIONS FOR THIS AUDIO SEGMENT:
 `;
 
   // Multi-model fallback chain: selected model + subsequent next model
-  const fallbackChain = getLiveModelFallbackChain(model || 'gemini-3.8-flash');
+  const fallbackChain = getLiveModelFallbackChain(model || DEFAULT_LIVE_MODEL || 'gemini-4-hydrogen');
   let lastError: any = null;
   const failedModels: string[] = [];
 
@@ -2193,7 +2170,7 @@ INSTRUCTIONS FOR THIS AUDIO SEGMENT:
  */
 export const synthesizeLiveReport = async (
   rawFindings: string[],
-  model: string = 'gemini-3.8-flash',
+  model: string = DEFAULT_LIVE_MODEL || 'gemini-4-hydrogen',
   customPrompt?: string,
   customImages?: Array<{ data: string; mimeType: string }> | null,
   customDocx?: CustomDocxInput
@@ -2234,7 +2211,7 @@ Perform a comprehensive, holistic review pass over the draft to generate the fin
 
 Output MUST be a JSON object with a single "findings" array of strings.`;
 
-  const fallbackChain = getLiveModelFallbackChain(model || 'gemini-3.8-flash');
+  const fallbackChain = getLiveModelFallbackChain(model || DEFAULT_LIVE_MODEL || 'gemini-4-hydrogen');
 
   for (let attempt = 0; attempt < fallbackChain.length; attempt++) {
     const currentModel = fallbackChain[attempt];

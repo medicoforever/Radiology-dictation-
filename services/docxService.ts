@@ -432,6 +432,280 @@ export function parseMarkdownTable(lines: string[]): string {
  * Converts findings array into clean HTML suitable for rich text editor and Word/RTF.
  * Strictly guarantees that exam heading contains ONLY the scan title without "Clinical profile".
  */
+/**
+ * Generates 100% clean, NeoRad PACS & RIS compliant HTML and plain text.
+ * In NeoRad PACS (powered by DevExpress RichEdit), any CSS borders, wrapper divs,
+ * or class names are parsed into Word/OpenXML paragraph borders (<w:pBdr>).
+ * While subtle during editing, NeoRad exports <w:pBdr> to the PDF generator on APPROVAL,
+ * causing solid black rectangular boxes around every affected section.
+ *
+ * This function guarantees:
+ * - Pure semantic <p> paragraphs with ZERO CSS classes, ZERO borders, and ZERO margin/color styling.
+ * - Exam Title centered, bold, underlined: <p style="text-align:center;"><strong><u>EXAM TITLE</u></strong></p>
+ * - Clinical Profile: <p><em>Clinical Profile: ...</em></p>
+ * - Anatomical Subheadings (e.g. C.T. SCAN OF BRAIN, C.T. SCAN OF NECK, etc.): centered, bold, underlined: <p style="text-align:center;"><strong><u>C.T. SCAN OF BRAIN</u></strong></p>
+ * - Dictated / Abnormal findings (marked with BOLD::): <p><strong>Finding text</strong></p>
+ * - Normal template findings: <p>Finding text</p>
+ * - Impression: <p><strong><u>IMPRESSION:</u></strong></p> followed by <p><strong>• Point 1</strong></p>
+ * - All multi-line and merged template findings are unpacked into atomic individual <p> lines.
+ * - Completely indistinguishable in NeoRad PACS from manually pasting row-by-row, with ZERO boxes after report approval.
+ */
+export function escapeHtml(text: string): string {
+  if (!text) return '';
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+export function findingsToNeoRadHtml(findings: string[]): { html: string; plainText: string } {
+  if (!findings || findings.length === 0) {
+    return { html: '', plainText: '' };
+  }
+
+  const htmlParagraphs: string[] = [];
+  const plainParagraphs: string[] = [];
+
+  const isAnatomicalSubheading = (text: string): boolean => {
+    const clean = text.replace(/^BOLD::/i, '').replace(/[*_~`#]+/g, '').trim();
+    if (!clean || clean.length > 80) return false;
+    if (/^(?:C\.?T\.?\s*SCAN\s+OF|CT\s+SCAN\s+OF|MRI\s+OF|ULTRASOUND\s+OF|USG\s+OF|X-?RAY\s+OF)\s+[A-Z\s\(\)\-\/]+$/i.test(clean)) {
+      return true;
+    }
+    if (/^[A-Z\s\-\/]{3,35}:$/i.test(clean)) {
+      return true;
+    }
+    return false;
+  };
+
+  const isExamTitle = (text: string, index: number): boolean => {
+    if (index === 0) return true;
+    const clean = text.replace(/^BOLD::/i, '').replace(/[*_~`#]+/g, '').trim();
+    if (clean === clean.toUpperCase() && clean.length > 5 && clean.length < 90 && !clean.endsWith('.')) {
+      if (/^(?:CT|C\.T\.|MRI|USG|ULTRASOUND|X-?RAY|PET|MAMMO)/i.test(clean) && !clean.includes('SCAN OF ')) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  // Flatten any lumped findings or multi-line strings
+  const expandedFindings: { text: string; isBold: boolean; origIndex: number }[] = [];
+
+  findings.forEach((raw, idx) => {
+    if (!raw || typeof raw !== 'string') return;
+    const trimmed = raw.trim();
+    if (!trimmed) return;
+
+    // Check if line 0 has Clinical Profile glued to scan title
+    if (idx === 0) {
+      const matchGlued = trimmed.match(/^(.*?)(?:Clinical\s*profile:?|Clinical\s*history:?)\s*(.*)$/i);
+      if (matchGlued && matchGlued[1].trim().length > 0) {
+        const titlePart = matchGlued[1].trim().replace(/^BOLD::/i, '').replace(/[*_]+$/g, '').trim();
+        const profilePart = matchGlued[2].trim().replace(/^BOLD::/i, '').trim();
+        expandedFindings.push({ text: titlePart, isBold: false, origIndex: 0 });
+        expandedFindings.push({
+          text: profilePart ? `Clinical Profile: ${profilePart}` : 'Clinical Profile: Routine evaluation.',
+          isBold: false,
+          origIndex: 1
+        });
+        return;
+      }
+    }
+
+    // Check if finding is structured with ###
+    if (trimmed.includes('###') && !trimmed.includes('|')) {
+      const parts = trimmed.split('###').map(p => p.trim()).filter(Boolean);
+      parts.forEach(p => {
+        const isBold = p.startsWith('BOLD::') || trimmed.startsWith('BOLD::');
+        expandedFindings.push({ text: p.replace(/^BOLD::/i, ''), isBold, origIndex: idx });
+      });
+      return;
+    }
+
+    // Check if finding has \n linebreaks (unless markdown table)
+    if (trimmed.includes('\n') && !trimmed.includes('|')) {
+      const parts = trimmed.split(/\r?\n/).map(p => p.trim()).filter(Boolean);
+      parts.forEach(p => {
+        const isBold = p.startsWith('BOLD::') || trimmed.startsWith('BOLD::');
+        expandedFindings.push({ text: p.replace(/^BOLD::/i, ''), isBold, origIndex: idx });
+      });
+      return;
+    }
+
+    const isBold = trimmed.startsWith('BOLD::');
+    expandedFindings.push({ text: trimmed.replace(/^BOLD::/i, ''), isBold, origIndex: idx });
+  });
+
+  for (let i = 0; i < expandedFindings.length; i++) {
+    const { text, isBold, origIndex } = expandedFindings[i];
+    const clean = text.replace(/^BOLD::/i, '').trim();
+    if (!clean) continue;
+
+    // 1. Clinical profile check
+    if (/^\*?\s*Clinical\s*(Profile|History):/i.test(clean)) {
+      const prof = cleanClinicalProfileText(clean);
+      plainParagraphs.push(prof);
+      htmlParagraphs.push(`<p><em>${escapeHtml(prof)}</em></p>`);
+      continue;
+    }
+
+    // 2. Exam Title (first line or primary title)
+    if (origIndex === 0 || isExamTitle(clean, origIndex)) {
+      const title = clean.replace(/[*_~`#]+/g, '').trim();
+      plainParagraphs.push(title);
+      htmlParagraphs.push(`<p style="text-align:center;"><strong><u>${escapeHtml(title)}</u></strong></p>`);
+      continue;
+    }
+
+    // 3. Anatomical Subheadings (C.T. SCAN OF BRAIN, C.T. SCAN OF NECK, etc.)
+    if (isAnatomicalSubheading(clean)) {
+      const sub = clean.replace(/[*_~`#]+/g, '').trim();
+      plainParagraphs.push(sub);
+      htmlParagraphs.push(`<p style="text-align:center;"><strong><u>${escapeHtml(sub)}</u></strong></p>`);
+      continue;
+    }
+
+    // 4. Impression block
+    if (clean.toUpperCase().startsWith('IMPRESSION:')) {
+      const impText = clean.replace(/^IMPRESSION:\s*/i, '').trim();
+      plainParagraphs.push('IMPRESSION:');
+      htmlParagraphs.push(`<p><strong><u>IMPRESSION:</u></strong></p>`);
+      if (impText) {
+        plainParagraphs.push(`• ${impText}`);
+        htmlParagraphs.push(`<p><strong>${escapeHtml(impText)}</strong></p>`);
+      }
+      continue;
+    }
+
+    // 5. Patient separator
+    if (clean.startsWith('--- PATIENT') || clean.startsWith('PATIENT:')) {
+      plainParagraphs.push(clean);
+      htmlParagraphs.push(`<p><strong><u>${escapeHtml(clean)}</u></strong></p>`);
+      continue;
+    }
+
+    // 6. Markdown table
+    if (clean.startsWith('|') && clean.endsWith('|')) {
+      const tableLines = [clean];
+      while (i + 1 < expandedFindings.length && expandedFindings[i + 1].text.trim().startsWith('|')) {
+        i++;
+        tableLines.push(expandedFindings[i].text.trim());
+      }
+      plainParagraphs.push(tableToPlainText(tableLines));
+      htmlParagraphs.push(parseMarkdownTable(tableLines));
+      continue;
+    }
+
+    // 7. Normal or Abnormal finding
+    plainParagraphs.push(clean);
+    if (isBold) {
+      htmlParagraphs.push(`<p><strong>${escapeHtml(clean)}</strong></p>`);
+    } else {
+      htmlParagraphs.push(`<p>${escapeHtml(clean)}</p>`);
+    }
+  }
+
+  return {
+    html: htmlParagraphs.join('\n'),
+    plainText: plainParagraphs.join('\n\n')
+  };
+}
+
+/**
+ * Strips all CSS borders, class names, divs, and styling that triggers DevExpress / NeoRad
+ * OpenXML paragraph borders (<w:pBdr>), guaranteeing zero black boxes upon approval.
+ */
+export function sanitizeHtmlForNeoRad(html: string): string {
+  if (!html) return '';
+
+  if (typeof document !== 'undefined') {
+    const temp = document.createElement('div');
+    temp.innerHTML = html;
+
+    const toRemove = temp.querySelectorAll('script, style, meta, link');
+    toRemove.forEach(el => el.remove());
+
+    const headings = temp.querySelectorAll('h1, h2, h3, h4');
+    headings.forEach(h => {
+      const p = document.createElement('p');
+      const text = h.textContent?.trim() || '';
+      if (h.tagName.toLowerCase() === 'h1' || text === text.toUpperCase()) {
+        p.setAttribute('style', 'text-align:center;');
+        p.innerHTML = `<strong><u>${escapeHtml(text)}</u></strong>`;
+      } else {
+        p.innerHTML = `<strong>${escapeHtml(text)}</strong>`;
+      }
+      h.replaceWith(p);
+    });
+
+    const wrappers = temp.querySelectorAll('div, section, article, header');
+    wrappers.forEach(wrap => {
+      const hasBlockChildren = wrap.querySelector('p, ul, ol, table');
+      if (!hasBlockChildren) {
+        const p = document.createElement('p');
+        p.innerHTML = wrap.innerHTML;
+        wrap.replaceWith(p);
+      } else {
+        while (wrap.firstChild) {
+          wrap.parentNode?.insertBefore(wrap.firstChild, wrap);
+        }
+        wrap.remove();
+      }
+    });
+
+    const lists = temp.querySelectorAll('ul, ol');
+    lists.forEach(list => {
+      const items = list.querySelectorAll('li');
+      items.forEach(li => {
+        const p = document.createElement('p');
+        p.innerHTML = `<strong>• ${li.innerHTML.trim()}</strong>`;
+        list.parentNode?.insertBefore(p, list);
+      });
+      list.remove();
+    });
+
+    const allEls = temp.querySelectorAll('*');
+    allEls.forEach(el => {
+      el.removeAttribute('class');
+      el.removeAttribute('id');
+      const s = el.getAttribute('style');
+      if (s) {
+        let cleanStyle = s.replace(/border[^;]+;?/gi, '')
+                          .replace(/margin[^;]+;?/gi, '')
+                          .replace(/padding[^;]+;?/gi, '')
+                          .replace(/color[^;]+;?/gi, '')
+                          .replace(/background[^;]+;?/gi, '')
+                          .trim();
+        if (cleanStyle.includes('text-align:center') || cleanStyle.includes('text-align: center')) {
+          el.setAttribute('style', 'text-align:center;');
+        } else if (cleanStyle) {
+          el.setAttribute('style', cleanStyle);
+        } else {
+          el.removeAttribute('style');
+        }
+      }
+    });
+
+    return temp.innerHTML;
+  }
+
+  return html
+    .replace(/<div[^>]*>/gi, '<p>')
+    .replace(/<\/div>/gi, '</p>')
+    .replace(/<h1[^>]*>(.*?)<\/h1>/gi, '<p style="text-align:center;"><strong><u>$1</u></strong></p>')
+    .replace(/<h[2-6][^>]*>(.*?)<\/h[2-6]>/gi, '<p><strong>$1</strong></p>')
+    .replace(/\sclass="[^"]*"/gi, '')
+    .replace(/\sstyle="[^"]*border[^"]*"/gi, '')
+    .replace(/\sstyle="(?!(?:text-align:\s*center;?))[^"]*"/gi, '');
+}
+
+/**
+ * Converts findings array into clean HTML suitable for rich text editor and Word/RTF.
+ * Guaranteed border-free with clean inline styles and no border-inducing CSS.
+ */
 export function findingsToRichHtml(findings: string[]): string {
   if (!findings || findings.length === 0) return '';
 
@@ -450,11 +724,11 @@ export function findingsToRichHtml(findings: string[]): string {
         const titleText = matchGlued[1].trim().replace(/^BOLD::/i, '').replace(/[*_]+$/g, '').trim();
         let profText = matchGlued[2].trim().replace(/^BOLD::/i, '').trim();
         profText = profText ? cleanClinicalProfileText(`Clinical Profile: ${profText}`) : '';
-        htmlParts.push(`<h1 style="margin-bottom: 14px; font-size: 20px; font-weight: bold; text-align: center; text-decoration: underline; color: #0f172a; text-transform: uppercase;">${escapeHtml(titleText)}</h1>`);
+        htmlParts.push(`<p style="margin-bottom: 12px; font-size: 18px; font-weight: bold; text-align: center; text-decoration: underline; text-transform: uppercase;"><strong><u>${escapeHtml(titleText)}</u></strong></p>`);
         if (profText) {
-          htmlParts.push(`<p class="clinical-profile" style="margin-bottom: 14px; font-style: italic; color: #334155;"><em><strong>${escapeHtml(profText)}</strong></em></p>`);
+          htmlParts.push(`<p style="margin-bottom: 12px; font-style: italic;"><em><strong>${escapeHtml(profText)}</strong></em></p>`);
         } else {
-          htmlParts.push(`<p class="clinical-profile" style="margin-bottom: 14px; font-style: italic; color: #334155;"><em><strong>Clinical Profile: Routine evaluation.</strong></em></p>`);
+          htmlParts.push(`<p style="margin-bottom: 12px; font-style: italic;"><em><strong>Clinical Profile: Routine evaluation.</strong></em></p>`);
         }
         isFirst = false;
         continue;
@@ -464,7 +738,7 @@ export function findingsToRichHtml(findings: string[]): string {
     // 1. Clinical profile line
     if (/^\*?\s*Clinical\s*(Profile|History):/i.test(trimmed)) {
       const inner = cleanClinicalProfileText(trimmed);
-      htmlParts.push(`<p class="clinical-profile" style="margin-bottom: 14px; font-style: italic; color: #334155;"><em><strong>${escapeHtml(inner)}</strong></em></p>`);
+      htmlParts.push(`<p style="margin-bottom: 12px; font-style: italic;"><em><strong>${escapeHtml(inner)}</strong></em></p>`);
       isFirst = false;
       continue;
     }
@@ -507,16 +781,12 @@ export function findingsToRichHtml(findings: string[]): string {
     // 5. Impression section (starts with IMPRESSION:### or IMPRESSION:)
     if (trimmed.startsWith('IMPRESSION:')) {
       const parts = trimmed.replace('IMPRESSION:', '').split('###').map(p => p.trim()).filter(Boolean);
-      let impressionHtml = `<div class="impression-section" style="margin-top: 20px; margin-bottom: 16px;">`;
-      impressionHtml += `<h3 style="margin: 0 0 8px 0; font-size: 16px; font-weight: bold; text-decoration: underline; text-transform: uppercase; color: #0f172a;">IMPRESSION:</h3>`;
+      let impressionHtml = `<p style="margin-top: 18px; margin-bottom: 6px; font-size: 15px; font-weight: bold; text-decoration: underline; text-transform: uppercase;"><strong><u>IMPRESSION:</u></strong></p>`;
       if (parts.length > 0) {
-        impressionHtml += `<ul style="margin: 0; padding-left: 24px; color: #0f172a;">`;
         for (const pt of parts) {
-          impressionHtml += `<li style="margin-bottom: 6px; font-weight: bold; line-height: 1.5;">${escapeHtml(pt)}</li>`;
+          impressionHtml += `<p style="margin-bottom: 4px; font-weight: bold; line-height: 1.5;"><strong>• ${escapeHtml(pt)}</strong></p>`;
         }
-        impressionHtml += `</ul>`;
       }
-      impressionHtml += `</div>`;
       htmlParts.push(impressionHtml);
       isFirst = false;
       continue;
@@ -525,7 +795,7 @@ export function findingsToRichHtml(findings: string[]): string {
     // 6. Patient separator
     if (trimmed.startsWith('BOLD::--- PATIENT') || trimmed.startsWith('--- PATIENT')) {
       const cleanTitle = trimmed.replace('BOLD::', '').trim();
-      htmlParts.push(`<h2 style="margin-top: 24px; margin-bottom: 12px; font-size: 18px; font-weight: bold; border-bottom: 2px solid #3b82f6; padding-bottom: 4px; color: #1d4ed8;">${escapeHtml(cleanTitle)}</h2>`);
+      htmlParts.push(`<p style="margin-top: 20px; margin-bottom: 8px; font-size: 16px; font-weight: bold; text-decoration: underline;"><strong><u>${escapeHtml(cleanTitle)}</u></strong></p>`);
       isFirst = false;
       continue;
     }
@@ -536,18 +806,25 @@ export function findingsToRichHtml(findings: string[]): string {
         .replace(/^BOLD::/i, '')
         .replace(/\s*clinical\s*(profile|history)\s*:?.*$/i, '')
         .trim();
-      htmlParts.push(`<h1 style="margin-bottom: 14px; font-size: 20px; font-weight: bold; text-align: center; text-decoration: underline; color: #0f172a; text-transform: uppercase;">${escapeHtml(cleanTitle)}</h1>`);
+      htmlParts.push(`<p style="margin-bottom: 12px; font-size: 18px; font-weight: bold; text-align: center; text-decoration: underline; text-transform: uppercase;"><strong><u>${escapeHtml(cleanTitle)}</u></strong></p>`);
       isFirst = false;
       continue;
     }
 
-    // 8. Findings with BOLD:: (dictated modifications/abnormalities)
+    // 8. Anatomical Subheading (e.g. C.T. SCAN OF BRAIN, C.T. SCAN OF NECK, etc.)
+    if (/^(?:C\.?T\.?\s*SCAN\s+OF|CT\s+SCAN\s+OF|MRI\s+OF|ULTRASOUND\s+OF|USG\s+OF|X-?RAY\s+OF)\s+[A-Z\s\(\)\-\/]+$/i.test(trimmed)) {
+      htmlParts.push(`<p style="margin-top: 14px; margin-bottom: 8px; font-size: 15px; font-weight: bold; text-align: center; text-decoration: underline;"><strong><u>${escapeHtml(trimmed)}</u></strong></p>`);
+      isFirst = false;
+      continue;
+    }
+
+    // 9. Findings with BOLD:: (dictated modifications/abnormalities)
     if (trimmed.startsWith('BOLD::')) {
       const content = trimmed.replace(/^BOLD::/, '');
-      htmlParts.push(`<p style="margin-bottom: 10px; line-height: 1.6; color: #0f172a;"><strong>${escapeHtml(content)}</strong></p>`);
+      htmlParts.push(`<p style="margin-bottom: 8px; line-height: 1.6;"><strong>${escapeHtml(content)}</strong></p>`);
     } else {
       // Normal template finding
-      htmlParts.push(`<p style="margin-bottom: 10px; line-height: 1.6; color: #334155;">${escapeHtml(trimmed)}</p>`);
+      htmlParts.push(`<p style="margin-bottom: 8px; line-height: 1.6;">${escapeHtml(trimmed)}</p>`);
     }
     isFirst = false;
   }
@@ -555,21 +832,6 @@ export function findingsToRichHtml(findings: string[]): string {
   return htmlParts.join('\n');
 }
 
-/**
- * Escapes HTML characters
- */
-function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;');
-}
-
-/**
- * Escapes special RTF characters and encodes unicode characters as \uN?
- */
 export function escapeRtf(text: string): string {
   if (!text) return '';
   let out = '';

@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { findingsToRichHtml, generateRtfDocument, generateWordHtmlDoc, generateDocxFromHtml, downloadFile } from '../services/docxService';
+import {  findingsToRichHtml, generateRtfDocument, generateWordHtmlDoc, generateDocxFromHtml, downloadFile , findingsToNeoRadHtml, sanitizeHtmlForNeoRad } from '../services/docxService';
 import CopyIcon from './icons/CopyIcon';
 import DownloadIcon from './icons/DownloadIcon';
 import SparklesIcon from './icons/SparklesIcon';
@@ -73,22 +73,32 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
 
   const handleCopyRichText = async () => {
     if (!editorRef.current) return;
-    const html = editorRef.current.innerHTML;
-    const plainText = editorRef.current.innerText || editorRef.current.textContent || '';
+    
+    // Generate clean NeoRad PACS compliant HTML (zero CSS borders, zero boxes upon approval)
+    let cleanHtml: string;
+    let plainText: string;
+
+    if (!isSynced && editorRef.current) {
+      cleanHtml = sanitizeHtmlForNeoRad(editorRef.current.innerHTML);
+      plainText = editorRef.current.innerText || editorRef.current.textContent || '';
+    } else {
+      const result = findingsToNeoRadHtml(findings);
+      cleanHtml = result.html;
+      plainText = result.plainText || editorRef.current.innerText || editorRef.current.textContent || '';
+    }
 
     try {
       if (typeof window !== 'undefined' && navigator.clipboard && window.ClipboardItem) {
         const textBlob = new Blob([plainText], { type: 'text/plain' });
-        const htmlBlob = new Blob([html], { type: 'text/html' });
+        const htmlBlob = new Blob([cleanHtml], { type: 'text/html' });
         await navigator.clipboard.write([
           new ClipboardItem({
             'text/plain': textBlob,
             'text/html': htmlBlob,
           }),
         ]);
-        setCopyStatus('Formatted Rich Text Copied!');
+        setCopyStatus('Copied for NeoRad PACS (No Boxes)!');
       } else {
-        // Fallback
         await navigator.clipboard.writeText(plainText);
         setCopyStatus('Copied Text!');
       }
@@ -102,20 +112,27 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
       }
     }
 
-    setTimeout(() => setCopyStatus(null), 3000);
+    setTimeout(() => setCopyStatus(null), 3500);
   };
 
   const handleCopyHtml = async () => {
     if (!editorRef.current) return;
-    const html = editorRef.current.innerHTML;
+    
+    let cleanHtml: string;
+    if (!isSynced && editorRef.current) {
+      cleanHtml = sanitizeHtmlForNeoRad(editorRef.current.innerHTML);
+    } else {
+      cleanHtml = findingsToNeoRadHtml(findings).html;
+    }
+
     try {
-      await navigator.clipboard.writeText(html);
-      setCopyStatus('Raw HTML Copied!');
+      await navigator.clipboard.writeText(cleanHtml);
+      setCopyStatus('Clean NeoRad HTML Copied!');
     } catch (err) {
       console.warn('Copy HTML error:', err);
       setCopyStatus('Failed to copy HTML');
     }
-    setTimeout(() => setCopyStatus(null), 3000);
+    setTimeout(() => setCopyStatus(null), 3500);
   };
 
   const handleDownloadHtml = () => {
@@ -281,11 +298,11 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
           <button
             type="button"
             onClick={handleCopyRichText}
-            className="flex items-center gap-1 px-2.5 py-1.5 bg-white text-blue-800 hover:bg-blue-50 font-bold text-xs rounded-lg shadow-sm transition-all cursor-pointer active:scale-95"
-            title="Copy formatted rich text to paste into PACS, RIS, or MS Word with bolding intact"
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white font-bold text-xs rounded-lg shadow-md transition-all cursor-pointer active:scale-95 ring-1 ring-blue-400/50"
+            title="Copy report specifically formatted for NeoRad PACS & RIS (Guaranteed NO black boxes upon report approval, exact paragraph structure)"
           >
-            <CopyIcon className="w-3.5 h-3.5 text-blue-700" />
-            {copyStatus || 'Copy Rich Text'}
+            <CopyIcon className="w-3.5 h-3.5 text-white" />
+            {copyStatus || '📋 Copy for NeoRad PACS (No Boxes)'}
           </button>
           <button
             type="button"
@@ -517,6 +534,21 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
           contentEditable
           suppressContentEditableWarning
           onInput={handleInput}
+          onCopy={(e) => {
+            const selection = window.getSelection();
+            if (selection && selection.rangeCount > 0 && !selection.isCollapsed) {
+              const range = selection.getRangeAt(0);
+              const container = document.createElement('div');
+              container.appendChild(range.cloneContents());
+              const cleanHtml = sanitizeHtmlForNeoRad(container.innerHTML);
+              const plainText = selection.toString();
+              e.preventDefault();
+              if (e.clipboardData) {
+                e.clipboardData.setData('text/html', cleanHtml);
+                e.clipboardData.setData('text/plain', plainText);
+              }
+            }
+          }}
           className="w-full max-w-4xl mx-auto bg-white text-slate-900 border border-slate-300 rounded-xl p-6 sm:p-10 shadow-lg focus:outline-none focus:ring-2 focus:ring-blue-500 font-sans leading-relaxed text-sm sm:text-base selection:bg-blue-200 selection:text-blue-900 break-words"
           style={{ 
             minHeight: '380px', 

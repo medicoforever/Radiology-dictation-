@@ -192,6 +192,25 @@ export function sanitizeReportFindings(findings: string[]): string[] {
       continue;
     }
 
+    // Split multi-line strings or ### delimited findings into individual finding items (unless table or impression)
+    if (trimmed.includes('\n') && !trimmed.includes('|') && !trimmed.toUpperCase().startsWith('IMPRESSION:')) {
+      const subLines = trimmed.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+      for (const sl of subLines) {
+        const isB = trimmed.startsWith('BOLD::') && !sl.startsWith('BOLD::');
+        result.push(isB ? `BOLD::${sl}` : sl);
+      }
+      continue;
+    }
+
+    if (trimmed.includes('###') && !trimmed.includes('|') && !trimmed.toUpperCase().startsWith('IMPRESSION:')) {
+      const subLines = trimmed.split('###').map(l => l.trim()).filter(Boolean);
+      for (const sl of subLines) {
+        const isB = trimmed.startsWith('BOLD::') && !sl.startsWith('BOLD::');
+        result.push(isB ? `BOLD::${sl}` : sl);
+      }
+      continue;
+    }
+
     result.push(trimmed);
   }
 
