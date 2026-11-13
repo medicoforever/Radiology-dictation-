@@ -28,7 +28,7 @@ import TemplateSelectionModal from './ui/TemplateSelectionModal';
 import { getTemplateDocxBase64 } from '../services/builtInTemplates';
 import ImageIcon from './icons/ImageIcon';
 import { mergeAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
-import { generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText, findingsToNeoRadHtml, sanitizeHtmlForNeoRad } from '../services/docxService';
+import { generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText, findingsToStandardHtml, sanitizeHtmlForClipboard } from '../services/docxService';
 import { stopRepeatingInterruptedAlert } from '../services/soundService';
 import RichTextReportEditor from './RichTextReportEditor';
 import type { DocxTemplateData } from './ui/CustomPromptInput';
@@ -872,8 +872,8 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   const handleCopyAll = async () => {
     if (!findings || findings.length === 0) return;
 
-    // Use clean NeoRad PACS generator (zero CSS borders, zero w:pBdr boxes on approval)
-    const { html, plainText } = findingsToNeoRadHtml(findings);
+    // Use clean standard HTML generator (zero CSS borders, zero boxes on approval)
+    const { html, plainText } = findingsToStandardHtml(findings);
 
     const success = await copyToClipboard(plainText, html);
     if (success) {
@@ -882,7 +882,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         const allValid = getValidFindingIndices();
         setSelectedIndices(allValid);
         setMultiSelectMode(true);
-        showNotification('Full report copied for NeoRad PACS (No Boxes)!');
+        showNotification('Full report copied!');
     } else {
         showNotification('Copy failed!');
     }

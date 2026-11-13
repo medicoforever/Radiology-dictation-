@@ -433,10 +433,10 @@ export function parseMarkdownTable(lines: string[]): string {
  * Strictly guarantees that exam heading contains ONLY the scan title without "Clinical profile".
  */
 /**
- * Generates 100% clean, NeoRad PACS & RIS compliant HTML and plain text.
- * In NeoRad PACS (powered by DevExpress RichEdit), any CSS borders, wrapper divs,
+ * Generates 100% clean, standard PACS & RIS compliant HTML and plain text.
+ * In hospital PACS & RIS editors, any CSS borders, wrapper divs,
  * or class names are parsed into Word/OpenXML paragraph borders (<w:pBdr>).
- * While subtle during editing, NeoRad exports <w:pBdr> to the PDF generator on APPROVAL,
+ * While subtle during editing, the editor exports <w:pBdr> to the PDF generator on approval,
  * causing solid black rectangular boxes around every affected section.
  *
  * This function guarantees:
@@ -448,7 +448,7 @@ export function parseMarkdownTable(lines: string[]): string {
  * - Normal template findings: <p>Finding text</p>
  * - Impression: <p><strong><u>IMPRESSION:</u></strong></p> followed by <p><strong>• Point 1</strong></p>
  * - All multi-line and merged template findings are unpacked into atomic individual <p> lines.
- * - Completely indistinguishable in NeoRad PACS from manually pasting row-by-row, with ZERO boxes after report approval.
+ * - Completely indistinguishable from manually pasting row-by-row, with ZERO boxes after report approval.
  */
 export function escapeHtml(text: string): string {
   if (!text) return '';
@@ -460,7 +460,7 @@ export function escapeHtml(text: string): string {
     .replace(/'/g, '&#039;');
 }
 
-export function findingsToNeoRadHtml(findings: string[]): { html: string; plainText: string } {
+export function findingsToStandardHtml(findings: string[]): { html: string; plainText: string } {
   if (!findings || findings.length === 0) {
     return { html: '', plainText: '' };
   }
@@ -615,10 +615,10 @@ export function findingsToNeoRadHtml(findings: string[]): { html: string; plainT
 }
 
 /**
- * Strips all CSS borders, class names, divs, and styling that triggers DevExpress / NeoRad
+ * Strips all CSS borders, class names, divs, and styling that triggers DevExpress or Word
  * OpenXML paragraph borders (<w:pBdr>), guaranteeing zero black boxes upon approval.
  */
-export function sanitizeHtmlForNeoRad(html: string): string {
+export function sanitizeHtmlForClipboard(html: string): string {
   if (!html) return '';
 
   if (typeof document !== 'undefined') {

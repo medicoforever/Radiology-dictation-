@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import {  findingsToRichHtml, generateRtfDocument, generateWordHtmlDoc, generateDocxFromHtml, downloadFile , findingsToNeoRadHtml, sanitizeHtmlForNeoRad } from '../services/docxService';
+import {  findingsToRichHtml, generateRtfDocument, generateWordHtmlDoc, generateDocxFromHtml, downloadFile , findingsToStandardHtml, sanitizeHtmlForClipboard } from '../services/docxService';
 import CopyIcon from './icons/CopyIcon';
 import DownloadIcon from './icons/DownloadIcon';
 import SparklesIcon from './icons/SparklesIcon';
@@ -74,15 +74,15 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
   const handleCopyRichText = async () => {
     if (!editorRef.current) return;
     
-    // Generate clean NeoRad PACS compliant HTML (zero CSS borders, zero boxes upon approval)
+    // Generate clean standard PACS/RIS compliant HTML (zero CSS borders, zero boxes upon approval)
     let cleanHtml: string;
     let plainText: string;
 
     if (!isSynced && editorRef.current) {
-      cleanHtml = sanitizeHtmlForNeoRad(editorRef.current.innerHTML);
+      cleanHtml = sanitizeHtmlForClipboard(editorRef.current.innerHTML);
       plainText = editorRef.current.innerText || editorRef.current.textContent || '';
     } else {
-      const result = findingsToNeoRadHtml(findings);
+      const result = findingsToStandardHtml(findings);
       cleanHtml = result.html;
       plainText = result.plainText || editorRef.current.innerText || editorRef.current.textContent || '';
     }
@@ -97,7 +97,7 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
             'text/html': htmlBlob,
           }),
         ]);
-        setCopyStatus('Copied for NeoRad PACS (No Boxes)!');
+        setCopyStatus('Formatted Rich Text Copied!');
       } else {
         await navigator.clipboard.writeText(plainText);
         setCopyStatus('Copied Text!');
@@ -120,14 +120,14 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
     
     let cleanHtml: string;
     if (!isSynced && editorRef.current) {
-      cleanHtml = sanitizeHtmlForNeoRad(editorRef.current.innerHTML);
+      cleanHtml = sanitizeHtmlForClipboard(editorRef.current.innerHTML);
     } else {
-      cleanHtml = findingsToNeoRadHtml(findings).html;
+      cleanHtml = findingsToStandardHtml(findings).html;
     }
 
     try {
       await navigator.clipboard.writeText(cleanHtml);
-      setCopyStatus('Clean NeoRad HTML Copied!');
+      setCopyStatus('HTML Copied!');
     } catch (err) {
       console.warn('Copy HTML error:', err);
       setCopyStatus('Failed to copy HTML');
@@ -298,11 +298,11 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
           <button
             type="button"
             onClick={handleCopyRichText}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white font-bold text-xs rounded-lg shadow-md transition-all cursor-pointer active:scale-95 ring-1 ring-blue-400/50"
-            title="Copy report specifically formatted for NeoRad PACS & RIS (Guaranteed NO black boxes upon report approval, exact paragraph structure)"
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-white text-blue-800 hover:bg-blue-50 font-bold text-xs rounded-lg shadow-sm transition-all cursor-pointer active:scale-95"
+            title="Copy formatted rich text to paste into PACS, RIS, or MS Word with bolding intact and zero boxes"
           >
-            <CopyIcon className="w-3.5 h-3.5 text-white" />
-            {copyStatus || '📋 Copy for NeoRad PACS (No Boxes)'}
+            <CopyIcon className="w-3.5 h-3.5 text-blue-700" />
+            {copyStatus || 'Copy Rich Text'}
           </button>
           <button
             type="button"
@@ -540,7 +540,7 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
               const range = selection.getRangeAt(0);
               const container = document.createElement('div');
               container.appendChild(range.cloneContents());
-              const cleanHtml = sanitizeHtmlForNeoRad(container.innerHTML);
+              const cleanHtml = sanitizeHtmlForClipboard(container.innerHTML);
               const plainText = selection.toString();
               e.preventDefault();
               if (e.clipboardData) {
