@@ -218,6 +218,14 @@ STRICT INSTRUCTIONS:
     - Separate each patient's report using a clear separator header line in the "findings" array, e.g., "BOLD::--- PATIENT 2 REPORT ---".
     - Ensure each patient receives their own complete report with appropriate integrated template/findings and synthesized IMPRESSION based on their specific dictated findings.
 13. **Final Output Format**: Your entire response must be a single JSON object with a key named "findings". The value of "findings" must be an array of strings, where each string is a part of the assembled report in the correct order specified in rule #5.
+14. **Spoken Structural & Heading/Title Modifications**:
+    - The radiologist may dictate modifications to the template structure, title, or section headings in the same breath as clinical findings (e.g., "change the CT extremity heading in that template to CT right arm", "change title to CT SCAN OF RIGHT FOREARM", "rename pelvis heading to lower abdomen", "omit bladder section").
+    - When such spoken modification commands are encountered:
+      * Immediately apply the requested change to the template title and section headings in the merged report (e.g., replace 'CT EXTREMITY' with 'CT RIGHT ARM' or 'C.T. SCAN OF RIGHT ARM').
+      * REMOVE the spoken instruction from the clinical findings — NEVER leave meta-instructions like "change CT extremity heading..." as a line or bullet in the output report.
+15. **Clinical Fidelity vs. Explicit AI Synthesis**:
+    - DEFAULT RULE: What the radiologist speaks are the real clinical findings and ground truth. Record and transcribe their spoken findings faithfully without inventing, hallucinating, or replacing them with textbook synthetic descriptions (e.g., if the doctor dictates "right slipped capital femoral epiphysis with Trethowan sign", preserve that exact observation).
+    - EXPLICIT SYNTHESIS ONLY: Generating complete line-by-line findings from scratch across sequences/planes (e.g. detailed glioblastoma features, MCA infarct expansion) MUST ONLY activate when the doctor EXPLICITLY commands the AI to generate/synthesize findings by itself (e.g., phrases containing "by yourself", "include detailed glioblastoma findings by yourself", "generate findings for X by yourself"). In the absence of an explicit "by yourself" command, faithfully preserve what was dictated.
 
 Example of desired JSON output for template workflow:
 {

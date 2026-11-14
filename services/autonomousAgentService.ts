@@ -189,8 +189,10 @@ YOUR CORE TASKS:
      * If only 1 patient is dictated, assign targetMode: 'single'.
      * If multiple patients are dictated without specific mode commands, assign the first patient to 'single' (active workstation report) and all subsequent patients to 'batch' (queued reports).
 
-3. TEMPLATE ASSIGNMENT & MERGE DIRECTIVES:
+3. TEMPLATE ASSIGNMENT & SPOKEN STRUCTURAL/HEADING MODIFICATIONS:
    - Identify if a template is requested for any patient (e.g., "CT Brain Trauma", "Chest X-Ray Normal", "MRI Lumbar Spine", "Abdomen USG", "PNS Sinusitis").
+   - Spoken Template & Heading Alterations: The doctor may dictate structural modifications to the template in the same breath as scan findings (e.g., "change the CT extremity heading in that template to CT right arm", "change title to CT SCAN OF RIGHT FOREARM", "rename pelvis heading to lower abdomen", "omit bladder section"). Capture these in "mergeDirectives" and ensure the target heading/title in the generated report reflects the modified heading.
+   - Crucial: Strip and remove spoken alteration commands from the patient's "findings" array so they never appear as report body findings.
    - Extract any specific merge instructions (e.g., "merge focusing on rib fractures", "when merging, omit normal sinus paragraphs", "replace impression with acute findings").
 
 4. SPOKEN MACRO & DICTIONARY CREATION:
@@ -213,14 +215,14 @@ YOUR CORE TASKS:
    - You MUST NOT read or parse the file contents yourself; your job is strictly to assign/hand over the referenced file(s) to the appropriate patient report(s) based on what the doctor dictates in the audio (e.g. "attach the first uploaded file to Patient 1", "use the Brain MRI for Patient 2", "attach all files to batch").
    - Set "attachedFileIndices" in the patient item to an array of 1-based indices (e.g., [1, 2]) of any files to hand over.
 
-8. NATURAL LANGUAGE CLINICAL PATHOLOGY UNDERSTANDING & HIGH-LEVEL SYNTHESIS (CRITICAL ANTI-LITERAL RULE):
-   - The radiologist may dictate high-level clinical shorthand, diagnostic directives, or pathology generation requests (e.g., "for a patient create 1 batch dictation and add detailed glioblastoma findings and merge it with Mr brain template", "add acute right MCA infarct findings", "add acute appendicitis", "add right slipped capital femoral epiphysis findings", "add whole body trauma findings with subarachnoid hemorrhage and skull fractures").
-   - CRITICAL ANTI-LITERAL RULE: NEVER insert meta-instruction phrases like "detailed glioblastoma findings" or "add glioblastoma findings" verbatim into the patient's findings array or report body!
-   - When the doctor requests or mentions a clinical entity/pathology:
-     * Intelligently interpret the pathology, imaging modality, and anatomical site.
+8. CLINICAL FIDELITY VS. EXPLICIT AI SYNTHESIS (CRITICAL ANTI-LITERAL RULE):
+   - DEFAULT RULE (REAL CLINICAL FINDINGS): What the radiologist speaks are the real clinical findings and ground truth. Transcribe each patient's actual observations accurately and faithfully into the findings array without inventing, hallucinating, or replacing them with textbook synthetic descriptions (e.g. if the doctor dictates "right slipped capital femoral epiphysis with Trethowan sign", transcribe that real observation faithfully).
+   - EXPLICIT SYNTHESIS ONLY: High-level AI pathology synthesis (generating complete line-by-line findings across sequences/planes from scratch, such as comprehensive Glioblastoma imaging features) MUST ONLY activate when the doctor EXPLICITLY instructs the AI to generate it by itself (e.g. phrases containing "by yourself", "include detailed glioblastoma findings by yourself", "add detailed findings for X by yourself", "generate findings for X by yourself", "synthesize detailed findings for X").
+   - When the doctor explicitly commands AI synthesis (e.g. "for a patient create 1 batch dictation and add detailed glioblastoma findings by yourself and merge it with Mr brain template"):
      * Synthesize realistic, authoritative, comprehensive, anatomically detailed line-by-line radiological findings corresponding to that pathology and modality (e.g. for glioblastoma in MR Brain: describe the thick irregular peripheral ring enhancement with central necrosis on post-contrast T1, extensive perilesional T2/FLAIR vasogenic edema along white matter tracts, multiple internal foci of microhemorrhage and neovascularity on SWI, restricted diffusion along the solid hypercellular rim on DWI/ADC, mass effect with sulcal effacement, ventricular compression, midline shift, and uncal/subfalcine herniation).
-     * If a template is requested (e.g. "Mr brain template", "CT Brain Trauma", "Chest PA View"), set "targetTemplateName" to the matching template.
-     * Also include an authoritative, clinical IMPRESSION adhering to the Smart Bullet Formatting in Impression rules.
+     * Set "targetTemplateName" to the matching template.
+     * Include an authoritative, clinical IMPRESSION adhering to the Smart Bullet Formatting in Impression rules.
+   - ANTI-LITERAL RULE: In either case, NEVER insert conversational meta-instruction phrases like "detailed glioblastoma findings by yourself" or "add glioblastoma findings" verbatim into the patient's findings array or report body!
 
 9. SMART BULLET FORMATTING IN IMPRESSION:
    - Single-Line / Lead-In Summaries: Statements such as "findings are s/o...", narrative summary paragraphs, or single normal summary sentences now start flush with the beginning of the line without any bullet point (e.g. "IMPRESSION:###Normal study without acute abnormality." or "IMPRESSION:###Findings are s/o acute appendicitis.").

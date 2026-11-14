@@ -64,7 +64,7 @@ const REGION_TAGS: RegionTag[] = [
 
 const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen, onClose, templates, onSelectTemplate, onSelectTemplates }) => {
   const [searchQuery, setSearchQuery] = useState('');
-  const [modalityFilter, setModalityFilter] = useState<'ALL' | 'CT' | 'MRI'>('ALL');
+  const [modalityFilter, setModalityFilter] = useState<'ALL' | 'CT' | 'MRI' | 'US' | 'DX' | 'OTHER'>('ALL');
   const [regionFilter, setRegionFilter] = useState<string>('ALL');
   const [selectedPreview, setSelectedPreview] = useState<ReportTemplate | null>(null);
   const [selectedTemplates, setSelectedTemplates] = useState<ReportTemplate[]>([]);
@@ -130,7 +130,19 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
   }, [templates]);
 
   const mriCount = useMemo(() => {
-    return templates.filter(t => (t.modality || t.category || '').toUpperCase().includes('MRI')).length;
+    return templates.filter(t => (t.modality || t.category || '').toUpperCase().includes('MR')).length;
+  }, [templates]);
+
+  const usCount = useMemo(() => {
+    return templates.filter(t => (t.modality || t.category || '').toUpperCase().includes('US')).length;
+  }, [templates]);
+
+  const dxCount = useMemo(() => {
+    return templates.filter(t => (t.modality || t.category || '').toUpperCase().includes('DX') || t.name.toUpperCase().includes('X-RAY')).length;
+  }, [templates]);
+
+  const otherCount = useMemo(() => {
+    return templates.filter(t => ['MG', 'NM', 'PT'].includes((t.modality || t.category || '').toUpperCase())).length;
   }, [templates]);
 
   const filteredTemplates = useMemo(() => {
@@ -140,7 +152,13 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
     if (modalityFilter === 'CT') {
       list = list.filter(t => (t.modality || t.category || '').toUpperCase().includes('CT'));
     } else if (modalityFilter === 'MRI') {
-      list = list.filter(t => (t.modality || t.category || '').toUpperCase().includes('MRI'));
+      list = list.filter(t => (t.modality || t.category || '').toUpperCase().includes('MR'));
+    } else if (modalityFilter === 'US') {
+      list = list.filter(t => (t.modality || t.category || '').toUpperCase().includes('US'));
+    } else if (modalityFilter === 'DX') {
+      list = list.filter(t => (t.modality || t.category || '').toUpperCase().includes('DX') || t.name.toUpperCase().includes('X-RAY'));
+    } else if (modalityFilter === 'OTHER') {
+      list = list.filter(t => ['MG', 'NM', 'PT'].includes((t.modality || t.category || '').toUpperCase()));
     }
 
     // Region filter
@@ -352,11 +370,11 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
             </div>
 
             {/* Modality Filter Pills */}
-            <div className="flex items-center gap-1 bg-slate-100 dark:bg-slate-800 p-1 rounded-xl flex-shrink-0">
+            <div className="flex items-center gap-1 bg-slate-100 dark:bg-slate-800 p-1 rounded-xl flex-shrink-0 overflow-x-auto scrollbar-none max-w-full">
               <button
                 type="button"
                 onClick={() => setModalityFilter('ALL')}
-                className={`text-xs font-semibold px-3 py-1.5 rounded-lg transition-all ${
+                className={`text-xs font-semibold px-2.5 py-1.5 rounded-lg transition-all shrink-0 ${
                   modalityFilter === 'ALL'
                     ? 'bg-white dark:bg-slate-900 text-blue-600 dark:text-blue-400 shadow-xs'
                     : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
@@ -367,7 +385,7 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
               <button
                 type="button"
                 onClick={() => setModalityFilter('CT')}
-                className={`text-xs font-semibold px-3 py-1.5 rounded-lg transition-all ${
+                className={`text-xs font-semibold px-2.5 py-1.5 rounded-lg transition-all shrink-0 ${
                   modalityFilter === 'CT'
                     ? 'bg-blue-600 text-white shadow-xs'
                     : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
@@ -378,13 +396,46 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
               <button
                 type="button"
                 onClick={() => setModalityFilter('MRI')}
-                className={`text-xs font-semibold px-3 py-1.5 rounded-lg transition-all ${
+                className={`text-xs font-semibold px-2.5 py-1.5 rounded-lg transition-all shrink-0 ${
                   modalityFilter === 'MRI'
                     ? 'bg-purple-600 text-white shadow-xs'
                     : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
                 }`}
               >
                 MRI ({mriCount})
+              </button>
+              <button
+                type="button"
+                onClick={() => setModalityFilter('US')}
+                className={`text-xs font-semibold px-2.5 py-1.5 rounded-lg transition-all shrink-0 ${
+                  modalityFilter === 'US'
+                    ? 'bg-emerald-600 text-white shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+                }`}
+              >
+                US ({usCount})
+              </button>
+              <button
+                type="button"
+                onClick={() => setModalityFilter('DX')}
+                className={`text-xs font-semibold px-2.5 py-1.5 rounded-lg transition-all shrink-0 ${
+                  modalityFilter === 'DX'
+                    ? 'bg-amber-600 text-white shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+                }`}
+              >
+                X-Ray ({dxCount})
+              </button>
+              <button
+                type="button"
+                onClick={() => setModalityFilter('OTHER')}
+                className={`text-xs font-semibold px-2.5 py-1.5 rounded-lg transition-all shrink-0 ${
+                  modalityFilter === 'OTHER'
+                    ? 'bg-rose-600 text-white shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+                }`}
+              >
+                Other ({otherCount})
               </button>
             </div>
           </div>

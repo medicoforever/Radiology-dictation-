@@ -399,12 +399,12 @@ export function parseMarkdownTable(lines: string[]): string {
   const headerCells = tableRows[0];
   const bodyRows = tableRows.slice(1);
 
-  let html = `<table style="width: 100%; border-collapse: collapse; margin: 16px 0; border: 1px solid #cbd5e1; font-size: 13.5px;">\n`;
+  let html = `<table border="1" cellpadding="6" cellspacing="0" style="width: 100%; border-collapse: collapse; margin: 16px 0; border: 1px solid #000000; font-family: 'Times New Roman', serif; font-size: 12pt;">\n`;
   html += `  <thead>\n    <tr style="background-color: #f1f5f9;">\n`;
   for (const h of headerCells) {
     const isBold = h.startsWith('BOLD::');
     const cleanH = h.replace(/^BOLD::/, '');
-    html += `      <th style="border: 1px solid #cbd5e1; padding: 8px 12px; text-align: left; font-weight: bold; color: #0f172a;">${isBold ? `<strong>${escapeHtml(cleanH)}</strong>` : escapeHtml(cleanH)}</th>\n`;
+    html += `      <th style="border: 1px solid #000000; padding: 6px 10px; text-align: left; font-weight: bold; color: #000000; font-family: 'Times New Roman', serif; font-size: 12pt;">${isBold ? `<strong>${escapeHtml(cleanH)}</strong>` : escapeHtml(cleanH)}</th>\n`;
   }
   html += `    </tr>\n  </thead>\n`;
 
@@ -418,7 +418,7 @@ export function parseMarkdownTable(lines: string[]): string {
         const val = row[cIdx] || '';
         const isBold = val.startsWith('BOLD::');
         const cleanVal = val.replace(/^BOLD::/, '');
-        html += `      <td style="border: 1px solid #cbd5e1; padding: 8px 12px; text-align: left; color: #334155;">${isBold ? `<strong>${escapeHtml(cleanVal)}</strong>` : escapeHtml(cleanVal)}</td>\n`;
+        html += `      <td style="border: 1px solid #000000; padding: 6px 10px; text-align: left; color: #000000; font-family: 'Times New Roman', serif; font-size: 12pt;">${isBold ? `<strong>${escapeHtml(cleanVal)}</strong>` : escapeHtml(cleanVal)}</td>\n`;
       }
       html += `    </tr>\n`;
     }

@@ -862,6 +862,72 @@ export const processAudio = async (
 };
 
 /**
+ * Detects spoken structural and heading modifications (e.g. "change CT extremity heading to CT right arm",
+ * "change title to CT SCAN OF RIGHT FOREARM", "rename pelvis heading to lower abdomen") and applies them to
+ * the report's title and section headings, while stripping out conversational meta-instructions.
+ */
+export function applySpokenHeadingModifications(findings: string[], directives?: string): string[] {
+  if (!findings || findings.length === 0) return findings;
+
+  const candidates: string[] = [];
+  if (directives) candidates.push(directives);
+  findings.forEach(f => {
+    if (
+      /change\s+(?:the\s+)?.*heading/i.test(f) ||
+      /change\s+(?:the\s+)?title/i.test(f) ||
+      /rename\s+(?:the\s+)?.*heading/i.test(f)
+    ) {
+      candidates.push(f);
+    }
+  });
+
+  if (candidates.length === 0) return findings;
+
+  let modified = [...findings];
+
+  for (const text of candidates) {
+    const m1 = text.match(/change\s+(?:the\s+)?(.+?)\s+heading(?:\s+in\s+(?:that|the)\s+template)?\s+to\s+([^,.\n]+)/i);
+    const m2 = text.match(/change\s+(?:the\s+)?title\s+to\s+([^,.\n]+)/i);
+    const m3 = text.match(/rename\s+(?:the\s+)?(.+?)\s+heading\s+to\s+([^,.\n]+)/i);
+
+    if (m1) {
+      const oldH = m1[1].trim().toLowerCase();
+      const newH = m1[2].trim().toUpperCase();
+      modified = modified.map((line, idx) => {
+        const clean = line.replace(/^BOLD::/i, '').trim().toLowerCase();
+        if (idx === 0 || clean === oldH || clean.includes(oldH) || oldH.includes(clean)) {
+          return line.startsWith('BOLD::') ? `BOLD::${newH}` : newH;
+        }
+        return line;
+      });
+    } else if (m2) {
+      const newTitle = m2[1].trim().toUpperCase();
+      if (modified.length > 0) {
+        modified[0] = modified[0].startsWith('BOLD::') ? `BOLD::${newTitle}` : newTitle;
+      }
+    } else if (m3) {
+      const oldH = m3[1].trim().toLowerCase();
+      const newH = m3[2].trim().toUpperCase();
+      modified = modified.map((line, idx) => {
+        const clean = line.replace(/^BOLD::/i, '').trim().toLowerCase();
+        if (clean === oldH || clean.includes(oldH) || (idx === 0 && oldH.includes('extremity'))) {
+          return line.startsWith('BOLD::') ? `BOLD::${newH}` : newH;
+        }
+        return line;
+      });
+    }
+  }
+
+  return modified.filter(line => {
+    const clean = line.replace(/^BOLD::/i, '').trim();
+    if (/^change\s+(?:the\s+)?.*heading.*to\s+/i.test(clean)) return false;
+    if (/^change\s+(?:the\s+)?title.*to\s+/i.test(clean)) return false;
+    if (/^rename\s+(?:the\s+)?.*heading.*to\s+/i.test(clean)) return false;
+    return true;
+  });
+}
+
+/**
  * Merges pre-existing dictated findings with a selected template after dictation.
  * Surgically gathers prompt texts from TEMPLATE_GEMINI_PROMPT and CRITICAL TEMPLATE MERGE DIRECTIVES
  * without altering existing behavior.
@@ -966,6 +1032,12 @@ CRITICAL TEMPLATE MERGE DIRECTIVES:
      * Single-Line / Lead-In Summaries: Statements such as "findings are s/o...", narrative summary paragraphs, or single normal summary sentences now start flush with the beginning of the line without any bullet point (e.g. "IMPRESSION:###Normal study without acute abnormality.").
      * Discrete / Multi-Point Findings: When the impression consists of 2 or more discrete clinical findings, each individual finding is cleanly formatted with bullet points (• Point 1, • Point 2) starting from the left margin (e.g. "IMPRESSION:###• Point 1###• Point 2").
 6. MEASUREMENT / COMPARATIVE TABLES: When the template or report contains measurement grids or comparative anatomical tables (e.g., bilateral kidney comparisons, TAVI measurements, pulmonary artery dimensions, cardiac ventricular volumes), preserve the table rows joined by '###' (e.g. 'Col1 | Col2###Val1 | Val2') so the full tabular grid is preserved as a cohesive unit.
+7. SPOKEN STRUCTURAL & HEADING/TITLE ALTERATIONS: When the doctor dictates commands to alter the template structure, title, or section headings (e.g. "change the CT extremity heading in that template to CT right arm", "change title to CT SCAN OF RIGHT FOREARM", "rename pelvis heading to lower abdomen", "omit bladder section"):
+   - Apply the requested modification immediately to the template title and section headings in the merged report (e.g., replace 'CT EXTREMITY' with 'CT RIGHT ARM' or 'C.T. SCAN OF RIGHT ARM').
+   - Remove the spoken instruction from the clinical findings completely — NEVER include instructions like 'change CT extremity heading...' as a line or bullet in the output report.
+8. CLINICAL FIDELITY VS. EXPLICIT-ONLY PATHOLOGY SYNTHESIS:
+   - DEFAULT RULE: What the radiologist speaks are the real clinical findings and ground truth. Record and transcribe their spoken findings faithfully without inventing, hallucinating, or replacing them with textbook synthetic descriptions (e.g., if the doctor dictates "right slipped capital femoral epiphysis with Trethowan sign", preserve that exact observation).
+   - EXPLICIT SYNTHESIS ONLY: Multi-sequence textbook pathology expansion (e.g. detailed glioblastoma features, MCA infarct expansion) MUST ONLY activate when the doctor EXPLICITLY requests it by commanding the AI to generate/synthesize findings by itself (e.g., phrases containing "by yourself", "include detailed glioblastoma findings by yourself", "generate findings for X by yourself"). In the absence of an explicit "by yourself" command, faithfully preserve what was dictated.
 ================================================================================
 `;
   }
@@ -980,10 +1052,14 @@ ${JSON.stringify({ findings: dictatedFindings }, null, 2)}
 TASK INSTRUCTIONS:
 You are provided with the doctor's actual dictated findings above.
 Carefully integrate these dictated findings into the "${templateName}" baseline template following all rules:
-- NATURAL LANGUAGE CLINICAL PATHOLOGY UNDERSTANDING & ANTI-LITERAL SYNTHESIS:
-  If any dictated finding, note, or directive contains shorthand clinical diagnoses or pathology generation requests (such as "detailed glioblastoma findings", "acute appendicitis", "slipped capital femoral epiphysis", "acute MCA infarct", etc.), NEVER insert the meta-phrase (such as "detailed glioblastoma findings") verbatim into the report body!
-  Instead, intelligently interpret the clinical diagnosis and synthesize comprehensive, realistic, authoritative, anatomically precise radiological observations for that pathology tailored to the active template sections (e.g. for glioblastoma in MR Brain: describe the intra-axial mass, necrotic core, thick irregular peripheral enhancement, surrounding vasogenic edema, SWI microhemorrhages, mass effect, midline shift, ventricular compression, and herniation in the brain parenchyma section).
-  Prefix each newly synthesized or modified finding with 'BOLD::'.
+- CLINICAL FIDELITY VS. EXPLICIT-ONLY PATHOLOGY SYNTHESIS:
+  * DEFAULT RULE (REAL CLINICAL FINDINGS): What the radiologist dictated is the ground truth. Merge and transcribe the doctor's actual observations into the report faithfully without inventing, hallucinating, or substituting them with synthetic textbook descriptions.
+  * EXPLICIT SYNTHESIS ONLY: If and only if the doctor explicitly instructs the AI to generate findings by itself (e.g. phrases containing "by yourself", "include detailed glioblastoma findings by yourself", "generate findings for X by yourself"), intelligently interpret the diagnosis and synthesize comprehensive, realistic, authoritative, anatomically precise radiological observations for that pathology tailored to the active template sections (e.g. for glioblastoma in MR Brain: describe the thick irregular ring-enhancing mass with central necrosis, extensive perilesional T2/FLAIR vasogenic edema along white matter tracts, SWI microhemorrhages, restricted diffusion along the solid hypercellular rim, mass effect, ventricular compression, and midline shift).
+  * ANTI-LITERAL RULE: NEVER insert conversational meta-instruction phrases like "detailed glioblastoma findings by yourself" or "add glioblastoma findings" verbatim into the report body!
+- SPOKEN STRUCTURAL & HEADING/TITLE ALTERATIONS:
+  * If the doctor's dictation, findings, or custom prompt contains instructions to modify a heading or title (e.g. "change the CT extremity heading in that template to CT right arm", "change title to CT SCAN OF RIGHT FOREARM", "rename pelvis heading to lower abdomen", "omit bladder section"):
+    - Apply the change immediately to the report's title and section headings (e.g., change 'CT EXTREMITY' to 'CT RIGHT ARM' or 'C.T. SCAN OF RIGHT ARM').
+    - REMOVE the spoken instruction from the clinical findings — NEVER leave meta-instruction sentences like "change CT extremity heading..." in the findings.
 - Any anatomical sections where the dictation describes pathology, abnormal lesions, or modifications must be updated with the dictated findings and prefixed with 'BOLD::'.
 - Any anatomical sections from the template that were normal or not mentioned in the dictation must remain present verbatim without 'BOLD::'.
 - Clinical profile if dictated or present must be preserved as its own line (*Clinical Profile: ...*).
@@ -1036,7 +1112,7 @@ Carefully integrate these dictated findings into the "${templateName}" baseline 
     const mergedFindings = extractFindingsFromResponse(rawResponseText);
 
     if (mergedFindings && mergedFindings.length > 0) {
-      return mergedFindings;
+      return applySpokenHeadingModifications(mergedFindings, customPrompt);
     }
     throw new Error("Invalid response format received while merging template.");
   } catch (error) {
@@ -1062,7 +1138,7 @@ Carefully integrate these dictated findings into the "${templateName}" baseline 
       const retryText = retryResponse.text?.trim() || '';
       const parsed = extractFindingsFromResponse(retryText);
       if (parsed && parsed.length > 0) {
-        return parsed;
+        return applySpokenHeadingModifications(parsed, customPrompt);
       }
     } catch (retryErr) {
       console.warn("mergeDictatedFindingsWithTemplate fallback failed:", retryErr);
@@ -1072,26 +1148,26 @@ Carefully integrate these dictated findings into the "${templateName}" baseline 
     if (isMulti) {
       const allLines = templates.flatMap(t => t.lines || []);
       const filteredDictated = dictatedFindings.filter(f => !f.toLowerCase().includes('normal') && !f.startsWith('IMPRESSION'));
-      return [
+      return applySpokenHeadingModifications([
         `COMBINED REPORT: ${templateName}`,
         "*Clinical Profile: Multi-region evaluation.*",
         ...allLines.filter(l => !l.startsWith('IMPRESSION') && !l.toLowerCase().startsWith('clinical profile')),
         ...filteredDictated.map(f => f.startsWith('BOLD::') ? f : `BOLD::${f}`),
         "IMPRESSION:###Multi-region examination evaluated."
-      ];
+      ], customPrompt);
     }
 
     const singleFirst = templates[0];
     if (singleFirst && singleFirst.lines && singleFirst.lines.length > 0) {
       const title = singleFirst.lines[0] || templateName;
       const filteredDictated = dictatedFindings.filter(f => !f.toLowerCase().includes('normal') && !f.startsWith('IMPRESSION'));
-      return [
+      return applySpokenHeadingModifications([
         title,
         "*Clinical Profile: Routine evaluation.*",
         ...singleFirst.lines.slice(1, -2),
         ...filteredDictated.map(f => f.startsWith('BOLD::') ? f : `BOLD::${f}`),
         singleFirst.lines[singleFirst.lines.length - 1] || "IMPRESSION:###Study evaluated."
-      ];
+      ], customPrompt);
     }
 
     throw error instanceof Error ? error : new Error("Failed to merge findings with template.");
