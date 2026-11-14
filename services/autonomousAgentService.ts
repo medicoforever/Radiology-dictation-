@@ -364,6 +364,177 @@ If the doctor mentions assigning any of these files or notes to a patient, set t
   );
 }
 
+const AUTONOMOUS_FEEDBACK_SYSTEM_PROMPT = `You are RADDOC Autonomous Radiology Director, an expert AI medical workstation agent.
+You previously orchestrated an autonomous radiology session that generated reports and workstation dispatches.
+Now, the radiologist has provided direct FEEDBACK, corrections, and modifications via spoken dictation and/or written instructions.
+
+YOUR CORE RESPONSIBILITY:
+Carefully inspect the previous execution manifest and all current patient findings, and accurately apply the doctor's feedback/modifications.
+Modify only the patient reports, findings, impressions, templates, headings, or workstation settings specified by the doctor.
+
+CRITICAL DIRECTIVES FOR APPLYING FEEDBACK:
+1. PRECISE ENTITY TARGETING:
+   - Identify which patient(s) the doctor is addressing (e.g., "for patient 1", "in John Doe's CT", "for the knee MRI", "for the second case", "in batch patient 2").
+   - If the doctor speaks about a single patient without naming them and only 1 patient exists, apply the changes to that patient.
+   - If the doctor adds a new patient, append them to the "patients" array.
+2. MODIFICATIONS & FINDINGS REFINEMENT:
+   - Specific Finding Edits: If the doctor corrects or adds a finding (e.g. "change liver finding to mild fatty infiltration", "remove the fracture sentence", "add 3mm nodule in right upper lobe"), modify that patient's findings accordingly.
+   - Impression Edits: If the doctor changes or refines the impression (e.g. "change impression to acute uncomplicated appendicitis", "add recommendation for surgical review"), update the impression lines following the Smart Bullet Formatting in Impression rules.
+3. SPOKEN TEMPLATE & HEADING ALTERATIONS:
+   - If the doctor says "change template to [X]" or "use [X] template instead", update targetTemplateName to match.
+   - If the doctor says "change heading to [X]" (e.g. "change CT extremity heading to CT right arm"), update mergeDirectives to include the heading alteration.
+   - Crucial: Strip and remove spoken modification commands from the patient's "findings" array so they never appear as report body findings.
+4. CLINICAL FIDELITY VS. EXPLICIT SYNTHESIS:
+   - What the doctor speaks is the ground truth. Preserve the real clinical observations faithfully.
+   - Full textbook multi-sequence pathology generation activates ONLY if the doctor explicitly commands "by yourself".
+5. PRESERVE UNTOUCHED REPORTS:
+   - Any patients or settings not referenced or modified in the doctor's feedback MUST be preserved with their existing findings and configurations.
+6. SMART BULLET FORMATTING IN IMPRESSION:
+   - Single-Line / Lead-In Summaries: Statements such as "findings are s/o...", narrative summary paragraphs, or single normal summary sentences now start flush with the beginning of the line without any bullet point (e.g. "IMPRESSION:###Normal study without acute abnormality.").
+   - Discrete / Multi-Point Findings: When the impression consists of 2 or more discrete clinical findings, each individual finding is cleanly formatted with bullet points (• Point 1, • Point 2) starting from the left margin (e.g. "IMPRESSION:###• Point 1###• Point 2").
+7. OUTPUT FORMAT:
+   - Respond ONLY with a valid JSON AutonomousExecutionPlan adhering to the exact schema:
+   {
+     "summary": "Clear, concise summary of the specific feedback modifications applied",
+     "totalPatientsDetected": 1,
+     "globalDirectives": {
+       "saveToDrive": true,
+       "downloadHtml": true,
+       "syncToWorkstation": true
+     },
+     "macrosToCreate": [],
+     "vocabularyToCreate": [],
+     "patients": [
+       {
+         "patientId": "pt_1",
+         "patientName": "Patient Name",
+         "targetMode": "single",
+         "findings": ["Line 1", "Line 2"],
+         "targetTemplateName": "Template Name",
+         "mergeDirectives": "",
+         "attachedFileIndices": []
+       }
+     ]
+   }`;
+
+/**
+ * Processes feedback/modification dictation or notes for an existing autonomous execution plan.
+ * Provides the full context of the previous plan, findings, and attached files to the AI agent.
+ */
+export async function parseAutonomousFeedbackDictation(
+  previousPlan: AutonomousExecutionPlan,
+  previousResult: AutonomousExecutionResult,
+  feedbackAudioBlob?: Blob | null,
+  feedbackText?: string,
+  selectedModel: string = 'gemini-2.5-pro',
+  attachedFiles?: AutonomousAttachedFile[]
+): Promise<AutonomousExecutionPlan> {
+  const targetModel = resolveApiTargetModel(selectedModel);
+  const macroContext = getMacroPromptContext();
+
+  let attachedFilesManifest = '';
+  if (attachedFiles && attachedFiles.length > 0) {
+    attachedFilesManifest = `\n================================================================================
+ATTACHED FILES & CLINICAL TEXT NOTES (Available for handoff):
+${attachedFiles.map(f => {
+  const typeLabel = f.isTextNote ? 'Typed/Pasted Text Note' : (f.file.type || 'file');
+  const preview = f.textContent ? ` [Content Preview: "${f.textContent.slice(0, 150).replace(/\s+/g, ' ')}${f.textContent.length > 150 ? '...' : ''}"]` : '';
+  return `- File #${f.index}: "${f.alias ? f.alias : f.file.name}" (Filename: ${f.file.name}, Type: ${typeLabel}, Size: ${(f.file.size / 1024).toFixed(1)} KB)${preview}`;
+}).join('\n')}
+================================================================================\n`;
+  }
+
+  const previousContextSummary = `
+================================================================================
+EXISTING AUTONOMOUS PLAN & PATIENT REPORTS (TO BE MODIFIED):
+Previous Summary: "${previousPlan.summary}"
+Global Directives: ${JSON.stringify(previousPlan.globalDirectives)}
+Total Current Patients: ${previousPlan.patients.length}
+
+CURRENT PATIENT REPORTS:
+${previousPlan.patients.map((p, idx) => {
+  return `--------------------------------------------------------------------------------
+PATIENT #${idx + 1}: "${p.patientName}" (ID: ${p.patientId})
+- Target Mode: ${p.targetMode}
+- Applied Template: ${p.targetTemplateName || 'None'}
+- Merge Directives: ${p.mergeDirectives || 'None'}
+- Attached File Indices: ${JSON.stringify(p.attachedFileIndices || [])}
+- Current Transcribed Findings (${p.findings.length} lines):
+${p.findings.map(f => `  * ${f}`).join('\n')}
+`;
+}).join('\n')}
+================================================================================
+`;
+
+  return executeWithApiKeyFailover(
+    async (client) => {
+      const promptInstruction = `${AUTONOMOUS_FEEDBACK_SYSTEM_PROMPT}
+${previousContextSummary}
+${macroContext}
+${attachedFilesManifest}
+${feedbackText ? `DOCTOR'S WRITTEN FEEDBACK & MODIFICATION INSTRUCTIONS:\n"""\n${feedbackText.trim()}\n"""\n` : ''}
+Execute feedback modifications now. Return the updated structured JSON execution plan.`;
+
+      const parts: any[] = [];
+
+      if (feedbackAudioBlob && feedbackAudioBlob.size > 0) {
+        const base64Audio = await blobToBase64(feedbackAudioBlob);
+        const mimeType = feedbackAudioBlob.type || 'audio/webm';
+        parts.push({
+          inlineData: {
+            mimeType: mimeType,
+            data: base64Audio,
+          },
+        });
+      }
+
+      parts.push({
+        text: promptInstruction
+      });
+
+      const response = await client.models.generateContent({
+        model: targetModel,
+        contents: {
+          role: 'user',
+          parts: parts
+        },
+        config: {
+          responseMimeType: 'application/json',
+          temperature: 0.1,
+        }
+      });
+
+      const responseText = response.text || '';
+      if (!responseText.trim()) {
+        throw new Error("Autonomous agent returned an empty response for feedback.");
+      }
+
+      let cleanJson = responseText.trim();
+      if (cleanJson.startsWith('```json')) {
+        cleanJson = cleanJson.replace(/^```json\s*/, '').replace(/```\s*$/, '');
+      } else if (cleanJson.startsWith('```')) {
+        cleanJson = cleanJson.replace(/^```\s*/, '').replace(/```\s*$/, '');
+      }
+
+      const plan: AutonomousExecutionPlan = JSON.parse(cleanJson);
+      if (!plan.patients || !Array.isArray(plan.patients)) {
+        throw new Error("Invalid plan structure: 'patients' array is missing in feedback response.");
+      }
+
+      // Preserve patient IDs if AI omitted them
+      plan.patients = plan.patients.map((p, idx) => ({
+        ...p,
+        patientId: p.patientId || previousPlan.patients[idx]?.patientId || `pt_${idx + 1}`,
+        targetMode: p.targetMode || previousPlan.patients[idx]?.targetMode || 'single',
+        findings: (p.findings && p.findings.length > 0) ? p.findings : (previousPlan.patients[idx]?.findings || [])
+      }));
+
+      return plan;
+    },
+    { selectedModel: targetModel }
+  );
+}
+
 /**
  * Executes the generated Autonomous Plan:
  * 1. Resolves and applies templates & merges for single and batch patients.

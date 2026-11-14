@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useAudioRecorder } from '../hooks/useAudioRecorder';
 import {
   parseAutonomousAudioDictation,
+  parseAutonomousFeedbackDictation,
   executeAutonomousPlan,
   AutonomousExecutionResult,
   AutonomousExecutionPlan,
@@ -12,6 +13,9 @@ import { SaveResult } from '../services/googleDriveService';
 import { triggerAudioDownload } from '../services/audioMerger';
 import MicIcon from './icons/MicIcon';
 import StopIcon from './icons/StopIcon';
+import PauseIcon from './icons/PauseIcon';
+import ResumeIcon from './icons/ResumeIcon';
+import MicPencilIcon from './icons/MicPencilIcon';
 import SparklesIcon from './icons/SparklesIcon';
 import WarningIcon from './icons/WarningIcon';
 import DownloadIcon from './icons/DownloadIcon';
@@ -86,6 +90,18 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const audioUploadInputRef = useRef<HTMLInputElement>(null);
 
+  // Dedicated recorder and state for Autonomous Feedback / Dictate Changes
+  const feedbackRecorder = useAudioRecorder();
+  const [feedbackRecordedBlob, setFeedbackRecordedBlob] = useState<Blob | null>(null);
+  const [feedbackAudioUrl, setFeedbackAudioUrl] = useState<string | null>(null);
+  const [feedbackTextInput, setFeedbackTextInput] = useState('');
+  const [isProcessingFeedback, setIsProcessingFeedback] = useState(false);
+  const [feedbackStep, setFeedbackStep] = useState<string>('');
+  const [feedbackError, setFeedbackError] = useState<string | null>(null);
+  const [feedbackSuccessMessage, setFeedbackSuccessMessage] = useState<string | null>(null);
+  const feedbackAudioUploadInputRef = useRef<HTMLInputElement>(null);
+  const feedbackFileInputRef = useRef<HTMLInputElement>(null);
+
   // Drag and Drop state
   const [isDraggingOver, setIsDraggingOver] = useState(false);
 
@@ -148,6 +164,24 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
       setAudioUrl(null);
     }
   }, [recordedBlob]);
+
+  // Clean up object URL when feedback audio blob changes
+  useEffect(() => {
+    if (feedbackRecordedBlob) {
+      const url = URL.createObjectURL(feedbackRecordedBlob);
+      setFeedbackAudioUrl(url);
+      return () => URL.revokeObjectURL(url);
+    } else {
+      setFeedbackAudioUrl(null);
+    }
+  }, [feedbackRecordedBlob]);
+
+  // Sync recorder errors
+  useEffect(() => {
+    if (feedbackRecorder.error) {
+      setFeedbackError(feedbackRecorder.error);
+    }
+  }, [feedbackRecorder.error]);
 
   // Global paste handler to automatically capture files or text notes
   useEffect(() => {
@@ -410,6 +444,112 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
     setRecordedBlob(null);
     setExecutionResult(null);
     setErrorMessage(null);
+    setFeedbackRecordedBlob(null);
+    setFeedbackTextInput('');
+    setFeedbackError(null);
+    setFeedbackSuccessMessage(null);
+  };
+
+  const handleStartFeedbackRecording = async () => {
+    setFeedbackError(null);
+    setFeedbackSuccessMessage(null);
+    setFeedbackRecordedBlob(null);
+    try {
+      await feedbackRecorder.startRecording();
+    } catch (err: any) {
+      setFeedbackError(err?.message || 'Could not access microphone for feedback.');
+    }
+  };
+
+  const handleStopFeedbackRecording = async () => {
+    try {
+      const blob = await feedbackRecorder.stopRecording();
+      setFeedbackRecordedBlob(blob);
+    } catch (err: any) {
+      setFeedbackError(err?.message || 'Failed to capture feedback audio.');
+    }
+  };
+
+  const handleStopAndApplyFeedbackRecording = async () => {
+    try {
+      const blob = await feedbackRecorder.stopRecording();
+      setFeedbackRecordedBlob(blob);
+      if (blob && blob.size > 0) {
+        await handleExecuteFeedback(blob, feedbackTextInput);
+      }
+    } catch (err: any) {
+      setFeedbackError(err?.message || 'Failed to capture feedback audio.');
+    }
+  };
+
+  const handleFeedbackAudioUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      setFeedbackRecordedBlob(file);
+      setFeedbackError(null);
+      setFeedbackSuccessMessage(null);
+    }
+    if (e.target) e.target.value = '';
+  };
+
+  const handleExecuteFeedback = async (
+    overrideAudioBlob?: Blob | null,
+    overrideText?: string
+  ) => {
+    const audioToUse = overrideAudioBlob !== undefined ? overrideAudioBlob : feedbackRecordedBlob;
+    const textToUse = overrideText !== undefined ? overrideText : feedbackTextInput;
+
+    if (!audioToUse && (!textToUse || !textToUse.trim())) {
+      setFeedbackError('Please dictate changes, upload an audio clip, or type written instructions first.');
+      return;
+    }
+
+    if (!lastPlan || !executionResult) {
+      setFeedbackError('No active execution plan or reports found to modify.');
+      return;
+    }
+
+    setIsProcessingFeedback(true);
+    setFeedbackError(null);
+    setFeedbackSuccessMessage(null);
+
+    try {
+      setFeedbackStep(`Analyzing feedback dictation with ${selectedModel}...`);
+      const updatedPlan = await parseAutonomousFeedbackDictation(
+        lastPlan,
+        executionResult,
+        audioToUse,
+        textToUse,
+        selectedModel,
+        attachedFiles
+      );
+
+      setLastPlan(updatedPlan);
+      setFeedbackStep('Applying modifications across patient reports & updating workstation...');
+
+      const newResult = await executeAutonomousPlan(updatedPlan, {
+        selectedModel,
+        audioBlob: audioToUse || recordedBlob,
+        attachedFiles,
+        onApplySingleReport,
+        onApplyBatchReports,
+        onDriveSaved: onSaveToDrive,
+      });
+
+      if (!newResult.success) {
+        setFeedbackError(newResult.error || 'Autonomous modification execution failed.');
+      } else {
+        setExecutionResult(newResult);
+        setFeedbackRecordedBlob(null);
+        setFeedbackTextInput('');
+        setFeedbackSuccessMessage(`Feedback modifications applied successfully! Updated ${updatedPlan.patients.length} patient report(s).`);
+      }
+    } catch (err: any) {
+      setFeedbackError(err?.message || 'Failed to apply feedback modifications.');
+    } finally {
+      setIsProcessingFeedback(false);
+      setFeedbackStep('');
+    }
   };
 
   // Helper to determine file badge representation
@@ -1135,6 +1275,289 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
                   </button>
                 </div>
               )}
+            </div>
+
+            {/* Autonomous Dictate Changes / Feedback Section */}
+            <div className="p-4 sm:p-5 rounded-2xl border border-indigo-500/50 bg-slate-900/90 shadow-xl space-y-4">
+              <div className="flex items-start sm:items-center justify-between gap-3 flex-wrap">
+                <div className="flex items-center gap-2.5">
+                  <span className="p-2 rounded-xl bg-indigo-500/10 border border-indigo-500/30 text-indigo-400">
+                    <MicPencilIcon className="w-5 h-5" />
+                  </span>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <h4 className="font-bold text-sm sm:text-base text-white">Dictate Changes / Refine Autonomous Reports</h4>
+                      {lastPlan && (
+                        <span className="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-indigo-950 border border-indigo-700/50 text-indigo-300">
+                          {lastPlan.patients.length} Report{lastPlan.patients.length > 1 ? 's' : ''} in Context
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      Dictate corrections, template swaps, heading modifications, or type written instructions. Full context of all reports is maintained.
+                    </p>
+                  </div>
+                </div>
+
+                {/* Staged files counter badge */}
+                {attachedFiles.length > 0 && (
+                  <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-slate-800 border border-slate-700 text-slate-300">
+                    📎 {attachedFiles.length} file{attachedFiles.length > 1 ? 's' : ''} available
+                  </span>
+                )}
+              </div>
+
+              {/* Spoken Voice Dictation Controls */}
+              <div className="p-3 sm:p-4 rounded-xl bg-slate-950/60 border border-slate-800/80 space-y-3">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <span className="text-xs font-bold text-slate-300 uppercase tracking-wider">
+                    1. Voice Dictation
+                  </span>
+
+                  {/* Audio upload button */}
+                  <div>
+                    <input
+                      type="file"
+                      ref={feedbackAudioUploadInputRef}
+                      onChange={handleFeedbackAudioUpload}
+                      accept="audio/*"
+                      className="hidden"
+                    />
+                    <button
+                      type="button"
+                      disabled={isProcessingFeedback || feedbackRecorder.isRecording}
+                      onClick={() => feedbackAudioUploadInputRef.current?.click()}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 text-xs font-semibold transition-colors cursor-pointer disabled:opacity-50"
+                      title="Upload pre-recorded audio feedback"
+                    >
+                      <UploadIcon className="w-3.5 h-3.5" />
+                      <span>Upload Audio</span>
+                    </button>
+                  </div>
+                </div>
+
+                {feedbackRecorder.isRecording ? (
+                  <div className="flex flex-col sm:flex-row items-center justify-between gap-3 p-3 rounded-xl bg-red-950/30 border border-red-800/50 animate-pulse">
+                    <div className="flex items-center gap-2.5">
+                      <span className="w-3 h-3 rounded-full bg-red-500 animate-ping" />
+                      <span className="text-xs font-bold text-red-400 uppercase tracking-wider">
+                        Recording Changes...
+                      </span>
+                      <span className="text-sm font-mono font-bold text-white px-2 py-0.5 rounded-md bg-red-950 border border-red-800">
+                        {formatTime(feedbackRecorder.recordingDuration)}
+                      </span>
+                      {feedbackRecorder.isPaused && (
+                        <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-amber-950 text-amber-300 border border-amber-800">
+                          Paused
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="flex items-center gap-2 w-full sm:w-auto">
+                      <button
+                        type="button"
+                        onClick={feedbackRecorder.isPaused ? feedbackRecorder.resumeRecording : feedbackRecorder.pauseRecording}
+                        className="flex-1 sm:flex-none inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-semibold transition-colors cursor-pointer"
+                      >
+                        {feedbackRecorder.isPaused ? (
+                          <>
+                            <ResumeIcon className="w-3.5 h-3.5" />
+                            <span>Resume</span>
+                          </>
+                        ) : (
+                          <>
+                            <PauseIcon className="w-3.5 h-3.5" />
+                            <span>Pause</span>
+                          </>
+                        )}
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={handleStopFeedbackRecording}
+                        className="flex-1 sm:flex-none inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold transition-colors cursor-pointer"
+                      >
+                        <StopIcon className="w-3.5 h-3.5" />
+                        <span>Stop</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={handleStopAndApplyFeedbackRecording}
+                        className="flex-1 sm:flex-none inline-flex items-center justify-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold shadow-md transition-colors cursor-pointer"
+                      >
+                        <SparklesIcon className="w-3.5 h-3.5" />
+                        <span>Stop &amp; Apply Changes</span>
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex flex-col sm:flex-row items-center gap-3">
+                    <button
+                      type="button"
+                      disabled={isProcessingFeedback}
+                      onClick={handleStartFeedbackRecording}
+                      className="w-full sm:w-auto flex-1 py-3 px-4 rounded-xl bg-gradient-to-r from-indigo-600 to-indigo-700 hover:from-indigo-500 hover:to-indigo-600 text-white font-bold text-xs sm:text-sm shadow-md transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+                    >
+                      <MicPencilIcon className="w-4 h-4" />
+                      <span>Start Dictating Changes</span>
+                    </button>
+
+                    {feedbackAudioUrl && (
+                      <div className="flex items-center gap-2 w-full sm:w-auto">
+                        <audio controls src={feedbackAudioUrl} className="h-9 w-48 sm:w-56 rounded-lg" />
+                        <button
+                          type="button"
+                          onClick={() => setFeedbackRecordedBlob(null)}
+                          className="text-xs text-red-400 hover:text-red-300 p-2 rounded-lg hover:bg-red-950/40 transition-colors cursor-pointer"
+                          title="Discard feedback recording"
+                        >
+                          ✕
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Reference Files & Notes Staging Controls (Exact same options as start of autonomous mode) */}
+              <div className="p-3 sm:p-4 rounded-xl bg-slate-950/60 border border-slate-800/80 space-y-2.5">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <span className="text-xs font-bold text-slate-300 uppercase tracking-wider">
+                    2. Reference Scans, Files &amp; Clinical Notes
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="file"
+                      ref={feedbackFileInputRef}
+                      onChange={handleFilesSelected}
+                      multiple
+                      accept="*/*"
+                      className="hidden"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => feedbackFileInputRef.current?.click()}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-indigo-950/80 hover:bg-indigo-900 border border-indigo-700/60 text-indigo-300 text-xs font-semibold transition-colors cursor-pointer"
+                    >
+                      <span>+ Attach More Files</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEditingFileId(null);
+                        setTextNoteTitle('');
+                        setTextNoteAlias('');
+                        setTextNoteContent('');
+                        setIsTextModalOpen(true);
+                      }}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-950/80 hover:bg-emerald-900 border border-emerald-700/60 text-emerald-300 text-xs font-semibold transition-colors cursor-pointer"
+                    >
+                      <span>+ Add / Paste Note</span>
+                    </button>
+                  </div>
+                </div>
+
+                {attachedFiles.length > 0 && (
+                  <div className="flex flex-wrap gap-2 pt-1">
+                    {attachedFiles.map(item => {
+                      const badge = getFileTypeBadge(item);
+                      return (
+                        <div
+                          key={item.id}
+                          className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-700 text-xs text-slate-200"
+                        >
+                          <span>{badge.icon}</span>
+                          <span className="font-medium max-w-[140px] truncate">{item.alias || item.file.name}</span>
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveFile(item.id)}
+                            className="text-slate-400 hover:text-red-400 ml-1 cursor-pointer"
+                            title="Remove file"
+                          >
+                            ✕
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {/* Written Feedback / Instructions */}
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold text-slate-300 uppercase tracking-wider block">
+                  3. Written Instructions / Modifications (Optional)
+                </label>
+                <textarea
+                  value={feedbackTextInput}
+                  onChange={(e) => setFeedbackTextInput(e.target.value)}
+                  rows={2}
+                  placeholder="e.g., 'Change CT extremity heading to CT right arm', 'In patient 2 impression add acute appendicitis with smart bullets', 'Include detailed glioblastoma findings by yourself'..."
+                  className="w-full p-2.5 rounded-xl bg-slate-950/80 border border-slate-800 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 resize-y"
+                />
+              </div>
+
+              {/* Processing Progress & Telemetry */}
+              {isProcessingFeedback && (
+                <div className="p-3 rounded-xl bg-indigo-950/40 border border-indigo-800/60 flex items-center gap-2.5">
+                  <svg className="animate-spin h-4 w-4 text-indigo-400 flex-shrink-0" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                  </svg>
+                  <span className="text-xs text-indigo-200 font-medium">
+                    {feedbackStep || 'Applying modifications to autonomous reports...'}
+                  </span>
+                </div>
+              )}
+
+              {/* Success Notification */}
+              {feedbackSuccessMessage && (
+                <div className="p-3 rounded-xl bg-emerald-950/50 border border-emerald-700/60 text-xs text-emerald-300 flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <span>✓</span>
+                    <span>{feedbackSuccessMessage}</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setFeedbackSuccessMessage(null)}
+                    className="text-emerald-400 hover:text-emerald-200 font-bold px-1 cursor-pointer"
+                  >
+                    ✕
+                  </button>
+                </div>
+              )}
+
+              {/* Error Notification */}
+              {feedbackError && (
+                <div className="p-3 rounded-xl bg-red-950/50 border border-red-700/60 text-xs text-red-300 flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <WarningIcon className="w-4 h-4 flex-shrink-0" />
+                    <span>{feedbackError}</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setFeedbackError(null)}
+                    className="text-red-400 hover:text-red-200 font-bold px-1 cursor-pointer"
+                  >
+                    ✕
+                  </button>
+                </div>
+              )}
+
+              {/* Apply Changes Action Button */}
+              <div className="flex justify-end pt-1">
+                <button
+                  type="button"
+                  disabled={isProcessingFeedback || (!feedbackRecordedBlob && !feedbackTextInput.trim())}
+                  onClick={() => handleExecuteFeedback()}
+                  className="py-2.5 px-5 rounded-xl bg-gradient-to-r from-indigo-600 via-purple-600 to-indigo-700 hover:from-indigo-500 hover:to-purple-500 text-white font-bold text-xs shadow-md transition-all flex items-center gap-2 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <SparklesIcon className="w-3.5 h-3.5" />
+                  <span>Apply Changes to Reports</span>
+                </button>
+              </div>
             </div>
 
             <div className="pt-2 flex justify-center">
