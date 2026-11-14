@@ -28,7 +28,7 @@ import TemplateSelectionModal from './ui/TemplateSelectionModal';
 import { getTemplateDocxBase64 } from '../services/builtInTemplates';
 import ImageIcon from './icons/ImageIcon';
 import { mergeAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
-import {  generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText , isSummaryLeadIn, formatImpressionOutput } from '../services/docxService';
+import {  generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText , isSummaryLeadIn, formatImpressionOutput, isReportTitle as isDocxReportTitle, isAnatomicalSubheading } from '../services/docxService';
 import { stopRepeatingInterruptedAlert } from '../services/soundService';
 import RichTextReportEditor from './RichTextReportEditor';
 import type { DocxTemplateData } from './ui/CustomPromptInput';
@@ -155,14 +155,8 @@ export const renderTableFinding = (lines: string[]) => {
   );
 };
 
-export const isReportTitle = (text: string, index: number): boolean => {
-  if (index !== 0) return false;
-  const t = text.replace(/BOLD::/g, '').trim();
-  if (!t) return false;
-  if (t === 'C.T.SCAN OF BRAIN (PLAIN)') return true;
-  if (/^(MRI|CT|C\.T\.|USG|ULTRASOUND|X-RAY|NCCT|CECT|HRCT|PET-CT|DEXA)\b/i.test(t)) return true;
-  if (t === t.toUpperCase() && t.length < 120 && !t.startsWith('IMPRESSION') && !t.startsWith('*')) return true;
-  return false;
+export const isReportTitle = (text: string, index: number = 0, allFindings?: string[]): boolean => {
+  return isDocxReportTitle(text, index, allFindings) || isAnatomicalSubheading(text);
 };
 
 export const sanitizeTitleText = (text: string): string => {
@@ -714,8 +708,9 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         const isItalic = !isTable && (isClinicalProfile || (!isStructured && displayFinding.startsWith('*') && displayFinding.endsWith('*')));
 
         if (isTitle) {
-          acc.plain.push(displayFinding);
-          acc.html.push(`<p style="text-align:center;"><strong><u>${displayFinding}</u></strong></p>`);
+          const titleUpper = displayFinding.toUpperCase();
+          acc.plain.push(titleUpper);
+          acc.html.push(`<p style="text-align:center;"><strong><u>${titleUpper}</u></strong></p>`);
         } else if (isClinicalProfile) {
           const profText = formatClinicalProfileText(displayFinding);
           acc.plain.push(profText);
@@ -830,8 +825,9 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     let htmlText: string;
 
     if (isTitle) {
-      plainText = displayFinding;
-      htmlText = `<p style="text-align:center;"><strong><u>${displayFinding}</u></strong></p>`;
+      const titleUpper = displayFinding.toUpperCase();
+      plainText = titleUpper;
+      htmlText = `<p style="text-align:center;"><strong><u>${titleUpper}</u></strong></p>`;
     } else if (isClinicalProfile) {
       const profText = formatClinicalProfileText(displayFinding);
       plainText = profText;
@@ -920,7 +916,8 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
       const isImpression = isStructured && !isTable && title.trim().toUpperCase() === 'IMPRESSION:';
       
       if (isTitle) {
-          return `<p style="text-align:center;"><strong><u>${displayFinding}</u></strong></p>`;
+          const titleUpper = displayFinding.toUpperCase();
+          return `<p style="text-align:center;"><strong><u>${titleUpper}</u></strong></p>`;
       }
       if (isTable) {
           return parseMarkdownTable(tableLines);

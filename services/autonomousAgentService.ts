@@ -177,14 +177,22 @@ const AUTONOMOUS_AGENT_SYSTEM_PROMPT = `You are RADDOC Autonomous Radiology Dire
 You analyze a single, continuous audio recording where a radiologist speaks in natural human language, giving clinical findings, patient details, and application control directives.
 
 YOUR CORE TASKS:
-1. MULTI-PATIENT DETECTION & CROSS-TURN ENTITY CONSOLIDATION:
-   - The radiologist may dictate Patient 1, move to Patient 2 in batch mode, and then later in the recording return to Patient 1 (e.g., "Oh, going back to Patient 1...", "For that first CT Brain patient, also add that there is a 4mm nodule...", "And one more finding for John Doe...").
-   - You MUST identify all patients mentioned by name, number, or anatomical study, and CONSOLIDATE all later findings, addenda, and corrections into that specific patient's report findings. Do NOT create duplicate split reports for the same patient.
+1. MULTI-PATIENT DETECTION & STRICT ISOLATION OF INDIVIDUAL REPORTS:
+   - When the radiologist dictates multiple patients or a batch of cases (e.g. "batch dictation with five patients", "Patient 1 ... Patient 2 ... Patient 3 ..."):
+     * STRICT REPORT PARTITIONING (ZERO CROSS-CONTAMINATION): Each patient must have their own separate, independent entry in the "patients" array.
+     * TOTAL ISOLATION RULE: NEVER include, append, or accumulate subsequent patients' findings (Patient 2, Patient 3, Patient 4, Patient 5...) inside Patient 1's findings array!
+     * Patient 1's "findings" array MUST contain ONLY Patient 1's clinical findings and observations.
+     * Patient 2's "findings" array MUST contain ONLY Patient 2's clinical findings and observations.
+     * Patient 3's "findings" array MUST contain ONLY Patient 3's clinical findings and observations.
+     * Patient 4's "findings" array MUST contain ONLY Patient 4's clinical findings and observations.
+     * Patient 5's "findings" array MUST contain ONLY Patient 5's clinical findings and observations.
+     * Each patient report is 100% independent, clean, and non-redundant.
+   - Cross-Turn Addenda / Corrections: If the radiologist moves to another patient and then later in the recording returns to an earlier patient (e.g., "Oh, going back to Patient 1...", "For that first CT Brain patient, also add that there is a 4mm nodule...", "And one more finding for John Doe..."), CONSOLIDATE that specific addition into that specific patient's report findings. Do NOT create duplicate split reports.
 
 2. TARGET MODE ROUTING (Single Dictation vs Batch Mode):
    - Determine whether each patient should go into 'single' mode or 'batch' mode.
+   - If the doctor specifies "in batch dictation", "batch mode", "add 5 patients in batch", or dictates a series of batch cases, route ALL of those patients to targetMode: 'batch'.
    - If the doctor says "single dictation", "single mode", or "record this first patient in single dictation", route that patient to targetMode: 'single'.
-   - If the doctor says "batch mode", "add 5 things to batch", or dictates a queue of subsequent patients, route them to targetMode: 'batch'.
    - If not explicitly mentioned:
      * If only 1 patient is dictated, assign targetMode: 'single'.
      * If multiple patients are dictated without specific mode commands, assign the first patient to 'single' (active workstation report) and all subsequent patients to 'batch' (queued reports).
@@ -687,7 +695,7 @@ export async function executeAutonomousPlan(
               finalFindings,
               matched,
               context.selectedModel,
-              context.audioBlob,
+              undefined,
               effectiveDirectives
             );
           } catch (mergeErr) {
@@ -794,7 +802,7 @@ export async function executeAutonomousPlan(
                 finalFindings,
                 matched,
                 context.selectedModel,
-                context.audioBlob,
+                undefined,
                 effectiveBpDirectives
               );
             } catch (mergeErr) {

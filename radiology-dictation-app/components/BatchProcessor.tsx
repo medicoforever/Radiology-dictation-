@@ -37,7 +37,7 @@ import { AVAILABLE_MODELS, REPORT_TEMPLATES, ReportTemplate } from '../constants
 import WarningIcon from './icons/WarningIcon';
 import BrainIcon from './icons/BrainIcon';
 import { autoSaveBatchDictations, SaveResult, BatchFolderInfo, isDriveConnected, subscribeToAuth } from '../services/googleDriveService';
-import { generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText, formatImpressionOutput } from '../services/docxService';
+import { generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText, formatImpressionOutput, findingsToStandardHtml, isReportTitle, isAnatomicalSubheading } from '../services/docxService';
 import { isClinicalProfileFinding, formatClinicalProfileText } from './ResultsDisplay';
 
 const BATCH_DRIVE_FOLDER_KEY = 'radiologyDictationBatchDriveFolder';
@@ -1527,15 +1527,16 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
           const finding = batch.findings![i];
           const isBold = finding.includes('BOLD::');
           const cleanFinding = finding.replace(/BOLD::/g, '');
-          const isTitle = cleanFinding.trim() === 'C.T.SCAN OF BRAIN (PLAIN)';
+          const isTitle = isReportTitle(cleanFinding, i, batch.findings) || isAnatomicalSubheading(cleanFinding);
           const isClinicalProfile = isClinicalProfileFinding(cleanFinding);
           const { isStructured, isTable, title, points, tableLines } = parseStructuredFinding(cleanFinding);
           const isImpression = isStructured && !isTable && title.trim().toUpperCase() === 'IMPRESSION:';
           const isItalic = !isTable && (isClinicalProfile || (!isStructured && cleanFinding.startsWith('*') && cleanFinding.endsWith('*')));
           
           if (isTitle) {
-            acc.plain.push(cleanFinding);
-            acc.html.push(`<p style="text-align:center;"><strong><u>${cleanFinding}</u></strong></p>`);
+            const titleUpper = cleanFinding.toUpperCase();
+            acc.plain.push(titleUpper);
+            acc.html.push(`<p style="text-align:center;"><strong><u>${titleUpper}</u></strong></p>`);
           } else if (isClinicalProfile) {
             const profText = formatClinicalProfileText(cleanFinding);
             acc.plain.push(profText);
@@ -1645,7 +1646,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         const findingToCopy = batch.findings[findingIndex];
         const isBold = findingToCopy.includes('BOLD::');
         const cleanFinding = findingToCopy.replace(/BOLD::/g, '');
-        const isTitle = cleanFinding.trim() === 'C.T.SCAN OF BRAIN (PLAIN)';
+        const isTitle = isReportTitle(cleanFinding, findingIndex, batch.findings) || isAnatomicalSubheading(cleanFinding);
         const isClinicalProfile = isClinicalProfileFinding(cleanFinding);
         const { isStructured, isTable, title, points, tableLines } = parseStructuredFinding(cleanFinding);
         const isImpression = isStructured && !isTable && title.trim().toUpperCase() === 'IMPRESSION:';
@@ -1654,8 +1655,9 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         let htmlText: string;
         
         if (isTitle) {
-          plainText = cleanFinding;
-          htmlText = `<p style="text-align:center;"><strong><u>${cleanFinding}</u></strong></p>`;
+          const titleUpper = cleanFinding.toUpperCase();
+          plainText = titleUpper;
+          htmlText = `<p style="text-align:center;"><strong><u>${titleUpper}</u></strong></p>`;
         } else if (isClinicalProfile) {
           plainText = formatClinicalProfileText(cleanFinding);
           htmlText = `<p><em>${plainText}</em></p>`;
@@ -1701,57 +1703,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     const handleCopyAllForBatch = async (batch: Batch) => {
         if (!batch.findings || batch.findings.length === 0) return;
 
-        const allTextPlain = batch.findings.map(f => {
-            const isBold = f.includes('BOLD::');
-            const cleanFinding = f.replace(/BOLD::/g, '');
-            const { isStructured, isTable, title, points, tableLines } = parseStructuredFinding(cleanFinding);
-            const isImpression = isStructured && !isTable && title.trim().toUpperCase() === 'IMPRESSION:';
-            if (isTable) {
-              return tableToPlainText(tableLines);
-            }
-            if (isImpression) {
-                return formatImpressionOutput(title, points).plain;
-            }
-            if (isClinicalProfileFinding(cleanFinding)) {
-                return formatClinicalProfileText(cleanFinding);
-            }
-            if (isStructured) {
-              return [title, ...points].join('\n');
-            }
-            if (cleanFinding.startsWith('*') && cleanFinding.endsWith('*')) {
-              return cleanFinding.slice(1, -1);
-            }
-            return cleanFinding;
-        }).join('\n\n');
-
-        const allTextHtml = batch.findings.map(f => {
-            const isBold = f.includes('BOLD::');
-            const cleanFinding = f.replace(/BOLD::/g, '');
-            const isTitle = cleanFinding.trim() === 'C.T.SCAN OF BRAIN (PLAIN)';
-            const { isStructured, isTable, title, points, tableLines } = parseStructuredFinding(cleanFinding);
-            const isImpression = isStructured && !isTable && title.trim().toUpperCase() === 'IMPRESSION:';
-            if (isTitle) {
-              return `<p style="text-align:center;"><strong><u>${cleanFinding}</u></strong></p>`;
-            }
-            if (isTable) {
-              return parseMarkdownTable(tableLines);
-            }
-            if (isImpression) {
-                return formatImpressionOutput(title, points).html;
-            }
-            if (isClinicalProfileFinding(cleanFinding)) {
-                return `<p><em>${formatClinicalProfileText(cleanFinding)}</em></p>`;
-            }
-            if (isStructured) {
-                let htmlContent = isBold ? `<p><strong>${title}</strong></p>` : `<p>${title}</p>`;
-                htmlContent += points.map(p => isBold ? `<p><strong>${p}</strong></p>` : `<p>${p}</p>`).join('');
-                return htmlContent;
-            }
-            if (cleanFinding.startsWith('*') && cleanFinding.endsWith('*')) {
-                return `<p><em>${cleanFinding.slice(1, -1)}</em></p>`;
-            }
-            return isBold ? `<p><strong>${cleanFinding}</strong></p>` : `<p>${cleanFinding}</p>`;
-        }).join('');
+        const { html: allTextHtml, plainText: allTextPlain } = findingsToStandardHtml(batch.findings);
 
         const success = await copyToClipboard(allTextPlain, allTextHtml);
         if (success) {
@@ -1778,37 +1730,9 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
 
         batchesWithFindings.forEach(b => {
             const name = b.name;
-            const plainFindings = b.findings!.map(f => {
-                const isBold = f.includes('BOLD::');
-                const cleanFinding = f.replace(/BOLD::/g, '');
-                const { isStructured, title, points } = parseStructuredFinding(cleanFinding);
-                const isImpression = isStructured && title.trim().toUpperCase() === 'IMPRESSION:';
-                if (isImpression) return formatImpressionOutput(title, points).plain;
-                if (isClinicalProfileFinding(cleanFinding)) return formatClinicalProfileText(cleanFinding);
-                if (isStructured) return [title, ...points].join('\n');
-                if (cleanFinding.startsWith('*') && cleanFinding.endsWith('*')) return cleanFinding.slice(1, -1);
-                return cleanFinding;
-            }).join('\n');
-            const htmlFindings = b.findings!.map(f => {
-                const isBold = f.includes('BOLD::');
-                const cleanFinding = f.replace(/BOLD::/g, '');
-                const isTitle = cleanFinding.trim() === 'C.T.SCAN OF BRAIN (PLAIN)';
-                const { isStructured, title, points } = parseStructuredFinding(cleanFinding);
-                const isImpression = isStructured && title.trim().toUpperCase() === 'IMPRESSION:';
-                if (isTitle) return `<p style="text-align:center;"><strong><u>${cleanFinding}</u></strong></p>`;
-                if (isImpression) return formatImpressionOutput(title, points).html;
-                if (isClinicalProfileFinding(cleanFinding)) return `<p><em>${formatClinicalProfileText(cleanFinding)}</em></p>`;
-                if (isStructured) {
-                  let htmlContent = isBold ? `<p><strong>${title}</strong></p>` : `<p>${title}</p>`;
-                  htmlContent += points.map(p => isBold ? `<p><strong>${p}</strong></p>` : `<p>${p}</p>`).join('');
-                  return htmlContent;
-                }
-                if (cleanFinding.startsWith('*') && cleanFinding.endsWith('*')) return `<p><em>${cleanFinding.slice(1, -1)}</em></p>`;
-                return isBold ? `<p><strong>${cleanFinding}</strong></p>` : `<p>${cleanFinding}</p>`;
-            }).join('');
-            
-            allTextPlain += `[${name}]\n${plainFindings}\n\n`;
-            allTextHtml += `<h3>${name}</h3>` + htmlFindings;
+            const std = findingsToStandardHtml(b.findings!);
+            allTextPlain += `[${name}]\n${std.plainText}\n\n`;
+            allTextHtml += `<p><strong><u>--- ${name} ---</u></strong></p>` + std.html;
         });
 
         const success = await copyToClipboard(allTextPlain.trim(), allTextHtml.trim());
@@ -3522,12 +3446,14 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                     {batch.findings.map((finding, index) => {
                                                         const isBold = finding.includes('BOLD::');
                                                         const cleanFinding = finding.replace(/BOLD::/g, '');
-                                                        const isTitle = cleanFinding.trim() === 'C.T.SCAN OF BRAIN (PLAIN)';
+                                                        const isTitle = isReportTitle(cleanFinding, index, batch.findings) || isAnatomicalSubheading(cleanFinding);
                                                         const isClinicalProfile = isClinicalProfileFinding(cleanFinding);
                                                         const { isStructured, isTable, title, points, tableLines } = parseStructuredFinding(cleanFinding);
                                                         const isItalic = !isTable && (isClinicalProfile || (!isStructured && cleanFinding.startsWith('*') && cleanFinding.endsWith('*')));
                                                         const textToDisplay = isClinicalProfile 
                                                             ? formatClinicalProfileText(cleanFinding) 
+                                                            : isTitle
+                                                            ? cleanFinding.toUpperCase()
                                                             : isItalic 
                                                             ? cleanFinding.slice(1, -1) 
                                                             : isStructured 
@@ -3535,7 +3461,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                             : cleanFinding;
 
                                                         const textContainerClasses = isTitle
-                                                            ? 'text-center font-bold underline'
+                                                            ? 'text-center font-bold underline uppercase'
                                                             : isItalic
                                                             ? 'italic'
                                                             : isBold

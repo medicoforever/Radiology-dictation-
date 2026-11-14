@@ -1,4 +1,4 @@
-import { parseMarkdownTable, cleanClinicalProfileText, isTableRowFinding, formatImpressionOutput } from './docxService';
+import { parseMarkdownTable, cleanClinicalProfileText, isTableRowFinding, formatImpressionOutput, isReportTitle, isAnatomicalSubheading } from './docxService';
 
 // A batch type used for report generation
 interface ReportBatch {
@@ -108,7 +108,7 @@ const getEmbeddedScript = () => `
 
             const isBold = rawFinding.includes('BOLD::');
             const cleanFinding = rawFinding.replace(/BOLD::/g, '');
-            const isTitle = cleanFinding.trim() === 'C.T.SCAN OF BRAIN (PLAIN)';
+            const isTitle = cleanFinding.trim() === 'C.T.SCAN OF BRAIN (PLAIN)' || /^(?:MRI|CT|C\.?T\.?|USG|ULTRASOUND|X-?RAY|NCCT|CECT|HRCT|PET-?CT|DEXA)\b/i.test(cleanFinding) || /^(?:C\.?T\.?\s*SCAN\s+OF|CT\s+SCAN\s+OF|MRI\s+OF|MRI\s+SCAN\s+OF|ULTRASOUND\s+OF|USG\s+OF|X-?RAY\s+OF)\s+[A-Z0-9\s\(\)\-\/\&]+$/i.test(cleanFinding) || /VIEW\s*$/i.test(cleanFinding);
             const isClinicalProfile = isClinicalProfileFinding(cleanFinding);
             const parts = cleanFinding.split('###');
             const isStructured = parts.length > 1;
@@ -118,8 +118,9 @@ const getEmbeddedScript = () => `
             let plainText, htmlText;
 
             if (isTitle) {
-                plainText = cleanFinding;
-                htmlText = \`<p style="text-align:center;"><strong><u>\${cleanFinding}</u></strong></p>\`;
+                const titleUpper = cleanFinding.toUpperCase();
+                plainText = titleUpper;
+                htmlText = \`<p style="text-align:center;"><strong><u>\${titleUpper}</u></strong></p>\`;
             } else if (isClinicalProfile) {
                 plainText = cleanClinicalProfileText(cleanFinding);
                 htmlText = \`<p><em>\${plainText}</em></p>\`;
@@ -297,14 +298,14 @@ const getEmbeddedScript = () => `
                 
                 const newParts = newClean.split('###');
                 const textEl = findingEl.querySelector('.finding-text');
-                const isTitle = newClean.trim() === 'C.T.SCAN OF BRAIN (PLAIN)';
+                const isTitle = newClean.trim() === 'C.T.SCAN OF BRAIN (PLAIN)' || /^(?:MRI|CT|C\.?T\.?|USG|ULTRASOUND|X-?RAY|NCCT|CECT|HRCT|PET-?CT|DEXA)\b/i.test(newClean) || /^(?:C\.?T\.?\s*SCAN\s+OF|CT\s+SCAN\s+OF|MRI\s+OF|MRI\s+SCAN\s+OF|ULTRASOUND\s+OF|USG\s+OF|X-?RAY\s+OF)\s+[A-Z0-9\s\(\)\-\/\&]+$/i.test(newClean) || /VIEW\s*$/i.test(newClean);
                 const isClinicalProfile = isClinicalProfileFinding(newClean);
                 const isImpression = newParts.length > 1 && newParts[0].trim().toUpperCase() === 'IMPRESSION:';
                 const isItalic = isClinicalProfile || (newParts.length === 1 && newClean.startsWith('*') && newClean.endsWith('*'));
 
                 if (isTitle) {
-                    textEl.className = 'finding-text text-slate-700 cursor-pointer text-center font-bold underline';
-                    textEl.innerHTML = newClean;
+                    textEl.className = 'finding-text text-slate-700 cursor-pointer text-center font-bold underline uppercase';
+                    textEl.innerHTML = newClean.toUpperCase();
                 } else if (isClinicalProfile) {
                     const profText = cleanClinicalProfileText(newClean);
                     textEl.className = 'finding-text text-slate-700 cursor-pointer italic';
@@ -1185,7 +1186,7 @@ const renderFindingsList = (findings: string[], batchId: string): string => {
             ${validFindings.map((finding, index) => {
                 const isBold = finding.includes('BOLD::');
                 const cleanFinding = finding.replace(/BOLD::/g, '');
-                const isTitle = cleanFinding.trim() === 'C.T.SCAN OF BRAIN (PLAIN)';
+                const isTitle = isReportTitle(cleanFinding, index, validFindings) || isAnatomicalSubheading(cleanFinding);
 
                 const parts = cleanFinding.split('###');
                 const isStructured = parts.length > 1;
@@ -1197,6 +1198,8 @@ const renderFindingsList = (findings: string[], batchId: string): string => {
                 const isItalic = isClinicalProfile || (!isStructured && cleanFinding.startsWith('*') && cleanFinding.endsWith('*'));
                 const textToDisplay = isClinicalProfile 
                     ? cleanClinicalProfileText(cleanFinding) 
+                    : isTitle
+                    ? cleanFinding.toUpperCase()
                     : isItalic 
                     ? cleanFinding.slice(1, -1) 
                     : title;
@@ -1212,8 +1215,8 @@ const renderFindingsList = (findings: string[], batchId: string): string => {
                         findingContent = parseMarkdownTable(parts) || cleanFinding;
                     }
                 } else if (isTitle) {
-                    findingContent = cleanFinding;
-                    textContainerClasses = 'text-center font-bold underline';
+                    findingContent = cleanFinding.toUpperCase();
+                    textContainerClasses = 'text-center font-bold underline uppercase';
                 } else if (isClinicalProfile) {
                     findingContent = cleanClinicalProfileText(cleanFinding);
                     textContainerClasses = 'italic';

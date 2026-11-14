@@ -519,6 +519,77 @@ export function escapeHtml(text: string): string {
     .replace(/'/g, '&#039;');
 }
 
+/**
+ * Detects whether a line is an anatomical subheading (e.g. C.T. SCAN OF BRAIN, MRI SPINE, etc.)
+ */
+export function isAnatomicalSubheading(text: string): boolean {
+  if (!text) return false;
+  const clean = text.replace(/^BOLD::/i, '').replace(/[*_~`#]+/g, '').trim();
+  if (!clean || clean.length > 90) return false;
+  // NEVER match IMPRESSION or Clinical Profile
+  if (/^IMPRESSION/i.test(clean) || /^Clinical\s*(Profile|History)/i.test(clean)) return false;
+  if (/^(?:C\.?T\.?\s*SCAN\s+OF|CT\s+SCAN\s+OF|MRI\s+OF|MRI\s+SCAN\s+OF|ULTRASOUND\s+OF|USG\s+OF|X-?RAY\s+OF)\s+[A-Z0-9\s\(\)\-\/\&]+$/i.test(clean)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Robustly detects if a line is the primary examination title / study heading.
+ * Handles all modality prefixes (CT, MRI, USG, X-Ray, etc.), contrast/plain variants,
+ * uppercase/mixed-case formatting, and anatomical scan study titles.
+ */
+export function isReportTitle(text: string, index: number = 0, allFindings?: string[]): boolean {
+  if (!text) return false;
+  const clean = text.replace(/^BOLD::/i, '').replace(/[*_~`#]+/g, '').trim();
+  if (!clean) return false;
+
+  // Never match IMPRESSION, Technique, Clinical Profile, or bullet points
+  if (/^(?:IMPRESSION|TECHNIQUE|CLINICAL\s*(?:PROFILE|HISTORY))/i.test(clean)) return false;
+  if (/^[•\-\*]\s+/i.test(clean)) return false;
+
+  // Check if this is the first non-profile finding in the report
+  let isEarlyLine = index === 0;
+  if (!isEarlyLine && allFindings && index === 1) {
+    const firstClean = allFindings[0]?.replace(/^BOLD::/i, '').replace(/[*_~`#]+/g, '').trim() || '';
+    if (/^Clinical\s*(Profile|History):/i.test(firstClean)) {
+      isEarlyLine = true;
+    }
+  }
+
+  // Exact known title match
+  if (clean.toUpperCase() === 'C.T.SCAN OF BRAIN (PLAIN)') return true;
+
+  // Any modality prefix (CT, C.T., MRI, MR, M.R.I., USG, ULTRASOUND, X-RAY, XRAY, NCCT, CECT, HRCT, PET-CT, PET/CT, DEXA, MAMMOGRAM)
+  if (/^(?:MRI|M\.R\.I\.|MR|CT|C\.?T\.?|USG|ULTRASOUND|X-?RAY|NCCT|CECT|HRCT|PET-?CT|PET\/CT|DEXA|MAMMOGRAM)\b/i.test(clean)) {
+    if (isEarlyLine || (clean.length < 110 && !clean.endsWith('.'))) {
+      return true;
+    }
+  }
+
+  // Modality descriptors at start (e.g. "Contrast CT", "Plain and Contrast CT", "High Resolution CT")
+  if (/^(?:PLAIN|CONTRAST|NON-?CONTRAST|CONTRAST\s+ENHANCED|HIGH\s+RESOLUTION)\s+(?:CT|C\.?T\.?|MRI|MR|SCAN)\b/i.test(clean)) {
+    if (isEarlyLine || clean.length < 110) return true;
+  }
+
+  // Phrases like "SCAN OF ...", "STUDY OF ...", "EXAMINATION OF ...", "... VIEW"
+  if (/^(?:SCAN\s+OF|STUDY\s+OF|EXAMINATION\s+OF)\b/i.test(clean)) {
+    if (isEarlyLine || clean.length < 110) return true;
+  }
+
+  // Anatomical scan titles (e.g. "CHEST PA VIEW", "KNEE AP AND LATERAL VIEW")
+  if (/VIEW\s*$/i.test(clean) && (isEarlyLine || clean.length < 80)) {
+    return true;
+  }
+
+  // All-caps heading at index 0 or early line
+  if (isEarlyLine && clean === clean.toUpperCase() && clean.length > 4 && clean.length < 110 && !clean.endsWith('.')) {
+    return true;
+  }
+
+  return false;
+}
+
 export function findingsToStandardHtml(findings: string[]): { html: string; plainText: string } {
   if (!findings || findings.length === 0) {
     return { html: '', plainText: '' };
@@ -526,28 +597,6 @@ export function findingsToStandardHtml(findings: string[]): { html: string; plai
 
   const htmlParagraphs: string[] = [];
   const plainParagraphs: string[] = [];
-
-  const isAnatomicalSubheading = (text: string): boolean => {
-    const clean = text.replace(/^BOLD::/i, '').replace(/[*_~`#]+/g, '').trim();
-    if (!clean || clean.length > 80) return false;
-    // NEVER match IMPRESSION or Clinical Profile
-    if (/^IMPRESSION/i.test(clean) || /^Clinical\s*(Profile|History)/i.test(clean)) return false;
-    if (/^(?:C\.?T\.?\s*SCAN\s+OF|CT\s+SCAN\s+OF|MRI\s+OF|ULTRASOUND\s+OF|USG\s+OF|X-?RAY\s+OF)\s+[A-Z\s\(\)\-\/\&]+$/i.test(clean)) {
-      return true;
-    }
-    return false;
-  };
-
-  const isExamTitle = (text: string, index: number): boolean => {
-    if (index !== 0) return false;
-    const clean = text.replace(/^BOLD::/i, '').replace(/[*_~`#]+/g, '').trim();
-    if (clean === 'C.T.SCAN OF BRAIN (PLAIN)') return true;
-    if (/^(MRI|CT|C\.T\.|USG|ULTRASOUND|X-RAY|NCCT|CECT|HRCT|PET-CT|DEXA)\b/i.test(clean)) return true;
-    if (clean === clean.toUpperCase() && clean.length > 5 && clean.length < 90 && !clean.endsWith('.') && !clean.startsWith('IMPRESSION') && !clean.startsWith('*')) {
-      return true;
-    }
-    return false;
-  };
 
   // Flatten multi-line findings while keeping IMPRESSION intact
   const expandedFindings: { text: string; isBold: boolean; origIndex: number }[] = [];
@@ -616,9 +665,9 @@ export function findingsToStandardHtml(findings: string[]): { html: string; plai
       continue;
     }
 
-    // 2. Exam Title (first line ONLY)
-    if (origIndex === 0 && isExamTitle(clean, origIndex)) {
-      const title = clean.replace(/[*_~`#]+/g, '').trim();
+    // 2. Exam Title (first line or early line)
+    if (isReportTitle(clean, origIndex, findings)) {
+      const title = clean.replace(/[*_~`#]+/g, '').trim().toUpperCase();
       plainParagraphs.push(title);
       htmlParagraphs.push(`<p style="text-align:center;"><strong><u>${escapeHtml(title)}</u></strong></p>`);
       continue;
@@ -626,7 +675,7 @@ export function findingsToStandardHtml(findings: string[]): { html: string; plai
 
     // 3. Anatomical Subheadings (C.T. SCAN OF BRAIN, C.T. SCAN OF NECK, etc.)
     if (isAnatomicalSubheading(clean)) {
-      const sub = clean.replace(/[*_~`#]+/g, '').trim();
+      const sub = clean.replace(/[*_~`#]+/g, '').trim().toUpperCase();
       plainParagraphs.push(sub);
       htmlParagraphs.push(`<p style="text-align:center;"><strong><u>${escapeHtml(sub)}</u></strong></p>`);
       continue;
