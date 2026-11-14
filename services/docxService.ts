@@ -587,9 +587,8 @@ export function formatImpressionOutput(title: string, points: string[]): { plain
       .replace(/^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i, '')
       .trim();
 
-    // Strip leading bullet symbol if already present to inspect raw content
-    const existingBulletMatch = cleanPt.match(/^[•\-\*]\s*(.+)/s);
-    const textWithoutBullet = existingBulletMatch ? existingBulletMatch[1].trim() : cleanPt;
+    // Strip ALL leading bullets (single, double, dashes, entities) and whitespace
+    const textWithoutBullet = cleanPt.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
 
     if (isExplicitNoBullet) {
       plainLines.push(textWithoutBullet);
@@ -889,10 +888,21 @@ export function sanitizeHtmlForClipboard(html: string): string {
       const items = list.querySelectorAll('li');
       items.forEach(li => {
         const p = document.createElement('p');
-        p.innerHTML = `<strong>• ${li.innerHTML.trim()}</strong>`;
+        let cleanLi = li.innerHTML.trim().replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
+        p.innerHTML = `<strong>• ${cleanLi}</strong>`;
         list.parentNode?.insertBefore(p, list);
       });
       list.remove();
+    });
+
+    const allParas = temp.querySelectorAll('p');
+    allParas.forEach(p => {
+      // Eliminate any duplicate or stacked bullets in paragraphs
+      p.innerHTML = p.innerHTML.replace(/(?:•\s*){2,}/g, '• ')
+                               .replace(/(?:&bull;\s*){2,}/g, '&bull; ')
+                               .replace(/(?:&#8226;\s*){2,}/g, '&#8226; ')
+                               .replace(/•\s*&bull;/g, '• ')
+                               .replace(/&bull;\s*•/g, '• ');
     });
 
     const allEls = temp.querySelectorAll('*');

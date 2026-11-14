@@ -86,6 +86,9 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
       cleanHtml = result.html;
       plainText = result.plainText || editorRef.current.innerText || editorRef.current.textContent || '';
     }
+    // Clean any stacked bullets
+    cleanHtml = cleanHtml.replace(/(?:•\s*){2,}/g, '• ').replace(/(?:&bull;\s*){2,}/g, '&bull; ');
+    plainText = plainText.replace(/(?:•\s*){2,}/g, '• ');
 
     try {
       if (typeof window !== 'undefined' && navigator.clipboard && window.ClipboardItem) {

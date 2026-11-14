@@ -319,7 +319,7 @@ const getEmbeddedScript = () => `
                                            /^suggested\\s+(?:clinical\\s+correlation|review(?:\\s+as\\s+indicated)?)\\.?$/i.test(cleanP.replace(/[.]+$/, ''));
                         const isLeadIn = /^findings\\s+(?:are\\s+)?s\\/?o(?:\\s*:)?$/i.test(cleanP);
                         const m = cleanP.match(/^[•\\-\\*]\\s*(.+)/s);
-                        const cText = m ? m[1].trim() : cleanP;
+                        const cText = cleanP.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
                         if (isPureCorr || isLeadIn) {
                             return \`<div class="font-bold">\${cText}</div>\`;
                         }
@@ -1236,7 +1236,7 @@ const renderFindingsList = (findings: string[], batchId: string): string => {
                                                    /^suggested\s+(?:clinical\s+correlation|review(?:\s+as\s+indicated)?)\.?$/i.test(cleanP.replace(/[.]+$/, ''));
                                 const isLeadIn = /^findings\s+(?:are\s+)?s\/?o(?:\s*:)?$/i.test(cleanP);
                                 const m = cleanP.match(/^[•\-\*]\s*(.+)/s);
-                                const cText = m ? m[1].trim() : cleanP;
+                                const cText = cleanP.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
                                 if (isPureCorr || isLeadIn) {
                                     return `<div class="font-bold">${cText}</div>`;
                                 }

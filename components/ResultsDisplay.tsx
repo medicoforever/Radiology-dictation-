@@ -652,8 +652,10 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   
   const copyToClipboard = async (plainText: string, htmlText: string) => {
     try {
-      const htmlBlob = new Blob([htmlText], { type: 'text/html' });
-      const textBlob = new Blob([plainText], { type: 'text/plain' });
+      const cleanHtmlText = htmlText.replace(/(?:•\s*){2,}/g, '• ').replace(/(?:&bull;\s*){2,}/g, '&bull; ');
+      const cleanPlainText = plainText.replace(/(?:•\s*){2,}/g, '• ');
+      const htmlBlob = new Blob([cleanHtmlText], { type: 'text/html' });
+      const textBlob = new Blob([cleanPlainText], { type: 'text/plain' });
       // The type definition for ClipboardItem is not standard in all environments, so we use `any`
       const clipboardItem = new (window as any).ClipboardItem({
         'text/html': htmlBlob,
@@ -2564,8 +2566,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                                                     .replace(/^NO_BULLET::\s*/i, '')
                                                     .replace(/^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i, '')
                                                     .trim();
-                                                const existingBulletMatch = cleanPt.match(/^[•\-\*]\s*(.+)/s);
-                                                const textWithoutBullet = existingBulletMatch ? existingBulletMatch[1].trim() : cleanPt;
+                                                const textWithoutBullet = cleanPt.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
                                                 if (isExplicitNoBullet || isPureCorrelationOrRecommendation(textWithoutBullet) || /^findings\s+(?:are\s+)?s\/?o(?:\s*:)?$/i.test(textWithoutBullet)) {
                                                     return (
                                                         <div key={i} className="font-bold">
