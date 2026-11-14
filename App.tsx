@@ -236,6 +236,14 @@ const App: React.FC = () => {
       document.documentElement.classList.remove('dark');
     }
     localStorage.setItem('theme', theme);
+
+    // Dynamically update mobile browser theme-color meta tag for Android status and navigation bar
+    try {
+      const themeColorMeta = document.querySelector('meta[name="theme-color"]');
+      if (themeColorMeta) {
+        themeColorMeta.setAttribute('content', isDarkVariant ? '#0f172a' : '#f8fafc');
+      }
+    } catch (_) {}
   }, [theme]);
   
   useEffect(() => {

@@ -1,4 +1,5 @@
-import React, { useState, useRef, useEffect, useMemo } from 'react';
+import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import { 
   Sun, 
   Moon, 
@@ -17,7 +18,8 @@ import {
   Feather, 
   Coffee, 
   Check, 
-  ChevronDown 
+  ChevronDown,
+  X 
 } from 'lucide-react';
 
 export type AppTheme = 
@@ -203,7 +205,42 @@ interface ThemeSelectorProps {
 export const ThemeSelector: React.FC<ThemeSelectorProps> = ({ currentTheme, onThemeChange }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [filterMode, setFilterMode] = useState<'all' | 'light' | 'dark'>('all');
-  const dropdownRef = useRef<HTMLDivElement>(null);
+  const [isMobile, setIsMobile] = useState<boolean>(() => {
+    if (typeof window !== 'undefined') {
+      return window.innerWidth < 640;
+    }
+    return false;
+  });
+  const [triggerRect, setTriggerRect] = useState<DOMRect | null>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+
+  const updatePosition = useCallback(() => {
+    if (triggerRef.current) {
+      setTriggerRect(triggerRef.current.getBoundingClientRect());
+    }
+    if (typeof window !== 'undefined') {
+      setIsMobile(window.innerWidth < 640);
+    }
+  }, []);
+
+  useEffect(() => {
+    const handleResize = () => {
+      updatePosition();
+    };
+    window.addEventListener('resize', handleResize);
+    window.addEventListener('scroll', handleResize, true);
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      window.removeEventListener('scroll', handleResize, true);
+    };
+  }, [updatePosition]);
+
+  const handleToggle = (e: React.MouseEvent | React.TouchEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    updatePosition();
+    setIsOpen(prev => !prev);
+  };
 
   const activeOption = THEME_OPTIONS.find(t => t.id === currentTheme) || THEME_OPTIONS[0];
   const ActiveIcon = activeOption.icon;
@@ -217,21 +254,6 @@ export const ThemeSelector: React.FC<ThemeSelectorProps> = ({ currentTheme, onTh
     }
     return THEME_OPTIONS;
   }, [filterMode]);
-
-  // Close when clicking outside
-  useEffect(() => {
-    const handleClickOutside = (event: MouseEvent) => {
-      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
-        setIsOpen(false);
-      }
-    };
-    if (isOpen) {
-      document.addEventListener('mousedown', handleClickOutside);
-    }
-    return () => {
-      document.removeEventListener('mousedown', handleClickOutside);
-    };
-  }, [isOpen]);
 
   // Close on Escape key
   useEffect(() => {
@@ -248,13 +270,280 @@ export const ThemeSelector: React.FC<ThemeSelectorProps> = ({ currentTheme, onTh
     };
   }, [isOpen]);
 
+  const portalContent = isOpen && typeof document !== 'undefined' ? (
+    <>
+      {isMobile ? (
+        /* Mobile Touch-Friendly Bottom Sheet Modal */
+        <div 
+          className="fixed inset-0 z-[9999] flex items-end justify-center bg-black/60 backdrop-blur-xs animate-fadeIn"
+          onClick={() => setIsOpen(false)}
+          role="dialog"
+          aria-modal="true"
+          aria-label="Select App Theme"
+        >
+          <div 
+            className="w-full max-h-[85vh] bg-white dark:bg-slate-900 rounded-t-3xl border-t border-slate-200 dark:border-slate-800 shadow-2xl p-4 flex flex-col animate-slideUp overscroll-contain"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Grab Pill & Header */}
+            <div className="flex flex-col items-center mb-3 shrink-0">
+              <div className="w-12 h-1.5 rounded-full bg-slate-300 dark:bg-slate-700 mb-3" />
+              <div className="w-full flex items-center justify-between px-1">
+                <div className="flex items-center gap-2">
+                  <div className="p-2 rounded-xl bg-blue-50 dark:bg-blue-950/60 text-blue-600 dark:text-blue-400">
+                    <Palette className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h3 className="text-base font-bold text-slate-800 dark:text-slate-100">
+                      App Theme & Mode
+                    </h3>
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                      Current: <span className="font-semibold">{activeOption.name}</span>
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setIsOpen(false)}
+                  className="p-2 rounded-full hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-500 dark:text-slate-400 cursor-pointer touch-manipulation"
+                  aria-label="Close theme selector"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+            </div>
+
+            {/* Quick Filter Tabs */}
+            <div className="flex items-center gap-1 p-1 bg-slate-100 dark:bg-slate-800/80 rounded-xl mb-3 shrink-0">
+              <button
+                type="button"
+                onClick={() => setFilterMode('all')}
+                className={`flex-1 py-1.5 px-2 text-xs font-semibold rounded-lg transition-colors cursor-pointer text-center touch-manipulation ${
+                  filterMode === 'all'
+                    ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400'
+                }`}
+              >
+                All ({THEME_OPTIONS.length})
+              </button>
+              <button
+                type="button"
+                onClick={() => setFilterMode('light')}
+                className={`flex-1 py-1.5 px-2 text-xs font-semibold rounded-lg transition-colors cursor-pointer text-center touch-manipulation ${
+                  filterMode === 'light'
+                    ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400'
+                }`}
+              >
+                Light ({THEME_OPTIONS.filter(t => !t.isDark).length})
+              </button>
+              <button
+                type="button"
+                onClick={() => setFilterMode('dark')}
+                className={`flex-1 py-1.5 px-2 text-xs font-semibold rounded-lg transition-colors cursor-pointer text-center touch-manipulation ${
+                  filterMode === 'dark'
+                    ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400'
+                }`}
+              >
+                Dark ({THEME_OPTIONS.filter(t => t.isDark).length})
+              </button>
+            </div>
+
+            {/* List of Themes - Mobile Touch Friendly */}
+            <div className="overflow-y-auto space-y-2 pr-0.5 flex-1 overscroll-contain">
+              {filteredOptions.map((themeOption) => {
+                const isSelected = themeOption.id === currentTheme;
+                const Icon = themeOption.icon;
+
+                return (
+                  <button
+                    key={themeOption.id}
+                    type="button"
+                    onClick={() => {
+                      onThemeChange(themeOption.id);
+                      setIsOpen(false);
+                    }}
+                    className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-2xl text-left transition-all cursor-pointer min-h-[50px] touch-manipulation ${
+                      isSelected
+                        ? 'bg-blue-50/95 dark:bg-blue-950/70 text-blue-900 dark:text-blue-100 border-2 border-blue-500 shadow-sm'
+                        : 'hover:bg-slate-100/90 dark:hover:bg-slate-800/80 text-slate-700 dark:text-slate-200 border border-slate-200/50 dark:border-slate-800'
+                    }`}
+                  >
+                    <div 
+                      className="w-9 h-9 rounded-xl shrink-0 flex items-center justify-center shadow-xs border border-black/10 dark:border-white/10"
+                      style={{ background: themeOption.swatchGradient }}
+                    >
+                      <Icon className={`w-5 h-5 ${themeOption.isDark ? 'text-white' : 'text-slate-900'}`} />
+                    </div>
+
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-sm font-semibold truncate">
+                          {themeOption.name}
+                        </span>
+                        <span className="text-[10px] px-1.5 py-0.2 rounded font-medium shrink-0 bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400">
+                          {themeOption.badge}
+                        </span>
+                      </div>
+                      <p className="text-xs text-slate-500 dark:text-slate-400 truncate mt-0.5">
+                        {themeOption.subtitle}
+                      </p>
+                    </div>
+
+                    {isSelected && (
+                      <Check className="w-5 h-5 text-blue-600 dark:text-blue-400 shrink-0" />
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      ) : (
+        /* Desktop Floating Popover Menu */
+        <div 
+          className="fixed inset-0 z-[9999]"
+          onClick={() => setIsOpen(false)}
+        >
+          <div 
+            style={{
+              position: 'fixed',
+              top: triggerRect ? triggerRect.bottom + 8 : 60,
+              right: triggerRect ? Math.max(16, window.innerWidth - triggerRect.right) : 16,
+            }}
+            className="w-80 sm:w-96 rounded-2xl bg-white/95 dark:bg-slate-900/95 backdrop-blur-xl border border-slate-200/80 dark:border-slate-700/80 shadow-2xl p-2.5 animate-fadeIn"
+            onClick={(e) => e.stopPropagation()}
+            role="listbox"
+            aria-label="Theme choices"
+          >
+            {/* Header */}
+            <div className="px-2.5 py-1.5 border-b border-slate-100 dark:border-slate-800/80 mb-2 flex items-center justify-between">
+              <span className="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                Appearance & Modes
+              </span>
+              <span className="text-[11px] font-semibold text-slate-400 dark:text-slate-500">
+                {THEME_OPTIONS.length} Themes
+              </span>
+            </div>
+
+            {/* Quick Filter Tabs */}
+            <div className="flex items-center gap-1 p-1 bg-slate-100 dark:bg-slate-800/80 rounded-xl mb-2">
+              <button
+                type="button"
+                onClick={() => setFilterMode('all')}
+                className={`flex-1 py-1 px-2 text-xs font-medium rounded-lg transition-colors cursor-pointer text-center ${
+                  filterMode === 'all'
+                    ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-xs font-semibold'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+                }`}
+              >
+                All ({THEME_OPTIONS.length})
+              </button>
+              <button
+                type="button"
+                onClick={() => setFilterMode('light')}
+                className={`flex-1 py-1 px-2 text-xs font-medium rounded-lg transition-colors cursor-pointer text-center ${
+                  filterMode === 'light'
+                    ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-xs font-semibold'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+                }`}
+              >
+                Light ({THEME_OPTIONS.filter(t => !t.isDark).length})
+              </button>
+              <button
+                type="button"
+                onClick={() => setFilterMode('dark')}
+                className={`flex-1 py-1 px-2 text-xs font-medium rounded-lg transition-colors cursor-pointer text-center ${
+                  filterMode === 'dark'
+                    ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-xs font-semibold'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+                }`}
+              >
+                Dark ({THEME_OPTIONS.filter(t => t.isDark).length})
+              </button>
+            </div>
+
+            {/* List of Themes */}
+            <div className="max-h-[380px] overflow-y-auto space-y-1 pr-0.5">
+              {filteredOptions.map((themeOption) => {
+                const isSelected = themeOption.id === currentTheme;
+                const Icon = themeOption.icon;
+
+                return (
+                  <button
+                    key={themeOption.id}
+                    type="button"
+                    onClick={() => {
+                      onThemeChange(themeOption.id);
+                      setIsOpen(false);
+                    }}
+                    className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl text-left transition-all cursor-pointer group ${
+                      isSelected
+                        ? 'bg-blue-50/90 dark:bg-blue-950/60 text-blue-900 dark:text-blue-100 border border-blue-200 dark:border-blue-700/60 shadow-xs'
+                        : 'hover:bg-slate-100/80 dark:hover:bg-slate-800/70 text-slate-700 dark:text-slate-200 border border-transparent'
+                    }`}
+                    role="option"
+                    aria-selected={isSelected}
+                  >
+                    <div 
+                      className="w-8 h-8 rounded-xl shrink-0 flex items-center justify-center shadow-xs border border-black/10 dark:border-white/10 group-hover:scale-105 transition-transform"
+                      style={{ background: themeOption.swatchGradient }}
+                    >
+                      <Icon className={`w-4 h-4 ${themeOption.isDark ? 'text-white' : 'text-slate-900'}`} />
+                    </div>
+
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-xs sm:text-sm font-semibold truncate">
+                          {themeOption.name}
+                        </span>
+                        <span className={`text-[10px] px-1.5 py-0.2 rounded font-medium shrink-0 ${
+                          themeOption.id === 'colourful' ? 'bg-pink-100 dark:bg-pink-900/50 text-pink-700 dark:text-pink-300' :
+                          themeOption.id === 'magical' ? 'bg-purple-100 dark:bg-purple-900/50 text-purple-700 dark:text-purple-300' :
+                          themeOption.id === 'creative' ? 'bg-orange-100 dark:bg-orange-900/50 text-orange-700 dark:text-orange-300' :
+                          themeOption.id === 'soothing' ? 'bg-emerald-100 dark:bg-emerald-900/50 text-emerald-700 dark:text-emerald-300' :
+                          themeOption.id === 'sunset' ? 'bg-rose-100 dark:bg-rose-900/50 text-rose-700 dark:text-rose-300' :
+                          themeOption.id === 'ocean' ? 'bg-cyan-100 dark:bg-cyan-900/50 text-cyan-700 dark:text-cyan-300' :
+                          themeOption.id === 'aurora' ? 'bg-teal-100 dark:bg-teal-900/50 text-teal-700 dark:text-teal-300' :
+                          themeOption.id === 'cyberpunk' ? 'bg-lime-100 dark:bg-lime-900/50 text-lime-700 dark:text-lime-300' :
+                          themeOption.id === 'velvet' ? 'bg-fuchsia-100 dark:bg-fuchsia-900/50 text-fuchsia-700 dark:text-fuchsia-300' :
+                          themeOption.id === 'nordic' ? 'bg-sky-100 dark:bg-sky-900/50 text-sky-700 dark:text-sky-300' :
+                          themeOption.id === 'solar' ? 'bg-amber-100 dark:bg-amber-900/50 text-amber-700 dark:text-amber-300' :
+                          themeOption.id === 'sakura' ? 'bg-rose-100 dark:bg-rose-900/50 text-rose-700 dark:text-rose-300' :
+                          themeOption.id === 'lavender' ? 'bg-violet-100 dark:bg-violet-900/50 text-violet-700 dark:text-violet-300' :
+                          themeOption.id === 'espresso' ? 'bg-amber-100 dark:bg-amber-950/60 text-amber-800 dark:text-amber-200' :
+                          'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400'
+                        }`}>
+                          {themeOption.badge}
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate mt-0.5">
+                        {themeOption.subtitle}
+                      </p>
+                    </div>
+
+                    {isSelected && (
+                      <Check className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0" />
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  ) : null;
+
   return (
-    <div className="relative inline-block" ref={dropdownRef}>
+    <div className="relative inline-block">
       {/* Trigger Button */}
       <button
+        ref={triggerRef}
         type="button"
-        onClick={() => setIsOpen(prev => !prev)}
-        className="p-2 sm:p-2.5 rounded-xl text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700 transition-all shrink-0 shadow-sm border border-slate-200/60 dark:border-slate-700/60 cursor-pointer min-h-[36px] flex items-center justify-center gap-1.5 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+        onClick={handleToggle}
+        className="p-2 sm:p-2.5 rounded-xl text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700 transition-all shrink-0 shadow-sm border border-slate-200/60 dark:border-slate-700/60 cursor-pointer min-h-[36px] flex items-center justify-center gap-1.5 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 touch-manipulation"
         aria-label={`Select theme mode (Current: ${activeOption.name})`}
         aria-expanded={isOpen}
         aria-haspopup="listbox"
@@ -272,131 +561,8 @@ export const ThemeSelector: React.FC<ThemeSelectorProps> = ({ currentTheme, onTh
         <ChevronDown className={`w-3 h-3 text-slate-400 transition-transform duration-200 ${isOpen ? 'rotate-180' : ''}`} />
       </button>
 
-      {/* Popover Menu */}
-      {isOpen && (
-        <div 
-          className="absolute right-0 mt-2 w-80 sm:w-96 rounded-2xl bg-white/95 dark:bg-slate-900/95 backdrop-blur-xl border border-slate-200/80 dark:border-slate-700/80 shadow-2xl p-2.5 z-50 animate-fadeIn"
-          role="listbox"
-          aria-label="Theme choices"
-        >
-          {/* Header */}
-          <div className="px-2.5 py-1.5 border-b border-slate-100 dark:border-slate-800/80 mb-2 flex items-center justify-between">
-            <span className="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
-              Appearance & Modes
-            </span>
-            <span className="text-[11px] font-semibold text-slate-400 dark:text-slate-500">
-              {THEME_OPTIONS.length} Themes
-            </span>
-          </div>
-
-          {/* Quick Filter Tabs */}
-          <div className="flex items-center gap-1 p-1 bg-slate-100 dark:bg-slate-800/80 rounded-xl mb-2">
-            <button
-              type="button"
-              onClick={() => setFilterMode('all')}
-              className={`flex-1 py-1 px-2 text-xs font-medium rounded-lg transition-colors cursor-pointer text-center ${
-                filterMode === 'all'
-                  ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-xs font-semibold'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
-              }`}
-            >
-              All ({THEME_OPTIONS.length})
-            </button>
-            <button
-              type="button"
-              onClick={() => setFilterMode('light')}
-              className={`flex-1 py-1 px-2 text-xs font-medium rounded-lg transition-colors cursor-pointer text-center ${
-                filterMode === 'light'
-                  ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-xs font-semibold'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
-              }`}
-            >
-              Light ({THEME_OPTIONS.filter(t => !t.isDark).length})
-            </button>
-            <button
-              type="button"
-              onClick={() => setFilterMode('dark')}
-              className={`flex-1 py-1 px-2 text-xs font-medium rounded-lg transition-colors cursor-pointer text-center ${
-                filterMode === 'dark'
-                  ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-xs font-semibold'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
-              }`}
-            >
-              Dark ({THEME_OPTIONS.filter(t => t.isDark).length})
-            </button>
-          </div>
-
-          {/* List of Themes */}
-          <div className="max-h-[380px] overflow-y-auto space-y-1 pr-0.5">
-            {filteredOptions.map((themeOption) => {
-              const isSelected = themeOption.id === currentTheme;
-              const Icon = themeOption.icon;
-
-              return (
-                <button
-                  key={themeOption.id}
-                  type="button"
-                  onClick={() => {
-                    onThemeChange(themeOption.id);
-                    setIsOpen(false);
-                  }}
-                  className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl text-left transition-all cursor-pointer group ${
-                    isSelected
-                      ? 'bg-blue-50/90 dark:bg-blue-950/60 text-blue-900 dark:text-blue-100 border border-blue-200 dark:border-blue-700/60 shadow-xs'
-                      : 'hover:bg-slate-100/80 dark:hover:bg-slate-800/70 text-slate-700 dark:text-slate-200 border border-transparent'
-                  }`}
-                  role="option"
-                  aria-selected={isSelected}
-                >
-                  {/* Swatch Pill with Icon */}
-                  <div 
-                    className="w-8 h-8 rounded-xl shrink-0 flex items-center justify-center shadow-xs border border-black/10 dark:border-white/10 group-hover:scale-105 transition-transform"
-                    style={{ background: themeOption.swatchGradient }}
-                  >
-                    <Icon className={`w-4 h-4 ${themeOption.isDark ? 'text-white' : 'text-slate-900'}`} />
-                  </div>
-
-                  {/* Text Details */}
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-1.5">
-                      <span className="text-xs sm:text-sm font-semibold truncate">
-                        {themeOption.name}
-                      </span>
-                      <span className={`text-[10px] px-1.5 py-0.2 rounded font-medium shrink-0 ${
-                        themeOption.id === 'colourful' ? 'bg-pink-100 dark:bg-pink-900/50 text-pink-700 dark:text-pink-300' :
-                        themeOption.id === 'magical' ? 'bg-purple-100 dark:bg-purple-900/50 text-purple-700 dark:text-purple-300' :
-                        themeOption.id === 'creative' ? 'bg-orange-100 dark:bg-orange-900/50 text-orange-700 dark:text-orange-300' :
-                        themeOption.id === 'soothing' ? 'bg-emerald-100 dark:bg-emerald-900/50 text-emerald-700 dark:text-emerald-300' :
-                        themeOption.id === 'sunset' ? 'bg-rose-100 dark:bg-rose-900/50 text-rose-700 dark:text-rose-300' :
-                        themeOption.id === 'ocean' ? 'bg-cyan-100 dark:bg-cyan-900/50 text-cyan-700 dark:text-cyan-300' :
-                        themeOption.id === 'aurora' ? 'bg-teal-100 dark:bg-teal-900/50 text-teal-700 dark:text-teal-300' :
-                        themeOption.id === 'cyberpunk' ? 'bg-lime-100 dark:bg-lime-900/50 text-lime-700 dark:text-lime-300' :
-                        themeOption.id === 'velvet' ? 'bg-fuchsia-100 dark:bg-fuchsia-900/50 text-fuchsia-700 dark:text-fuchsia-300' :
-                        themeOption.id === 'nordic' ? 'bg-sky-100 dark:bg-sky-900/50 text-sky-700 dark:text-sky-300' :
-                        themeOption.id === 'solar' ? 'bg-amber-100 dark:bg-amber-900/50 text-amber-700 dark:text-amber-300' :
-                        themeOption.id === 'sakura' ? 'bg-rose-100 dark:bg-rose-900/50 text-rose-700 dark:text-rose-300' :
-                        themeOption.id === 'lavender' ? 'bg-violet-100 dark:bg-violet-900/50 text-violet-700 dark:text-violet-300' :
-                        themeOption.id === 'espresso' ? 'bg-amber-100 dark:bg-amber-950/60 text-amber-800 dark:text-amber-200' :
-                        'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400'
-                      }`}>
-                        {themeOption.badge}
-                      </span>
-                    </div>
-                    <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate mt-0.5">
-                      {themeOption.subtitle}
-                    </p>
-                  </div>
-
-                  {/* Active Checkmark */}
-                  {isSelected && (
-                    <Check className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0" />
-                  )}
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      )}
+      {/* Render via Portal to document.body so no parent overflow-x-auto or clipping can affect it */}
+      {portalContent && createPortal(portalContent, document.body)}
     </div>
   );
 };
