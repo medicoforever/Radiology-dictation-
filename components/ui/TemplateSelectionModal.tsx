@@ -273,7 +273,7 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
       aria-labelledby="template-modal-title"
     >
       <div
-        className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl shadow-2xl w-full max-w-5xl flex flex-col h-[90vh] max-h-[820px] overflow-hidden"
+        className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl shadow-2xl w-full max-w-5xl xl:max-w-6xl 2xl:max-w-7xl flex flex-col h-[92vh] max-h-[900px] overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -502,7 +502,7 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
                       className="inline-flex items-center gap-1 text-[11px] font-medium bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200 px-2 py-0.5 rounded-md border border-blue-200 dark:border-blue-800 shadow-2xs"
                     >
                       <span className="w-3.5 h-3.5 rounded-full bg-blue-600 text-white text-[9px] flex items-center justify-center font-bold shrink-0">{idx + 1}</span>
-                      <span className="truncate max-w-[130px]">{t.name}</span>
+                      <span className="truncate max-w-[220px] sm:max-w-xs">{t.name}</span>
                       <button
                         type="button"
                         onClick={() => toggleTemplateSelection(t)}
@@ -621,7 +621,7 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
                               </span>
                             )}
                           </div>
-                          <p className="font-bold text-sm text-slate-800 dark:text-slate-100 truncate">
+                          <p className="font-bold text-sm text-slate-800 dark:text-slate-100 break-words whitespace-normal leading-snug">
                             {template.name}
                           </p>
                           <p className="text-xs text-slate-500 dark:text-slate-400 line-clamp-1 mt-0.5">
@@ -728,7 +728,7 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
                       setPreviewTab(t.id || t.name);
                       setSelectedPreview(t);
                     }}
-                    className={`text-xs font-semibold px-2.5 py-1.5 rounded-lg transition-all cursor-pointer truncate max-w-[150px] shrink-0 ${
+                    className={`text-xs font-semibold px-2.5 py-1.5 rounded-lg transition-all cursor-pointer truncate max-w-[240px] sm:max-w-xs shrink-0 ${
                       previewTab === (t.id || t.name)
                         ? 'bg-blue-100 dark:bg-blue-900/60 text-blue-800 dark:text-blue-200 font-bold border border-blue-300 dark:border-blue-700'
                         : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200 bg-white/60 dark:bg-slate-900/60'
@@ -1072,7 +1072,7 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
                   {selectedTemplates.length}
                 </span>
                 <div className="min-w-0">
-                  <p className="text-xs font-bold text-blue-900 dark:text-blue-100 truncate">
+                  <p className="text-xs font-bold text-blue-900 dark:text-blue-100 break-words whitespace-normal leading-snug">
                     {selectedTemplates.map(t => t.name).join(' + ')}
                   </p>
                   <p className="text-[11px] text-blue-700 dark:text-blue-300 hidden sm:block">

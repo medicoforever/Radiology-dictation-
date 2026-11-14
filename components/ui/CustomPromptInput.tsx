@@ -1007,7 +1007,7 @@ const CustomPromptInput: React.FC<{
                                     </span>
                                   )}
                                 </button>
-                                <h4 className="font-bold text-sm text-slate-800 dark:text-slate-100 truncate" title={tmpl.name}>
+                                <h4 className="font-bold text-sm text-slate-800 dark:text-slate-100 break-words whitespace-normal leading-snug" title={tmpl.name}>
                                   {tmpl.name}
                                 </h4>
                               </div>

@@ -450,6 +450,69 @@ export function parseMarkdownTable(lines: string[]): string {
  * - All multi-line and merged template findings are unpacked into atomic individual <p> lines.
  * - Completely indistinguishable from manually pasting row-by-row, with ZERO boxes after report approval.
  */
+
+/**
+ * Detects if an impression sentence is an overarching lead-in or summary statement
+ * (e.g., "findings are s/o...", "Features suggestive of...", "In summary...", etc.)
+ * which should start from the start of the row without a bullet point.
+ */
+export function isSummaryLeadIn(text: string): boolean {
+  if (!text) return false;
+  const clean = text.replace(/^BOLD::/i, '').replace(/[*_~`#]+/g, '').trim();
+  const patterns = [
+    /^(?:findings\s+(?:are\s+)?s\/o|features\s+(?:are\s+)?s\/o)/i,
+    /^(?:findings\s+(?:are\s+)?suggestive\s+of|features\s+(?:are\s+)?suggestive\s+of)/i,
+    /^(?:in\s+summary|overall\s+features|summary\s*:|impression\s*:)/i,
+    /^(?:suggestive\s+of\b|consistent\s+with\b)/i,
+    /^(?:no\s+significant\s+.*abnormality|study\s+within\s+normal\s+limits|normal\s+.*study)/i
+  ];
+  return patterns.some(p => p.test(clean));
+}
+
+/**
+ * Formats impression output with exact matching font style (<p> tags matching body paragraphs)
+ * and smart bulleting: single-line or summary lead-in lines start at start of row (no bullet),
+ * while multiple individual findings are kept in bullets.
+ */
+export function formatImpressionOutput(title: string, points: string[]): { plain: string; html: string } {
+  const cleanTitle = title.trim().toUpperCase() || 'IMPRESSION:';
+  const cleanPoints = points.map(p => p.replace(/^BOLD::/i, '').trim()).filter(Boolean);
+
+  if (cleanPoints.length === 0) {
+    return {
+      plain: cleanTitle,
+      html: `<p><strong style="text-decoration: underline;">${cleanTitle}</strong></p>`
+    };
+  }
+
+  const plainLines = [cleanTitle];
+  const htmlParagraphs = [`<p><strong style="text-decoration: underline;">${cleanTitle}</strong></p>`];
+
+  // If only 1 item in impression: NEVER bullet! Start from start of row itself
+  if (cleanPoints.length === 1) {
+    const pt = cleanPoints[0];
+    plainLines.push(pt);
+    htmlParagraphs.push(`<p><strong>${escapeHtml(pt)}</strong></p>`);
+  } else {
+    cleanPoints.forEach(pt => {
+      if (isSummaryLeadIn(pt)) {
+        // Starts from start of row itself without bullet
+        plainLines.push(pt);
+        htmlParagraphs.push(`<p><strong>${escapeHtml(pt)}</strong></p>`);
+      } else {
+        // Individual findings: keep in bullets
+        plainLines.push(`• ${pt}`);
+        htmlParagraphs.push(`<p><strong>• ${escapeHtml(pt)}</strong></p>`);
+      }
+    });
+  }
+
+  return {
+    plain: plainLines.join('\n'),
+    html: htmlParagraphs.join('')
+  };
+}
+
 export function escapeHtml(text: string): string {
   if (!text) return '';
   return text
@@ -573,12 +636,12 @@ export function findingsToStandardHtml(findings: string[]): { html: string; plai
       continue;
     }
 
-    // 4. IMPRESSION section: ALWAYS LEFT-ALIGNED (NOT CENTERED!), WITH BOLD POINTS
+    // 4. IMPRESSION section: Left-aligned, matching body font style, smart bullets
     if (clean.toUpperCase().startsWith('IMPRESSION:')) {
       const parts = clean.replace(/^IMPRESSION:\s*/i, '').split('###').map(p => p.trim()).filter(Boolean);
-      plainParagraphs.push(`IMPRESSION:\n${parts.map(p => `• ${p}`).join('\n')}`);
-      const pointsHtml = parts.map(p => `<li><strong>${escapeHtml(p)}</strong></li>`).join('');
-      htmlParagraphs.push(`<p><strong style="text-decoration: underline;">IMPRESSION:</strong></p><ul>${pointsHtml}</ul>`);
+      const imp = formatImpressionOutput('IMPRESSION:', parts);
+      plainParagraphs.push(imp.plain);
+      htmlParagraphs.push(imp.html);
       continue;
     }
 

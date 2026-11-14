@@ -28,7 +28,7 @@ import TemplateSelectionModal from './ui/TemplateSelectionModal';
 import { getTemplateDocxBase64 } from '../services/builtInTemplates';
 import ImageIcon from './icons/ImageIcon';
 import { mergeAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
-import { generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText } from '../services/docxService';
+import {  generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText , isSummaryLeadIn, formatImpressionOutput } from '../services/docxService';
 import { stopRepeatingInterruptedAlert } from '../services/soundService';
 import RichTextReportEditor from './RichTextReportEditor';
 import type { DocxTemplateData } from './ui/CustomPromptInput';
@@ -724,8 +724,9 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
           acc.plain.push(tableToPlainText(tableLines));
           acc.html.push(parseMarkdownTable(tableLines));
         } else if (isImpression) {
-            acc.plain.push(`${title.toUpperCase()}\n${points.map(p => `• ${p}`).join('\n')}`);
-            acc.html.push(`<p><strong style="text-decoration: underline;">${title.toUpperCase()}</strong></p><ul>${points.map(p => `<li><strong>${p}</strong></li>`).join('')}</ul>`);
+            const imp = formatImpressionOutput(title, points);
+            acc.plain.push(imp.plain);
+            acc.html.push(imp.html);
         } else if (isStructured) {
           acc.plain.push([title, ...points].join('\n'));
           let htmlContent = isBold ? `<p><strong>${title}</strong></p>` : `<p>${title}</p>`;
@@ -839,8 +840,9 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
       plainText = tableToPlainText(tableLines);
       htmlText = parseMarkdownTable(tableLines);
     } else if (isImpression) {
-        plainText = `${title.toUpperCase()}\n${points.map(p => `• ${p}`).join('\n')}`;
-        htmlText = `<p><strong style="text-decoration: underline;">${title.toUpperCase()}</strong></p><ul>${points.map(p => `<li><strong>${p}</strong></li>`).join('')}</ul>`;
+        const imp = formatImpressionOutput(title, points);
+        plainText = imp.plain;
+        htmlText = imp.html;
     } else if (isStructured) {
         plainText = [title, ...points].join('\n');
         let htmlContent = isBold ? `<p><strong>${title}</strong></p>` : `<p>${title}</p>`;
@@ -893,7 +895,8 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         return tableToPlainText(tableLines);
       }
       if (isImpression) {
-          return `${title.toUpperCase()}\n${points.map(p => `• ${p}`).join('\n')}`;
+          const imp = formatImpressionOutput(title, points);
+          return imp.plain;
       }
       if (isStructured) {
         return [title, ...points].join('\n');
@@ -923,7 +926,8 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
           return parseMarkdownTable(tableLines);
       }
       if (isImpression) {
-          return `<p><strong style="text-decoration: underline;">${title.toUpperCase()}</strong></p><ul>${points.map(p => `<li><strong>${p}</strong></li>`).join('')}</ul>`;
+          const imp = formatImpressionOutput(title, points);
+          return imp.html;
       }
       if (isStructured) {
         let htmlContent = isBold ? `<p><strong>${title}</strong></p>` : `<p>${title}</p>`;
@@ -2553,11 +2557,16 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                     ) : isImpression ? (
                         <>
                             <span className="font-bold underline uppercase">{title}</span>
-                            <ul className="list-disc list-inside pl-4 mt-1">
-                                {points.map((point, i) => (
-                                    <li key={i} className="font-bold">{point}</li>
-                                ))}
-                            </ul>
+                            <div className="mt-1 space-y-1">
+                                {points.map((point, i) => {
+                                    const isLead = points.length === 1 || isSummaryLeadIn(point);
+                                    return (
+                                        <div key={i} className="font-bold">
+                                            {isLead ? point : `• ${point}`}
+                                        </div>
+                                    );
+                                })}
+                            </div>
                         </>
                     ) : isStructured ? (
                       <>
