@@ -518,6 +518,9 @@ CRITICAL MULTI-TEMPLATE COMBINATION & MERGE DIRECTIVES:
    - Prefix only dictated/abnormal or modified lines with 'BOLD::'.
 3. NORMAL FINDINGS PRESERVATION: For any anatomical regions from either template where no abnormalities were dictated or where the dictation indicated normal/unremarkable, preserve the complete normal baseline findings verbatim WITHOUT the 'BOLD::' prefix.
 4. COMBINED CLINICAL IMPRESSION: Synthesize ONE unified, comprehensive, prioritized IMPRESSION covering all examined regions (format: 'IMPRESSION:###point 1###point 2...'). Prioritize significant acute abnormalities first, followed by incidental findings or normal summaries for the respective regions.
+   - Smart Bullet Formatting in Impression:
+     * Single-Line / Lead-In Summaries: Statements such as "findings are s/o...", narrative summary paragraphs, or single normal summary sentences now start flush with the beginning of the line without any bullet point (e.g. "IMPRESSION:###Normal study without acute abnormality.").
+     * Discrete / Multi-Point Findings: When the impression consists of 2 or more discrete clinical findings, each individual finding is cleanly formatted with bullet points (• Point 1, • Point 2) starting from the left margin (e.g. "IMPRESSION:###• Point 1###• Point 2").
 5. PRESERVE TABULAR DATA: When any template contains measurement tables or comparative grids, preserve them intact with rows joined by '###'.
 ================================================================================
 `;
@@ -557,6 +560,9 @@ CRITICAL TEMPLATE MERGE DIRECTIVES:
 3. ABNORMAL / DICTATED FINDINGS MERGING: When the doctor dictates specific abnormal findings, observations, or modifications, merge them into the corresponding template sections and prefix only those dictated/abnormal lines with 'BOLD::'.
 4. NEW FINDINGS: Any new findings dictated that are not covered in the template should be inserted in the appropriate clinical location with 'BOLD::'.
 5. IMPRESSION: Synthesize an accurate, comprehensive IMPRESSION based on all findings (normal and abnormal) in the format 'IMPRESSION:###point 1###point 2...'.
+   - Smart Bullet Formatting in Impression:
+     * Single-Line / Lead-In Summaries: Statements such as "findings are s/o...", narrative summary paragraphs, or single normal summary sentences now start flush with the beginning of the line without any bullet point (e.g. "IMPRESSION:###Normal study without acute abnormality.").
+     * Discrete / Multi-Point Findings: When the impression consists of 2 or more discrete clinical findings, each individual finding is cleanly formatted with bullet points (• Point 1, • Point 2) starting from the left margin (e.g. "IMPRESSION:###• Point 1###• Point 2").
 6. MEASUREMENT / COMPARATIVE TABLES: When the template or report contains measurement grids or comparative anatomical tables (e.g., bilateral kidney comparisons, TAVI measurements, pulmonary artery dimensions, cardiac ventricular volumes), preserve the table rows joined by '###' (e.g. 'Col1 | Col2###Val1 | Val2') so the full tabular grid is preserved as a cohesive unit.
 ================================================================================
 `;
@@ -919,6 +925,9 @@ CRITICAL MULTI-TEMPLATE COMBINATION & MERGE DIRECTIVES:
    - Prefix only dictated/abnormal or modified lines with 'BOLD::'.
 3. NORMAL FINDINGS PRESERVATION: For any anatomical regions from either template where no abnormalities were dictated or where the dictation indicated normal/unremarkable, preserve the complete normal baseline findings verbatim WITHOUT the 'BOLD::' prefix.
 4. COMBINED CLINICAL IMPRESSION: Synthesize ONE unified, comprehensive, prioritized IMPRESSION covering all examined regions (format: 'IMPRESSION:###point 1###point 2...'). Prioritize significant acute abnormalities first, followed by incidental findings or normal summaries for the respective regions.
+   - Smart Bullet Formatting in Impression:
+     * Single-Line / Lead-In Summaries: Statements such as "findings are s/o...", narrative summary paragraphs, or single normal summary sentences now start flush with the beginning of the line without any bullet point (e.g. "IMPRESSION:###Normal study without acute abnormality.").
+     * Discrete / Multi-Point Findings: When the impression consists of 2 or more discrete clinical findings, each individual finding is cleanly formatted with bullet points (• Point 1, • Point 2) starting from the left margin (e.g. "IMPRESSION:###• Point 1###• Point 2").
 5. PRESERVE TABULAR DATA: When any template contains measurement tables or comparative grids, preserve them intact with rows joined by '###'.
 ================================================================================
 `;
@@ -953,6 +962,9 @@ CRITICAL TEMPLATE MERGE DIRECTIVES:
 3. ABNORMAL / DICTATED FINDINGS MERGING: When the doctor dictates specific abnormal findings, observations, or modifications, merge them into the corresponding template sections and prefix only those dictated/abnormal lines with 'BOLD::'.
 4. NEW FINDINGS: Any new findings dictated that are not covered in the template should be inserted in the appropriate clinical location with 'BOLD::'.
 5. IMPRESSION: Synthesize an accurate, comprehensive IMPRESSION based on all findings (normal and abnormal) in the format 'IMPRESSION:###point 1###point 2...'.
+   - Smart Bullet Formatting in Impression:
+     * Single-Line / Lead-In Summaries: Statements such as "findings are s/o...", narrative summary paragraphs, or single normal summary sentences now start flush with the beginning of the line without any bullet point (e.g. "IMPRESSION:###Normal study without acute abnormality.").
+     * Discrete / Multi-Point Findings: When the impression consists of 2 or more discrete clinical findings, each individual finding is cleanly formatted with bullet points (• Point 1, • Point 2) starting from the left margin (e.g. "IMPRESSION:###• Point 1###• Point 2").
 6. MEASUREMENT / COMPARATIVE TABLES: When the template or report contains measurement grids or comparative anatomical tables (e.g., bilateral kidney comparisons, TAVI measurements, pulmonary artery dimensions, cardiac ventricular volumes), preserve the table rows joined by '###' (e.g. 'Col1 | Col2###Val1 | Val2') so the full tabular grid is preserved as a cohesive unit.
 ================================================================================
 `;
@@ -968,11 +980,18 @@ ${JSON.stringify({ findings: dictatedFindings }, null, 2)}
 TASK INSTRUCTIONS:
 You are provided with the doctor's actual dictated findings above.
 Carefully integrate these dictated findings into the "${templateName}" baseline template following all rules:
+- NATURAL LANGUAGE CLINICAL PATHOLOGY UNDERSTANDING & ANTI-LITERAL SYNTHESIS:
+  If any dictated finding, note, or directive contains shorthand clinical diagnoses or pathology generation requests (such as "detailed glioblastoma findings", "acute appendicitis", "slipped capital femoral epiphysis", "acute MCA infarct", etc.), NEVER insert the meta-phrase (such as "detailed glioblastoma findings") verbatim into the report body!
+  Instead, intelligently interpret the clinical diagnosis and synthesize comprehensive, realistic, authoritative, anatomically precise radiological observations for that pathology tailored to the active template sections (e.g. for glioblastoma in MR Brain: describe the intra-axial mass, necrotic core, thick irregular peripheral enhancement, surrounding vasogenic edema, SWI microhemorrhages, mass effect, midline shift, ventricular compression, and herniation in the brain parenchyma section).
+  Prefix each newly synthesized or modified finding with 'BOLD::'.
 - Any anatomical sections where the dictation describes pathology, abnormal lesions, or modifications must be updated with the dictated findings and prefixed with 'BOLD::'.
 - Any anatomical sections from the template that were normal or not mentioned in the dictation must remain present verbatim without 'BOLD::'.
 - Clinical profile if dictated or present must be preserved as its own line (*Clinical Profile: ...*).
 - If the dictated findings contain previous or intermediate "IMPRESSION:" lines from continued dictation sessions, consolidate all findings into ONE single comprehensive final IMPRESSION at the end of the report (format: 'IMPRESSION:###point 1###point 2...'). Do NOT leave intermediate impressions scattered in the body of the report.
 - Generate a new, comprehensive IMPRESSION synthesizing all normal and abnormal findings starting with 'IMPRESSION:###'.
+  * Smart Bullet Formatting in Impression:
+    - Single-Line / Lead-In Summaries: Statements such as "findings are s/o...", narrative summary paragraphs, or single normal summary sentences now start flush with the beginning of the line without any bullet point (e.g. "IMPRESSION:###Normal study without acute abnormality.").
+    - Discrete / Multi-Point Findings: When the impression consists of 2 or more discrete clinical findings, each individual finding is cleanly formatted with bullet points (• Point 1, • Point 2) starting from the left margin (e.g. "IMPRESSION:###• Point 1###• Point 2").
 - Return ONLY a JSON object with the "findings" string array in the assembled report order.
 ================================================================================
 `;
@@ -2184,8 +2203,11 @@ Perform a comprehensive, holistic review pass over the draft to generate the fin
    - Clinical profile without asterisks and without BOLD:: (e.g., "Clinical Profile: C/o trauma.") and with no trailing or extra asterisks.
 6. **IMPRESSION**:
    - If an impression exists, ensure it is formatted as "IMPRESSION:###point 1###point 2".
+   - Smart Bullet Formatting in Impression:
+     * Single-Line / Lead-In Summaries: Statements such as "findings are s/o...", narrative summary paragraphs, or single normal summary sentences now start flush with the beginning of the line without any bullet point (e.g. "IMPRESSION:###Normal study without acute abnormality.").
+     * Discrete / Multi-Point Findings: When the impression consists of 2 or more discrete clinical findings, each individual finding is cleanly formatted with bullet points (• Point 1, • Point 2) starting from the left margin (e.g. "IMPRESSION:###• Point 1###• Point 2").
    - Ensure the impression highlights the most clinically significant and acute abnormalities first.
-   - If findings clearly describe definitive pathologies but no impression was dictated, synthesize a concise, non-verbal impression matching the findings.
+   - If findings clearly describe definitive pathologies but no impression was dictated, synthesize a concise, non-verbal impression matching the findings adhering to the Smart Bullet Formatting rules.
 7. **Anti-Hallucination**:
    - DO NOT fabricate any new findings or lesions not present in the draft.
    - Discard any stray casual fragments or non-medical words if any slipped through.

@@ -37,7 +37,7 @@ import { AVAILABLE_MODELS, REPORT_TEMPLATES, ReportTemplate } from '../constants
 import WarningIcon from './icons/WarningIcon';
 import BrainIcon from './icons/BrainIcon';
 import { autoSaveBatchDictations, SaveResult, BatchFolderInfo, isDriveConnected, subscribeToAuth } from '../services/googleDriveService';
-import { generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText } from '../services/docxService';
+import { generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText, formatImpressionOutput } from '../services/docxService';
 import { isClinicalProfileFinding, formatClinicalProfileText } from './ResultsDisplay';
 
 const BATCH_DRIVE_FOLDER_KEY = 'radiologyDictationBatchDriveFolder';
@@ -1544,8 +1544,9 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             acc.plain.push(tableToPlainText(tableLines));
             acc.html.push(parseMarkdownTable(tableLines));
           } else if (isImpression) {
-            acc.plain.push(`${title.toUpperCase()}\n${points.map(p => `• ${p}`).join('\n')}`);
-            acc.html.push(`<p><strong style="text-decoration: underline;">${title.toUpperCase()}</strong></p><ul>${points.map(p => `<li><strong>${p}</strong></li>`).join('')}</ul>`);
+            const imp = formatImpressionOutput(title, points);
+            acc.plain.push(imp.plain);
+            acc.html.push(imp.html);
           } else if (isStructured) {
             acc.plain.push([title, ...points].join('\n'));
             let htmlContent = isBold ? `<p><strong>${title}</strong></p>` : `<p>${title}</p>`;
@@ -1662,8 +1663,9 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
           plainText = tableToPlainText(tableLines);
           htmlText = parseMarkdownTable(tableLines);
         } else if (isImpression) {
-            plainText = `${title.toUpperCase()}\n${points.map(p => `• ${p}`).join('\n')}`;
-            htmlText = `<p><strong style="text-decoration: underline;">${title.toUpperCase()}</strong></p><ul>${points.map(p => `<li><strong>${p}</strong></li>`).join('')}</ul>`;
+            const imp = formatImpressionOutput(title, points);
+            plainText = imp.plain;
+            htmlText = imp.html;
         } else if (isStructured) {
             plainText = [title, ...points].join('\n');
             let htmlContent = isBold ? `<p><strong>${title}</strong></p>` : `<p>${title}</p>`;
@@ -1708,7 +1710,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
               return tableToPlainText(tableLines);
             }
             if (isImpression) {
-                return `${title.toUpperCase()}\n${points.map(p => `• ${p}`).join('\n')}`;
+                return formatImpressionOutput(title, points).plain;
             }
             if (isClinicalProfileFinding(cleanFinding)) {
                 return formatClinicalProfileText(cleanFinding);
@@ -1735,7 +1737,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
               return parseMarkdownTable(tableLines);
             }
             if (isImpression) {
-                return `<p><strong style="text-decoration: underline;">${title.toUpperCase()}</strong></p><ul>${points.map(p => `<li><strong>${p}</strong></li>`).join('')}</ul>`;
+                return formatImpressionOutput(title, points).html;
             }
             if (isClinicalProfileFinding(cleanFinding)) {
                 return `<p><em>${formatClinicalProfileText(cleanFinding)}</em></p>`;
@@ -1781,7 +1783,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                 const cleanFinding = f.replace(/BOLD::/g, '');
                 const { isStructured, title, points } = parseStructuredFinding(cleanFinding);
                 const isImpression = isStructured && title.trim().toUpperCase() === 'IMPRESSION:';
-                if (isImpression) return `${title.toUpperCase()}\n${points.map(p => `• ${p}`).join('\n')}`;
+                if (isImpression) return formatImpressionOutput(title, points).plain;
                 if (isClinicalProfileFinding(cleanFinding)) return formatClinicalProfileText(cleanFinding);
                 if (isStructured) return [title, ...points].join('\n');
                 if (cleanFinding.startsWith('*') && cleanFinding.endsWith('*')) return cleanFinding.slice(1, -1);
@@ -1794,7 +1796,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                 const { isStructured, title, points } = parseStructuredFinding(cleanFinding);
                 const isImpression = isStructured && title.trim().toUpperCase() === 'IMPRESSION:';
                 if (isTitle) return `<p style="text-align:center;"><strong><u>${cleanFinding}</u></strong></p>`;
-                if (isImpression) return `<p><strong style="text-decoration: underline;">${title.toUpperCase()}</strong></p><ul>${points.map(p => `<li><strong>${p}</strong></li>`).join('')}</ul>`;
+                if (isImpression) return formatImpressionOutput(title, points).html;
                 if (isClinicalProfileFinding(cleanFinding)) return `<p><em>${formatClinicalProfileText(cleanFinding)}</em></p>`;
                 if (isStructured) {
                   let htmlContent = isBold ? `<p><strong>${title}</strong></p>` : `<p>${title}</p>`;
@@ -3710,11 +3712,18 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                                             {isImpression ? (
                                                                                 <>
                                                                                     <span className="font-bold underline uppercase">{title}</span>
-                                                                                    <ul className="list-disc list-inside pl-4 mt-1">
-                                                                                        {points.map((point, i) => (
-                                                                                            <li key={i} className="font-bold">{point}</li>
-                                                                                        ))}
-                                                                                    </ul>
+                                                                                    <div className="mt-1 space-y-1">
+                                                                                        {points.map((point, i) => {
+                                                                                            const bulletMatch = point.match(/^[•\-\*]\s*(.+)/s);
+                                                                                            const hasBullet = !!bulletMatch;
+                                                                                            const cleanPt = bulletMatch ? bulletMatch[1].trim() : point.trim();
+                                                                                            return (
+                                                                                                <div key={i} className="font-bold">
+                                                                                                    {hasBullet ? `• ${cleanPt}` : cleanPt}
+                                                                                                </div>
+                                                                                            );
+                                                                                        })}
+                                                                                    </div>
                                                                                 </>
                                                                             ) : isTable ? (
                                                                                 renderBatchTableFinding(tableLines)

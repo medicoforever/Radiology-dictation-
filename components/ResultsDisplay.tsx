@@ -2559,10 +2559,12 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                             <span className="font-bold underline uppercase">{title}</span>
                             <div className="mt-1 space-y-1">
                                 {points.map((point, i) => {
-                                    const isLead = points.length === 1 || isSummaryLeadIn(point);
+                                    const bulletMatch = point.match(/^[•\-\*]\s*(.+)/s);
+                                    const hasBullet = !!bulletMatch;
+                                    const cleanPt = bulletMatch ? bulletMatch[1].trim() : point.trim();
                                     return (
                                         <div key={i} className="font-bold">
-                                            {isLead ? point : `• ${point}`}
+                                            {hasBullet ? `• ${cleanPt}` : cleanPt}
                                         </div>
                                     );
                                 })}

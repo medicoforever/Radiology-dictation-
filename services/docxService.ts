@@ -471,8 +471,9 @@ export function isSummaryLeadIn(text: string): boolean {
 
 /**
  * Formats impression output with exact matching font style (<p> tags matching body paragraphs)
- * and smart bulleting: single-line or summary lead-in lines start at start of row (no bullet),
- * while multiple individual findings are kept in bullets.
+ * and smart bulleting guided directly by the LLM prompt:
+ * - Single-Line / Lead-In Summaries: Statements such as "findings are s/o..." or single normal summary sentences start flush with the beginning of the line without any bullet point.
+ * - Discrete / Multi-Point Findings: When the impression consists of 2 or more discrete clinical findings, each individual finding is cleanly formatted with bullet points (• Point 1, • Point 2) starting from the left margin.
  */
 export function formatImpressionOutput(title: string, points: string[]): { plain: string; html: string } {
   const cleanTitle = title.trim().toUpperCase() || 'IMPRESSION:';
@@ -488,24 +489,19 @@ export function formatImpressionOutput(title: string, points: string[]): { plain
   const plainLines = [cleanTitle];
   const htmlParagraphs = [`<p><strong style="text-decoration: underline;">${cleanTitle}</strong></p>`];
 
-  // If only 1 item in impression: NEVER bullet! Start from start of row itself
-  if (cleanPoints.length === 1) {
-    const pt = cleanPoints[0];
-    plainLines.push(pt);
-    htmlParagraphs.push(`<p><strong>${escapeHtml(pt)}</strong></p>`);
-  } else {
-    cleanPoints.forEach(pt => {
-      if (isSummaryLeadIn(pt)) {
-        // Starts from start of row itself without bullet
-        plainLines.push(pt);
-        htmlParagraphs.push(`<p><strong>${escapeHtml(pt)}</strong></p>`);
-      } else {
-        // Individual findings: keep in bullets
-        plainLines.push(`• ${pt}`);
-        htmlParagraphs.push(`<p><strong>• ${escapeHtml(pt)}</strong></p>`);
-      }
-    });
-  }
+  cleanPoints.forEach(pt => {
+    // Check if the finding starts with a bullet symbol (•, -, *)
+    const bulletMatch = pt.match(/^[•\-\*]\s*(.+)/s);
+    if (bulletMatch) {
+      const cleanBulletText = bulletMatch[1].trim();
+      plainLines.push(`• ${cleanBulletText}`);
+      htmlParagraphs.push(`<p><strong>• ${escapeHtml(cleanBulletText)}</strong></p>`);
+    } else {
+      // Starts flush with the beginning of the line without any bullet point
+      plainLines.push(pt);
+      htmlParagraphs.push(`<p><strong>${escapeHtml(pt)}</strong></p>`);
+    }
+  });
 
   return {
     plain: plainLines.join('\n'),

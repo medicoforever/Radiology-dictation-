@@ -130,7 +130,10 @@ Follow these strict instructions to produce a clean and accurate report:
         - List unrelated findings as separate points. For example, hepatomegaly and splenomegaly should be separate points if not related to a primary diagnosis.
         - The impression must NOT contain any numerical values or measurements.
          -  If clinically relevant, you may add concluding phrases like "likely infective etiology" or "likely inflammatory etiology" or "likely neoplastic etiology” or “likely reactive” or “suggested clinical correlation/ review as indicated” or similar phrases. Avoid vague, non-committal conclusions when a more specific diagnosis is possible.
-    d. Format this new, AI-generated impression using the structured format described in rule #8 (starting with "IMPRESSION:###..."). Add this generated impression as the last item in the "findings" array.
+    d. **Smart Bullet Formatting in Impression**:
+        - Single-Line / Lead-In Summaries: Statements such as "findings are s/o...", narrative summary paragraphs, or single normal summary sentences now start flush with the beginning of the line without any bullet point (e.g. "IMPRESSION:###Normal study without acute intracranial abnormality." or "IMPRESSION:###Findings are s/o acute appendicitis.").
+        - Discrete / Multi-Point Findings: When the impression consists of 2 or more discrete clinical findings, each individual finding is cleanly formatted with bullet points (• Point 1, • Point 2) starting from the left margin (e.g. "IMPRESSION:###• Finding 1###• Finding 2").
+    e. Format this new, AI-generated impression using the structured format described in rule #8 (starting with "IMPRESSION:###..."). Add this generated impression as the last item in the "findings" array.
 10. **Multi-Patient Dictation & Report Splitting**:
     - If the audio dictation contains findings or reports for more than one patient in a single recording—whether explicitly spoken (e.g., "Next patient", "Second patient", "Patient 2:", "New patient") or implicitly indicated through logical reasoning and context (such as a shift to a new patient name/ID, age/gender, new clinical profile, or a distinct new scan study)—you MUST logically split the dictation into separate, distinct reports for each patient.
     - Structure each patient's report completely with its own study title, Clinical Profile (if dictated), findings, and IMPRESSION.
@@ -205,7 +208,10 @@ STRICT INSTRUCTIONS:
         - List unrelated findings as separate points.
         - The impression must NOT contain any numerical values or measurements.
         -  If clinically relevant, you may add concluding phrases like "likely infective etiology" or "likely inflammatory etiology" or "likely neoplastic etiology” or “likely reactive” or “suggested clinical correlation/ review as indicated” or similar phrases. Avoid vague, non-committal conclusions when a more specific diagnosis is possible.
-    b. The entire impression MUST be a single string formatted with a title and points separated by '###'. It must start with "IMPRESSION:". For example: "IMPRESSION:###Hepatomegaly.###Splenomegaly."
+    b. **Smart Bullet Formatting in Impression**:
+        - Single-Line / Lead-In Summaries: Statements such as "findings are s/o...", narrative summary paragraphs, or single normal summary sentences now start flush with the beginning of the line without any bullet point (e.g. "IMPRESSION:###Normal study without acute abnormality.").
+        - Discrete / Multi-Point Findings: When the impression consists of 2 or more discrete clinical findings, each individual finding is cleanly formatted with bullet points (• Point 1, • Point 2) starting from the left margin (e.g. "IMPRESSION:###• Point 1###• Point 2").
+    c. The entire impression MUST be a single string formatted with a title and points separated by '###'. It must start with "IMPRESSION:". For example: "IMPRESSION:###• Hepatomegaly.###• Splenomegaly."
 
 12. **Multi-Patient Dictation & Report Splitting**:
     - If the user dictates findings for more than one patient in a single audio recording (explicitly via "next patient", "patient 2", etc., or implicitly via logical reasoning and context shifts like new patient names/IDs or different study procedures), you MUST generate separate report structures for each patient.
@@ -360,7 +366,10 @@ Your primary task is to:
    - Combine multiple related findings, including all their key descriptors, into single, coherent impression points.
    - List unrelated findings as separate points.
    - The impression must NOT contain any numerical values or measurements.
-   - The entire impression MUST be a single string starting with "IMPRESSION:" and with points separated by '###'. (e.g., "IMPRESSION:###No significant neuroparenchymal abnormality noted." or "IMPRESSION:###Patches of contusion in the right anterior temporal region.").
+   - **Smart Bullet Formatting in Impression**:
+     * Single-Line / Lead-In Summaries: Statements such as "findings are s/o...", narrative summary paragraphs, or single normal summary sentences now start flush with the beginning of the line without any bullet point (e.g. "IMPRESSION:###Normal study without acute abnormality.").
+     * Discrete / Multi-Point Findings: When the impression consists of 2 or more discrete clinical findings, each individual finding is cleanly formatted with bullet points (• Point 1, • Point 2) starting from the left margin (e.g. "IMPRESSION:###• Finding 1###• Finding 2").
+   - The entire impression MUST be a single string starting with "IMPRESSION:" and with points separated by '###'. (e.g., "IMPRESSION:###No significant neuroparenchymal abnormality noted." or "IMPRESSION:###• Patches of contusion in the right anterior temporal region.").
 7. **Specific Transcription Rules for Dictated Parts**:
    - Transcribe "few" exactly as "few", not "a few".
    - Replace the dictated word "query" with a question mark symbol "?".

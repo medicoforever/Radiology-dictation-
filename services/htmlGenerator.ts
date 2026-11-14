@@ -1,4 +1,4 @@
-import { parseMarkdownTable, cleanClinicalProfileText, isTableRowFinding } from './docxService';
+import { parseMarkdownTable, cleanClinicalProfileText, isTableRowFinding, formatImpressionOutput } from './docxService';
 
 // A batch type used for report generation
 interface ReportBatch {
@@ -126,8 +126,9 @@ const getEmbeddedScript = () => `
             } else if (isImpression) {
                 const title = parts[0];
                 const points = parts.slice(1);
-                plainText = \`\${title.toUpperCase()}\\n\${points.map(p => \`• \${p}\`).join('\\n')}\`;
-                htmlText = \`<p><strong style="text-decoration: underline;">\${title.toUpperCase()}</strong></p><ul>\${points.map(p => \`<li><strong>\${p}</strong></li>\`).join('')}</ul>\`;
+                const imp = formatImpressionOutput(title, points);
+                plainText = imp.plain;
+                htmlText = imp.html;
             } else if (isStructured) {
                 plainText = parts.join('\\n');
                 let htmlContent = isBold ? \`<p><strong>\${parts[0]}</strong></p>\` : \`<p>\${parts[0]}</p>\`;
@@ -311,7 +312,12 @@ const getEmbeddedScript = () => `
                     findingEl.dataset.findingRaw = encodeURIComponent((isBold ? 'BOLD::' : '') + profText);
                 } else if (isImpression) {
                     textEl.className = 'finding-text text-slate-700 cursor-pointer';
-                    textEl.innerHTML = \`<strong class="underline uppercase">\${newParts[0]}</strong><ul class="list-disc list-inside pl-4 mt-1">\${newParts.slice(1).map(p => \`<li class="font-bold">\${p}</li>\`).join('')}</ul>\`;
+                    textEl.innerHTML = \`<strong class="underline uppercase">\${newParts[0]}</strong><div class="mt-1 space-y-1">\${newParts.slice(1).map(p => {
+                        const m = p.match(/^[•\\-\\*]\\s*(.+)/s);
+                        const hasB = !!m;
+                        const cText = m ? m[1].trim() : p.trim();
+                        return \`<div class="font-bold">\${hasB ? \`• \${cText}\` : cText}</div>\`;
+                    }).join('')}</div>\`;
                 } else if (newParts.length > 1) {
                     textEl.className = 'finding-text text-slate-700 cursor-pointer';
                     textEl.innerHTML = \`<strong class="font-bold">\${newParts[0]}</strong>\${newParts.slice(1).map(p => \`<span class="block font-semibold">\${p}</span>\`).join('')}\`;
@@ -1214,9 +1220,14 @@ const renderFindingsList = (findings: string[], batchId: string): string => {
                 } else if (isImpression) {
                     findingContent = `
                         <strong class="underline uppercase">${title}</strong>
-                        <ul class="list-disc list-inside pl-4 mt-1">
-                            ${points.map(p => `<li class="font-bold">${p}</li>`).join('')}
-                        </ul>
+                        <div class="mt-1 space-y-1">
+                            ${points.map(p => {
+                                const m = p.match(/^[•\-\*]\s*(.+)/s);
+                                const hasB = !!m;
+                                const cText = m ? m[1].trim() : p.trim();
+                                return `<div class="font-bold">${hasB ? `• ${cText}` : cText}</div>`;
+                            }).join('')}
+                        </div>
                     `;
                 } else if (isStructured) {
                     findingContent = `<strong class="font-bold">${title}</strong>${points.map(p => `<span class="block font-semibold">${p}</span>`).join('')}`;

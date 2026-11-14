@@ -125,7 +125,9 @@ async function blobToBase64(blob: Blob): Promise<string> {
  */
 export function findTemplateByFuzzyName(query?: string): BuiltInTemplateItem | null {
   if (!query || !query.trim()) return null;
-  const q = query.toLowerCase().trim();
+  let q = query.toLowerCase().trim();
+  // Normalize common spoken modality abbreviations
+  q = q.replace(/\bmr\b/g, 'mri').replace(/\bcat\b/g, 'ct').replace(/\bus\b/g, 'ultrasound').replace(/\bxray\b/g, 'x-ray');
 
   // 1. Exact or startsWith match
   const exact = ALL_RADNITO_TEMPLATES.find(
@@ -140,17 +142,27 @@ export function findTemplateByFuzzyName(query?: string): BuiltInTemplateItem | n
   if (direct) return direct;
 
   // 3. Keyword matching (modality + anatomy)
-  const tokens = q.split(/\s+/).filter(tok => tok.length > 2);
+  const tokens = q.split(/\s+/).filter(tok => tok.length >= 2);
   let bestMatch: BuiltInTemplateItem | null = null;
   let maxScore = 0;
 
   for (const t of ALL_RADNITO_TEMPLATES) {
     const tName = t.name.toLowerCase();
     const tDesc = (t.description || '').toLowerCase();
+    const tMod = (t.modality || '').toLowerCase();
     let score = 0;
     for (const tok of tokens) {
-      if (tName.includes(tok)) score += 3;
-      else if (tDesc.includes(tok)) score += 1;
+      if (tok === 'mri' || tok === 'mr') {
+        if (tMod === 'mr' || tName.includes('mri')) score += 5;
+      } else if (tok === 'ct') {
+        if (tMod === 'ct' || tName.includes('ct') || tName.includes('c.t.')) score += 5;
+      } else if (tok === 'contrast') {
+        if (tName.includes('contrast')) score += 4;
+      } else if (tName.includes(tok)) {
+        score += 3;
+      } else if (tDesc.includes(tok)) {
+        score += 1;
+      }
     }
     if (score > maxScore) {
       maxScore = score;
@@ -200,6 +212,19 @@ YOUR CORE TASKS:
    - The user may upload reference files (such as scans, prior reports, images, documents) and optionally assign names/labels to them or refer to them as "first uploaded file", "File 1", "Brain MRI scan", etc.
    - You MUST NOT read or parse the file contents yourself; your job is strictly to assign/hand over the referenced file(s) to the appropriate patient report(s) based on what the doctor dictates in the audio (e.g. "attach the first uploaded file to Patient 1", "use the Brain MRI for Patient 2", "attach all files to batch").
    - Set "attachedFileIndices" in the patient item to an array of 1-based indices (e.g., [1, 2]) of any files to hand over.
+
+8. NATURAL LANGUAGE CLINICAL PATHOLOGY UNDERSTANDING & HIGH-LEVEL SYNTHESIS (CRITICAL ANTI-LITERAL RULE):
+   - The radiologist may dictate high-level clinical shorthand, diagnostic directives, or pathology generation requests (e.g., "for a patient create 1 batch dictation and add detailed glioblastoma findings and merge it with Mr brain template", "add acute right MCA infarct findings", "add acute appendicitis", "add right slipped capital femoral epiphysis findings", "add whole body trauma findings with subarachnoid hemorrhage and skull fractures").
+   - CRITICAL ANTI-LITERAL RULE: NEVER insert meta-instruction phrases like "detailed glioblastoma findings" or "add glioblastoma findings" verbatim into the patient's findings array or report body!
+   - When the doctor requests or mentions a clinical entity/pathology:
+     * Intelligently interpret the pathology, imaging modality, and anatomical site.
+     * Synthesize realistic, authoritative, comprehensive, anatomically detailed line-by-line radiological findings corresponding to that pathology and modality (e.g. for glioblastoma in MR Brain: describe the thick irregular peripheral ring enhancement with central necrosis on post-contrast T1, extensive perilesional T2/FLAIR vasogenic edema along white matter tracts, multiple internal foci of microhemorrhage and neovascularity on SWI, restricted diffusion along the solid hypercellular rim on DWI/ADC, mass effect with sulcal effacement, ventricular compression, midline shift, and uncal/subfalcine herniation).
+     * If a template is requested (e.g. "Mr brain template", "CT Brain Trauma", "Chest PA View"), set "targetTemplateName" to the matching template.
+     * Also include an authoritative, clinical IMPRESSION adhering to the Smart Bullet Formatting in Impression rules.
+
+9. SMART BULLET FORMATTING IN IMPRESSION:
+   - Single-Line / Lead-In Summaries: Statements such as "findings are s/o...", narrative summary paragraphs, or single normal summary sentences now start flush with the beginning of the line without any bullet point (e.g. "IMPRESSION:###Normal study without acute abnormality." or "IMPRESSION:###Findings are s/o acute appendicitis.").
+   - Discrete / Multi-Point Findings: When the impression consists of 2 or more discrete clinical findings, each individual finding is cleanly formatted with bullet points (• Point 1, • Point 2) starting from the left margin (e.g. "IMPRESSION:###• Point 1###• Point 2").
 
 OUTPUT JSON FORMAT:
 Respond with ONLY valid JSON adhering to this schema:
