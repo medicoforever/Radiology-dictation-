@@ -233,8 +233,25 @@ YOUR CORE TASKS:
    - ANTI-LITERAL RULE: In either case, NEVER insert conversational meta-instruction phrases like "detailed glioblastoma findings by yourself" or "add glioblastoma findings" verbatim into the patient's findings array or report body!
 
 9. SMART BULLET FORMATTING IN IMPRESSION:
+   - Explicit No-Bullet Directives: If the radiologist commands a point to be added without bullet (e.g. "add this point without bullet in impression", "without bullet", "no bullet"), that point MUST start flush from the left margin WITHOUT ANY bullet symbol (no '•', '-', or '*').
    - Single-Line / Lead-In Summaries: Statements such as "findings are s/o...", narrative summary paragraphs, or single normal summary sentences now start flush with the beginning of the line without any bullet point (e.g. "IMPRESSION:###Normal study without acute abnormality." or "IMPRESSION:###Findings are s/o acute appendicitis.").
-   - Discrete / Multi-Point Findings: When the impression consists of 2 or more discrete clinical findings, each individual finding is cleanly formatted with bullet points (• Point 1, • Point 2) starting from the left margin (e.g. "IMPRESSION:###• Point 1###• Point 2").
+   - Discrete / Multi-Point Findings: When the impression consists of 2 or more discrete clinical findings, each individual finding is cleanly formatted with bullet points (• Point 1, • Point 2) starting from the left margin, EXCEPT for points instructed without bullets.
+
+10. TECHNIQUE & PROTOCOL DIRECTIVE:
+   - If the template or report lacks a Technique / Protocol section or sentence, do NOT add or invent "Standard imaging protocol was performed." or any placeholder protocol line. Omit it completely unless explicitly present in the template or dictated by the radiologist.
+
+11. CLINICAL PROFILE FORMATTING & SPOKEN STYLE DIRECTIVES:
+   - Default: format clinical profile in single asterisks (*Clinical Profile: ...*), which renders as italic alone.
+   - If the doctor dictates formatting commands for Clinical Profile (e.g., "keep clinical profile sentence underlined bold and unitalic", "bold and underline clinical profile", "make clinical profile not italic", "underline clinical profile"):
+     * Obey the requested style formatting!
+     * Prefix the Clinical Profile line with style tags: e.g. [STYLE:bold,underline,unitalic]*Clinical Profile: ...* or BOLD::UNDERLINE::UNITALIC::*Clinical Profile: ...*.
+     * Strip out the conversational command phrase completely from the clinical history text!
+
+12. IMPRESSION & SPOKEN NO-BULLET DIRECTIVES:
+   - If the doctor dictates to add a point without bullet in impression (e.g. "add this point without bullet in impression", "in impression add without bullet: ...", "no bullet for this point"):
+     * Incorporate the point into the IMPRESSION.
+     * That specific point MUST start flush with the beginning of the line without any bullet symbol (no '•', '-', or '*').
+     * Remove the spoken instruction phrase like "add this point without bullet in impression" so only the clinical observation appears.
 
 OUTPUT JSON FORMAT:
 Respond with ONLY valid JSON adhering to this schema:

@@ -2555,16 +2555,30 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                         <>
                             <span className="font-bold underline uppercase">{title}</span>
                             <div className="mt-1 space-y-1">
-                                {points.map((point, i) => {
-                                    const bulletMatch = point.match(/^[•\-\*]\s*(.+)/s);
-                                    const hasBullet = !!bulletMatch;
-                                    const cleanPt = bulletMatch ? bulletMatch[1].trim() : point.trim();
-                                    return (
-                                        <div key={i} className="font-bold">
-                                            {hasBullet ? `• ${cleanPt}` : cleanPt}
-                                        </div>
-                                    );
-                                })}
+                                            {points.map((point, i) => {
+                                                const isExplicitNoBullet = /^\[NO_BULLET\]\s*/i.test(point) ||
+                                                    /^NO_BULLET::\s*/i.test(point) ||
+                                                    /^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i.test(point);
+                                                let cleanPt = point
+                                                    .replace(/^\[NO_BULLET\]\s*/i, '')
+                                                    .replace(/^NO_BULLET::\s*/i, '')
+                                                    .replace(/^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i, '')
+                                                    .trim();
+                                                const existingBulletMatch = cleanPt.match(/^[•\-\*]\s*(.+)/s);
+                                                const textWithoutBullet = existingBulletMatch ? existingBulletMatch[1].trim() : cleanPt;
+                                                if (isExplicitNoBullet || isPureCorrelationOrRecommendation(textWithoutBullet) || /^findings\s+(?:are\s+)?s\/?o(?:\s*:)?$/i.test(textWithoutBullet)) {
+                                                    return (
+                                                        <div key={i} className="font-bold">
+                                                            {textWithoutBullet}
+                                                        </div>
+                                                    );
+                                                }
+                                                return (
+                                                    <div key={i} className="font-bold">
+                                                        • {textWithoutBullet}
+                                                    </div>
+                                                );
+                                            })}
                             </div>
                         </>
                     ) : isStructured ? (

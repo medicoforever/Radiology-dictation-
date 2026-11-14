@@ -314,10 +314,16 @@ const getEmbeddedScript = () => `
                 } else if (isImpression) {
                     textEl.className = 'finding-text text-slate-700 cursor-pointer';
                     textEl.innerHTML = \`<strong class="underline uppercase">\${newParts[0]}</strong><div class="mt-1 space-y-1">\${newParts.slice(1).map(p => {
-                        const m = p.match(/^[•\\-\\*]\\s*(.+)/s);
-                        const hasB = !!m;
-                        const cText = m ? m[1].trim() : p.trim();
-                        return \`<div class="font-bold">\${hasB ? \`• \${cText}\` : cText}</div>\`;
+                        const cleanP = p.replace(/^BOLD::/i, '').trim();
+                        const isPureCorr = /^(?:suggested\\s+)?clinical\\s+correlation(?:\\s*[\\/\\&,]\\s*review)?(?:\\s+as\\s+indicated)?\\.?$/i.test(cleanP.replace(/[.]+$/, '')) ||
+                                           /^suggested\\s+(?:clinical\\s+correlation|review(?:\\s+as\\s+indicated)?)\\.?$/i.test(cleanP.replace(/[.]+$/, ''));
+                        const isLeadIn = /^findings\\s+(?:are\\s+)?s\\/?o(?:\\s*:)?$/i.test(cleanP);
+                        const m = cleanP.match(/^[•\\-\\*]\\s*(.+)/s);
+                        const cText = m ? m[1].trim() : cleanP;
+                        if (isPureCorr || isLeadIn) {
+                            return \`<div class="font-bold">\${cText}</div>\`;
+                        }
+                        return \`<div class="font-bold">• \${cText}</div>\`;
                     }).join('')}</div>\`;
                 } else if (newParts.length > 1) {
                     textEl.className = 'finding-text text-slate-700 cursor-pointer';
@@ -1225,10 +1231,16 @@ const renderFindingsList = (findings: string[], batchId: string): string => {
                         <strong class="underline uppercase">${title}</strong>
                         <div class="mt-1 space-y-1">
                             ${points.map(p => {
-                                const m = p.match(/^[•\-\*]\s*(.+)/s);
-                                const hasB = !!m;
-                                const cText = m ? m[1].trim() : p.trim();
-                                return `<div class="font-bold">${hasB ? `• ${cText}` : cText}</div>`;
+                                const cleanP = p.replace(/^BOLD::/i, '').trim();
+                                const isPureCorr = /^(?:suggested\s+)?clinical\s+correlation(?:\s*[\/\&,]\s*review)?(?:\s+as\s+indicated)?\.?$/i.test(cleanP.replace(/[.]+$/, '')) ||
+                                                   /^suggested\s+(?:clinical\s+correlation|review(?:\s+as\s+indicated)?)\.?$/i.test(cleanP.replace(/[.]+$/, ''));
+                                const isLeadIn = /^findings\s+(?:are\s+)?s\/?o(?:\s*:)?$/i.test(cleanP);
+                                const m = cleanP.match(/^[•\-\*]\s*(.+)/s);
+                                const cText = m ? m[1].trim() : cleanP;
+                                if (isPureCorr || isLeadIn) {
+                                    return `<div class="font-bold">${cText}</div>`;
+                                }
+                                return `<div class="font-bold">• ${cText}</div>`;
                             }).join('')}
                         </div>
                     `;

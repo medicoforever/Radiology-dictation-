@@ -317,7 +317,7 @@ export async function parseDocx(fileOrBlob: File | Blob): Promise<ParsedDocxResu
 }
 
 export function cleanClinicalProfileText(text: string): string {
-  let inner = text.replace(/^BOLD::/i, '').trim();
+  let inner = text.replace(/^BOLD::/i, '').replace(/^UNDERLINE::/i, '').replace(/^UNITALIC::/i, '').replace(/\[STYLE:[^\]]+\]/i, '').trim();
   inner = inner.replace(/^[*_\s]+/, '');
   inner = inner.replace(/[*_\s]+$/, '');
   inner = inner.replace(/\.\*+$/, '.');
@@ -328,6 +328,83 @@ export function cleanClinicalProfileText(text: string): string {
   inner = inner.replace(/[*_\s]+$/, '').trim();
   inner = inner.replace(/^[*_\s]+/, '').trim();
   return inner.trim();
+}
+
+export interface ClinicalProfileStyle {
+  text: string;
+  bold: boolean;
+  underline: boolean;
+  italic: boolean;
+}
+
+export function isClinicalProfileFinding(text: string): boolean {
+  if (!text || typeof text !== 'string') return false;
+  const clean = text
+    .replace(/^BOLD::/i, '')
+    .replace(/^UNDERLINE::/i, '')
+    .replace(/^UNITALIC::/i, '')
+    .replace(/\[STYLE:[^\]]+\]/i, '')
+    .replace(/^[*_\s]+|[*_\s]+$/g, '')
+    .trim();
+  return /^clinical\s*(?:profile|history):/i.test(clean);
+}
+
+export function parseClinicalProfileStyle(rawText: string): ClinicalProfileStyle {
+  if (!rawText) return { text: 'Clinical Profile:', bold: false, underline: false, italic: true };
+
+  let str = rawText.trim();
+  let bold = false;
+  let underline = false;
+  let italic = true; // default is italic alone
+
+  // Check explicit markers/tags
+  if (/BOLD::/i.test(str)) { bold = true; str = str.replace(/BOLD::/gi, ''); }
+  if (/UNDERLINE::/i.test(str)) { underline = true; str = str.replace(/UNDERLINE::/gi, ''); }
+  if (/UNITALIC::|NOITALIC::|NOTITALIC::/i.test(str)) { italic = false; str = str.replace(/(?:UNITALIC|NOITALIC|NOTITALIC)::/gi, ''); }
+
+  // Check [STYLE:...] tag
+  const styleTagMatch = str.match(/\[STYLE:([^\]]+)\]/i);
+  if (styleTagMatch) {
+    const tagContent = styleTagMatch[1].toLowerCase();
+    if (tagContent.includes('bold')) bold = true;
+    if (tagContent.includes('underline')) underline = true;
+    if (tagContent.includes('unitalic') || tagContent.includes('noitalic') || tagContent.includes('notitalic')) italic = false;
+    str = str.replace(/\[STYLE:[^\]]+\]/gi, '');
+  }
+
+  // Check HTML tags
+  if (/<strong>|<b>/i.test(str)) bold = true;
+  if (/<u>/i.test(str)) underline = true;
+
+  // Spoken directives matching:
+  // e.g. "keep clinical profile sentence underlined bold and unitalic", "bold and underlined clinical profile", etc.
+  const spokenDirectiveRegex = /(?:,\s*)?(?:please\s*)?(?:keep\s+)?(?:clinical\s*profile\s*(?:sentence\s*)?)?(?:to\s+be\s+)?(?:underlined|underline|bold|bolded|unitalic|un-italic|not\s+italic|non-italic|no\s+italic|italic)(?:[\s,]+(?:and\s+)?(?:underlined|underline|bold|bolded|unitalic|un-italic|not\s+italic|non-italic|no\s+italic|italic))*(?:\s*(?:like\s+that|please))?/i;
+
+  const match = str.match(spokenDirectiveRegex);
+  if (match && match[0].trim().length > 6) {
+    const directiveStr = match[0].toLowerCase();
+    if (directiveStr.includes('bold')) bold = true;
+    if (directiveStr.includes('underline') || directiveStr.includes('underlined')) underline = true;
+    if (directiveStr.includes('unitalic') || directiveStr.includes('un-italic') || directiveStr.includes('not italic') || directiveStr.includes('non-italic') || directiveStr.includes('no italic')) {
+      italic = false;
+    }
+    str = str.replace(spokenDirectiveRegex, '');
+  }
+
+  // Also clean up any lingering conversational directive remnants
+  str = str.replace(/keep\s+clinical\s+profile\s+sentence[^\n.]*/gi, '')
+           .replace(/(?:underlined|bold|unitalic|not italic)\s+like\s+that/gi, '');
+
+  let cleanText = cleanClinicalProfileText(str);
+  return { text: cleanText, bold, underline, italic };
+}
+
+export function clinicalProfileStyleToHtml(style: ClinicalProfileStyle): string {
+  let inner = escapeHtml(style.text);
+  if (style.underline) inner = `<u>${inner}</u>`;
+  if (style.bold) inner = `<strong>${inner}</strong>`;
+  if (style.italic) inner = `<em>${inner}</em>`;
+  return `<p>${inner}</p>`;
 }
 
 export function parseTableRow(line: string): string[] {
@@ -475,6 +552,15 @@ export function isSummaryLeadIn(text: string): boolean {
  * - Single-Line / Lead-In Summaries: Statements such as "findings are s/o..." or single normal summary sentences start flush with the beginning of the line without any bullet point.
  * - Discrete / Multi-Point Findings: When the impression consists of 2 or more discrete clinical findings, each individual finding is cleanly formatted with bullet points (• Point 1, • Point 2) starting from the left margin.
  */
+export function isPureCorrelationOrRecommendation(str: string): boolean {
+  if (!str) return false;
+  const s = str.trim().replace(/[.]+$/, '').trim();
+  return /^(?:suggested\s+)?clinical\s+correlation(?:\s*[\/\&,]\s*review)?(?:\s+as\s+indicated)?$/i.test(s) ||
+         /^suggested\s+(?:clinical\s+correlation|review(?:\s+as\s+indicated)?)$/i.test(s) ||
+         /^(?:please\s+)?correlate\s+clinically$/i.test(s) ||
+         /^(?:clinical\s+review|clinical\s+follow-up)(?:\s+as\s+indicated)?$/i.test(s);
+}
+
 export function formatImpressionOutput(title: string, points: string[]): { plain: string; html: string } {
   const cleanTitle = title.trim().toUpperCase() || 'IMPRESSION:';
   const cleanPoints = points.map(p => p.replace(/^BOLD::/i, '').trim()).filter(Boolean);
@@ -490,17 +576,46 @@ export function formatImpressionOutput(title: string, points: string[]): { plain
   const htmlParagraphs = [`<p><strong style="text-decoration: underline;">${cleanTitle}</strong></p>`];
 
   cleanPoints.forEach(pt => {
-    // Check if the finding starts with a bullet symbol (•, -, *)
-    const bulletMatch = pt.match(/^[•\-\*]\s*(.+)/s);
-    if (bulletMatch) {
-      const cleanBulletText = bulletMatch[1].trim();
-      plainLines.push(`• ${cleanBulletText}`);
-      htmlParagraphs.push(`<p><strong>• ${escapeHtml(cleanBulletText)}</strong></p>`);
-    } else {
-      // Starts flush with the beginning of the line without any bullet point
-      plainLines.push(pt);
-      htmlParagraphs.push(`<p><strong>${escapeHtml(pt)}</strong></p>`);
+    // 1. Explicit no-bullet directive
+    const isExplicitNoBullet = /^\[NO_BULLET\]\s*/i.test(pt) ||
+      /^NO_BULLET::\s*/i.test(pt) ||
+      /^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i.test(pt);
+
+    let cleanPt = pt
+      .replace(/^\[NO_BULLET\]\s*/i, '')
+      .replace(/^NO_BULLET::\s*/i, '')
+      .replace(/^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i, '')
+      .trim();
+
+    // Strip leading bullet symbol if already present to inspect raw content
+    const existingBulletMatch = cleanPt.match(/^[•\-\*]\s*(.+)/s);
+    const textWithoutBullet = existingBulletMatch ? existingBulletMatch[1].trim() : cleanPt;
+
+    if (isExplicitNoBullet) {
+      plainLines.push(textWithoutBullet);
+      htmlParagraphs.push(`<p><strong>${escapeHtml(textWithoutBullet)}</strong></p>`);
+      return;
     }
+
+    // 2. Standalone correlation sentence alone on its own separate row -> KEPT WITHOUT BULLET
+    const isStandaloneCorrelation = isPureCorrelationOrRecommendation(textWithoutBullet);
+    if (isStandaloneCorrelation) {
+      plainLines.push(textWithoutBullet);
+      htmlParagraphs.push(`<p><strong>${escapeHtml(textWithoutBullet)}</strong></p>`);
+      return;
+    }
+
+    // 3. Standalone lead-in summary like "Findings are s/o:"
+    const isLeadIn = /^findings\s+(?:are\s+)?s\/?o(?:\s*:)?$/i.test(textWithoutBullet);
+    if (isLeadIn) {
+      plainLines.push(textWithoutBullet);
+      htmlParagraphs.push(`<p><strong>${escapeHtml(textWithoutBullet)}</strong></p>`);
+      return;
+    }
+
+    // 4. Clinical finding (even with "Suggested clinical correlation..." appended) -> ALWAYS INCLUDE BULLET POINT
+    plainLines.push(`• ${textWithoutBullet}`);
+    htmlParagraphs.push(`<p><strong>• ${escapeHtml(textWithoutBullet)}</strong></p>`);
   });
 
   return {
@@ -658,10 +773,15 @@ export function findingsToStandardHtml(findings: string[]): { html: string; plai
     if (!clean) continue;
 
     // 1. Clinical profile check
-    if (/^\*?\s*Clinical\s*(Profile|History):/i.test(clean)) {
-      const prof = cleanClinicalProfileText(clean);
-      plainParagraphs.push(prof);
-      htmlParagraphs.push(`<p><em>${escapeHtml(prof)}</em></p>`);
+    if (isClinicalProfileFinding(clean)) {
+      const profStyle = parseClinicalProfileStyle(clean);
+      plainParagraphs.push(profStyle.text);
+      htmlParagraphs.push(clinicalProfileStyleToHtml(profStyle));
+      continue;
+    }
+
+    // 1.5 Omit generic technique placeholder if template lacked technique
+    if (/^(?:Standard imaging protocol was performed|Standard protocol was followed)\.?$/i.test(clean)) {
       continue;
     }
 
@@ -833,20 +953,17 @@ export function findingsToRichHtml(findings: string[]): string {
         let profText = matchGlued[2].trim().replace(/^BOLD::/i, '').trim();
         profText = profText ? cleanClinicalProfileText(`Clinical Profile: ${profText}`) : '';
         htmlParts.push(`<h1 style="margin-bottom: 14px; font-size: 20px; font-weight: bold; text-align: center; text-decoration: underline; color: #0f172a; text-transform: uppercase;">${escapeHtml(titleText)}</h1>`);
-        if (profText) {
-          htmlParts.push(`<p class="clinical-profile" style="margin-bottom: 14px; font-style: italic; color: #334155;"><em><strong>${escapeHtml(profText)}</strong></em></p>`);
-        } else {
-          htmlParts.push(`<p class="clinical-profile" style="margin-bottom: 14px; font-style: italic; color: #334155;"><em><strong>Clinical Profile: Routine evaluation.</strong></em></p>`);
-        }
+        const profStyle = parseClinicalProfileStyle(profText || 'Clinical Profile: Routine evaluation.');
+        htmlParts.push(`<p class="clinical-profile" style="margin-bottom: 14px; color: #334155;">${clinicalProfileStyleToHtml(profStyle).replace(/^<p>|<\/p>$/g, '')}</p>`);
         isFirst = false;
         continue;
       }
     }
 
     // 1. Clinical profile line
-    if (/^\*?\s*Clinical\s*(Profile|History):/i.test(trimmed)) {
-      const inner = cleanClinicalProfileText(trimmed);
-      htmlParts.push(`<p class="clinical-profile" style="margin-bottom: 14px; font-style: italic; color: #334155;"><em><strong>${escapeHtml(inner)}</strong></em></p>`);
+    if (isClinicalProfileFinding(trimmed)) {
+      const profStyle = parseClinicalProfileStyle(trimmed);
+      htmlParts.push(`<p class="clinical-profile" style="margin-bottom: 14px; color: #334155;">${clinicalProfileStyleToHtml(profStyle).replace(/^<p>|<\/p>$/g, '')}</p>`);
       isFirst = false;
       continue;
     }
@@ -888,18 +1005,9 @@ export function findingsToRichHtml(findings: string[]): string {
 
     // 5. Impression section (starts with IMPRESSION:### or IMPRESSION:)
     if (trimmed.startsWith('IMPRESSION:')) {
-      const parts = trimmed.replace('IMPRESSION:', '').split('###').map(p => p.trim()).filter(Boolean);
-      let impressionHtml = `<div class="impression-section" style="margin-top: 20px; margin-bottom: 16px;">`;
-      impressionHtml += `<h3 style="margin: 0 0 8px 0; font-size: 16px; font-weight: bold; text-decoration: underline; text-transform: uppercase; color: #0f172a;">IMPRESSION:</h3>`;
-      if (parts.length > 0) {
-        impressionHtml += `<ul style="margin: 0; padding-left: 24px; color: #0f172a;">`;
-        for (const pt of parts) {
-          impressionHtml += `<li style="margin-bottom: 6px; font-weight: bold; line-height: 1.5;">${escapeHtml(pt)}</li>`;
-        }
-        impressionHtml += `</ul>`;
-      }
-      impressionHtml += `</div>`;
-      htmlParts.push(impressionHtml);
+      const parts = trimmed.replace(/^IMPRESSION:\s*/i, '').split('###').map(p => p.trim()).filter(Boolean);
+      const imp = formatImpressionOutput('IMPRESSION:', parts);
+      htmlParts.push(`<div class="impression-section" style="margin-top: 20px; margin-bottom: 16px;">${imp.html}</div>`);
       isFirst = false;
       continue;
     }
@@ -1870,15 +1978,17 @@ export async function generateDocxFromFindings(findings: string[], title = 'Radi
     }
 
     // Clinical profile
-    if (/^\*?\s*Clinical\s*(Profile|History):/i.test(raw)) {
-      const inner = cleanClinicalProfileText(raw);
+    if (isClinicalProfileFinding(raw)) {
+      const profStyle = parseClinicalProfileStyle(raw);
       paragraphs.push(
         new Paragraph({
           spacing: { before: 100, after: 120 },
           children: [
             new TextRun({
-              text: inner,
-              italics: true,
+              text: profStyle.text,
+              italics: profStyle.italic,
+              bold: profStyle.bold,
+              underline: profStyle.underline ? {} : undefined,
               font: 'Calibri',
               size: 22,
               color: '334155',

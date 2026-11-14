@@ -37,7 +37,7 @@ import { AVAILABLE_MODELS, REPORT_TEMPLATES, ReportTemplate } from '../constants
 import WarningIcon from './icons/WarningIcon';
 import BrainIcon from './icons/BrainIcon';
 import { autoSaveBatchDictations, SaveResult, BatchFolderInfo, isDriveConnected, subscribeToAuth } from '../services/googleDriveService';
-import { generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText, formatImpressionOutput, findingsToStandardHtml, isReportTitle, isAnatomicalSubheading } from '../services/docxService';
+import { generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText, formatImpressionOutput, findingsToStandardHtml, isPureCorrelationOrRecommendation, isReportTitle, isAnatomicalSubheading } from '../services/docxService';
 import { isClinicalProfileFinding, formatClinicalProfileText } from './ResultsDisplay';
 
 const BATCH_DRIVE_FOLDER_KEY = 'radiologyDictationBatchDriveFolder';
@@ -3640,12 +3640,26 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                                                     <span className="font-bold underline uppercase">{title}</span>
                                                                                     <div className="mt-1 space-y-1">
                                                                                         {points.map((point, i) => {
-                                                                                            const bulletMatch = point.match(/^[•\-\*]\s*(.+)/s);
-                                                                                            const hasBullet = !!bulletMatch;
-                                                                                            const cleanPt = bulletMatch ? bulletMatch[1].trim() : point.trim();
+                                                                                            const isExplicitNoBullet = /^\[NO_BULLET\]\s*/i.test(point) ||
+                                                                                                /^NO_BULLET::\s*/i.test(point) ||
+                                                                                                /^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i.test(point);
+                                                                                            let cleanPt = point
+                                                                                                .replace(/^\[NO_BULLET\]\s*/i, '')
+                                                                                                .replace(/^NO_BULLET::\s*/i, '')
+                                                                                                .replace(/^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i, '')
+                                                                                                .trim();
+                                                                                            const existingBulletMatch = cleanPt.match(/^[•\-\*]\s*(.+)/s);
+                                                                                            const textWithoutBullet = existingBulletMatch ? existingBulletMatch[1].trim() : cleanPt;
+                                                                                            if (isExplicitNoBullet || isPureCorrelationOrRecommendation(textWithoutBullet) || /^findings\s+(?:are\s+)?s\/?o(?:\s*:)?$/i.test(textWithoutBullet)) {
+                                                                                                return (
+                                                                                                    <div key={i} className="font-bold">
+                                                                                                        {textWithoutBullet}
+                                                                                                    </div>
+                                                                                                );
+                                                                                            }
                                                                                             return (
                                                                                                 <div key={i} className="font-bold">
-                                                                                                    {hasBullet ? `• ${cleanPt}` : cleanPt}
+                                                                                                    • {textWithoutBullet}
                                                                                                 </div>
                                                                                             );
                                                                                         })}

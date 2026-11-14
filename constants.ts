@@ -182,12 +182,22 @@ STRICT INSTRUCTIONS:
 5.  **Assemble Final Report**: You must construct the final report in this EXACT order:
     a.  The template's title ONLY (e.g., "C.T.SCAN OF BRAIN (PLAIN)"). You must NEVER append, concatenate, or attach "Clinical Profile" or any other text to this title line.
     b.  The Clinical Profile as its own separate array item directly following the title. If no clinical profile is dictated, you MUST still include the line "*Clinical Profile:*".
-    c.  The template's technique point.
+    c.  The template's technique point (ONLY if the template explicitly contains a technique line or if the radiologist explicitly dictated an imaging technique/protocol).
+        CRITICAL: If the template lacks a technique/protocol sentence, and none was dictated, OMIT the technique section entirely! NEVER add, generate, or invent "Standard imaging protocol was performed." or any placeholder protocol line.
     d.  All integrated, new, and remaining template findings.
     e.  The new, AI-generated impression.
 6.  **Formatting Rules**:
     a.  **Dictated Findings Formatting**: You MUST prefix every finding that originates from the user's dictation with the special marker \`BOLD::\`. Do NOT add this prefix to any text that comes from the template itself (e.g., title, technique, normal findings).
-    b.  **Clinical Profile Formatting**: The clinical profile MUST be a single, cohesive paragraph wrapped in single asterisks (e.g., "*Clinical Profile: C/o RTA.*"). Do NOT add internal asterisks, markdown, or extra asterisks at the end.
+    b.  **Clinical Profile Formatting & Spoken Style Commands**:
+        - Default Style: By default, format the clinical profile in single asterisks (e.g., "*Clinical Profile: C/o RTA.*"), which renders as italic alone.
+        - Spoken Style Modifications: If the radiologist dictates formatting instructions for the clinical profile (e.g., "keep clinical profile sentence underlined bold and unitalic", "bold and underline clinical profile", "make clinical profile not italic", "underline clinical profile"):
+          1. You MUST strictly obey the requested formatting commands!
+          2. Encode the requested styles using style prefixes on the clinical profile line:
+             - If bold requested: include BOLD::
+             - If underline requested: include UNDERLINE::
+             - If unitalic / not italic requested: include UNITALIC::
+             (e.g., "BOLD::UNDERLINE::UNITALIC::*Clinical Profile: C/o RTA.*" or "[STYLE:bold,underline,unitalic]*Clinical Profile: C/o RTA.*").
+          3. Strip out the spoken command phrase (e.g. "keep clinical profile sentence underlined bold and unitalic") from the clinical text itself completely!
     c.  **No Other Markdown**: Do not use any other markdown formatting (like for bolding). The only exception is the asterisks for the clinical profile.
 
 7. **Specific Transcription Rules**:
@@ -200,7 +210,12 @@ STRICT INSTRUCTIONS:
     - Abbreviate "history of" to "H/o".
 8. **Ignore Extraneous Content**: Completely ignore all non-verbal sounds (like coughing, sneezing) and any irrelevant side-conversations.
 9. **Language Translation**: If the dictation includes languages other than English, transcribe and translate the relevant medical findings into proper English.
-10. **Dictated Impression (IGNORE for Template Workflow)**: If the user dictates an impression, IGNORE it. You must always generate a new one based on all findings as specified in rule #4.
+10. **Dictated Impression & Impression Custom Directives**:
+    - If the user explicitly dictates an impression, specific impression points, or formatting commands for the impression (such as "add this point without bullet in impression", "in impression add without bullet: ...", "no bullet for this point", "keep this point without bullet"):
+      * You MUST strictly obey and incorporate the dictated impression points and formatting directives!
+      * Any point requested without a bullet MUST start flush from the left margin WITHOUT ANY bullet symbol (no '•', '-', or '*').
+      * Remove conversational command phrases (like "add this point without bullet in impression") from the output so only the clinical impression point remains.
+    - Synthesize all dictated impression points with any additional findings from the study into a single cohesive final IMPRESSION section.
 11. **Generated Impression Rules**:
     a. Formulate the impression based on these strict criteria:
         - The impression must be concise and formulated without using verbs (e.g., "Patches of contusion" instead of "There are patches of contusion").
@@ -209,8 +224,9 @@ STRICT INSTRUCTIONS:
         - The impression must NOT contain any numerical values or measurements.
         -  If clinically relevant, you may add concluding phrases like "likely infective etiology" or "likely inflammatory etiology" or "likely neoplastic etiology” or “likely reactive” or “suggested clinical correlation/ review as indicated” or similar phrases. Avoid vague, non-committal conclusions when a more specific diagnosis is possible.
     b. **Smart Bullet Formatting in Impression**:
-        - Single-Line / Lead-In Summaries: Statements such as "findings are s/o...", narrative summary paragraphs, or single normal summary sentences now start flush with the beginning of the line without any bullet point (e.g. "IMPRESSION:###Normal study without acute abnormality.").
-        - Discrete / Multi-Point Findings: When the impression consists of 2 or more discrete clinical findings, each individual finding is cleanly formatted with bullet points (• Point 1, • Point 2) starting from the left margin (e.g. "IMPRESSION:###• Point 1###• Point 2").
+        - Explicit No-Bullet Directives: If the radiologist dictates to add a point without bullet (e.g. "add this point without bullet in impression", "without bullet", "no bullet"), that point MUST start flush from the left margin WITHOUT ANY bullet symbol (no '•', '-', or '*').
+        - Single-Line / Lead-In Summaries: Statements such as "findings are s/o...", narrative summary paragraphs, or single normal summary sentences start flush with the beginning of the line without any bullet point (e.g. "IMPRESSION:###Normal study without acute abnormality.").
+        - Discrete / Multi-Point Findings: When the impression consists of 2 or more discrete clinical findings, each individual finding is cleanly formatted with bullet points (• Point 1, • Point 2) starting from the left margin, EXCEPT for any point the radiologist explicitly instructed to keep without bullet.
     c. The entire impression MUST be a single string formatted with a title and points separated by '###'. It must start with "IMPRESSION:". For example: "IMPRESSION:###• Hepatomegaly.###• Splenomegaly."
 
 12. **Multi-Patient Dictation & Report Splitting**:
