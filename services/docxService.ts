@@ -471,27 +471,26 @@ export function findingsToStandardHtml(findings: string[]): { html: string; plai
   const isAnatomicalSubheading = (text: string): boolean => {
     const clean = text.replace(/^BOLD::/i, '').replace(/[*_~`#]+/g, '').trim();
     if (!clean || clean.length > 80) return false;
+    // NEVER match IMPRESSION or Clinical Profile
+    if (/^IMPRESSION/i.test(clean) || /^Clinical\s*(Profile|History)/i.test(clean)) return false;
     if (/^(?:C\.?T\.?\s*SCAN\s+OF|CT\s+SCAN\s+OF|MRI\s+OF|ULTRASOUND\s+OF|USG\s+OF|X-?RAY\s+OF)\s+[A-Z\s\(\)\-\/]+$/i.test(clean)) {
-      return true;
-    }
-    if (/^[A-Z\s\-\/]{3,35}:$/i.test(clean)) {
       return true;
     }
     return false;
   };
 
   const isExamTitle = (text: string, index: number): boolean => {
-    if (index === 0) return true;
+    if (index !== 0) return false;
     const clean = text.replace(/^BOLD::/i, '').replace(/[*_~`#]+/g, '').trim();
-    if (clean === clean.toUpperCase() && clean.length > 5 && clean.length < 90 && !clean.endsWith('.')) {
-      if (/^(?:CT|C\.T\.|MRI|USG|ULTRASOUND|X-?RAY|PET|MAMMO)/i.test(clean) && !clean.includes('SCAN OF ')) {
-        return true;
-      }
+    if (clean === 'C.T.SCAN OF BRAIN (PLAIN)') return true;
+    if (/^(MRI|CT|C\.T\.|USG|ULTRASOUND|X-RAY|NCCT|CECT|HRCT|PET-CT|DEXA)\b/i.test(clean)) return true;
+    if (clean === clean.toUpperCase() && clean.length > 5 && clean.length < 90 && !clean.endsWith('.') && !clean.startsWith('IMPRESSION') && !clean.startsWith('*')) {
+      return true;
     }
     return false;
   };
 
-  // Flatten any lumped findings or multi-line strings
+  // Flatten multi-line findings while keeping IMPRESSION intact
   const expandedFindings: { text: string; isBold: boolean; origIndex: number }[] = [];
 
   findings.forEach((raw, idx) => {
@@ -515,7 +514,13 @@ export function findingsToStandardHtml(findings: string[]): { html: string; plai
       }
     }
 
-    // Check if finding is structured with ###
+    // Keep IMPRESSION intact as one structured finding
+    if (trimmed.toUpperCase().startsWith('IMPRESSION:')) {
+      expandedFindings.push({ text: trimmed, isBold: false, origIndex: idx });
+      return;
+    }
+
+    // Check if finding is structured with ### (and not table)
     if (trimmed.includes('###') && !trimmed.includes('|')) {
       const parts = trimmed.split('###').map(p => p.trim()).filter(Boolean);
       parts.forEach(p => {
@@ -552,8 +557,8 @@ export function findingsToStandardHtml(findings: string[]): { html: string; plai
       continue;
     }
 
-    // 2. Exam Title (first line or primary title)
-    if (origIndex === 0 || isExamTitle(clean, origIndex)) {
+    // 2. Exam Title (first line ONLY)
+    if (origIndex === 0 && isExamTitle(clean, origIndex)) {
       const title = clean.replace(/[*_~`#]+/g, '').trim();
       plainParagraphs.push(title);
       htmlParagraphs.push(`<p style="text-align:center;"><strong><u>${escapeHtml(title)}</u></strong></p>`);
@@ -568,15 +573,12 @@ export function findingsToStandardHtml(findings: string[]): { html: string; plai
       continue;
     }
 
-    // 4. Impression block
+    // 4. IMPRESSION section: ALWAYS LEFT-ALIGNED (NOT CENTERED!), WITH BOLD POINTS
     if (clean.toUpperCase().startsWith('IMPRESSION:')) {
-      const impText = clean.replace(/^IMPRESSION:\s*/i, '').trim();
-      plainParagraphs.push('IMPRESSION:');
-      htmlParagraphs.push(`<p><strong><u>IMPRESSION:</u></strong></p>`);
-      if (impText) {
-        plainParagraphs.push(`• ${impText}`);
-        htmlParagraphs.push(`<p><strong>${escapeHtml(impText)}</strong></p>`);
-      }
+      const parts = clean.replace(/^IMPRESSION:\s*/i, '').split('###').map(p => p.trim()).filter(Boolean);
+      plainParagraphs.push(`IMPRESSION:\n${parts.map(p => `• ${p}`).join('\n')}`);
+      const pointsHtml = parts.map(p => `<li><strong>${escapeHtml(p)}</strong></li>`).join('');
+      htmlParagraphs.push(`<p><strong style="text-decoration: underline;">IMPRESSION:</strong></p><ul>${pointsHtml}</ul>`);
       continue;
     }
 
@@ -614,10 +616,6 @@ export function findingsToStandardHtml(findings: string[]): { html: string; plai
   };
 }
 
-/**
- * Strips all CSS borders, class names, divs, and styling that triggers DevExpress or Word
- * OpenXML paragraph borders (<w:pBdr>), guaranteeing zero black boxes upon approval.
- */
 export function sanitizeHtmlForClipboard(html: string): string {
   if (!html) return '';
 
