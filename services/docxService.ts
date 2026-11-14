@@ -473,7 +473,7 @@ export function findingsToStandardHtml(findings: string[]): { html: string; plai
     if (!clean || clean.length > 80) return false;
     // NEVER match IMPRESSION or Clinical Profile
     if (/^IMPRESSION/i.test(clean) || /^Clinical\s*(Profile|History)/i.test(clean)) return false;
-    if (/^(?:C\.?T\.?\s*SCAN\s+OF|CT\s+SCAN\s+OF|MRI\s+OF|ULTRASOUND\s+OF|USG\s+OF|X-?RAY\s+OF)\s+[A-Z\s\(\)\-\/]+$/i.test(clean)) {
+    if (/^(?:C\.?T\.?\s*SCAN\s+OF|CT\s+SCAN\s+OF|MRI\s+OF|ULTRASOUND\s+OF|USG\s+OF|X-?RAY\s+OF)\s+[A-Z\s\(\)\-\/\&]+$/i.test(clean)) {
       return true;
     }
     return false;
@@ -630,7 +630,9 @@ export function sanitizeHtmlForClipboard(html: string): string {
     headings.forEach(h => {
       const p = document.createElement('p');
       const text = h.textContent?.trim() || '';
-      if (h.tagName.toLowerCase() === 'h1' || text === text.toUpperCase()) {
+      if (/^IMPRESSION/i.test(text)) {
+        p.innerHTML = `<strong><u>${escapeHtml(text)}</u></strong>`;
+      } else if (h.tagName.toLowerCase() === 'h1' || text === text.toUpperCase()) {
         p.setAttribute('style', 'text-align:center;');
         p.innerHTML = `<strong><u>${escapeHtml(text)}</u></strong>`;
       } else {
@@ -722,11 +724,11 @@ export function findingsToRichHtml(findings: string[]): string {
         const titleText = matchGlued[1].trim().replace(/^BOLD::/i, '').replace(/[*_]+$/g, '').trim();
         let profText = matchGlued[2].trim().replace(/^BOLD::/i, '').trim();
         profText = profText ? cleanClinicalProfileText(`Clinical Profile: ${profText}`) : '';
-        htmlParts.push(`<p style="margin-bottom: 12px; font-size: 18px; font-weight: bold; text-align: center; text-decoration: underline; text-transform: uppercase;"><strong><u>${escapeHtml(titleText)}</u></strong></p>`);
+        htmlParts.push(`<h1 style="margin-bottom: 14px; font-size: 20px; font-weight: bold; text-align: center; text-decoration: underline; color: #0f172a; text-transform: uppercase;">${escapeHtml(titleText)}</h1>`);
         if (profText) {
-          htmlParts.push(`<p style="margin-bottom: 12px; font-style: italic;"><em><strong>${escapeHtml(profText)}</strong></em></p>`);
+          htmlParts.push(`<p class="clinical-profile" style="margin-bottom: 14px; font-style: italic; color: #334155;"><em><strong>${escapeHtml(profText)}</strong></em></p>`);
         } else {
-          htmlParts.push(`<p style="margin-bottom: 12px; font-style: italic;"><em><strong>Clinical Profile: Routine evaluation.</strong></em></p>`);
+          htmlParts.push(`<p class="clinical-profile" style="margin-bottom: 14px; font-style: italic; color: #334155;"><em><strong>Clinical Profile: Routine evaluation.</strong></em></p>`);
         }
         isFirst = false;
         continue;
@@ -736,7 +738,7 @@ export function findingsToRichHtml(findings: string[]): string {
     // 1. Clinical profile line
     if (/^\*?\s*Clinical\s*(Profile|History):/i.test(trimmed)) {
       const inner = cleanClinicalProfileText(trimmed);
-      htmlParts.push(`<p style="margin-bottom: 12px; font-style: italic;"><em><strong>${escapeHtml(inner)}</strong></em></p>`);
+      htmlParts.push(`<p class="clinical-profile" style="margin-bottom: 14px; font-style: italic; color: #334155;"><em><strong>${escapeHtml(inner)}</strong></em></p>`);
       isFirst = false;
       continue;
     }
@@ -779,12 +781,16 @@ export function findingsToRichHtml(findings: string[]): string {
     // 5. Impression section (starts with IMPRESSION:### or IMPRESSION:)
     if (trimmed.startsWith('IMPRESSION:')) {
       const parts = trimmed.replace('IMPRESSION:', '').split('###').map(p => p.trim()).filter(Boolean);
-      let impressionHtml = `<p style="margin-top: 18px; margin-bottom: 6px; font-size: 15px; font-weight: bold; text-decoration: underline; text-transform: uppercase;"><strong><u>IMPRESSION:</u></strong></p>`;
+      let impressionHtml = `<div class="impression-section" style="margin-top: 20px; margin-bottom: 16px;">`;
+      impressionHtml += `<h3 style="margin: 0 0 8px 0; font-size: 16px; font-weight: bold; text-decoration: underline; text-transform: uppercase; color: #0f172a;">IMPRESSION:</h3>`;
       if (parts.length > 0) {
+        impressionHtml += `<ul style="margin: 0; padding-left: 24px; color: #0f172a;">`;
         for (const pt of parts) {
-          impressionHtml += `<p style="margin-bottom: 4px; font-weight: bold; line-height: 1.5;"><strong>• ${escapeHtml(pt)}</strong></p>`;
+          impressionHtml += `<li style="margin-bottom: 6px; font-weight: bold; line-height: 1.5;">${escapeHtml(pt)}</li>`;
         }
+        impressionHtml += `</ul>`;
       }
+      impressionHtml += `</div>`;
       htmlParts.push(impressionHtml);
       isFirst = false;
       continue;
@@ -793,7 +799,7 @@ export function findingsToRichHtml(findings: string[]): string {
     // 6. Patient separator
     if (trimmed.startsWith('BOLD::--- PATIENT') || trimmed.startsWith('--- PATIENT')) {
       const cleanTitle = trimmed.replace('BOLD::', '').trim();
-      htmlParts.push(`<p style="margin-top: 20px; margin-bottom: 8px; font-size: 16px; font-weight: bold; text-decoration: underline;"><strong><u>${escapeHtml(cleanTitle)}</u></strong></p>`);
+      htmlParts.push(`<h2 style="margin-top: 24px; margin-bottom: 12px; font-size: 18px; font-weight: bold; border-bottom: 2px solid #3b82f6; padding-bottom: 4px; color: #1d4ed8;">${escapeHtml(cleanTitle)}</h2>`);
       isFirst = false;
       continue;
     }
@@ -804,14 +810,14 @@ export function findingsToRichHtml(findings: string[]): string {
         .replace(/^BOLD::/i, '')
         .replace(/\s*clinical\s*(profile|history)\s*:?.*$/i, '')
         .trim();
-      htmlParts.push(`<p style="margin-bottom: 12px; font-size: 18px; font-weight: bold; text-align: center; text-decoration: underline; text-transform: uppercase;"><strong><u>${escapeHtml(cleanTitle)}</u></strong></p>`);
+      htmlParts.push(`<h1 style="margin-bottom: 14px; font-size: 20px; font-weight: bold; text-align: center; text-decoration: underline; color: #0f172a; text-transform: uppercase;">${escapeHtml(cleanTitle)}</h1>`);
       isFirst = false;
       continue;
     }
 
-    // 8. Anatomical Subheading (e.g. C.T. SCAN OF BRAIN, C.T. SCAN OF NECK, etc.)
-    if (/^(?:C\.?T\.?\s*SCAN\s+OF|CT\s+SCAN\s+OF|MRI\s+OF|ULTRASOUND\s+OF|USG\s+OF|X-?RAY\s+OF)\s+[A-Z\s\(\)\-\/]+$/i.test(trimmed)) {
-      htmlParts.push(`<p style="margin-top: 14px; margin-bottom: 8px; font-size: 15px; font-weight: bold; text-align: center; text-decoration: underline;"><strong><u>${escapeHtml(trimmed)}</u></strong></p>`);
+    // 8. Anatomical Subheadings (C.T. SCAN OF BRAIN, C.T. SCAN OF CHEST, etc.)
+    if (/^(?:C\.?T\.?\s*SCAN\s+OF|CT\s+SCAN\s+OF|MRI\s+OF|ULTRASOUND\s+OF|USG\s+OF|X-?RAY\s+OF)\s+[A-Z\s\(\)\-\/\&]+$/i.test(trimmed)) {
+      htmlParts.push(`<h2 style="margin-top: 20px; margin-bottom: 10px; font-size: 17px; font-weight: bold; text-align: center; text-decoration: underline; color: #0f172a;">${escapeHtml(trimmed)}</h2>`);
       isFirst = false;
       continue;
     }
@@ -819,10 +825,10 @@ export function findingsToRichHtml(findings: string[]): string {
     // 9. Findings with BOLD:: (dictated modifications/abnormalities)
     if (trimmed.startsWith('BOLD::')) {
       const content = trimmed.replace(/^BOLD::/, '');
-      htmlParts.push(`<p style="margin-bottom: 8px; line-height: 1.6;"><strong>${escapeHtml(content)}</strong></p>`);
+      htmlParts.push(`<p style="margin-bottom: 10px; line-height: 1.6; color: #0f172a;"><strong>${escapeHtml(content)}</strong></p>`);
     } else {
       // Normal template finding
-      htmlParts.push(`<p style="margin-bottom: 8px; line-height: 1.6;">${escapeHtml(trimmed)}</p>`);
+      htmlParts.push(`<p style="margin-bottom: 10px; line-height: 1.6; color: #334155;">${escapeHtml(trimmed)}</p>`);
     }
     isFirst = false;
   }
