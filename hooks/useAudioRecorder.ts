@@ -1,4 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
+import { getTabId, markTabActive, isTabHeartbeatAlive } from '../services/storageService';
 import {
   saveActiveSession,
   clearActiveSession,
@@ -97,6 +98,11 @@ export const useAudioRecorder = (): AudioRecorderResult => {
         session = await getUnsavedActiveSession();
       }
       if (session && session.chunks.length > 0 && session.totalBytes > 0) {
+        const currentTabId = getTabId();
+        // If this session belongs to another tab actively recording or processing, DO NOT sound alert or hijack!
+        if (session.tabId && session.tabId !== currentTabId && isTabHeartbeatAlive(session.tabId)) {
+          return;
+        }
         setUnsavedSession(session);
         // Alert the user immediately and repeat every 10 seconds until an option is selected
         if (!hasAlertedUnsavedRef.current) {
@@ -169,6 +175,7 @@ export const useAudioRecorder = (): AudioRecorderResult => {
     mediaRecorderRef.current = null;
     setIsRecording(false);
     setIsPaused(false);
+    markTabActive('idle');
 
     setInterruptedNotice(
       `Dictation stopped (${reason}). An alert sound was played, and your audio has been preserved in storage.`

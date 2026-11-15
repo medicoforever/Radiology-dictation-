@@ -1,4 +1,5 @@
 // IndexedDB Storage Service for Audio Persistence and Recovery
+import { getTabId } from './storageService';
 
 const DB_NAME = 'RadiologyDictationAudioDB';
 const STORE_CHUNKS = 'active_chunks';
@@ -10,6 +11,7 @@ export interface UnsavedSession {
   mimeType: string;
   chunks: Blob[];
   totalBytes: number;
+  tabId?: string;
 }
 
 export interface SavedRecording {
@@ -213,9 +215,11 @@ export async function saveActiveSession(chunks: Blob[], mimeType: string, timest
     const db = await getDB();
     if (!db) return;
 
+    const tabId = getTabId();
     const combinedBlob = new Blob(chunks, { type: mimeType || 'audio/webm' });
     const record = {
       id: 'current_session',
+      tabId,
       timestamp: timestamp || Date.now(),
       mimeType: mimeType || combinedBlob.type || 'audio/webm',
       chunks: [combinedBlob],
@@ -228,6 +232,7 @@ export async function saveActiveSession(chunks: Blob[], mimeType: string, timest
 
     try {
       localStorage.setItem('has_unsaved_session', JSON.stringify({
+        tabId,
         timestamp: record.timestamp,
         totalBytes: record.totalBytes,
         mimeType: record.mimeType,
@@ -266,6 +271,7 @@ export async function getUnsavedActiveSession(): Promise<UnsavedSession | null> 
               mimeType: data.mimeType || 'audio/webm',
               chunks: chunks,
               totalBytes: data.totalBytes || chunks.reduce((acc, c) => acc + c.size, 0),
+              tabId: data.tabId,
             });
             return;
           }

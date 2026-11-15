@@ -42,7 +42,7 @@ import MacrosAndDictionaryModal from './components/MacrosAndDictionaryModal';
 import { subscribeToMacroDictionary, syncMacrosWithGoogleDrive, expandMacrosInFindings } from './services/macroDictionaryService';
 import { FloatingNewDictationButton } from './components/FloatingNewDictationButton';
 import ErrorBoundary from './components/ErrorBoundary';
-import { safeLocalStorage } from './services/storageService';
+import { safeLocalStorage, getTabId, markTabActive, isTabHeartbeatAlive } from './services/storageService';
 
 interface ChatMessage {
   author: 'You' | 'AI';
@@ -323,19 +323,25 @@ const App: React.FC = () => {
 
         // Check for any in-flight recording that was interrupted during processing, network disruption, or page reload
         try {
-          const inFlightBlob = await getAudioBlob('in_flight_recording');
-          if (inFlightBlob && inFlightBlob.size > 0) {
-            let meta: { timestamp: number; type: string; size: number } | null = null;
-            try {
-              const rawMeta = localStorage.getItem('in_flight_recording_meta');
-              if (rawMeta) meta = JSON.parse(rawMeta);
-            } catch (_) {}
+          let meta: { tabId?: string; timestamp: number; type: string; size: number } | null = null;
+          try {
+            const rawMeta = safeLocalStorage.getRaw('in_flight_recording_meta', '');
+            if (rawMeta) meta = JSON.parse(rawMeta);
+          } catch (_) {}
 
-            setRecoveredInFlightAudio({
-              blob: inFlightBlob,
-              timestamp: meta?.timestamp || Date.now(),
-              size: inFlightBlob.size,
-            });
+          const currentTabId = getTabId();
+          // Multi-tab protection: if another tab is actively processing right now, DO NOT sound alarms or hijack audio!
+          const isOtherActive = meta?.tabId && meta.tabId !== currentTabId && isTabHeartbeatAlive(meta.tabId);
+
+          if (!isOtherActive) {
+            const inFlightBlob = await getAudioBlob('in_flight_recording');
+            if (inFlightBlob && inFlightBlob.size > 0) {
+              setRecoveredInFlightAudio({
+                blob: inFlightBlob,
+                timestamp: meta?.timestamp || Date.now(),
+                size: inFlightBlob.size,
+              });
+            }
           }
         } catch (inFlightErr) {
           console.warn("Notice: could not check in-flight recording recovery:", inFlightErr);
@@ -513,24 +519,30 @@ const App: React.FC = () => {
     const primaryBlob = audioBlobs[0];
     setAudioBlob(audioBlobs.length > 1 ? audioBlobs : primaryBlob); // Preserve all input blobs (audio, text files, docx, etc.)
 
-    // Immediate Zero-Loss Pre-Save:
-    // Persist audio into IndexedDB BEFORE dispatching network requests to Gemini.
-    // If the server, browser tab, or network gets disrupted during processing,
-    // the audio is 100% safely persisted and can be recovered on reload.
+    // Multi-tab isolated pre-save: pulse heartbeat and tag in_flight_recording_meta with current tabId
+    const currentTabId = getTabId();
+    markTabActive('processing');
+    const processingHeartbeatTimer = setInterval(() => {
+      markTabActive('processing');
+    }, 4000);
+
     saveAudioBlob('in_flight_recording', primaryBlob).catch(err => {
       console.warn("Could not pre-save in-flight audio:", err);
     });
     try {
-      localStorage.setItem('in_flight_recording_meta', JSON.stringify({
+      safeLocalStorage.setItem('in_flight_recording_meta', {
+        tabId: currentTabId,
         timestamp: Date.now(),
         type: primaryBlob.type || 'audio/webm',
         size: primaryBlob.size,
-      }));
+      });
     } catch (_) {}
     setRecoveredInFlightAudio(null);
 
     try {
       const processedText = await processAudio(audioBlobs, selectedModel, customPrompt, customImages, undefined, customDocx);
+      clearInterval(processingHeartbeatTimer);
+      markTabActive('idle');
       if (processingRequestIdRef.current !== reqId) return; // cancelled
       setFindings(processedText);
 
@@ -564,6 +576,8 @@ const App: React.FC = () => {
       // Trigger Hospital Workstation Auto-Sync if configured (pure report HTML)
       checkAndAutoSyncReport(300, { findings: processedText, timestamp });
     } catch (err) {
+      clearInterval(processingHeartbeatTimer);
+      markTabActive('idle');
       if (processingRequestIdRef.current !== reqId) return; // cancelled
       console.error(err);
       setError(err instanceof Error ? err.message : 'An unknown error occurred during processing.');
@@ -860,7 +874,7 @@ const App: React.FC = () => {
   };
 
   const resetSingleMode = () => {
-    // If there was active session content, snapshot it for the Undo Snackbar
+    // 1. If there was active session content, hold it in RAM memory ONLY for the 15-second Undo window
     if (findings.length > 0 || audioBlob !== null) {
       previousSingleSessionRef.current = {
         findings: [...findings],
@@ -892,25 +906,24 @@ const App: React.FC = () => {
           if (prev.secondsRemaining <= 1) {
             clearInterval(undoCountdownIntervalRef.current!);
             undoCountdownIntervalRef.current = null;
-            // Now finalize cleanup of persistent storage
-            try {
-              safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
-              deleteAudioBlob('single_mode_audio').catch(() => {});
-            } catch (e) {}
+            // 15 seconds elapsed without undo: permanently discard RAM copy!
             previousSingleSessionRef.current = null;
             return null;
           }
           return { ...prev, secondsRemaining: prev.secondsRemaining - 1 };
         });
       }, 1000);
-    } else {
-      // Nothing to undo, perform instant cleanup
-      try {
-        safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
-        deleteAudioBlob('single_mode_audio').catch(() => {});
-      } catch (error) {
-        console.error("Failed to remove item from localStorage:", error);
-      }
+    }
+
+    // 2. WIPE PERSISTENT STORAGE IMMEDIATELY AT SECOND 0!
+    try {
+      safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
+      deleteAudioBlob('single_mode_audio').catch(() => {});
+      deleteAudioBlob('in_flight_recording').catch(() => {});
+      safeLocalStorage.removeItem('in_flight_recording_meta');
+      safeLocalStorage.removeItem('has_unsaved_session');
+    } catch (e) {
+      console.warn("Storage wipe on reset:", e);
     }
 
     // Reset workspace to idle immediately so user can record right away without confirmation friction

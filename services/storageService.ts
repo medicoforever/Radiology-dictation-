@@ -16,6 +16,54 @@ const TEMPORARY_CACHE_KEYS = [
   'dictate_changes_audio_meta',
 ];
 
+
+let cachedTabId: string | null = null;
+
+export function getTabId(): string {
+  if (cachedTabId) return cachedTabId;
+  if (typeof window === 'undefined') return 'tab_ssr';
+  try {
+    let id = window.sessionStorage?.getItem('raddoc_tab_id');
+    if (!id) {
+      id = 'tab_' + Date.now().toString(36) + '_' + Math.random().toString(36).substring(2, 7);
+      window.sessionStorage?.setItem('raddoc_tab_id', id);
+    }
+    cachedTabId = id;
+    return id;
+  } catch (_) {
+    cachedTabId = 'tab_' + Date.now();
+    return cachedTabId;
+  }
+}
+
+export interface TabHeartbeat {
+  tabId: string;
+  status: 'recording' | 'processing' | 'idle';
+  timestamp: number;
+}
+
+export function markTabActive(status: 'recording' | 'processing' | 'idle'): void {
+  try {
+    const tabId = getTabId();
+    safeLocalStorage.setItem(`tab_heartbeat_${tabId}`, {
+      tabId,
+      status,
+      timestamp: Date.now(),
+    });
+  } catch (_) {}
+}
+
+export function isTabHeartbeatAlive(tabId?: string, maxAgeMs = 25000): boolean {
+  if (!tabId) return false;
+  try {
+    const hb = safeLocalStorage.getItem<TabHeartbeat | null>(`tab_heartbeat_${tabId}`, null);
+    if (!hb) return false;
+    return Date.now() - hb.timestamp < maxAgeMs && hb.status !== 'idle';
+  } catch (_) {
+    return false;
+  }
+}
+
 export function isLocalStorageAvailable(): boolean {
   try {
     const testKey = '__test_storage_availability__';
