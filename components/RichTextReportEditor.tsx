@@ -216,7 +216,7 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
         <head>
           <title>${title}</title>
           <style>
-            body { font-family: 'Calibri', Arial, sans-serif; padding: 40px; color: #111; line-height: 1.6; }
+            body { font-family: 'Times New Roman', serif; padding: 40px; color: #111; line-height: 1.6; }
             h1 { font-size: 18pt; text-align: center; text-decoration: underline; margin-bottom: 20px; }
             h2 { font-size: 14pt; color: #1e3a8a; border-bottom: 1px solid #ccc; padding-bottom: 4px; margin-top: 20px; }
             h3 { font-size: 13pt; margin-top: 16px; }

@@ -916,6 +916,8 @@ export function sanitizeHtmlForClipboard(html: string): string {
                           .replace(/padding[^;]+;?/gi, '')
                           .replace(/color[^;]+;?/gi, '')
                           .replace(/background[^;]+;?/gi, '')
+                          .replace(/font-family[^;]+;?/gi, '')
+                          .replace(/font:[^;]+;?/gi, '')
                           .trim();
         if (cleanStyle.includes('text-align:center') || cleanStyle.includes('text-align: center')) {
           el.setAttribute('style', 'text-align:center;');
@@ -1325,7 +1327,7 @@ export function generateWordHtmlDoc(bodyHtml: string, title = 'Radiology Report'
     margin: 1.0in;
   }
   body {
-    font-family: 'Calibri', 'Segoe UI', Arial, sans-serif;
+    font-family: 'Times New Roman', serif;
     font-size: 11pt;
     line-height: 1.5;
     color: #111827;

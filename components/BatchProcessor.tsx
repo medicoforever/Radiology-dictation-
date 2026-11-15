@@ -1538,7 +1538,11 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
 
     const copyToClipboard = async (plainText: string, htmlText: string) => {
         try {
-          const cleanHtmlText = htmlText.replace(/(?:•\s*){2,}/g, '• ').replace(/(?:&bull;\s*){2,}/g, '&bull; ');
+          const cleanHtmlText = htmlText
+            .replace(/(?:•\s*){2,}/g, '• ')
+            .replace(/(?:&bull;\s*){2,}/g, '&bull; ')
+            .replace(/font-family\s*:\s*[^;"]+;?/gi, '')
+            .replace(/font\s*:\s*[^;"]+;?/gi, '');
           const cleanPlainText = plainText.replace(/(?:•\s*){2,}/g, '• ');
           const htmlBlob = new Blob([cleanHtmlText], { type: 'text/html' });
           const textBlob = new Blob([cleanPlainText], { type: 'text/plain' });
