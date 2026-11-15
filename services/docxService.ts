@@ -581,7 +581,7 @@ export function formatImpressionOutput(title: string, points: string[]): { plain
     if (currentUlItems.length > 0) {
       htmlParts.push(
         `<ul style="list-style-type: disc; margin: 4pt 0 6pt 0; padding-left: 24pt;">` +
-        currentUlItems.map(item => `<li style="font-family: 'Times New Roman', serif; font-size: 12pt; margin-bottom: 3pt; line-height: 1.4;"><strong style="font-family: 'Times New Roman', serif; font-size: 12pt;">${escapeHtml(item)}</strong></li>`).join('') +
+        currentUlItems.map(item => `<li style="font-family: 'Times New Roman', serif; font-size: 12pt; margin-bottom: 3pt; line-height: 1.4;"><strong style="font-family: 'Times New Roman', serif; font-size: 12pt;"><font face="Times New Roman" size="3">${escapeHtml(item)}</font></strong></li>`).join('') +
         `</ul>`
       );
       currentUlItems = [];
@@ -864,6 +864,13 @@ export function findingsToStandardHtml(findings: string[]): { html: string; plai
 export function sanitizeHtmlForClipboard(html: string): string {
   if (!html) return '';
 
+  const CLIPBOARD_STYLE = `<style>
+p, li, ul, ol, span, strong, em, b, u, div, font {
+  font-family: 'Times New Roman', Times, serif !important;
+  font-size: 12pt !important;
+}
+</style>`;
+
   if (typeof document !== 'undefined') {
     const temp = document.createElement('div');
     temp.innerHTML = html;
@@ -876,12 +883,14 @@ export function sanitizeHtmlForClipboard(html: string): string {
       const p = document.createElement('p');
       const text = h.textContent?.trim() || '';
       if (/^IMPRESSION/i.test(text)) {
-        p.innerHTML = `<strong><u>${escapeHtml(text)}</u></strong>`;
+        p.innerHTML = `<strong style="font-family: 'Times New Roman', serif; font-size: 12pt;"><u style="font-family: 'Times New Roman', serif; font-size: 12pt;">${escapeHtml(text)}</u></strong>`;
+        p.setAttribute('style', "font-family: 'Times New Roman', serif; font-size: 12pt;");
       } else if (h.tagName.toLowerCase() === 'h1' || text === text.toUpperCase()) {
-        p.setAttribute('style', 'text-align:center;');
-        p.innerHTML = `<strong><u>${escapeHtml(text)}</u></strong>`;
+        p.setAttribute('style', "text-align:center; font-family: 'Times New Roman', serif; font-size: 12pt;");
+        p.innerHTML = `<strong style="font-family: 'Times New Roman', serif; font-size: 12pt;"><u style="font-family: 'Times New Roman', serif; font-size: 12pt;">${escapeHtml(text)}</u></strong>`;
       } else {
-        p.innerHTML = `<strong>${escapeHtml(text)}</strong>`;
+        p.setAttribute('style', "font-family: 'Times New Roman', serif; font-size: 12pt;");
+        p.innerHTML = `<strong style="font-family: 'Times New Roman', serif; font-size: 12pt;">${escapeHtml(text)}</strong>`;
       }
       h.replaceWith(p);
     });
@@ -919,10 +928,10 @@ export function sanitizeHtmlForClipboard(html: string): string {
             return m.toLowerCase().includes('strong') ? '<strong>' : (m.toLowerCase().includes('b') ? '<b>' : '');
           }).trim();
           inner = inner.replace(/^<(strong|b)>\s*(?:•|&bull;|&#8226;|[-*])\s*/i, '<$1>');
-          if (!inner.startsWith('<strong>') && !inner.startsWith('<b>')) {
-            inner = `<strong style="font-family: 'Times New Roman', serif; font-size: 12pt;">${inner}</strong>`;
-          }
-          li.innerHTML = inner;
+          const textOnly = inner.replace(/^<font[^>]*>/i, '').replace(/<\/font>$/i, '')
+                                .replace(/^<strong[^>]*>/i, '').replace(/<\/strong>$/i, '')
+                                .replace(/^<b[^>]*>/i, '').replace(/<\/b>$/i, '');
+          li.innerHTML = `<strong style="font-family: 'Times New Roman', serif; font-size: 12pt;"><font face="Times New Roman" size="3">${textOnly}</font></strong>`;
           ul.appendChild(li);
           p.remove();
         });
@@ -952,10 +961,10 @@ export function sanitizeHtmlForClipboard(html: string): string {
       items.forEach(li => {
         let cleanLi = li.innerHTML.trim().replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
         cleanLi = cleanLi.replace(/^<(strong|b)>\s*(?:•|&bull;|&#8226;|[-*])\s*/i, '<$1>');
-        if (!cleanLi.startsWith('<strong>') && !cleanLi.startsWith('<b>')) {
-          cleanLi = `<strong style="font-family: 'Times New Roman', serif; font-size: 12pt;">${cleanLi}</strong>`;
-        }
-        li.innerHTML = cleanLi;
+        const textOnly = cleanLi.replace(/^<font[^>]*>/i, '').replace(/<\/font>$/i, '')
+                                .replace(/^<strong[^>]*>/i, '').replace(/<\/strong>$/i, '')
+                                .replace(/^<b[^>]*>/i, '').replace(/<\/b>$/i, '');
+        li.innerHTML = `<strong style="font-family: 'Times New Roman', serif; font-size: 12pt;"><font face="Times New Roman" size="3">${textOnly}</font></strong>`;
         li.setAttribute('style', "font-family: 'Times New Roman', serif; font-size: 12pt; margin-bottom: 3pt; line-height: 1.4;");
         li.removeAttribute('class');
         li.removeAttribute('id');
@@ -980,15 +989,15 @@ export function sanitizeHtmlForClipboard(html: string): string {
       el.removeAttribute('class');
       el.removeAttribute('id');
       const tag = el.tagName.toLowerCase();
-      if (tag !== 'p' && tag !== 'table' && tag !== 'th' && tag !== 'td' && tag !== 'ul' && tag !== 'ol' && tag !== 'li') {
+      if (tag !== 'p' && tag !== 'table' && tag !== 'th' && tag !== 'td' && tag !== 'ul' && tag !== 'ol' && tag !== 'li' && tag !== 'strong' && tag !== 'font' && tag !== 'span' && tag !== 'em' && tag !== 'u' && tag !== 'b') {
         el.removeAttribute('style');
       }
     });
 
-    return temp.innerHTML;
+    return `${CLIPBOARD_STYLE}\n${temp.innerHTML}`;
   }
 
-  return html
+  return `${CLIPBOARD_STYLE}\n` + html
     .replace(/<div[^>]*>/gi, '<p style="font-family: \'Times New Roman\', serif; font-size: 12pt;">')
     .replace(/<\/div>/gi, '</p>')
     .replace(/<h1[^>]*>(.*?)<\/h1>/gi, '<p style="text-align:center; font-family: \'Times New Roman\', serif; font-size: 12pt;"><strong><u>$1</u></strong></p>')
