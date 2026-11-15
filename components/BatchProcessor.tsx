@@ -597,10 +597,18 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     useEffect(() => {
         const loadState = async () => {
             try {
-                const savedStateJSON = localStorage.getItem(BATCH_MODE_STORAGE_KEY);
-                if (savedStateJSON) {
-                    const savedBatches: SerializableBatch[] = JSON.parse(savedStateJSON);
-                    
+                let savedBatches: SerializableBatch[] | null = await getReportSession(BATCH_MODE_STORAGE_KEY);
+                if (!savedBatches || !Array.isArray(savedBatches) || savedBatches.length === 0) {
+                    const savedStateJSON = localStorage.getItem(BATCH_MODE_STORAGE_KEY);
+                    if (savedStateJSON) {
+                        try {
+                            savedBatches = JSON.parse(savedStateJSON);
+                        } catch {
+                            savedBatches = null;
+                        }
+                    }
+                }
+                if (savedBatches && Array.isArray(savedBatches) && savedBatches.length > 0) {
                     const restoredBatches: Batch[] = await Promise.all(savedBatches.map(async (savedBatch) => {
                         const audioBlobs: Blob[] = [];
 

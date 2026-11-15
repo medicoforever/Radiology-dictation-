@@ -187,15 +187,18 @@ YOUR CORE TASKS:
      * Patient 4's "findings" array MUST contain ONLY Patient 4's clinical findings and observations.
      * Patient 5's "findings" array MUST contain ONLY Patient 5's clinical findings and observations.
      * Each patient report is 100% independent, clean, and non-redundant.
+     * ZERO COMBINED REDUNDANCY: NEVER create an additional combined report containing multiple patients. Do NOT accumulate all patients into a single report.
    - Cross-Turn Addenda / Corrections: If the radiologist moves to another patient and then later in the recording returns to an earlier patient (e.g., "Oh, going back to Patient 1...", "For that first CT Brain patient, also add that there is a 4mm nodule...", "And one more finding for John Doe..."), CONSOLIDATE that specific addition into that specific patient's report findings. Do NOT create duplicate split reports.
 
-2. TARGET MODE ROUTING (Single Dictation vs Batch Mode):
-   - Determine whether each patient should go into 'single' mode or 'batch' mode.
-   - If the doctor specifies "in batch dictation", "batch mode", "add 5 patients in batch", or dictates a series of batch cases, route ALL of those patients to targetMode: 'batch'.
-   - If the doctor says "single dictation", "single mode", or "record this first patient in single dictation", route that patient to targetMode: 'single'.
-   - If not explicitly mentioned:
-     * If only 1 patient is dictated, assign targetMode: 'single'.
-     * If multiple patients are dictated without specific mode commands, assign the first patient to 'single' (active workstation report) and all subsequent patients to 'batch' (queued reports).
+2. TARGET MODE ROUTING (Multi-Case Batch Queue vs Standalone Single Case):
+   - STREAMLINED QUEUE ROUTING:
+     * When multiple patients are dictated, or when the doctor mentions "batch", "batch dictation", "batch mode", "add as batch", "in batch", or dictates a series of findings:
+       Route ALL patients to targetMode: 'batch'.
+       Every individual patient becomes an independent case in the batch queue.
+       NEVER route one patient to 'single' and others to 'batch'.
+       NEVER create a combined multi-patient report for 'single' mode.
+     * 'single' mode (targetMode: 'single') is RESERVED ONLY for when the doctor dictates strictly 1 patient AND explicitly specifies "single dictation" or "single mode".
+     * If the doctor dictates 1 patient without specifying a mode, route to targetMode: 'batch' (or 'single' if standalone single case). In general, batch mode handles all cases seamlessly.
 
 3. TEMPLATE ASSIGNMENT & SPOKEN STRUCTURAL/HEADING MODIFICATIONS:
    - Identify if a template is requested for any patient (e.g., "CT Brain Trauma", "Chest X-Ray Normal", "MRI Lumbar Spine", "Abdomen USG", "PNS Sinusitis").
@@ -279,7 +282,7 @@ Respond with ONLY valid JSON adhering to this schema:
     {
       "patientId": "pt_1",
       "patientName": "Patient 1 (CT Brain)",
-      "targetMode": "single",
+      "targetMode": "batch",
       "findings": [
         "C.T.SCAN OF BRAIN (PLAIN)",
         "Partial right cervical rib noted on the right side.",
@@ -655,8 +658,20 @@ export async function executeAutonomousPlan(
       return { images, otherFiles, fileNames };
     };
 
-    const singlePatientItem = plan.patients.find(p => p.targetMode === 'single');
-    const batchPatientItems = plan.patients.filter(p => p.targetMode === 'batch');
+    // Streamlined Routing (Batch Mode as the dedicated multi-patient queue):
+    // If there are multiple patients (> 1) OR any patient has targetMode === 'batch',
+    // ALL patients are routed exclusively to Batch Mode so that each patient gets their own
+    // independent report card with RTF editing, audio playback, and Drive sync.
+    // Single Dictation is used strictly when there is exactly 1 patient AND targetMode is 'single'.
+    const isMultiOrBatch = plan.patients.length > 1 || plan.patients.some(p => p.targetMode === 'batch');
+
+    const singlePatientItem = (!isMultiOrBatch && plan.patients.length === 1 && plan.patients[0].targetMode === 'single')
+      ? plan.patients[0]
+      : null;
+
+    const batchPatientItems = isMultiOrBatch
+      ? plan.patients
+      : [];
 
     let processedSingle: { name: string; findings: string[]; templateUsed?: string; attachedFilesCount?: number } | null = null;
     const processedBatches: Array<{ 

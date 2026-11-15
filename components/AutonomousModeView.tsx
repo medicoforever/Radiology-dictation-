@@ -1119,10 +1119,10 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
             {/* Card 1 */}
             <div className="p-3.5 rounded-xl bg-slate-950/60 border border-slate-800 space-y-1.5">
               <div className="font-bold text-white">
-                Non-Linear Single + Batch Dictation:
+                Multi-Patient Batch Dictation:
               </div>
               <p className="text-slate-400 italic leading-relaxed">
-                &quot;Use single dictation for Patient Ramesh: CT Brain shows right MCA infarct. Now use batch mode and create 5 patients... Oh, and back to Ramesh in single mode, add 4mm midline shift and merge with CT Brain Plain template.&quot;
+                &quot;Batch dictation for 5 patients. Patient 1: CT Brain shows right MCA acute infarct... Patient 2: Normal Chest X-Ray... Oh, going back to Patient 1, also add 4mm midline shift and merge with CT Brain Plain template.&quot;
               </p>
             </div>
 
@@ -1132,7 +1132,7 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
                 File Handover, Drive Save &amp; HTML Export:
               </div>
               <p className="text-slate-400 italic leading-relaxed">
-                &quot;Hand over the first uploaded file to Single Mode, put the 2nd and 3rd files into Batch Mode, save everything to Google Drive, and download all HTMLs of the batch.&quot;
+                &quot;Attach the first uploaded file to Patient 1, attach the second file to Patient 2, save all reports to Google Drive, and download batch HTML.&quot;
               </p>
             </div>
           </div>
@@ -1208,20 +1208,20 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
             )}
 
             {/* Slices Cards: Single Report & Batch Queue */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className={`grid grid-cols-1 ${executionResult.singlePatient && executionResult.batchPatients && executionResult.batchPatients.length > 0 ? 'md:grid-cols-2' : ''} gap-4`}>
               {/* Single Dictation Slice Card */}
               {executionResult.singlePatient && (
-                <div className="p-4 rounded-xl border border-indigo-900/60 bg-slate-900/90 space-y-3">
+                <div className="p-4 sm:p-5 rounded-xl border border-indigo-900/60 bg-slate-900/90 space-y-3.5 shadow-lg">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2 font-bold text-sm text-indigo-300">
                       <MicIcon className="w-4 h-4 text-indigo-400" />
-                      <span>Single Dictation Slice</span>
+                      <span>Single Dictation Report</span>
                     </div>
-                    <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-indigo-950 border border-indigo-700/50 text-indigo-300">
+                    <span className="text-xs font-semibold px-2.5 py-0.5 rounded-full bg-indigo-950 border border-indigo-700/50 text-indigo-300">
                       Active Report
                     </span>
                   </div>
-                  <div className="text-xs space-y-1 text-slate-300">
+                  <div className="text-xs space-y-1.5 text-slate-300">
                     <p><strong>Patient:</strong> {executionResult.singlePatient.name}</p>
                     <p><strong>Findings:</strong> {executionResult.singlePatient.findings.length} findings transcribed &amp; merged</p>
                     {executionResult.singlePatient.templateUsed && (
@@ -1236,7 +1236,7 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
                     onClick={onNavigateToSingle}
                     className="w-full py-2.5 px-3 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs shadow-sm transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
                   >
-                    <span>Open Active Single Report</span>
+                    <span>Open Report in Single Dictation</span>
                     <span>→</span>
                   </button>
                 </div>
@@ -1244,22 +1244,28 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
 
               {/* Batch Processing Slice Card */}
               {executionResult.batchPatients && executionResult.batchPatients.length > 0 && (
-                <div className="p-4 rounded-xl border border-purple-900/60 bg-slate-900/90 space-y-3">
+                <div className="p-4 sm:p-5 rounded-xl border border-purple-900/60 bg-slate-900/90 space-y-3.5 shadow-lg">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2 font-bold text-sm text-purple-300">
                       <span className="text-base">📑</span>
-                      <span>Batch Queue Slice</span>
+                      <span>Multi-Patient Batch Queue</span>
                     </div>
-                    <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-purple-950 border border-purple-700/50 text-purple-300">
-                      {executionResult.batchPatients.length} Cases Queued
+                    <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-purple-950 border border-purple-700/50 text-purple-300">
+                      {executionResult.batchPatients.length} Reports Ready
                     </span>
                   </div>
-                  <div className="text-xs space-y-1 text-slate-300 max-h-32 overflow-y-auto">
+                  <div className="text-xs space-y-2 text-slate-300 max-h-56 overflow-y-auto pr-1">
                     {executionResult.batchPatients.map((bp, i) => (
-                      <div key={i} className="flex items-center justify-between py-1 border-b border-slate-800 last:border-none">
-                        <span className="font-medium truncate max-w-[180px]">{bp.name}</span>
-                        <span className="text-slate-400">
+                      <div key={i} className="flex items-center justify-between py-1.5 px-2.5 rounded-lg bg-slate-800/60 border border-slate-700/40">
+                        <div className="flex items-center gap-2 truncate mr-2">
+                          <span className="w-5 h-5 rounded-full bg-purple-600/30 text-purple-300 flex items-center justify-center text-[10px] font-bold shrink-0">
+                            {i + 1}
+                          </span>
+                          <span className="font-semibold text-slate-200 truncate">{bp.name}</span>
+                        </div>
+                        <span className="text-slate-400 text-[11px] shrink-0">
                           {bp.findings.length} findings
+                          {bp.templateUsed ? ` • ${bp.templateUsed}` : ''}
                           {bp.attachedFilesCount ? ` • ${bp.attachedFilesCount} file(s)` : ''}
                         </span>
                       </div>
@@ -1268,9 +1274,9 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
                   <button
                     type="button"
                     onClick={onNavigateToBatch}
-                    className="w-full py-2.5 px-3 rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-bold text-xs shadow-sm transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
+                    className="w-full py-3 px-4 rounded-xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white font-bold text-sm shadow-md transition-all flex items-center justify-center gap-2 cursor-pointer"
                   >
-                    <span>View All in Batch Mode</span>
+                    <span>Open Patient Reports in Batch Mode</span>
                     <span>→</span>
                   </button>
                 </div>

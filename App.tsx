@@ -1303,8 +1303,11 @@ const App: React.FC = () => {
             }}
             onApplyBatchReports={async (newBatches) => {
               try {
-                const currentBatchesRaw = localStorage.getItem('radiologyDictationBatchMode');
-                const currentBatches: any[] = currentBatchesRaw ? JSON.parse(currentBatchesRaw) : [];
+                let currentBatches: any[] = (await getReportSession('radiologyDictationBatchMode')) || [];
+                if (!currentBatches || currentBatches.length === 0) {
+                  const currentBatchesRaw = localStorage.getItem('radiologyDictationBatchMode');
+                  currentBatches = currentBatchesRaw ? JSON.parse(currentBatchesRaw) : [];
+                }
                 
                 // Save audio blobs to IndexedDB so they can be retrieved and downloaded in Batch Mode
                 for (let idx = 0; idx < newBatches.length; idx++) {
@@ -1337,9 +1340,10 @@ const App: React.FC = () => {
                   };
                 });
                 const updated = [...currentBatches, ...formattedBatches];
-                localStorage.setItem('radiologyDictationBatchMode', JSON.stringify(updated));
+                await saveReportSession('radiologyDictationBatchMode', updated);
+                safeLocalStorage.setItem('radiologyDictationBatchMode', JSON.stringify(updated));
               } catch (e) {
-                console.warn('Failed to append autonomous batches to localStorage:', e);
+                console.warn('Failed to append autonomous batches to storage:', e);
               }
             }}
             onNavigateToSingle={() => setMode('single')}
