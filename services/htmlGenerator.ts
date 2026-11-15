@@ -323,7 +323,7 @@ const getEmbeddedScript = () => `
                         if (isPureCorr || isLeadIn) {
                             return \`<div class="font-bold">\${cText}</div>\`;
                         }
-                        return \`<li style="font-weight: bold; margin-bottom: 3pt;"><strong>\${cText}</strong></li>\`;
+                        return \`<div class="font-bold">• \${cText}</div>\`;
                     }).join('')}</div>\`;
                 } else if (newParts.length > 1) {
                     textEl.className = 'finding-text text-slate-700 cursor-pointer';
@@ -1229,7 +1229,7 @@ const renderFindingsList = (findings: string[], batchId: string): string => {
                 } else if (isImpression) {
                     findingContent = `
                         <strong class="underline uppercase">${title}</strong>
-                        <ul style="list-style-type: disc; margin: 4pt 0 6pt 0; padding-left: 24pt;">
+                        <div class="mt-1 space-y-1">
                             ${points.map(p => {
                                 const cleanP = p.replace(/^BOLD::/i, '').trim();
                                 const isPureCorr = /^(?:suggested\s+)?clinical\s+correlation(?:\s*[\/\&,]\s*review)?(?:\s+as\s+indicated)?\.?$/i.test(cleanP.replace(/[.]+$/, '')) ||
@@ -1240,9 +1240,9 @@ const renderFindingsList = (findings: string[], batchId: string): string => {
                                 if (isPureCorr || isLeadIn) {
                                     return `<div class="font-bold">${cText}</div>`;
                                 }
-                                    return `<li style="font-weight: bold; margin-bottom: 3pt;"><strong>${cText}</strong></li>`;
+                                return `<div class="font-bold">• ${cText}</div>`;
                             }).join('')}
-                        </ul>
+                        </div>
                     `;
                 } else if (isStructured) {
                     findingContent = `<strong class="font-bold">${title}</strong>${points.map(p => `<span class="block font-semibold">${p}</span>`).join('')}`;

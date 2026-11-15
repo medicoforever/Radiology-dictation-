@@ -3691,59 +3691,30 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                                             {isImpression ? (
                                                                                 <>
                                                                                     <span className="font-bold underline uppercase">{title}</span>
-                                                                                    <div className="mt-2 space-y-1">
-                                                                                        {(() => {
-                                                                                            const batchNodes: React.ReactNode[] = [];
-                                                                                            let batchList: { text: string; origIdx: number }[] = [];
-
-                                                                                            const flushBatchList = (key: string) => {
-                                                                                                if (batchList.length > 0) {
-                                                                                                    batchNodes.push(
-                                                                                                        <ul
-                                                                                                            key={key}
-                                                                                                            className="list-disc pl-7 sm:pl-8 space-y-1.5 my-1.5"
-                                                                                                            style={{ listStyleType: 'disc', paddingLeft: '28px', margin: '4px 0 6px 0' }}
-                                                                                                        >
-                                                                                                            {batchList.map((item, idx) => (
-                                                                                                                <li
-                                                                                                                    key={idx}
-                                                                                                                    className="font-bold text-slate-800 dark:text-slate-100 leading-relaxed"
-                                                                                                                    style={{ fontWeight: 'bold', marginBottom: '3px' }}
-                                                                                                                >
-                                                                                                                    {item.text}
-                                                                                                                </li>
-                                                                                                            ))}
-                                                                                                        </ul>
-                                                                                                    );
-                                                                                                    batchList = [];
-                                                                                                }
-                                                                                            };
-
-                                                                                            points.forEach((point, i) => {
-                                                                                                const isExplicitNoBullet = /^\[NO_BULLET\]\s*/i.test(point) ||
-                                                                                                    /^NO_BULLET::\s*/i.test(point) ||
-                                                                                                    /^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i.test(point);
-                                                                                                let cleanPt = point
-                                                                                                    .replace(/^\[NO_BULLET\]\s*/i, '')
-                                                                                                    .replace(/^NO_BULLET::\s*/i, '')
-                                                                                                    .replace(/^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i, '')
-                                                                                                    .trim();
-                                                                                                const textWithoutBullet = cleanPt.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
-                                                                                                if (isExplicitNoBullet || isPureCorrelationOrRecommendation(textWithoutBullet) || /^findings\s+(?:are\s+)?s\/?o(?:\s*:)?$/i.test(textWithoutBullet)) {
-                                                                                                    flushBatchList(`ul-${i}`);
-                                                                                                    batchNodes.push(
-                                                                                                        <div key={`no-bullet-${i}`} className="font-bold text-slate-800 dark:text-slate-100 my-1">
-                                                                                                            {textWithoutBullet}
-                                                                                                        </div>
-                                                                                                    );
-                                                                                                } else {
-                                                                                                    batchList.push({ text: textWithoutBullet, origIdx: i });
-                                                                                                }
-                                                                                            });
-
-                                                                                            flushBatchList('ul-final');
-                                                                                            return batchNodes;
-                                                                                        })()}
+                                                                                    <div className="mt-1 space-y-1">
+                                                                                        {points.map((point, i) => {
+                                                                                            const isExplicitNoBullet = /^\[NO_BULLET\]\s*/i.test(point) ||
+                                                                                                /^NO_BULLET::\s*/i.test(point) ||
+                                                                                                /^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i.test(point);
+                                                                                            let cleanPt = point
+                                                                                                .replace(/^\[NO_BULLET\]\s*/i, '')
+                                                                                                .replace(/^NO_BULLET::\s*/i, '')
+                                                                                                .replace(/^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i, '')
+                                                                                                .trim();
+                                                                                            const textWithoutBullet = cleanPt.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
+                                                                                            if (isExplicitNoBullet || isPureCorrelationOrRecommendation(textWithoutBullet) || /^findings\s+(?:are\s+)?s\/?o(?:\s*:)?$/i.test(textWithoutBullet)) {
+                                                                                                return (
+                                                                                                    <div key={i} className="font-bold">
+                                                                                                        {textWithoutBullet}
+                                                                                                    </div>
+                                                                                                );
+                                                                                            }
+                                                                                            return (
+                                                                                                <div key={i} className="font-bold">
+                                                                                                    • {textWithoutBullet}
+                                                                                                </div>
+                                                                                            );
+                                                                                        })}
                                                                                     </div>
                                                                                 </>
                                                                             ) : isTable ? (
