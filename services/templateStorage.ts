@@ -25,7 +25,7 @@ const STORE_TEMPLATES = 'user_templates';
 const DB_VERSION = 1;
 const HIDDEN_BUILTINS_KEY = 'rad_hidden_builtin_templates';
 
-// Ensure any previously hidden built-in IDs are purged so all 72 built-in templates are always visible
+// Ensure any previously hidden built-in IDs are purged so all 300 built-in templates are always visible
 export function restoreAllBuiltInTemplates(): void {
   try {
     if (typeof window !== 'undefined' && window.localStorage) {
@@ -108,7 +108,7 @@ export async function saveUserTemplate(template: Omit<UserTemplate, 'createdAt'>
       createdAt: Date.now(),
     };
 
-    return new Promise<void>((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       const tx = db.transaction(STORE_TEMPLATES, 'readwrite');
       const store = tx.objectStore(STORE_TEMPLATES);
       const req = store.put(fullTemplate);
@@ -116,6 +116,10 @@ export async function saveUserTemplate(template: Omit<UserTemplate, 'createdAt'>
       req.onsuccess = () => resolve();
       req.onerror = () => reject(req.error || new Error('Failed to save template'));
     });
+
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('radiology_templates_updated'));
+    }
   } catch (err) {
     console.error('saveUserTemplate error:', err);
     throw err;
@@ -148,7 +152,7 @@ export async function getUserTemplates(): Promise<UserTemplate[]> {
       });
     }
 
-    // Convert all 72 authoritative templates into UserTemplate format - permanently built in and non-deletable
+    // Convert all 300 authoritative templates into UserTemplate format - permanently built in and non-deletable
     const builtInCustoms: UserTemplate[] = ALL_RADNITO_TEMPLATES.map(t => {
       let extractedText = '';
       if (t.lines && t.lines.length > 0) {
@@ -195,7 +199,7 @@ export async function getUserTemplates(): Promise<UserTemplate[]> {
 
 /**
  * Delete a user-created custom template.
- * Built-in system templates (all 72 templates) are permanent and cannot be deleted.
+ * Built-in system templates (all 300 templates) are permanent and cannot be deleted.
  */
 export async function deleteUserTemplate(id: string): Promise<void> {
   // Built-in templates are permanent system fixtures and cannot be deleted
@@ -208,7 +212,7 @@ export async function deleteUserTemplate(id: string): Promise<void> {
     const db = await getDB();
     if (!db) return;
 
-    return new Promise<void>((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       const tx = db.transaction(STORE_TEMPLATES, 'readwrite');
       const store = tx.objectStore(STORE_TEMPLATES);
       const req = store.delete(id);
@@ -216,8 +220,45 @@ export async function deleteUserTemplate(id: string): Promise<void> {
       req.onsuccess = () => resolve();
       req.onerror = () => reject(req.error || new Error('Failed to delete template'));
     });
+
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('radiology_templates_updated'));
+    }
   } catch (err) {
     console.error('deleteUserTemplate error:', err);
     throw err;
+  }
+}
+
+export interface DynamicTemplateStats {
+  totalCount: number;
+  builtInCount: number;
+  customCount: number;
+  customTemplates: UserTemplate[];
+}
+
+/**
+ * Calculates real-time dynamic template statistics:
+ * 300 authoritative built-in clinical templates + any user-uploaded custom templates stored in IndexedDB.
+ */
+export async function getDynamicTemplateStats(): Promise<DynamicTemplateStats> {
+  try {
+    const all = await getUserTemplates();
+    const custom = all.filter(t => !t.isBuiltIn && !t.id.startsWith('builtin_') && !t.id.startsWith('tpl_'));
+    const builtInCount = ALL_RADNITO_TEMPLATES.length; // 300 built-in templates
+    return {
+      totalCount: builtInCount + custom.length,
+      builtInCount,
+      customCount: custom.length,
+      customTemplates: custom,
+    };
+  } catch (e) {
+    console.warn('Failed to load dynamic template stats:', e);
+    return {
+      totalCount: ALL_RADNITO_TEMPLATES.length,
+      builtInCount: ALL_RADNITO_TEMPLATES.length,
+      customCount: 0,
+      customTemplates: [],
+    };
   }
 }

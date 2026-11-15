@@ -22,6 +22,8 @@ import DownloadIcon from './icons/DownloadIcon';
 import UploadIcon from './icons/UploadIcon';
 import CopyIcon from './icons/CopyIcon';
 import PencilIcon from './icons/PencilIcon';
+import { ALL_RADNITO_TEMPLATES } from '../services/builtInTemplates';
+import { getDynamicTemplateStats } from '../services/templateStorage';
 
 interface AutonomousModeViewProps {
   selectedModel: string;
@@ -83,7 +85,16 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
   // Workspace context stats
   const [batchCount, setBatchCount] = useState<number>(0);
   const [singleModeStatus, setSingleModeStatus] = useState<'Empty' | 'Active'>('Empty');
-  const templateCount = 72;
+  const [templateStats, setTemplateStats] = useState<{
+    totalCount: number;
+    builtInCount: number;
+    customCount: number;
+  }>({
+    totalCount: ALL_RADNITO_TEMPLATES.length, // 300 built-in templates
+    builtInCount: ALL_RADNITO_TEMPLATES.length,
+    customCount: 0,
+  });
+  const templateCount = templateStats.totalCount;
 
   // Staged files attached to the autonomous session
   const [attachedFiles, setAttachedFiles] = useState<AutonomousAttachedFile[]>([]);
@@ -146,6 +157,38 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
       setSingleModeStatus(singleFindingsCount > 0 ? 'Active' : 'Empty');
     }
   }, [singleFindingsCount, executionResult]);
+
+  // Dynamically load template stats (300 authoritative built-in templates + user-uploaded custom templates)
+  useEffect(() => {
+    let isMounted = true;
+    const fetchTemplateStats = async () => {
+      try {
+        const stats = await getDynamicTemplateStats();
+        if (isMounted) {
+          setTemplateStats({
+            totalCount: stats.totalCount,
+            builtInCount: stats.builtInCount,
+            customCount: stats.customCount,
+          });
+        }
+      } catch (err) {
+        console.warn('Error fetching dynamic template stats:', err);
+      }
+    };
+
+    fetchTemplateStats();
+
+    // Listen for template upload / deletion events across the app in real time
+    const handleTemplatesChanged = () => {
+      fetchTemplateStats();
+    };
+
+    window.addEventListener('radiology_templates_updated', handleTemplatesChanged);
+    return () => {
+      isMounted = false;
+      window.removeEventListener('radiology_templates_updated', handleTemplatesChanged);
+    };
+  }, []);
 
   // Format recording timer: mm:ss
   const formatTime = (seconds: number) => {
@@ -699,7 +742,7 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
     md += `- **Active AI Model:** \`${selectedModel}\`\n`;
     md += `- **Single Mode Status:** ${singleModeStatus}\n`;
     md += `- **Batch Queue:** ${batchCount} cases queued\n`;
-    md += `- **Available Templates:** ${templateCount}\n`;
+    md += `- **Available Templates:** ${templateStats.totalCount} (${templateStats.builtInCount} built-in${templateStats.customCount > 0 ? ` + ${templateStats.customCount} custom user templates` : ''})\n`;
     md += `- **Staged Handover Files & Notes:** ${attachedFiles.length}\n`;
     md += `- **Audio Recording Captured:** ${recordedBlob ? 'Yes' : 'No'}\n\n`;
     
@@ -716,7 +759,7 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
     md += `## Slices Overview\n`;
     md += `- **Slice 1 (Single Mode):** Active instant dictation with RTF format support\n`;
     md += `- **Slice 2 (Batch Queue):** Multi-patient queuing and parallel dispatch\n`;
-    md += `- **Slice 3 (Template System):** 72 built-in docx templates and variable injection\n`;
+    md += `- **Slice 3 (Template System):** ${templateStats.totalCount} authoritative templates (${templateStats.builtInCount} built-in docx templates${templateStats.customCount > 0 ? ` + ${templateStats.customCount} custom user templates` : ''}) and variable injection\n`;
     md += `- **Slice 4 (Agent Bridge):** Zero-Read file & text note router, spoken macro creator, and auto-export\n`;
 
     return md;
@@ -771,7 +814,7 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
             <span className="text-slate-600">·</span>
             <span>Batch Queue: <strong className="text-slate-200 font-semibold">{batchCount} {batchCount === 1 ? 'batch' : 'batches'}</strong></span>
             <span className="text-slate-600">·</span>
-            <span>Templates: <strong className="text-slate-200 font-semibold">{templateCount}</strong></span>
+            <span>Templates: <strong className="text-slate-200 font-semibold">{templateStats.totalCount}</strong>{templateStats.customCount > 0 ? <span className="text-emerald-400 font-normal ml-1">({templateStats.builtInCount} + {templateStats.customCount} custom)</span> : null}</span>
             <span className="text-slate-600">·</span>
             <span>Model: <strong className="text-indigo-400 font-mono font-semibold">{selectedModel}</strong></span>
           </div>

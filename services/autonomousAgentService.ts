@@ -28,6 +28,7 @@ import {
   getMacroPromptContext 
 } from "./macroDictionaryService";
 import { autoSyncReport, checkAndAutoSyncReport } from "./workstationSync";
+import { getUserTemplates } from "./templateStorage";
 
 export interface AutonomousAttachedFile {
   id: string;
@@ -121,22 +122,27 @@ async function blobToBase64(blob: Blob): Promise<string> {
 }
 
 /**
- * Fuzzy matches a template name against the built-in clinical templates
+ * Fuzzy matches a template name against authoritative built-in templates (300)
+ * plus any user-uploaded custom templates stored in the browser.
  */
-export function findTemplateByFuzzyName(query?: string): BuiltInTemplateItem | null {
+export function findTemplateByFuzzyName(query?: string, customTemplates?: BuiltInTemplateItem[]): BuiltInTemplateItem | null {
   if (!query || !query.trim()) return null;
   let q = query.toLowerCase().trim();
   // Normalize common spoken modality abbreviations
   q = q.replace(/\bmr\b/g, 'mri').replace(/\bcat\b/g, 'ct').replace(/\bus\b/g, 'ultrasound').replace(/\bxray\b/g, 'x-ray');
 
+  const pool = customTemplates && customTemplates.length > 0
+    ? [...customTemplates, ...ALL_RADNITO_TEMPLATES]
+    : ALL_RADNITO_TEMPLATES;
+
   // 1. Exact or startsWith match
-  const exact = ALL_RADNITO_TEMPLATES.find(
+  const exact = pool.find(
     t => t.name.toLowerCase() === q || t.id.toLowerCase() === q
   );
   if (exact) return exact;
 
   // 2. Query contains template name or vice-versa
-  const direct = ALL_RADNITO_TEMPLATES.find(
+  const direct = pool.find(
     t => t.name.toLowerCase().includes(q) || q.includes(t.name.toLowerCase())
   );
   if (direct) return direct;
@@ -146,7 +152,7 @@ export function findTemplateByFuzzyName(query?: string): BuiltInTemplateItem | n
   let bestMatch: BuiltInTemplateItem | null = null;
   let maxScore = 0;
 
-  for (const t of ALL_RADNITO_TEMPLATES) {
+  for (const t of pool) {
     const tName = t.name.toLowerCase();
     const tDesc = (t.description || '').toLowerCase();
     const tMod = (t.modality || '').toLowerCase();
@@ -685,6 +691,27 @@ export async function executeAutonomousPlan(
       attachedFilesCount?: number;
     }> = [];
 
+    // Load user-uploaded custom templates from IndexedDB so the autonomous agent can match and merge them
+    let userCustomTemplatePool: BuiltInTemplateItem[] = [];
+    try {
+      const userTpls = await getUserTemplates();
+      userCustomTemplatePool = userTpls
+        .filter(t => !t.isBuiltIn && !t.id.startsWith('builtin_') && !t.id.startsWith('tpl_'))
+        .map(t => ({
+          id: t.id,
+          name: t.name,
+          description: `Custom template: ${t.name}`,
+          category: t.category || 'CUSTOM',
+          modality: t.modality || 'CUSTOM',
+          lines: t.lines || (t.text ? t.text.split('\n') : []),
+          fileName: t.docxFile?.name || `${t.name}.docx`,
+          docxBase64: t.docxFile?.data,
+          content: t.text || (t.lines ? t.lines.join('\n') : '')
+        }));
+    } catch (e) {
+      console.warn('Could not load user custom templates for autonomous agent:', e);
+    }
+
     // 1. Process Single Mode Patient (if any)
     if (singlePatientItem) {
       // Expand user voice macros into findings
@@ -694,7 +721,7 @@ export async function executeAutonomousPlan(
       let singlePrompt = singlePatientItem.customPrompt || '';
 
       if (singlePatientItem.targetTemplateName) {
-        const matched = findTemplateByFuzzyName(singlePatientItem.targetTemplateName);
+        const matched = findTemplateByFuzzyName(singlePatientItem.targetTemplateName, userCustomTemplatePool);
         if (matched) {
           templateUsed = matched.name;
           try {
@@ -802,7 +829,7 @@ export async function executeAutonomousPlan(
         let bpPrompt = bp.customPrompt || '';
 
         if (bp.targetTemplateName) {
-          const matched = findTemplateByFuzzyName(bp.targetTemplateName);
+          const matched = findTemplateByFuzzyName(bp.targetTemplateName, userCustomTemplatePool);
           if (matched) {
             templateUsed = matched.name;
             try {
