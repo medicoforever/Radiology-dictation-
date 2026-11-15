@@ -8,7 +8,7 @@ import { AppStatus, IdentifiedError } from './types';
 import { processAudio, createChat, blobToBase64, base64ToBlob, createChatFromText, identifyPotentialErrors } from './services/geminiService';
 import Spinner from './components/ui/Spinner';
 import { Chat } from '@google/genai';
-import { saveAudioBlob, getAudioBlob, deleteAudioBlob } from './services/audioStorage';
+import { saveAudioBlob, getAudioBlob, deleteAudioBlob, saveReportSession, getReportSession, deleteReportSession } from './services/audioStorage';
 // FIX: Changed import to a named import based on the error message.
 import { BatchProcessor } from './components/BatchProcessor';
 import LiveDictation from './components/LiveDictation';
@@ -270,7 +270,10 @@ const App: React.FC = () => {
   useEffect(() => {
     const loadState = async () => {
       try {
-        const savedState = safeLocalStorage.getItem<any>(SINGLE_MODE_STORAGE_KEY, null);
+        let savedState = await getReportSession<any>(SINGLE_MODE_STORAGE_KEY);
+        if (!savedState) {
+          savedState = safeLocalStorage.getItem<any>(SINGLE_MODE_STORAGE_KEY, null);
+        }
         if (savedState) {
           let blob: Blob | null = null;
 
@@ -378,7 +381,10 @@ const App: React.FC = () => {
             driveSynced: isSynced,
             driveSyncedHash: driveSyncedHashRef.current,
           };
-          safeLocalStorage.setItem(SINGLE_MODE_STORAGE_KEY, stateToSave);
+          // Save full report state directly to IndexedDB (bypassing the 5MB localStorage limit completely!)
+          await saveReportSession(SINGLE_MODE_STORAGE_KEY, stateToSave);
+          // Purge from localStorage so localStorage remains 99.9% empty
+          safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
 
           if (audioBlob) {
             await saveAudioBlob('single_mode_audio', audioBlob);
@@ -391,6 +397,7 @@ const App: React.FC = () => {
       } else if (status === AppStatus.Idle && findings.length === 0) {
         safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
         deleteAudioBlob('single_mode_audio').catch(() => {});
+      deleteReportSession(SINGLE_MODE_STORAGE_KEY).catch(() => {});
       }
     };
     saveState();
@@ -919,6 +926,7 @@ const App: React.FC = () => {
     try {
       safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
       deleteAudioBlob('single_mode_audio').catch(() => {});
+      deleteReportSession(SINGLE_MODE_STORAGE_KEY).catch(() => {});
       deleteAudioBlob('in_flight_recording').catch(() => {});
       safeLocalStorage.removeItem('in_flight_recording_meta');
       safeLocalStorage.removeItem('has_unsaved_session');
@@ -1026,6 +1034,7 @@ const App: React.FC = () => {
     try {
       safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
       deleteAudioBlob('single_mode_audio').catch(() => {});
+      deleteReportSession(SINGLE_MODE_STORAGE_KEY).catch(() => {});
     } catch (e) {}
     previousSingleSessionRef.current = null;
   };

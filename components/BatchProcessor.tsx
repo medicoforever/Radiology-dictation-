@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useAudioRecorder } from '../hooks/useAudioRecorder';
 import { processAudio, createChat, blobToBase64, continueAudioDictation, base64ToBlob, modifyFindingWithAudio, modifyReportWithAudio, identifyPotentialErrors, runComplexImpressionGeneration, transcribeAudioForPrompt, detectAndExtractTemplate, mergeDictatedFindingsWithTemplate } from '../services/geminiService';
-import { saveAudioBlob, getAudioBlob, clearUnusedAudioBlobs } from '../services/audioStorage';
+import { saveAudioBlob, getAudioBlob, clearUnusedAudioBlobs, saveReportSession, getReportSession, deleteReportSession } from '../services/audioStorage';
 import { mergeMultipleAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
 import { ClipboardPaste, X, CheckSquare } from 'lucide-react';
 import { safeLocalStorage } from '../services/storageService';
@@ -802,7 +802,9 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                     })
                 );
 
-                safeLocalStorage.setItem(BATCH_MODE_STORAGE_KEY, serializableBatches);
+                // Save batch reports directly to IndexedDB (zero localStorage quota usage!)
+        await saveReportSession(BATCH_MODE_STORAGE_KEY, serializableBatches);
+        safeLocalStorage.removeItem(BATCH_MODE_STORAGE_KEY);
                 clearUnusedAudioBlobs(usedKeys).catch(() => {});
             } catch (error) {
                 console.error("Failed to save batch state:", error);

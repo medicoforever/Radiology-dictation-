@@ -464,3 +464,68 @@ export async function deleteDictateChangesAudio(): Promise<void> {
 }
 
 
+
+
+/**
+ * Saves a report session (findings, prompts, chat, docx) to IndexedDB.
+ * Completely bypasses the restrictive 5MB localStorage limit.
+ */
+export async function saveReportSession(key: string, data: any): Promise<void> {
+  try {
+    const db = await getDB();
+    if (!db) return;
+    const jsonStr = JSON.stringify(data);
+    const blob = new Blob([jsonStr], { type: 'application/json' });
+    const tx = db.transaction(STORE_BLOBS, 'readwrite');
+    const store = tx.objectStore(STORE_BLOBS);
+    store.put({ key: `report_session_${key}`, blob, mimeType: 'application/json', timestamp: Date.now() });
+  } catch (err) {
+    console.debug(`Failed to save report session [${key}]:`, err);
+  }
+}
+
+/**
+ * Retrieves a report session from IndexedDB.
+ */
+export async function getReportSession<T>(key: string): Promise<T | null> {
+  try {
+    const db = await getDB();
+    if (!db) return null;
+    const tx = db.transaction(STORE_BLOBS, 'readonly');
+    const store = tx.objectStore(STORE_BLOBS);
+    return new Promise((resolve) => {
+      const req = store.get(`report_session_${key}`);
+      req.onsuccess = async () => {
+        if (req.result && req.result.blob) {
+          try {
+            const text = await (req.result.blob as Blob).text();
+            resolve(JSON.parse(text) as T);
+          } catch {
+            resolve(null);
+          }
+        } else {
+          resolve(null);
+        }
+      };
+      req.onerror = () => resolve(null);
+    });
+  } catch (err) {
+    console.debug(`Failed to read report session [${key}]:`, err);
+    return null;
+  }
+}
+
+/**
+ * Deletes a report session from IndexedDB.
+ */
+export async function deleteReportSession(key: string): Promise<void> {
+  try {
+    const db = await getDB();
+    if (!db) return;
+    const tx = db.transaction(STORE_BLOBS, 'readwrite');
+    const store = tx.objectStore(STORE_BLOBS);
+    store.delete(`report_session_${key}`);
+  } catch (err) {
+    console.debug(`Failed to delete report session [${key}]:`, err);
+  }
+}
