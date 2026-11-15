@@ -1321,6 +1321,89 @@ const App: React.FC = () => {
     }
   };
 
+  const handleApplyAutonomousBatches = async (newBatches: Array<{
+    id?: string;
+    name: string;
+    findings: string[];
+    audioBlobs: Blob[];
+    selectedModel: string;
+    customPrompt?: string;
+    customDocx?: DocxTemplateData | null;
+    customImages?: Array<{ data: string; mimeType: string }>;
+    extraFiles?: File[];
+  }>) => {
+    try {
+      const currentTabId = getTabId();
+      const curBatchKey = getBatchModeStorageKey(currentTabId);
+      let currentBatches: any[] = (await getReportSession(curBatchKey)) || (await getReportSession('radiologyDictationBatchMode')) || [];
+      if (!currentBatches || currentBatches.length === 0) {
+        const currentBatchesRaw = localStorage.getItem(curBatchKey) || localStorage.getItem('radiologyDictationBatchMode');
+        currentBatches = currentBatchesRaw ? JSON.parse(currentBatchesRaw) : [];
+      }
+      
+      for (let idx = 0; idx < newBatches.length; idx++) {
+        const b = newBatches[idx];
+        const incomingName = (b.name || '').trim().toLowerCase();
+        
+        // Match existing batch by ID, or by patient name
+        const existingIdx = currentBatches.findIndex(existing => {
+          if (b.id && existing.id === b.id) return true;
+          const existName = (existing.name || '').trim().toLowerCase();
+          return existName === incomingName;
+        });
+
+        const batchId = existingIdx !== -1 
+          ? currentBatches[existingIdx].id 
+          : (b.id || `batch-auto-${Date.now()}-${idx}`);
+
+        // Save audio blobs to IndexedDB if provided
+        if (b.audioBlobs && b.audioBlobs.length > 0) {
+          for (let bIdx = 0; bIdx < b.audioBlobs.length; bIdx++) {
+            try {
+              await saveAudioBlob(`batch_audio_${currentTabId}_${batchId}_${bIdx}`, b.audioBlobs[bIdx]);
+              await saveAudioBlob(`batch_audio_${batchId}_${bIdx}`, b.audioBlobs[bIdx]);
+            } catch (e) {
+              console.warn('Failed to save batch audio blob to IndexedDB:', e);
+            }
+          }
+        }
+
+        const formattedBatch = {
+          id: batchId,
+          name: b.name,
+          audioCount: b.audioBlobs && b.audioBlobs.length > 0 
+            ? b.audioBlobs.length 
+            : (existingIdx !== -1 ? currentBatches[existingIdx].audioCount : 0),
+          findings: b.findings,
+          status: 'complete',
+          selectedModel: b.selectedModel || selectedModel,
+          customPrompt: b.customPrompt || (existingIdx !== -1 ? currentBatches[existingIdx].customPrompt : ''),
+          customDocx: b.customDocx !== undefined ? b.customDocx : (existingIdx !== -1 ? currentBatches[existingIdx].customDocx : null),
+          customImages: b.customImages || (existingIdx !== -1 ? currentBatches[existingIdx].customImages : []),
+          extraFiles: b.extraFiles || (existingIdx !== -1 ? currentBatches[existingIdx].extraFiles : []),
+        };
+
+        if (existingIdx !== -1) {
+          // Replace previous version in-place so modified version stays where it is
+          currentBatches[existingIdx] = {
+            ...currentBatches[existingIdx],
+            ...formattedBatch,
+          };
+        } else {
+          // New patient: append to batch queue
+          currentBatches.push(formattedBatch);
+        }
+      }
+
+      await saveReportSession(curBatchKey, currentBatches);
+      safeLocalStorage.removeItem(curBatchKey);
+      safeLocalStorage.removeItem('radiologyDictationBatchMode');
+      await deleteReportSession('radiologyDictationBatchMode').catch(() => {});
+    } catch (e) {
+      console.warn('Failed to save/update autonomous batches in storage:', e);
+    }
+  };
+
   const renderContent = () => {
     switch (mode) {
       case 'single':
@@ -1351,72 +1434,7 @@ const App: React.FC = () => {
           </ErrorBoundary>
         );
       case 'autonomous':
-        return (
-          <ErrorBoundary sectionName="Autonomous Mode" onReset={() => setMode('single')}>
-            <AutonomousModeView
-            selectedModel={selectedModel}
-            singleFindingsCount={findings.length}
-            onApplySingleReport={(loadedFindings, patientName, loadedAudio, loadedImages, loadedFiles, loadedPrompt, loadedDocx, templateUsed) => {
-              handleLoadReportFindings(loadedFindings, patientName, loadedAudio, loadedImages, loadedFiles, loadedPrompt, loadedDocx, templateUsed);
-            }}
-            onApplyBatchReports={async (newBatches) => {
-              try {
-                const currentTabId = getTabId();
-                const curBatchKey = getBatchModeStorageKey(currentTabId);
-                let currentBatches: any[] = (await getReportSession(curBatchKey)) || (await getReportSession('radiologyDictationBatchMode')) || [];
-                if (!currentBatches || currentBatches.length === 0) {
-                  const currentBatchesRaw = localStorage.getItem(curBatchKey) || localStorage.getItem('radiologyDictationBatchMode');
-                  currentBatches = currentBatchesRaw ? JSON.parse(currentBatchesRaw) : [];
-                }
-                
-                // Save audio blobs to IndexedDB so they can be retrieved and downloaded in Batch Mode
-                for (let idx = 0; idx < newBatches.length; idx++) {
-                  const b = newBatches[idx];
-                  const batchId = `batch-auto-${Date.now()}-${idx}`;
-                  if (b.audioBlobs && b.audioBlobs.length > 0) {
-                    for (let bIdx = 0; bIdx < b.audioBlobs.length; bIdx++) {
-                      try {
-                        await saveAudioBlob(`batch_audio_${batchId}_${bIdx}`, b.audioBlobs[bIdx]);
-                      } catch (e) {
-                        console.warn('Failed to save batch audio blob to IndexedDB:', e);
-                      }
-                    }
-                  }
-                }
-
-                const formattedBatches = newBatches.map((b, idx) => {
-                  const batchId = `batch-auto-${Date.now()}-${idx}`;
-                  return {
-                    id: batchId,
-                    name: b.name,
-                    audioCount: b.audioBlobs ? b.audioBlobs.length : 0,
-                    findings: b.findings,
-                    status: 'complete',
-                    selectedModel: b.selectedModel || selectedModel,
-                    customPrompt: b.customPrompt || '',
-                    customDocx: b.customDocx || null,
-                    customImages: b.customImages || [],
-                    extraFiles: b.extraFiles || []
-                  };
-                });
-                const updated = [...currentBatches, ...formattedBatches];
-                await saveReportSession(curBatchKey, updated);
-                safeLocalStorage.removeItem(curBatchKey);
-                safeLocalStorage.removeItem('radiologyDictationBatchMode');
-                await deleteReportSession('radiologyDictationBatchMode').catch(() => {});
-              } catch (e) {
-                console.warn('Failed to append autonomous batches to storage:', e);
-              }
-            }}
-            onNavigateToSingle={() => setMode('single')}
-            onNavigateToBatch={() => setMode('batch')}
-            onSaveToDrive={(res) => {
-              setDriveSaveResult(res);
-              checkAndAutoSyncReport(300);
-            }}
-          />
-          </ErrorBoundary>
-        );
+        return null;
       default:
         return renderSingleModeContent();
     }
@@ -1832,6 +1850,19 @@ const App: React.FC = () => {
 
         {/* Main Content Card */}
         <main className="bg-white dark:bg-slate-800 rounded-2xl shadow-xl p-3.5 sm:p-6 md:p-8 min-h-[300px] border border-slate-100 dark:border-slate-700/50 transition-all">
+          <div className={mode === 'autonomous' ? 'block' : 'hidden'}>
+            <ErrorBoundary sectionName="Autonomous Mode" onReset={() => setMode('single')}>
+              <AutonomousModeView
+                selectedModel={selectedModel}
+                onApplyBatchReports={handleApplyAutonomousBatches}
+                onNavigateToBatch={() => setMode('batch')}
+                onSaveToDrive={(res) => {
+                  setDriveSaveResult(res);
+                  checkAndAutoSyncReport(300);
+                }}
+              />
+            </ErrorBoundary>
+          </div>
           {renderContent()}
         </main>
         

@@ -29,7 +29,7 @@ import { markTabActive, getTabId, getSingleModeStorageKey, getBatchModeStorageKe
 interface AutonomousModeViewProps {
   selectedModel: string;
   singleFindingsCount?: number;
-  onApplySingleReport: (
+  onApplySingleReport?: (
     findings: string[], 
     patientName: string, 
     audioBlob?: Blob | null,
@@ -40,6 +40,7 @@ interface AutonomousModeViewProps {
     templateUsed?: string
   ) => void;
   onApplyBatchReports: (batches: Array<{
+    id?: string;
     name: string;
     findings: string[];
     audioBlobs: Blob[];
@@ -49,7 +50,7 @@ interface AutonomousModeViewProps {
     customImages?: Array<{ data: string; mimeType: string }>;
     extraFiles?: File[];
   }>) => void;
-  onNavigateToSingle: () => void;
+  onNavigateToSingle?: () => void;
   onNavigateToBatch: () => void;
   onSaveToDrive?: (result: SaveResult) => void;
 }
@@ -123,6 +124,133 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
   const [textNoteAlias, setTextNoteAlias] = useState('');
   const [textNoteContent, setTextNoteContent] = useState('');
   const [editingFileId, setEditingFileId] = useState<string | null>(null);
+
+  // Expanded report cards and copy states for viewing full reports inside Autonomous Mode
+  const [expandedReports, setExpandedReports] = useState<Record<number, boolean>>({});
+  const [copiedReportIndex, setCopiedReportIndex] = useState<number | null>(null);
+
+  const toggleExpandReport = (idx: number) => {
+    setExpandedReports(prev => ({
+      ...prev,
+      [idx]: prev[idx] === undefined ? false : !prev[idx]
+    }));
+  };
+
+  const handleCopyReport = async (findings: string[], idx: number) => {
+    try {
+      const text = findings.map(f => {
+        if (f.includes('###')) {
+          const parts = f.split('###');
+          const title = parts[0].trim();
+          const points = parts.slice(1).map(p => {
+            const clean = p.replace(/^BOLD::/i, '').replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
+            return `• ${clean}`;
+          }).join('\n');
+          return `${title}\n${points}`;
+        }
+        return f;
+      }).join('\n\n');
+      await navigator.clipboard.writeText(text);
+      setCopiedReportIndex(idx);
+      setTimeout(() => setCopiedReportIndex(null), 2000);
+    } catch (err) {
+      console.warn('Could not copy report:', err);
+    }
+  };
+
+  const renderFindingLine = (finding: string, idx: number) => {
+    if (finding.includes('###')) {
+      const parts = finding.split('###');
+      const title = parts[0].trim();
+      const isImpression = title.toUpperCase().startsWith('IMPRESSION');
+      const points = parts.slice(1).map(p => p.trim()).filter(Boolean);
+
+      return (
+        <div key={idx} className="my-2 p-3 rounded-lg bg-slate-900/80 border border-slate-800">
+          <span className="font-bold uppercase tracking-wider text-slate-100 underline text-xs sm:text-sm">
+            {title}
+          </span>
+          <div className="mt-2 space-y-1.5 pl-1">
+            {points.map((pt, pIdx) => {
+              const cleanPt = pt.replace(/^BOLD::/i, '').trim();
+              const textWithoutBullet = cleanPt.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
+              const isNoBullet = isImpression && (/^\[NO_BULLET\]/i.test(pt) || /^findings\s+(?:are\s+)?s\/?o/i.test(textWithoutBullet));
+              if (isNoBullet) {
+                return (
+                  <div key={pIdx} className="font-bold text-slate-200">
+                    {textWithoutBullet}
+                  </div>
+                );
+              }
+              return (
+                <div key={pIdx} className="font-bold text-slate-200 flex items-start gap-2">
+                  <span className="select-none text-slate-400 shrink-0">•</span>
+                  <span className="flex-1">{textWithoutBullet}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    const isHeading = /^[A-Z0-9 /&_-]+:/.test(finding.trim()) && !finding.trim().includes('\n');
+    if (isHeading) {
+      const colonIdx = finding.indexOf(':');
+      const headerTitle = finding.slice(0, colonIdx + 1);
+      const rest = finding.slice(colonIdx + 1).trim();
+
+      return (
+        <div key={idx} className="my-2 text-xs sm:text-sm text-slate-300 leading-relaxed">
+          <span className="font-bold text-slate-100 underline uppercase">{headerTitle}</span>
+          {rest && <span className="ml-2 font-normal text-slate-200">{rest}</span>}
+        </div>
+      );
+    }
+
+    return (
+      <div key={idx} className="my-1.5 text-xs sm:text-sm text-slate-200 leading-relaxed">
+        {finding}
+      </div>
+    );
+  };
+
+  // Restore autonomous session from sessionStorage on mount (tab-scoped)
+  useEffect(() => {
+    const curTabId = getTabId();
+    try {
+      const raw = sessionStorage.getItem(`raddoc_auto_session_${curTabId}`);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed.lastPlan && parsed.executionResult) {
+          setLastPlan(parsed.lastPlan);
+          setExecutionResult(parsed.executionResult);
+          if (parsed.feedbackSuccessMessage) {
+            setFeedbackSuccessMessage(parsed.feedbackSuccessMessage);
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("Could not restore autonomous session:", e);
+    }
+  }, []);
+
+  // Persist autonomous session to sessionStorage whenever plan or result updates
+  useEffect(() => {
+    const curTabId = getTabId();
+    if (lastPlan && executionResult) {
+      try {
+        const autoSessionData = {
+          lastPlan,
+          executionResult,
+          feedbackSuccessMessage,
+        };
+        sessionStorage.setItem(`raddoc_auto_session_${curTabId}`, JSON.stringify(autoSessionData));
+      } catch (e) {
+        console.warn("Could not persist autonomous session:", e);
+      }
+    }
+  }, [lastPlan, executionResult, feedbackSuccessMessage]);
 
   // Sync workspace stats from localStorage
   useEffect(() => {
@@ -474,7 +602,6 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
         selectedModel,
         audioBlob: recordedBlob,
         attachedFiles,
-        onApplySingleReport,
         onApplyBatchReports,
         onDriveSaved: onSaveToDrive,
       });
@@ -495,13 +622,21 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
   };
 
   const handleResetSession = () => {
+    const curTabId = getTabId();
+    try {
+      sessionStorage.removeItem(`raddoc_auto_session_${curTabId}`);
+    } catch (_) {}
     setRecordedBlob(null);
     setExecutionResult(null);
+    setLastPlan(null);
     setErrorMessage(null);
     setFeedbackRecordedBlob(null);
     setFeedbackTextInput('');
     setFeedbackError(null);
     setFeedbackSuccessMessage(null);
+    setAttachedFiles([]);
+    setExpandedReports({});
+    setCopiedReportIndex(null);
   };
 
   const handleStartFeedbackRecording = async () => {
@@ -585,7 +720,6 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
         selectedModel,
         audioBlob: audioToUse || recordedBlob,
         attachedFiles,
-        onApplySingleReport,
         onApplyBatchReports,
         onDriveSaved: onSaveToDrive,
       });
@@ -798,6 +932,15 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
           <div className="flex items-center gap-2.5 shrink-0 self-start sm:self-center">
             <button
               type="button"
+              onClick={handleResetSession}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold text-slate-200 transition-colors cursor-pointer shadow-sm"
+              title="Start a fresh autonomous session"
+            >
+              <span className="text-emerald-400 font-bold">+</span>
+              <span>New Session</span>
+            </button>
+            <button
+              type="button"
               onClick={handleDownloadLastAudio}
               className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold text-slate-200 transition-colors cursor-pointer shadow-sm disabled:opacity-50"
               title="Download the last recorded or uploaded voice audio"
@@ -821,8 +964,6 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
         <div className="bg-slate-950/60 border border-slate-800 rounded-xl px-4 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-slate-300">
             <span className="font-bold text-white">Live Workspace Context:</span>
-            <span>Single Mode: <strong className={singleModeStatus === 'Active' ? 'text-emerald-400 font-semibold' : 'text-slate-200 font-semibold'}>{singleModeStatus}</strong></span>
-            <span className="text-slate-600">·</span>
             <span>Batch Queue: <strong className="text-slate-200 font-semibold">{batchCount} {batchCount === 1 ? 'batch' : 'batches'}</strong></span>
             <span className="text-slate-600">·</span>
             <span>Templates: <strong className="text-slate-200 font-semibold">{templateStats.totalCount}</strong>{templateStats.customCount > 0 ? <span className="text-emerald-400 font-normal ml-1">({templateStats.builtInCount} + {templateStats.customCount} custom)</span> : null}</span>
@@ -833,18 +974,10 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
           <div className="flex items-center gap-2 text-xs shrink-0">
             <button
               type="button"
-              onClick={onNavigateToSingle}
-              className="text-indigo-400 hover:text-indigo-300 font-semibold transition-colors cursor-pointer"
-            >
-              View Single
-            </button>
-            <span className="text-slate-600">·</span>
-            <button
-              type="button"
               onClick={onNavigateToBatch}
-              className="text-indigo-400 hover:text-indigo-300 font-semibold transition-colors cursor-pointer"
+              className="text-indigo-400 hover:text-indigo-300 font-semibold transition-colors cursor-pointer underline"
             >
-              View Batches
+              View Batch Queue →
             </button>
           </div>
         </div>
@@ -1261,81 +1394,107 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
               </div>
             )}
 
-            {/* Slices Cards: Single Report & Batch Queue */}
-            <div className={`grid grid-cols-1 ${executionResult.singlePatient && executionResult.batchPatients && executionResult.batchPatients.length > 0 ? 'md:grid-cols-2' : ''} gap-4`}>
-              {/* Single Dictation Slice Card */}
-              {executionResult.singlePatient && (
-                <div className="p-4 sm:p-5 rounded-xl border border-indigo-900/60 bg-slate-900/90 space-y-3.5 shadow-lg">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2 font-bold text-sm text-indigo-300">
-                      <MicIcon className="w-4 h-4 text-indigo-400" />
-                      <span>Single Dictation Report</span>
-                    </div>
+            {/* Generated Patient Reports - Full Expandable Clinical View */}
+            {executionResult.batchPatients && executionResult.batchPatients.length > 0 && (
+              <div className="space-y-4">
+                <div className="flex items-center justify-between flex-wrap gap-2 pt-2 border-t border-slate-800">
+                  <div className="flex items-center gap-2">
+                    <span className="text-base">📑</span>
+                    <h4 className="font-bold text-sm sm:text-base text-white">
+                      Generated Patient Reports ({executionResult.batchPatients.length})
+                    </h4>
                     <span className="text-xs font-semibold px-2.5 py-0.5 rounded-full bg-indigo-950 border border-indigo-700/50 text-indigo-300">
-                      Active Report
+                      Saved in Batch Queue
                     </span>
                   </div>
-                  <div className="text-xs space-y-1.5 text-slate-300">
-                    <p><strong>Patient:</strong> {executionResult.singlePatient.name}</p>
-                    <p><strong>Findings:</strong> {executionResult.singlePatient.findings.length} findings transcribed &amp; merged</p>
-                    {executionResult.singlePatient.templateUsed && (
-                      <p><strong>Template (RTF Ready):</strong> {executionResult.singlePatient.templateUsed}</p>
-                    )}
-                    {executionResult.singlePatient.attachedFilesCount ? (
-                      <p><strong>Attached Items:</strong> {executionResult.singlePatient.attachedFilesCount} handed over</p>
-                    ) : null}
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const allCollapsed = Object.values(expandedReports).length > 0 && Object.values(expandedReports).every(v => v === false);
+                        const next: Record<number, boolean> = {};
+                        executionResult.batchPatients.forEach((_, i) => {
+                          next[i] = allCollapsed ? true : false;
+                        });
+                        setExpandedReports(next);
+                      }}
+                      className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium transition-colors cursor-pointer"
+                    >
+                      {Object.values(expandedReports).length > 0 && Object.values(expandedReports).every(v => v === false) ? 'Expand All' : 'Collapse All'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={onNavigateToBatch}
+                      className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white text-xs font-bold shadow-sm transition-all cursor-pointer"
+                    >
+                      <span>Open Batch Mode</span>
+                      <span>→</span>
+                    </button>
                   </div>
-                  <button
-                    type="button"
-                    onClick={onNavigateToSingle}
-                    className="w-full py-2.5 px-3 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs shadow-sm transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
-                  >
-                    <span>Open Report in Single Dictation</span>
-                    <span>→</span>
-                  </button>
                 </div>
-              )}
 
-              {/* Batch Processing Slice Card */}
-              {executionResult.batchPatients && executionResult.batchPatients.length > 0 && (
-                <div className="p-4 sm:p-5 rounded-xl border border-purple-900/60 bg-slate-900/90 space-y-3.5 shadow-lg">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2 font-bold text-sm text-purple-300">
-                      <span className="text-base">📑</span>
-                      <span>Multi-Patient Batch Queue</span>
-                    </div>
-                    <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-purple-950 border border-purple-700/50 text-purple-300">
-                      {executionResult.batchPatients.length} Reports Ready
-                    </span>
-                  </div>
-                  <div className="text-xs space-y-2 text-slate-300 max-h-56 overflow-y-auto pr-1">
-                    {executionResult.batchPatients.map((bp, i) => (
-                      <div key={i} className="flex items-center justify-between py-1.5 px-2.5 rounded-lg bg-slate-800/60 border border-slate-700/40">
-                        <div className="flex items-center gap-2 truncate mr-2">
-                          <span className="w-5 h-5 rounded-full bg-purple-600/30 text-purple-300 flex items-center justify-center text-[10px] font-bold shrink-0">
-                            {i + 1}
-                          </span>
-                          <span className="font-semibold text-slate-200 truncate">{bp.name}</span>
+                <div className="space-y-3">
+                  {executionResult.batchPatients.map((bp, i) => {
+                    const isExpanded = expandedReports[i] !== false; // expanded by default
+                    return (
+                      <div
+                        key={i}
+                        className="rounded-xl border border-slate-800 bg-slate-900/90 overflow-hidden shadow-md transition-all"
+                      >
+                        {/* Report Header */}
+                        <div
+                          onClick={() => toggleExpandReport(i)}
+                          className="flex items-center justify-between p-3 sm:p-4 bg-slate-800/60 hover:bg-slate-800/80 cursor-pointer select-none transition-colors border-b border-slate-700/40"
+                        >
+                          <div className="flex items-center gap-2.5 min-w-0">
+                            <span className="w-6 h-6 rounded-full bg-indigo-600/30 text-indigo-300 border border-indigo-500/40 flex items-center justify-center text-xs font-bold shrink-0">
+                              {i + 1}
+                            </span>
+                            <span className="font-bold text-sm sm:text-base text-white truncate">
+                              {bp.name}
+                            </span>
+                            {bp.templateUsed && (
+                              <span className="hidden sm:inline-block text-[11px] font-semibold px-2 py-0.5 rounded-md bg-purple-950 border border-purple-700/50 text-purple-300 shrink-0">
+                                {bp.templateUsed}
+                              </span>
+                            )}
+                          </div>
+
+                          <div className="flex items-center gap-2 shrink-0">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleCopyReport(bp.findings, i);
+                              }}
+                              className="px-2.5 py-1 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 text-xs font-medium transition-colors flex items-center gap-1 cursor-pointer"
+                              title="Copy report to clipboard"
+                            >
+                              <CopyIcon className="w-3.5 h-3.5" />
+                              <span>{copiedReportIndex === i ? 'Copied! ✓' : 'Copy'}</span>
+                            </button>
+                            <span className="text-slate-400 text-xs px-1">
+                              {isExpanded ? '▲' : '▼'}
+                            </span>
+                          </div>
                         </div>
-                        <span className="text-slate-400 text-[11px] shrink-0">
-                          {bp.findings.length} findings
-                          {bp.templateUsed ? ` • ${bp.templateUsed}` : ''}
-                          {bp.attachedFilesCount ? ` • ${bp.attachedFilesCount} file(s)` : ''}
-                        </span>
+
+                        {/* Full Report Findings Content */}
+                        {isExpanded && (
+                          <div className="p-3.5 sm:p-5 text-slate-200 space-y-2 bg-slate-950/40 font-mono text-xs sm:text-[13px] leading-relaxed max-h-96 overflow-y-auto">
+                            {bp.findings && bp.findings.length > 0 ? (
+                              bp.findings.map((f, fIdx) => renderFindingLine(f, fIdx))
+                            ) : (
+                              <p className="text-slate-500 italic">No findings recorded for this report.</p>
+                            )}
+                          </div>
+                        )}
                       </div>
-                    ))}
-                  </div>
-                  <button
-                    type="button"
-                    onClick={onNavigateToBatch}
-                    className="w-full py-3 px-4 rounded-xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white font-bold text-sm shadow-md transition-all flex items-center justify-center gap-2 cursor-pointer"
-                  >
-                    <span>Open Patient Reports in Batch Mode</span>
-                    <span>→</span>
-                  </button>
+                    );
+                  })}
                 </div>
-              )}
-            </div>
+              </div>
+            )}
 
             {/* Autonomous Dictate Changes / Feedback Section */}
             <div className="p-4 sm:p-5 rounded-2xl border border-indigo-500/50 bg-slate-900/90 shadow-xl space-y-4">

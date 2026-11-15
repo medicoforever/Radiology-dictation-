@@ -196,15 +196,13 @@ YOUR CORE TASKS:
      * ZERO COMBINED REDUNDANCY: NEVER create an additional combined report containing multiple patients. Do NOT accumulate all patients into a single report.
    - Cross-Turn Addenda / Corrections: If the radiologist moves to another patient and then later in the recording returns to an earlier patient (e.g., "Oh, going back to Patient 1...", "For that first CT Brain patient, also add that there is a 4mm nodule...", "And one more finding for John Doe..."), CONSOLIDATE that specific addition into that specific patient's report findings. Do NOT create duplicate split reports.
 
-2. TARGET MODE ROUTING (Multi-Case Batch Queue vs Standalone Single Case):
-   - STREAMLINED QUEUE ROUTING:
-     * When multiple patients are dictated, or when the doctor mentions "batch", "batch dictation", "batch mode", "add as batch", "in batch", or dictates a series of findings:
-       Route ALL patients to targetMode: 'batch'.
-       Every individual patient becomes an independent case in the batch queue.
-       NEVER route one patient to 'single' and others to 'batch'.
-       NEVER create a combined multi-patient report for 'single' mode.
-     * 'single' mode (targetMode: 'single') is RESERVED ONLY for when the doctor dictates strictly 1 patient AND explicitly specifies "single dictation" or "single mode".
-     * If the doctor dictates 1 patient without specifying a mode, route to targetMode: 'batch' (or 'single' if standalone single case). In general, batch mode handles all cases seamlessly.
+2. TARGET MODE ROUTING (Dedicated Multi-Patient Batch Queue):
+   - ALWAYS ROUTE TO BATCH QUEUE:
+     * In Autonomous Mode, EVERY dictated patient is ALWAYS routed to targetMode: 'batch'.
+     * Single dictation mode is completely omitted from autonomous orchestration to maintain streamlined simplicity.
+     * Whether the doctor dictates 1 patient or 10 patients, every individual patient becomes an independent, clean report card in the batch queue.
+     * NEVER route to 'single' mode.
+     * ZERO COMBINED REDUNDANCY: Each patient gets their own separate report.
 
 3. TEMPLATE ASSIGNMENT & SPOKEN STRUCTURAL/HEADING MODIFICATIONS:
    - Identify if a template is requested for any patient (e.g., "CT Brain Trauma", "Chest X-Ray Normal", "MRI Lumbar Spine", "Abdomen USG", "PNS Sinusitis").
@@ -583,7 +581,7 @@ export async function executeAutonomousPlan(
     selectedModel: string;
     audioBlob?: Blob | null;
     attachedFiles?: AutonomousAttachedFile[];
-    onApplySingleReport: (
+    onApplySingleReport?: (
       findings: string[], 
       patientName: string, 
       audioBlob?: Blob | null,
@@ -664,23 +662,12 @@ export async function executeAutonomousPlan(
       return { images, otherFiles, fileNames };
     };
 
-    // Streamlined Routing (Batch Mode as the dedicated multi-patient queue):
-    // If there are multiple patients (> 1) OR any patient has targetMode === 'batch',
-    // ALL patients are routed exclusively to Batch Mode so that each patient gets their own
-    // independent report card with RTF editing, audio playback, and Drive sync.
-    // Single Dictation is used strictly when there is exactly 1 patient AND targetMode is 'single'.
-    const isMultiOrBatch = plan.patients.length > 1 || plan.patients.some(p => p.targetMode === 'batch');
+    // Autonomous Mode routes ALL patients exclusively to the Batch Queue
+    // Every patient gets their own independent report card with template merging, RTF editing, and Drive sync.
+    const batchPatientItems = plan.patients;
 
-    const singlePatientItem = (!isMultiOrBatch && plan.patients.length === 1 && plan.patients[0].targetMode === 'single')
-      ? plan.patients[0]
-      : null;
-
-    const batchPatientItems = isMultiOrBatch
-      ? plan.patients
-      : [];
-
-    let processedSingle: { name: string; findings: string[]; templateUsed?: string; attachedFilesCount?: number } | null = null;
     const processedBatches: Array<{ 
+      patientId: string;
       name: string; 
       findings: string[]; 
       templateUsed?: string; 
@@ -712,112 +699,7 @@ export async function executeAutonomousPlan(
       console.warn('Could not load user custom templates for autonomous agent:', e);
     }
 
-    // 1. Process Single Mode Patient (if any)
-    if (singlePatientItem) {
-      // Expand user voice macros into findings
-      let finalFindings = expandMacrosInFindings([...singlePatientItem.findings]);
-      let templateUsed: string | undefined = undefined;
-      let singleDocx: DocxTemplateData | null = null;
-      let singlePrompt = singlePatientItem.customPrompt || '';
-
-      if (singlePatientItem.targetTemplateName) {
-        const matched = findTemplateByFuzzyName(singlePatientItem.targetTemplateName, userCustomTemplatePool);
-        if (matched) {
-          templateUsed = matched.name;
-          try {
-            const docxB64 = matched.docxBase64 || await getTemplateDocxBase64(matched.id);
-            if (docxB64) {
-              singleDocx = {
-                data: docxB64,
-                size: Math.round((docxB64.length * 3) / 4),
-                name: `${matched.name}.docx`,
-                extractedText: matched.lines ? matched.lines.join('\n') : matched.name
-              };
-            }
-          } catch (e) {
-            console.warn('Could not load docx for single template:', e);
-          }
-
-          singlePrompt = `[TEMPLATE_ID: ${matched.id}] Merged with template: ${matched.name}. ${singlePatientItem.mergeDirectives || ''}`.trim();
-
-          let effectiveDirectives = singlePatientItem.mergeDirectives || '';
-          const handedOverNotes = context.attachedFiles?.filter(
-            f => (singlePatientItem.attachedFileIndices || []).includes(f.index) && f.textContent
-          );
-          if (handedOverNotes && handedOverNotes.length > 0) {
-            const notesText = handedOverNotes
-              .map(n => `[Attached Reference Note - "${n.alias || n.file.name}"]:\n${n.textContent}`)
-              .join('\n\n');
-            effectiveDirectives = `${effectiveDirectives}\n\nClinical Reference Notes for Context:\n${notesText}`.trim();
-          }
-
-          try {
-            finalFindings = await mergeDictatedFindingsWithTemplate(
-              finalFindings,
-              matched,
-              context.selectedModel,
-              undefined,
-              effectiveDirectives
-            );
-          } catch (mergeErr) {
-            console.warn(`Template merge for ${singlePatientItem.patientName} failed, using raw findings:`, mergeErr);
-          }
-        }
-      }
-
-      // Resolve handed-over attached files
-      const singleFiles = await resolveFilesForIndices(singlePatientItem.attachedFileIndices);
-      if (singleFiles.fileNames.length > 0) {
-        handedOverFilesSummary.push({
-          patientName: singlePatientItem.patientName,
-          fileNames: singleFiles.fileNames
-        });
-      }
-
-      processedSingle = {
-        name: singlePatientItem.patientName,
-        findings: finalFindings,
-        templateUsed,
-        attachedFilesCount: singleFiles.fileNames.length
-      };
-
-      // Dispatch to Single Dictation state with audioBlob, attached files, and RTF template config
-      context.onApplySingleReport(
-        finalFindings, 
-        singlePatientItem.patientName, 
-        context.audioBlob, 
-        singleFiles.images, 
-        singleFiles.otherFiles,
-        singlePrompt,
-        singleDocx,
-        templateUsed
-      );
-
-      // Handle Single Drive Save
-      if (isDriveConnected() || plan.globalDirectives.saveToDrive || singlePatientItem.saveToDrive) {
-        if (isDriveConnected()) {
-          try {
-            const driveRes = await autoSaveSingleDictation(finalFindings, singlePatientItem.patientName);
-            if (context.onDriveSaved) {
-              context.onDriveSaved(driveRes);
-            }
-          } catch (driveErr) {
-            console.warn("Drive auto-save failed:", driveErr);
-          }
-        }
-      }
-
-      // Handle Single HTML Download
-      if (plan.globalDirectives.downloadHtml || singlePatientItem.downloadHtml) {
-        try {
-          const htmlContent = generateSingleDictationHTML(finalFindings);
-          const safeName = singlePatientItem.patientName.replace(/[^a-zA-Z0-9_-]/g, '_');
-          downloadFile(htmlContent, `${safeName}_Report.html`, 'text/html;charset=utf-8');
-        } catch (htmlErr) {
-          console.warn("Single HTML download failed:", htmlErr);
-        }
-      }
-    }
+// All patients are processed cleanly as batch items below
 
     // 2. Process Batch Mode Patients (if any)
     if (batchPatientItems.length > 0) {
@@ -883,6 +765,7 @@ export async function executeAutonomousPlan(
         }
 
         processedBatches.push({
+          patientId: bp.patientId || `pt_${processedBatches.length + 1}`,
           name: bp.patientName,
           findings: finalFindings,
           templateUsed,
@@ -894,9 +777,10 @@ export async function executeAutonomousPlan(
         });
       }
 
-      // Dispatch to Batch Processor state with audioBlobs, RTF docx, and handed-over files
+      // Dispatch to Batch Processor state with patient ID, audioBlobs, RTF docx, and handed-over files
       context.onApplyBatchReports(
         processedBatches.map(b => ({
+          id: b.patientId,
           name: b.name,
           findings: b.findings,
           audioBlobs: context.audioBlob ? [context.audioBlob] : [],
@@ -950,9 +834,7 @@ export async function executeAutonomousPlan(
       const id = localStorage.getItem("workstation_gist_id");
       if (token && id) {
         try {
-          if (processedSingle) {
-            await autoSyncReport(token, id, { findings: processedSingle.findings });
-          } else if (processedBatches.length > 0) {
+          if (processedBatches.length > 0) {
             await autoSyncReport(token, id, {
               batches: processedBatches.map((b, idx) => ({ id: `auto_${idx}`, name: b.name, findings: b.findings }))
             });
@@ -974,9 +856,15 @@ export async function executeAutonomousPlan(
     return {
       success: true,
       summary: plan.summary,
-      totalPatients: plan.patients.length,
-      singlePatient: processedSingle,
-      batchPatients: processedBatches,
+      totalPatients: processedBatches.length,
+      singlePatient: null,
+      batchPatients: processedBatches.map(b => ({
+        patientId: b.patientId,
+        name: b.name,
+        findings: b.findings,
+        templateUsed: b.templateUsed,
+        attachedFilesCount: b.attachedFilesCount,
+      })),
       driveSaved: !!plan.globalDirectives.saveToDrive && isDriveConnected(),
       htmlDownloaded: !!plan.globalDirectives.downloadHtml,
       workstationSynced,
