@@ -6,6 +6,7 @@
  */
 
 import { loadJsonFileFromRootFolder, saveJsonFileToRootFolder, isDriveConnected } from './googleDriveService';
+import { safeLocalStorage } from './storageService';
 
 export interface RadiologyMacro {
   id: string;
@@ -94,7 +95,7 @@ function normalizeMacro(m: Partial<RadiologyMacro> & { name: string; text?: stri
  */
 export function getMacroDictionaryStore(): MacroDictionaryStore {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = safeLocalStorage.getRaw(STORAGE_KEY, '');
     if (raw) {
       const parsed = JSON.parse(raw) as MacroDictionaryStore;
       if (Array.isArray(parsed.macros)) {
@@ -115,7 +116,7 @@ export function getMacroDictionaryStore(): MacroDictionaryStore {
         // If legacy items were purged, save the clean store back
         if (cleanedMacros.length !== parsed.macros.length) {
           try {
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+            safeLocalStorage.setItem(STORAGE_KEY, store);
           } catch {}
         }
 
@@ -135,7 +136,7 @@ export function getMacroDictionaryStore(): MacroDictionaryStore {
   };
 
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(emptyStore));
+    safeLocalStorage.setItem(STORAGE_KEY, emptyStore);
   } catch {}
 
   return emptyStore;
@@ -152,7 +153,7 @@ export function saveMacroDictionaryStore(store: MacroDictionaryStore): void {
   };
 
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(normalized));
+    safeLocalStorage.setItem(STORAGE_KEY, normalized);
   } catch (err) {
     console.warn('Failed to save macro store to localStorage:', err);
   }

@@ -41,6 +41,8 @@ import { getUpcomingTemplate, clearUpcomingTemplate, subscribeToUpcomingTemplate
 import MacrosAndDictionaryModal from './components/MacrosAndDictionaryModal';
 import { subscribeToMacroDictionary, syncMacrosWithGoogleDrive, expandMacrosInFindings } from './services/macroDictionaryService';
 import { FloatingNewDictationButton } from './components/FloatingNewDictationButton';
+import ErrorBoundary from './components/ErrorBoundary';
+import { safeLocalStorage } from './services/storageService';
 
 interface ChatMessage {
   author: 'You' | 'AI';
@@ -135,19 +137,18 @@ const App: React.FC = () => {
   const [identifiedErrors, setIdentifiedErrors] = useState<IdentifiedError[]>([]);
   const [errorCheckStatus, setErrorCheckStatus] = useState<'idle' | 'checking' | 'complete'>('idle');
   const [theme, setTheme] = useState(() => {
-    const storedTheme = localStorage.getItem('theme');
+    const storedTheme = safeLocalStorage.getRaw('theme', '');
     if (storedTheme) {
       return storedTheme;
     }
-    return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    return (typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
   });
   const [isErrorCheckEnabled, setIsErrorCheckEnabled] = useState(() => {
-    const saved = localStorage.getItem(ERROR_CHECK_ENABLED_KEY);
-    return saved ? JSON.parse(saved) : false; // Default is OFF
+    return safeLocalStorage.getItem<boolean>(ERROR_CHECK_ENABLED_KEY, false);
   });
   const [isPowerMode, setIsPowerMode] = useState<boolean>(() => {
-    const saved = localStorage.getItem(POWER_MODE_KEY);
-    return saved !== null ? saved === 'true' : true; // Default is ON
+    const saved = safeLocalStorage.getRaw(POWER_MODE_KEY, '');
+    return saved !== '' ? saved === 'true' : true;
   });
   const [multipleFilesModal, setMultipleFilesModal] = useState<File[] | null>(null);
   const [pendingBatchFiles, setPendingBatchFiles] = useState<File[] | null>(null);
@@ -235,7 +236,7 @@ const App: React.FC = () => {
     } else {
       document.documentElement.classList.remove('dark');
     }
-    localStorage.setItem('theme', theme);
+    safeLocalStorage.setRaw('theme', theme);
 
     // Dynamically update mobile browser theme-color meta tag for Android status and navigation bar
     try {
@@ -247,7 +248,7 @@ const App: React.FC = () => {
   }, [theme]);
   
   useEffect(() => {
-    localStorage.setItem(POWER_MODE_KEY, String(isPowerMode));
+    safeLocalStorage.setRaw(POWER_MODE_KEY, String(isPowerMode));
     if (!isPowerMode) {
       document.documentElement.classList.add('low-power-mode');
     } else {
@@ -256,7 +257,7 @@ const App: React.FC = () => {
   }, [isPowerMode]);
 
   useEffect(() => {
-    localStorage.setItem(ERROR_CHECK_ENABLED_KEY, JSON.stringify(isErrorCheckEnabled));
+    safeLocalStorage.setItem(ERROR_CHECK_ENABLED_KEY, isErrorCheckEnabled);
   }, [isErrorCheckEnabled]);
 
   const toggleTheme = () => {
@@ -269,9 +270,8 @@ const App: React.FC = () => {
   useEffect(() => {
     const loadState = async () => {
       try {
-        const savedStateJSON = localStorage.getItem(SINGLE_MODE_STORAGE_KEY);
-        if (savedStateJSON) {
-          const savedState = JSON.parse(savedStateJSON);
+        const savedState = safeLocalStorage.getItem<any>(SINGLE_MODE_STORAGE_KEY, null);
+        if (savedState) {
           let blob: Blob | null = null;
 
           // Try loading audio blob from IndexedDB first
@@ -342,7 +342,7 @@ const App: React.FC = () => {
         }
       } catch (err) {
         console.error("Failed to load state from localStorage:", err);
-        localStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
+        safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
       } finally {
         setIsRestored(true);
       }
@@ -372,7 +372,7 @@ const App: React.FC = () => {
             driveSynced: isSynced,
             driveSyncedHash: driveSyncedHashRef.current,
           };
-          localStorage.setItem(SINGLE_MODE_STORAGE_KEY, JSON.stringify(stateToSave));
+          safeLocalStorage.setItem(SINGLE_MODE_STORAGE_KEY, stateToSave);
 
           if (audioBlob) {
             await saveAudioBlob('single_mode_audio', audioBlob);
@@ -383,7 +383,7 @@ const App: React.FC = () => {
           console.error("Failed to save state:", err);
         }
       } else if (status === AppStatus.Idle && findings.length === 0) {
-        localStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
+        safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
         deleteAudioBlob('single_mode_audio').catch(() => {});
       }
     };
@@ -894,7 +894,7 @@ const App: React.FC = () => {
             undoCountdownIntervalRef.current = null;
             // Now finalize cleanup of persistent storage
             try {
-              localStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
+              safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
               deleteAudioBlob('single_mode_audio').catch(() => {});
             } catch (e) {}
             previousSingleSessionRef.current = null;
@@ -906,7 +906,7 @@ const App: React.FC = () => {
     } else {
       // Nothing to undo, perform instant cleanup
       try {
-        localStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
+        safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
         deleteAudioBlob('single_mode_audio').catch(() => {});
       } catch (error) {
         console.error("Failed to remove item from localStorage:", error);
@@ -980,7 +980,7 @@ const App: React.FC = () => {
         isLive: prev.isLive,
         driveSyncedHash: prev.driveSyncedHash,
       };
-      localStorage.setItem(SINGLE_MODE_STORAGE_KEY, JSON.stringify(stateToSave));
+      safeLocalStorage.setItem(SINGLE_MODE_STORAGE_KEY, stateToSave);
       if (prev.audioBlob) {
         await saveAudioBlob('single_mode_audio', prev.audioBlob);
       }
@@ -1011,7 +1011,7 @@ const App: React.FC = () => {
     }
     setUndoSnackbar(null);
     try {
-      localStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
+      safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
       deleteAudioBlob('single_mode_audio').catch(() => {});
     } catch (e) {}
     previousSingleSessionRef.current = null;
@@ -1105,7 +1105,8 @@ const App: React.FC = () => {
         );
       case AppStatus.Success:
         return (
-          <ResultsDisplay 
+          <ErrorBoundary sectionName="Results Display" onReset={resetSingleMode}>
+            <ResultsDisplay 
             findings={findings} 
             onReset={resetSingleMode} 
             audioBlob={audioBlob}
@@ -1130,7 +1131,8 @@ const App: React.FC = () => {
             identifiedErrors={identifiedErrors}
             errorCheckStatus={errorCheckStatus}
             onOpenMacrosModal={() => setIsMacrosModalOpen(true)}
-          />
+            />
+          </ErrorBoundary>
         );
       case AppStatus.Error:
         return (
@@ -1217,7 +1219,9 @@ const App: React.FC = () => {
       case 'single':
         return renderSingleModeContent();
       case 'batch':
-        return <BatchProcessor 
+        return (
+          <ErrorBoundary sectionName="Batch Mode" onReset={() => setMode('single')}>
+            <BatchProcessor 
                     selectedModel={selectedModel} 
                     isErrorCheckEnabled={isErrorCheckEnabled}
                     initialFiles={pendingBatchFiles}
@@ -1230,12 +1234,19 @@ const App: React.FC = () => {
                         resetSingleMode();
                         setMode('single');
                     }} 
-                />;
+                />
+          </ErrorBoundary>
+        );
       case 'live':
-        return <LiveDictation onComplete={handleLiveDictationComplete} onBack={() => setMode('single')} onOpenMacrosModal={() => setIsMacrosModalOpen(true)} />;
+        return (
+          <ErrorBoundary sectionName="Live Dictation" onReset={() => setMode('single')}>
+            <LiveDictation onComplete={handleLiveDictationComplete} onBack={() => setMode('single')} onOpenMacrosModal={() => setIsMacrosModalOpen(true)} />
+          </ErrorBoundary>
+        );
       case 'autonomous':
         return (
-          <AutonomousModeView
+          <ErrorBoundary sectionName="Autonomous Mode" onReset={() => setMode('single')}>
+            <AutonomousModeView
             selectedModel={selectedModel}
             singleFindingsCount={findings.length}
             onApplySingleReport={(loadedFindings, patientName, loadedAudio, loadedImages, loadedFiles, loadedPrompt, loadedDocx, templateUsed) => {
@@ -1289,6 +1300,7 @@ const App: React.FC = () => {
               checkAndAutoSyncReport(300);
             }}
           />
+          </ErrorBoundary>
         );
       default:
         return renderSingleModeContent();

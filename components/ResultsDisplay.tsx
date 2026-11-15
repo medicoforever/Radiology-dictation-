@@ -28,7 +28,7 @@ import TemplateSelectionModal from './ui/TemplateSelectionModal';
 import { getTemplateDocxBase64 } from '../services/builtInTemplates';
 import ImageIcon from './icons/ImageIcon';
 import { mergeAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
-import {  generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText , isSummaryLeadIn, formatImpressionOutput, isReportTitle as isDocxReportTitle, isAnatomicalSubheading } from '../services/docxService';
+import {  generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText , isSummaryLeadIn, formatImpressionOutput, isReportTitle as isDocxReportTitle, isAnatomicalSubheading, isPureCorrelationOrRecommendation } from '../services/docxService';
 import { stopRepeatingInterruptedAlert } from '../services/soundService';
 import RichTextReportEditor from './RichTextReportEditor';
 import type { DocxTemplateData } from './ui/CustomPromptInput';

@@ -247,7 +247,7 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
   };
 
   const handleFilesSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files || []);
+    const files = Array.from(e.target.files || []) as File[];
     if (files.length > 0) {
       await addFilesToState(files);
     }
@@ -271,7 +271,7 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
     e.stopPropagation();
     setIsDraggingOver(false);
 
-    const files = Array.from(e.dataTransfer.files || []);
+    const files = Array.from(e.dataTransfer.files || []) as File[];
     if (files.length > 0) {
       await addFilesToState(files);
     }

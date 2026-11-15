@@ -47,6 +47,22 @@
           }
         });
       }
+      // Fail-safe protection against blank screen: catches unhandled script/extension errors
+      window.addEventListener('error', function(e) {
+        console.error('Unhandled runtime error caught by safety listener:', e.error || e.message);
+        setTimeout(function() {
+          var root = document.getElementById('root');
+          if (root && (!root.firstElementChild || root.innerHTML.trim() === '')) {
+            root.innerHTML = '<div style="margin:40px auto;max-width:550px;padding:24px;background:#fff1f2;border:1px solid #fecdd3;border-radius:12px;font-family:system-ui,-apple-system,sans-serif;color:#9f1239;box-shadow:0 10px 25px -5px rgba(0,0,0,0.1);">' +
+              '<h3 style="margin:0 0 8px 0;font-size:18px;font-weight:700;">Display Safeguard Activated</h3>' +
+              '<p style="margin:0 0 16px 0;font-size:14px;color:#4c0519;line-height:1.5;">An unexpected script error occurred, but your dictated recordings and cache are preserved. Click below to refresh the view.</p>' +
+              '<div style="display:flex;gap:10px;">' +
+              '<button onclick="window.location.reload();" style="padding:8px 16px;background:#e11d48;color:#fff;border:none;border-radius:6px;font-weight:600;font-size:13px;cursor:pointer;">Reload App</button>' +
+              '<button onclick=\"try{localStorage.removeItem('radiologyDictationSingleMode');localStorage.removeItem('radiologyDictationBatchMode');}catch(_){}window.location.reload();\" style="padding:8px 16px;background:#475569;color:#fff;border:none;border-radius:6px;font-weight:600;font-size:13px;cursor:pointer;">Clear Cache & Reload</button>' +
+              '</div></div>';
+          }
+        }, 100);
+      });
     </script>
   </head>
   <body class="bg-gray-50 dark:bg-slate-900">

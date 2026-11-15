@@ -664,6 +664,7 @@ export async function executeAutonomousPlan(
       findings: string[]; 
       templateUsed?: string; 
       customPrompt?: string;
+      customDocx?: DocxTemplateData | null;
       customImages?: Array<{ data: string; mimeType: string }>;
       extraFiles?: File[];
       attachedFilesCount?: number;
@@ -685,7 +686,8 @@ export async function executeAutonomousPlan(
             const docxB64 = matched.docxBase64 || await getTemplateDocxBase64(matched.id);
             if (docxB64) {
               singleDocx = {
-                base64: docxB64,
+                data: docxB64,
+                size: Math.round((docxB64.length * 3) / 4),
                 name: `${matched.name}.docx`,
                 extractedText: matched.lines ? matched.lines.join('\n') : matched.name
               };
@@ -792,7 +794,8 @@ export async function executeAutonomousPlan(
               const docxB64 = matched.docxBase64 || await getTemplateDocxBase64(matched.id);
               if (docxB64) {
                 bpDocx = {
-                  base64: docxB64,
+                  data: docxB64,
+                  size: Math.round((docxB64.length * 3) / 4),
                   name: `${matched.name}.docx`,
                   extractedText: matched.lines ? matched.lines.join('\n') : matched.name
                 };

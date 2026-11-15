@@ -4,6 +4,7 @@ import { processAudio, createChat, blobToBase64, continueAudioDictation, base64T
 import { saveAudioBlob, getAudioBlob, clearUnusedAudioBlobs } from '../services/audioStorage';
 import { mergeMultipleAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
 import { ClipboardPaste, X, CheckSquare } from 'lucide-react';
+import { safeLocalStorage } from '../services/storageService';
 import PasteTextModal from './PasteTextModal';
 import RichTextReportEditor from './RichTextReportEditor';
 import TemplateSelectionModal from './ui/TemplateSelectionModal';
@@ -801,7 +802,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                     })
                 );
 
-                localStorage.setItem(BATCH_MODE_STORAGE_KEY, JSON.stringify(serializableBatches));
+                safeLocalStorage.setItem(BATCH_MODE_STORAGE_KEY, serializableBatches);
                 clearUnusedAudioBlobs(usedKeys).catch(() => {});
             } catch (error) {
                 console.error("Failed to save batch state:", error);

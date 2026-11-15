@@ -1,6 +1,7 @@
 import { ReportTemplate } from '../constants';
 import { DocxTemplateData } from '../components/ui/CustomPromptInput';
 import { getTemplateDocxBase64 } from './builtInTemplates';
+import { safeLocalStorage } from './storageService';
 
 export interface UpcomingTemplateConfig {
   id: string;
@@ -26,12 +27,7 @@ export const subscribeToUpcomingTemplate = (listener: UpcomingTemplateListener):
 };
 
 export const getUpcomingTemplate = (): UpcomingTemplateConfig | null => {
-  try {
-    const raw = typeof window !== 'undefined' ? localStorage.getItem(UPCOMING_TEMPLATE_KEY) : null;
-    return raw ? JSON.parse(raw) : null;
-  } catch {
-    return null;
-  }
+  return safeLocalStorage.getItem<UpcomingTemplateConfig | null>(UPCOMING_TEMPLATE_KEY, null);
 };
 
 export const setUpcomingTemplate = async (template: ReportTemplate | ReportTemplate[] | any): Promise<UpcomingTemplateConfig> => {
@@ -89,13 +85,7 @@ export const setUpcomingTemplate = async (template: ReportTemplate | ReportTempl
       content: combinedExtractedText,
     };
 
-    try {
-      if (typeof window !== 'undefined') {
-        localStorage.setItem(UPCOMING_TEMPLATE_KEY, JSON.stringify(config));
-      }
-    } catch (err) {
-      console.warn('Failed to save upcoming combined template to localStorage', err);
-    }
+    safeLocalStorage.setItem(UPCOMING_TEMPLATE_KEY, config);
 
     listeners.forEach((listener) => {
       try {
@@ -145,13 +135,7 @@ export const setUpcomingTemplate = async (template: ReportTemplate | ReportTempl
     content: template.content,
   };
 
-  try {
-    if (typeof window !== 'undefined') {
-      localStorage.setItem(UPCOMING_TEMPLATE_KEY, JSON.stringify(config));
-    }
-  } catch (err) {
-    console.warn('Failed to save upcoming template to localStorage', err);
-  }
+  safeLocalStorage.setItem(UPCOMING_TEMPLATE_KEY, config);
 
   listeners.forEach((listener) => {
     try {
@@ -165,11 +149,7 @@ export const setUpcomingTemplate = async (template: ReportTemplate | ReportTempl
 };
 
 export const clearUpcomingTemplate = (): void => {
-  try {
-    if (typeof window !== 'undefined') {
-      localStorage.removeItem(UPCOMING_TEMPLATE_KEY);
-    }
-  } catch {}
+  safeLocalStorage.removeItem(UPCOMING_TEMPLATE_KEY);
 
   listeners.forEach((listener) => {
     try {
