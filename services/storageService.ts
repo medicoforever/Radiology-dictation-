@@ -183,6 +183,14 @@ export const safeLocalStorage = {
           window.localStorage.removeItem(k);
         } catch (_) {}
       }
+      for (let i = 0; i < window.localStorage.length; i++) {
+        const k = window.localStorage.key(i);
+        if (k && (k.startsWith('has_unsaved_session_') || k.startsWith('in_flight_recording_meta_') || k.startsWith('tab_heartbeat_'))) {
+          try {
+            window.localStorage.removeItem(k);
+          } catch (_) {}
+        }
+      }
     } catch (_) {}
   },
 

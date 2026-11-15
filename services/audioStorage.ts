@@ -207,7 +207,7 @@ export async function clearUnusedAudioBlobs(validKeys: string[]): Promise<void> 
 }
 
 /**
- * Saves active recording session chunks into IndexedDB
+ * Saves active recording session chunks into IndexedDB (isolated per browser tab)
  */
 export async function saveActiveSession(chunks: Blob[], mimeType: string, timestamp?: number): Promise<void> {
   if (!chunks || chunks.length === 0) return;
@@ -218,7 +218,7 @@ export async function saveActiveSession(chunks: Blob[], mimeType: string, timest
     const tabId = getTabId();
     const combinedBlob = new Blob(chunks, { type: mimeType || 'audio/webm' });
     const record = {
-      id: 'current_session',
+      id: `session_${tabId}`,
       tabId,
       timestamp: timestamp || Date.now(),
       mimeType: mimeType || combinedBlob.type || 'audio/webm',
@@ -231,7 +231,7 @@ export async function saveActiveSession(chunks: Blob[], mimeType: string, timest
     store.put(record);
 
     try {
-      localStorage.setItem('has_unsaved_session', JSON.stringify({
+      localStorage.setItem(`has_unsaved_session_${tabId}`, JSON.stringify({
         tabId,
         timestamp: record.timestamp,
         totalBytes: record.totalBytes,
@@ -244,18 +244,21 @@ export async function saveActiveSession(chunks: Blob[], mimeType: string, timest
 }
 
 /**
- * Checks for any unsaved active session chunks from an interrupted or crashed recording.
+ * Checks for any unsaved active session chunks for THIS specific browser tab.
+ * Isolated per tab to eliminate cross-tab audio alarms or overwriting.
  */
 export async function getUnsavedActiveSession(): Promise<UnsavedSession | null> {
   try {
     const db = await getDB();
     if (!db) return null;
 
+    const tabId = getTabId();
     const tx = db.transaction(STORE_CHUNKS, 'readonly');
     const store = tx.objectStore(STORE_CHUNKS);
 
     return new Promise((resolve) => {
-      const req = store.get('current_session');
+      // 1. Check tab-scoped session first
+      const req = store.get(`session_${tabId}`);
       req.onsuccess = () => {
         const data = req.result;
         if (data) {
@@ -271,12 +274,37 @@ export async function getUnsavedActiveSession(): Promise<UnsavedSession | null> 
               mimeType: data.mimeType || 'audio/webm',
               chunks: chunks,
               totalBytes: data.totalBytes || chunks.reduce((acc, c) => acc + c.size, 0),
-              tabId: data.tabId,
+              tabId: data.tabId || tabId,
             });
             return;
           }
         }
-        resolve(null);
+
+        // 2. Safe check on legacy key ONLY if it was created by this exact same tab
+        const legacyReq = store.get('current_session');
+        legacyReq.onsuccess = () => {
+          const legacyData = legacyReq.result;
+          if (legacyData && legacyData.tabId === tabId) {
+            let chunks: Blob[] = [];
+            if (Array.isArray(legacyData.chunks) && legacyData.chunks.length > 0) {
+              chunks = legacyData.chunks;
+            } else if (legacyData.blob instanceof Blob) {
+              chunks = [legacyData.blob];
+            }
+            if (chunks.length > 0) {
+              resolve({
+                timestamp: legacyData.timestamp || Date.now(),
+                mimeType: legacyData.mimeType || 'audio/webm',
+                chunks: chunks,
+                totalBytes: legacyData.totalBytes || chunks.reduce((acc, c) => acc + c.size, 0),
+                tabId: legacyData.tabId,
+              });
+              return;
+            }
+          }
+          resolve(null);
+        };
+        legacyReq.onerror = () => resolve(null);
       };
       req.onerror = () => resolve(null);
     });
@@ -287,11 +315,13 @@ export async function getUnsavedActiveSession(): Promise<UnsavedSession | null> 
 }
 
 /**
- * Clears the active session from IndexedDB and localStorage.
+ * Clears the active session from IndexedDB and localStorage for this tab.
  */
 export async function clearActiveSession(): Promise<void> {
   try {
+    const tabId = getTabId();
     try {
+      localStorage.removeItem(`has_unsaved_session_${tabId}`);
       localStorage.removeItem('has_unsaved_session');
     } catch {}
 
@@ -300,6 +330,7 @@ export async function clearActiveSession(): Promise<void> {
 
     const tx = db.transaction(STORE_CHUNKS, 'readwrite');
     const store = tx.objectStore(STORE_CHUNKS);
+    store.delete(`session_${tabId}`);
     store.delete('current_session');
   } catch (err) {
     console.debug('Failed to clear active session from IndexedDB:', err);

@@ -4,7 +4,7 @@ import { processAudio, createChat, blobToBase64, continueAudioDictation, base64T
 import { saveAudioBlob, getAudioBlob, clearUnusedAudioBlobs, saveReportSession, getReportSession, deleteReportSession } from '../services/audioStorage';
 import { mergeMultipleAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
 import { ClipboardPaste, X, CheckSquare } from 'lucide-react';
-import { safeLocalStorage } from '../services/storageService';
+import { safeLocalStorage, markTabActive } from '../services/storageService';
 import PasteTextModal from './PasteTextModal';
 import RichTextReportEditor from './RichTextReportEditor';
 import TemplateSelectionModal from './ui/TemplateSelectionModal';
@@ -1367,37 +1367,47 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         const batchesToProcess = batches.filter(b => (b.status === 'complete' || b.status === 'paused') && b.audioBlobs.length > 0 && !b.findings);
         if (batchesToProcess.length === 0) return;
 
+        markTabActive('processing');
+        const processingHeartbeatTimer = setInterval(() => {
+            markTabActive('processing');
+        }, 3000);
+
         batchesToProcess.forEach(b => {
             batchProcessingIdRef.current[b.id] = (batchProcessingIdRef.current[b.id] || 0) + 1;
         });
 
         setBatches(prev => prev.map(b => batchesToProcess.find(p => p.id === b.id) ? {...b, status: 'processing'} : b));
 
-        await Promise.all(batchesToProcess.map(async (batch) => {
-            if (batch.audioBlobs.length === 0) return;
-            const currentReqId = batchProcessingIdRef.current[batch.id];
-            try {
-                const mergedBlob = await mergeMultipleAudioBlobs(batch.audioBlobs);
-                const currentUpcoming = getUpcomingTemplate();
-                const effectivePrompt = batch.customPrompt || (currentUpcoming ? currentUpcoming.promptText : globalCustomPrompt);
-                const effectiveDocx = batch.customDocx || (currentUpcoming ? (currentUpcoming.docxData || null) : null);
-                const findings = await processAudio(mergedBlob, batch.selectedModel, effectivePrompt, batch.customImages, undefined, effectiveDocx);
-                
-                if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
+        try {
+            await Promise.all(batchesToProcess.map(async (batch) => {
+                if (batch.audioBlobs.length === 0) return;
+                const currentReqId = batchProcessingIdRef.current[batch.id];
+                try {
+                    const mergedBlob = await mergeMultipleAudioBlobs(batch.audioBlobs);
+                    const currentUpcoming = getUpcomingTemplate();
+                    const effectivePrompt = batch.customPrompt || (currentUpcoming ? currentUpcoming.promptText : globalCustomPrompt);
+                    const effectiveDocx = batch.customDocx || (currentUpcoming ? (currentUpcoming.docxData || null) : null);
+                    const findings = await processAudio(mergedBlob, batch.selectedModel, effectivePrompt, batch.customImages, undefined, effectiveDocx);
+                    
+                    if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
 
-                const chatSession = await createChat(mergedBlob, findings, effectivePrompt, batch.customImages, batch.selectedModel);
-                const aiGreeting = "I have reviewed the audio and transcript for this dictation. How can I help you further?";
-                const initialChatHistory = [{ author: 'AI' as const, text: `${findings.join('\n\n')}\n\n${aiGreeting}` }];
+                    const chatSession = await createChat(mergedBlob, findings, effectivePrompt, batch.customImages, batch.selectedModel);
+                    const aiGreeting = "I have reviewed the audio and transcript for this dictation. How can I help you further?";
+                    const initialChatHistory = [{ author: 'AI' as const, text: `${findings.join('\n\n')}\n\n${aiGreeting}` }];
 
-                if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
+                    if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
 
-                setBatches(prev => prev.map(b => b.id === batch.id ? { ...b, status: 'complete', findings, chat: chatSession, chatHistory: initialChatHistory, isChatting: false } : b));
-            } catch (err) {
-                if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
-                const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';
-                setBatches(prev => prev.map(b => b.id === batch.id ? { ...b, status: 'error', error: errorMessage } : b));
-            }
-        }));
+                    setBatches(prev => prev.map(b => b.id === batch.id ? { ...b, status: 'complete', findings, chat: chatSession, chatHistory: initialChatHistory, isChatting: false } : b));
+                } catch (err) {
+                    if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
+                    const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';
+                    setBatches(prev => prev.map(b => b.id === batch.id ? { ...b, status: 'error', error: errorMessage } : b));
+                }
+            }));
+        } finally {
+            clearInterval(processingHeartbeatTimer);
+            markTabActive('idle');
+        }
 
         // Automatically archive processed batch reports as HTML to Google Drive in hidden background
         setTimeout(() => {

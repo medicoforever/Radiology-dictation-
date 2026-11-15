@@ -24,6 +24,7 @@ import CopyIcon from './icons/CopyIcon';
 import PencilIcon from './icons/PencilIcon';
 import { ALL_RADNITO_TEMPLATES } from '../services/builtInTemplates';
 import { getDynamicTemplateStats } from '../services/templateStorage';
+import { markTabActive } from '../services/storageService';
 
 interface AutonomousModeViewProps {
   selectedModel: string;
@@ -451,6 +452,11 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
     setErrorMessage(null);
     setExecutionResult(null);
 
+    markTabActive('processing');
+    const heartbeatTimer = setInterval(() => {
+      markTabActive('processing');
+    }, 3000);
+
     try {
       setExecutionStep(`Analyzing spoken audio with ${selectedModel}...`);
       const plan: AutonomousExecutionPlan = await parseAutonomousAudioDictation(
@@ -478,6 +484,8 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
     } catch (err: any) {
       setErrorMessage(err?.message || 'Failed to parse and execute autonomous instructions.');
     } finally {
+      clearInterval(heartbeatTimer);
+      markTabActive('idle');
       setIsProcessing(false);
       setExecutionStep('');
     }

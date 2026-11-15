@@ -326,19 +326,20 @@ const App: React.FC = () => {
 
         // Check for any in-flight recording that was interrupted during processing, network disruption, or page reload
         try {
+          const currentTabId = getTabId();
           let meta: { tabId?: string; timestamp: number; type: string; size: number } | null = null;
           try {
-            const rawMeta = safeLocalStorage.getRaw('in_flight_recording_meta', '');
+            const rawMeta = safeLocalStorage.getRaw(`in_flight_recording_meta_${currentTabId}`, safeLocalStorage.getRaw('in_flight_recording_meta', ''));
             if (rawMeta) meta = JSON.parse(rawMeta);
           } catch (_) {}
 
-          const currentTabId = getTabId();
-          // Multi-tab protection: if another tab is actively processing right now, DO NOT sound alarms or hijack audio!
-          const isOtherActive = meta?.tabId && meta.tabId !== currentTabId && isTabHeartbeatAlive(meta.tabId);
+          // Multi-tab protection: if this audio belongs to another active tab, never hijack or recover it in this tab
+          const isFromOtherTab = !!(meta?.tabId && meta.tabId !== currentTabId);
+          const isOtherActive = isFromOtherTab && isTabHeartbeatAlive(meta.tabId);
 
-          if (!isOtherActive) {
-            const inFlightBlob = await getAudioBlob('in_flight_recording');
-            if (inFlightBlob && inFlightBlob.size > 0) {
+          if (!isOtherActive && !isFromOtherTab) {
+            const inFlightBlob = (await getAudioBlob(`in_flight_recording_${currentTabId}`)) || (await getAudioBlob('in_flight_recording'));
+            if (inFlightBlob && inFlightBlob.size > 0 && (!meta?.tabId || meta.tabId === currentTabId)) {
               setRecoveredInFlightAudio({
                 blob: inFlightBlob,
                 timestamp: meta?.timestamp || Date.now(),
@@ -498,7 +499,10 @@ const App: React.FC = () => {
   const handleDiscardRecoveredAudio = useCallback(async () => {
     setRecoveredInFlightAudio(null);
     try {
+      const currentTabId = getTabId();
+      localStorage.removeItem(`in_flight_recording_meta_${currentTabId}`);
       localStorage.removeItem('in_flight_recording_meta');
+      await deleteAudioBlob(`in_flight_recording_${currentTabId}`);
       await deleteAudioBlob('in_flight_recording');
     } catch (e) {
       console.warn("Could not discard in-flight recording:", e);
@@ -531,12 +535,18 @@ const App: React.FC = () => {
     markTabActive('processing');
     const processingHeartbeatTimer = setInterval(() => {
       markTabActive('processing');
-    }, 4000);
+    }, 3000);
 
-    saveAudioBlob('in_flight_recording', primaryBlob).catch(err => {
+    saveAudioBlob(`in_flight_recording_${currentTabId}`, primaryBlob).catch(err => {
       console.warn("Could not pre-save in-flight audio:", err);
     });
     try {
+      safeLocalStorage.setItem(`in_flight_recording_meta_${currentTabId}`, {
+        tabId: currentTabId,
+        timestamp: Date.now(),
+        type: primaryBlob.type || 'audio/webm',
+        size: primaryBlob.size,
+      });
       safeLocalStorage.setItem('in_flight_recording_meta', {
         tabId: currentTabId,
         timestamp: Date.now(),
@@ -568,8 +578,10 @@ const App: React.FC = () => {
       window.scrollTo({ top: 0, behavior: 'instant' });
 
       // Processing succeeded! Safely clear the temporary in-flight backup
+      deleteAudioBlob(`in_flight_recording_${currentTabId}`).catch(() => {});
       deleteAudioBlob('in_flight_recording').catch(() => {});
       try {
+        localStorage.removeItem(`in_flight_recording_meta_${currentTabId}`);
         localStorage.removeItem('in_flight_recording_meta');
       } catch (_) {}
 
@@ -951,12 +963,16 @@ const App: React.FC = () => {
 
     // 2. WIPE PERSISTENT STORAGE IMMEDIATELY AT SECOND 0!
     try {
+      const curTabId = getTabId();
       safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
       deleteAudioBlob('single_mode_audio').catch(() => {});
       deleteReportSession(SINGLE_MODE_STORAGE_KEY).catch(() => {});
       deleteAudioBlob('in_flight_recording').catch(() => {});
+      deleteAudioBlob(`in_flight_recording_${curTabId}`).catch(() => {});
       safeLocalStorage.removeItem('in_flight_recording_meta');
+      safeLocalStorage.removeItem(`in_flight_recording_meta_${curTabId}`);
       safeLocalStorage.removeItem('has_unsaved_session');
+      safeLocalStorage.removeItem(`has_unsaved_session_${curTabId}`);
     } catch (e) {
       console.warn("Storage wipe on reset:", e);
     }

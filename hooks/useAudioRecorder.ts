@@ -99,18 +99,20 @@ export const useAudioRecorder = (): AudioRecorderResult => {
       }
       if (session && session.chunks.length > 0 && session.totalBytes > 0) {
         const currentTabId = getTabId();
-        // If this session belongs to another tab actively recording or processing, DO NOT sound alert or hijack!
-        if (session.tabId && session.tabId !== currentTabId && isTabHeartbeatAlive(session.tabId)) {
+        // Multi-tab isolation: if this session does not belong to this tab, DO NOT touch it or alert
+        if (session.tabId && session.tabId !== currentTabId) {
+          stopRepeatingInterruptedAlert();
           return;
         }
         setUnsavedSession(session);
-        // Alert the user immediately and repeat every 10 seconds until an option is selected
+        // Alert the user immediately and repeat every 10 seconds until an option is selected (only for this tab)
         if (!hasAlertedUnsavedRef.current) {
           hasAlertedUnsavedRef.current = true;
           startRepeatingInterruptedAlert(10000);
         }
       } else {
         setUnsavedSession(null);
+        stopRepeatingInterruptedAlert();
       }
     } catch (err) {
       console.warn('Error checking unsaved audio session:', err);
@@ -204,6 +206,7 @@ export const useAudioRecorder = (): AudioRecorderResult => {
       // Update timer when not paused
       if (!isPausedRef.current) {
         setRecordingDuration(prev => prev + 1);
+        markTabActive('recording');
       }
 
       // Watchdog checks that execute reliably even when minimized:
@@ -269,6 +272,7 @@ export const useAudioRecorder = (): AudioRecorderResult => {
     setIsRequestingMic(true);
     isUserInitiatedStopRef.current = false;
     lastChunkTimestampRef.current = Date.now();
+    markTabActive('recording');
     
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       console.warn("Recording is already in progress.");
@@ -355,9 +359,12 @@ export const useAudioRecorder = (): AudioRecorderResult => {
         if (event.data && event.data.size > 0) {
           lastChunkTimestampRef.current = Date.now();
           audioChunksRef.current.push(event.data);
-          saveActiveSession(audioChunksRef.current, mimeTypeRef.current, sessionStartTimeRef.current).catch((e) =>
-            console.warn('Failed to auto-save active recording session:', e)
-          );
+          // Never persist active chunks if user already initiated stop
+          if (isRecordingRef.current && !isUserInitiatedStopRef.current) {
+            saveActiveSession(audioChunksRef.current, mimeTypeRef.current, sessionStartTimeRef.current).catch((e) =>
+              console.warn('Failed to auto-save active recording session:', e)
+            );
+          }
         }
       });
 
@@ -420,7 +427,10 @@ export const useAudioRecorder = (): AudioRecorderResult => {
 
   const stopRecording = useCallback((): Promise<Blob> => {
     isUserInitiatedStopRef.current = true;
+    isRecordingRef.current = false;
     stopRepeatingInterruptedAlert();
+    clearActiveSession().catch(() => {});
+    markTabActive('idle');
 
     if (workerRef.current) {
       workerRef.current.postMessage('stop');
@@ -464,11 +474,13 @@ export const useAudioRecorder = (): AudioRecorderResult => {
         } catch (stopErr) {
           console.warn('Error during recorder.stop():', stopErr);
           cleanupAndSetState().then(() => {
+            clearActiveSession().catch(() => {});
             const fallbackBlob = new Blob(audioChunksRef.current, { type: mimeTypeRef.current });
             resolve(fallbackBlob);
           });
         }
       } else {
+        clearActiveSession().catch(() => {});
         const fallbackBlob = new Blob(audioChunksRef.current, { type: mimeTypeRef.current });
         setIsRecording(false);
         setIsPaused(false);
