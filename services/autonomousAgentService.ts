@@ -752,7 +752,7 @@ export async function executeAutonomousPlan(
       );
 
       // Handle Single Drive Save
-      if (plan.globalDirectives.saveToDrive || singlePatientItem.saveToDrive) {
+      if (isDriveConnected() || plan.globalDirectives.saveToDrive || singlePatientItem.saveToDrive) {
         if (isDriveConnected()) {
           try {
             const driveRes = await autoSaveSingleDictation(finalFindings, singlePatientItem.patientName);
@@ -867,7 +867,7 @@ export async function executeAutonomousPlan(
       );
 
       // Handle Batch Drive Save
-      if (plan.globalDirectives.saveToDrive) {
+      if (isDriveConnected() || plan.globalDirectives.saveToDrive) {
         if (isDriveConnected()) {
           try {
             const batchDrivePayload = processedBatches.map((b, idx) => ({

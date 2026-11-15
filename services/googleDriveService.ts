@@ -9,6 +9,8 @@ import {
 } from 'firebase/auth';
 import firebaseConfig from '../firebase-applet-config.json';
 import { generateSingleDictationHTML, generateBatchDictationHTML } from './htmlGenerator';
+import { getReportSession, saveReportSession } from './audioStorage';
+import { safeLocalStorage } from './storageService';
 
 // Initialize Firebase App
 const app = !getApps().length ? initializeApp(firebaseConfig) : getApp();
@@ -877,59 +879,61 @@ export async function syncPendingLocalDictationsToDrive(): Promise<{
 
   const results: { singleResult?: SaveResult; batchResult?: BatchSaveResult } = {};
 
-  // 1. Check Single Mode storage
+  // 1. Check Single Mode storage (IndexedDB first, fallback to localStorage)
   try {
-    const singleRaw = localStorage.getItem('radiologyDictationSingleMode');
-    if (singleRaw) {
-      const singleState = JSON.parse(singleRaw);
-      if (
-        singleState &&
-        Array.isArray(singleState.findings) &&
-        singleState.findings.length > 0 &&
-        !singleState.driveSynced
-      ) {
-        const res = singleState.isLive
-          ? await autoSaveLiveDictation(singleState.findings, singleState.timestamp)
-          : await autoSaveSingleDictation(singleState.findings, undefined, singleState.timestamp);
+    let singleState = await getReportSession<any>('radiologyDictationSingleMode');
+    if (!singleState) {
+      const singleRaw = safeLocalStorage.getRaw('radiologyDictationSingleMode', '');
+      if (singleRaw) singleState = JSON.parse(singleRaw);
+    }
+    if (
+      singleState &&
+      Array.isArray(singleState.findings) &&
+      singleState.findings.length > 0 &&
+      !singleState.driveSynced
+    ) {
+      const res = singleState.isLive
+        ? await autoSaveLiveDictation(singleState.findings, singleState.timestamp)
+        : await autoSaveSingleDictation(singleState.findings, undefined, singleState.timestamp);
 
-        if (res.success) {
-          singleState.driveSynced = true;
-          singleState.driveFileId = res.fileId;
-          singleState.driveSyncedHash = singleState.findings.join('|||');
-          localStorage.setItem('radiologyDictationSingleMode', JSON.stringify(singleState));
-          results.singleResult = res;
-        }
+      if (res.success) {
+        singleState.driveSynced = true;
+        singleState.driveFileId = res.fileId;
+        singleState.driveSyncedHash = singleState.findings.join('|||');
+        await saveReportSession('radiologyDictationSingleMode', singleState);
+        results.singleResult = res;
       }
     }
   } catch (e) {
     console.warn('Error checking pending single dictations:', e);
   }
 
-  // 2. Check Batch Mode storage
+  // 2. Check Batch Mode storage (IndexedDB first, fallback to localStorage)
   try {
-    const batchRaw = localStorage.getItem('radiologyDictationBatchMode');
-    if (batchRaw) {
-      const batches = JSON.parse(batchRaw);
-      if (Array.isArray(batches)) {
-        const completed = batches.filter((b: any) => b.findings && b.findings.length > 0);
-        const savedFolderRaw = localStorage.getItem('radiologyDictationBatchDriveFolder');
-        const savedTimestampRaw = localStorage.getItem('radiologyDictationBatchSessionTimestamp');
-        const savedHash = localStorage.getItem('radiologyDictationBatchDriveSyncedHash');
+    let batches = await getReportSession<any[]>('radiologyDictationBatchMode');
+    if (!batches) {
+      const batchRaw = safeLocalStorage.getRaw('radiologyDictationBatchMode', '');
+      if (batchRaw) batches = JSON.parse(batchRaw);
+    }
+    if (Array.isArray(batches)) {
+      const completed = batches.filter((b: any) => b.findings && b.findings.length > 0);
+      const savedFolderRaw = safeLocalStorage.getRaw('radiologyDictationBatchDriveFolder', '');
+      const savedTimestampRaw = safeLocalStorage.getRaw('radiologyDictationBatchSessionTimestamp', '');
+      const savedHash = safeLocalStorage.getRaw('radiologyDictationBatchDriveSyncedHash', '');
 
-        const currentHash = completed.map((b: any) => `${b.id}:${(b.findings || []).join('|')}`).join(';;;');
-        
-        if (completed.length > 0 && currentHash !== savedHash) {
-          const existingFolder = savedFolderRaw ? JSON.parse(savedFolderRaw) : null;
-          const sessionTimestamp = savedTimestampRaw ? parseInt(savedTimestampRaw, 10) : Date.now();
+      const currentHash = completed.map((b: any) => `${b.id}:${(b.findings || []).join('|')}`).join(';;;');
+      
+      if (completed.length > 0 && currentHash !== savedHash) {
+        const existingFolder = savedFolderRaw ? JSON.parse(savedFolderRaw) : null;
+        const sessionTimestamp = savedTimestampRaw ? parseInt(savedTimestampRaw, 10) : Date.now();
 
-          const batchRes = await autoSaveBatchDictations(batches, existingFolder, sessionTimestamp);
-          if (batchRes.success) {
-            if (batchRes.batchFolder) {
-              localStorage.setItem('radiologyDictationBatchDriveFolder', JSON.stringify(batchRes.batchFolder));
-            }
-            localStorage.setItem('radiologyDictationBatchDriveSyncedHash', currentHash);
-            results.batchResult = batchRes;
+        const batchRes = await autoSaveBatchDictations(batches, existingFolder, sessionTimestamp);
+        if (batchRes.success) {
+          if (batchRes.batchFolder) {
+            safeLocalStorage.setItem('radiologyDictationBatchDriveFolder', batchRes.batchFolder);
           }
+          safeLocalStorage.setRaw('radiologyDictationBatchDriveSyncedHash', currentHash);
+          results.batchResult = batchRes;
         }
       }
     }

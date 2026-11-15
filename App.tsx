@@ -743,6 +743,31 @@ const App: React.FC = () => {
     }
   }, [audioBlob, selectedModel, customPrompt, customImages, customDocx, findings]);
 
+  const driveEditDebounceTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  const debouncedDriveAutoSave = useCallback((updatedFindings: string[]) => {
+    if (!isDriveConnected() || updatedFindings.length === 0) return;
+    if (driveEditDebounceTimerRef.current) {
+      clearTimeout(driveEditDebounceTimerRef.current);
+    }
+    driveEditDebounceTimerRef.current = setTimeout(() => {
+      const timestamp = activeDictationTimestampRef.current || Date.now();
+      const currentHash = updatedFindings.join('|||');
+      if (currentHash === driveSyncedHashRef.current) return;
+      driveSyncedHashRef.current = currentHash;
+
+      const savePromise = activeDictationIsLiveRef.current
+        ? autoSaveLiveDictation(updatedFindings, timestamp)
+        : autoSaveSingleDictation(updatedFindings, undefined, timestamp);
+
+      savePromise.then(res => {
+        if (res.success) {
+          setDriveSaveResult(res);
+        }
+      }).catch(err => console.warn('Drive edit auto-save notice:', err));
+    }, 1500);
+  }, []);
+
   const handleUpdateFinding = (index: number, newText: string) => {
     let updatedFindingsToSync: string[] = [];
     setFindings(prevFindings => {
@@ -754,12 +779,14 @@ const App: React.FC = () => {
       return updatedFindings;
     });
     checkAndAutoSyncReport(400, { findings: updatedFindingsToSync, timestamp: activeDictationTimestampRef.current || Date.now() });
+    debouncedDriveAutoSave(updatedFindingsToSync);
   };
 
   const handleAllFindingsUpdate = useCallback((newFindings: string[]) => {
     const expanded = expandMacrosInFindings(newFindings);
     setFindings(expanded);
     checkAndAutoSyncReport(400, { findings: expanded, timestamp: activeDictationTimestampRef.current || Date.now() });
+    debouncedDriveAutoSave(expanded);
   }, []);
 
   const handleAudioBlobUpdate = useCallback((newBlob: Blob) => {

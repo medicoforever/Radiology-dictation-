@@ -682,7 +682,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
 
         if (!batchSessionTimestampRef.current) {
             batchSessionTimestampRef.current = Date.now();
-            localStorage.setItem(BATCH_SESSION_TIMESTAMP_KEY, String(batchSessionTimestampRef.current));
+            safeLocalStorage.setRaw(BATCH_SESSION_TIMESTAMP_KEY, String(batchSessionTimestampRef.current));
         }
 
         const currentHash = completed.map(b => `${b.id}:${(b.findings || []).join('|')}`).join(';;;');
@@ -708,10 +708,10 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                 if (res.batchFolder) {
                     setDriveBatchFolder(res.batchFolder);
                     driveBatchFolderRef.current = res.batchFolder;
-                    localStorage.setItem(BATCH_DRIVE_FOLDER_KEY, JSON.stringify(res.batchFolder));
+                    safeLocalStorage.setItem(BATCH_DRIVE_FOLDER_KEY, res.batchFolder);
                 }
                 setDriveSyncedBatchHash(currentHash);
-                localStorage.setItem(BATCH_DRIVE_SYNCED_HASH_KEY, currentHash);
+                safeLocalStorage.setRaw(BATCH_DRIVE_SYNCED_HASH_KEY, currentHash);
 
                 if (onSaveToDrive) {
                     onSaveToDrive(res);
@@ -1039,9 +1039,9 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             setDriveBatchFolder(null);
             setDriveSyncedBatchHash(null);
             batchSessionTimestampRef.current = null;
-            localStorage.removeItem(BATCH_DRIVE_FOLDER_KEY);
-            localStorage.removeItem(BATCH_SESSION_TIMESTAMP_KEY);
-            localStorage.removeItem(BATCH_DRIVE_SYNCED_HASH_KEY);
+            safeLocalStorage.removeItem(BATCH_DRIVE_FOLDER_KEY);
+            safeLocalStorage.removeItem(BATCH_SESSION_TIMESTAMP_KEY);
+            safeLocalStorage.removeItem(BATCH_DRIVE_SYNCED_HASH_KEY);
         }
     };
 
