@@ -573,7 +573,19 @@ export function formatImpressionOutput(title: string, points: string[]): { plain
   }
 
   const plainLines = [cleanTitle];
-  const htmlParagraphs = [`<p><strong style="text-decoration: underline;">${cleanTitle}</strong></p>`];
+  const htmlParts = [`<p><strong style="text-decoration: underline;">${cleanTitle}</strong></p>`];
+
+  let currentUlItems: string[] = [];
+
+  const flushUl = () => {
+    if (currentUlItems.length > 0) {
+      const itemsHtml = currentUlItems
+        .map(item => `<li style="font-weight: bold; margin-bottom: 3pt; font-family: Calibri, 'Times New Roman', sans-serif;"><strong>${escapeHtml(item)}</strong></li>`)
+        .join('');
+      htmlParts.push(`<ul style="list-style-type: disc; margin: 4pt 0 6pt 0; padding-left: 24pt;">${itemsHtml}</ul>`);
+      currentUlItems = [];
+    }
+  };
 
   cleanPoints.forEach(pt => {
     // 1. Explicit no-bullet directive
@@ -591,35 +603,40 @@ export function formatImpressionOutput(title: string, points: string[]): { plain
     const textWithoutBullet = cleanPt.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
 
     if (isExplicitNoBullet) {
+      flushUl();
       plainLines.push(textWithoutBullet);
-      htmlParagraphs.push(`<p><strong>${escapeHtml(textWithoutBullet)}</strong></p>`);
+      htmlParts.push(`<p><strong>${escapeHtml(textWithoutBullet)}</strong></p>`);
       return;
     }
 
     // 2. Standalone correlation sentence alone on its own separate row -> KEPT WITHOUT BULLET
     const isStandaloneCorrelation = isPureCorrelationOrRecommendation(textWithoutBullet);
     if (isStandaloneCorrelation) {
+      flushUl();
       plainLines.push(textWithoutBullet);
-      htmlParagraphs.push(`<p><strong>${escapeHtml(textWithoutBullet)}</strong></p>`);
+      htmlParts.push(`<p><strong>${escapeHtml(textWithoutBullet)}</strong></p>`);
       return;
     }
 
     // 3. Standalone lead-in summary like "Findings are s/o:"
     const isLeadIn = /^findings\s+(?:are\s+)?s\/?o(?:\s*:)?$/i.test(textWithoutBullet);
     if (isLeadIn) {
+      flushUl();
       plainLines.push(textWithoutBullet);
-      htmlParagraphs.push(`<p><strong>${escapeHtml(textWithoutBullet)}</strong></p>`);
+      htmlParts.push(`<p><strong>${escapeHtml(textWithoutBullet)}</strong></p>`);
       return;
     }
 
-    // 4. Clinical finding (even with "Suggested clinical correlation..." appended) -> ALWAYS INCLUDE BULLET POINT WITH INDENT & HANGING INDENT
+    // 4. Clinical finding -> ADD TO NATIVE UL
     plainLines.push(`   •   ${textWithoutBullet}`);
-    htmlParagraphs.push(`<p class="impression-bullet" style="margin-left: 36pt; text-indent: -18pt; margin-top: 2pt; margin-bottom: 3pt; line-height: 1.4;"><strong>•&nbsp;&nbsp;&nbsp;${escapeHtml(textWithoutBullet)}</strong></p>`);
+    currentUlItems.push(textWithoutBullet);
   });
+
+  flushUl();
 
   return {
     plain: plainLines.join('\n'),
-    html: htmlParagraphs.join('')
+    html: htmlParts.join('')
   };
 }
 
@@ -885,15 +902,15 @@ export function sanitizeHtmlForClipboard(html: string): string {
 
     const lists = temp.querySelectorAll('ul, ol');
     lists.forEach(list => {
+      list.setAttribute('style', 'list-style-type: disc; margin: 4pt 0 6pt 0; padding-left: 24pt;');
       const items = list.querySelectorAll('li');
       items.forEach(li => {
-        const p = document.createElement('p');
+        // Strip any literal bullet from inside li.innerHTML so Word never renders double bullets
         let cleanLi = li.innerHTML.trim().replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
-        p.setAttribute('style', 'margin-left: 36pt; text-indent: -18pt; margin-top: 2pt; margin-bottom: 3pt; line-height: 1.4;');
-        p.innerHTML = `<strong>•&nbsp;&nbsp;&nbsp;${cleanLi}</strong>`;
-        list.parentNode?.insertBefore(p, list);
+        cleanLi = cleanLi.replace(/^<strong>(?:•|&bull;|&#8226;|[-*]|\s)+/i, '<strong>').trim();
+        li.setAttribute('style', 'font-weight: bold; margin-bottom: 3pt;');
+        li.innerHTML = cleanLi.startsWith('<strong>') ? cleanLi : `<strong>${cleanLi}</strong>`;
       });
-      list.remove();
     });
 
     const allParas = temp.querySelectorAll('p');
@@ -908,16 +925,17 @@ export function sanitizeHtmlForClipboard(html: string): string {
 
     const allEls = temp.querySelectorAll('*');
     allEls.forEach(el => {
-      const isBulletPara = (el.tagName.toLowerCase() === 'p' && (el.classList.contains('impression-bullet') || (el.textContent || '').trim().startsWith('•')));
+      const tag = el.tagName.toLowerCase();
       const s = el.getAttribute('style') || '';
       const isCenter = s.includes('text-align:center') || s.includes('text-align: center');
-      const hasBulletIndent = isBulletPara || (s.includes('text-indent') && s.includes('margin-left'));
 
       el.removeAttribute('class');
       el.removeAttribute('id');
 
-      if (hasBulletIndent) {
-        el.setAttribute('style', 'margin-left: 36pt; text-indent: -18pt; margin-top: 2pt; margin-bottom: 3pt; line-height: 1.4;');
+      if (tag === 'ul' || tag === 'ol') {
+        el.setAttribute('style', 'list-style-type: disc; margin: 4pt 0 6pt 0; padding-left: 24pt;');
+      } else if (tag === 'li') {
+        el.setAttribute('style', 'font-weight: bold; margin-bottom: 3pt;');
       } else if (isCenter) {
         el.setAttribute('style', 'text-align:center;');
       } else {
@@ -945,7 +963,7 @@ export function sanitizeHtmlForClipboard(html: string): string {
     .replace(/<h[2-6][^>]*>(.*?)<\/h[2-6]>/gi, '<p><strong>$1</strong></p>')
     .replace(/\sclass="[^"]*"/gi, '')
     .replace(/\sstyle="[^"]*border[^"]*"/gi, '')
-    .replace(/\sstyle="(?!(?:text-align:\s*center;?|margin-left:[^"]*|text-indent:[^"]*))[^"]*"/gi, '');
+    .replace(/\sstyle="(?!(?:text-align:\s*center;?|list-style-type:[^"]*|padding-left:[^"]*|font-weight:[^"]*|margin-left:[^"]*|text-indent:[^"]*))[^"]*"/gi, '');
 }
 
 /**

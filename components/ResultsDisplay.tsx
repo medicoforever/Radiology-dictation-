@@ -2556,31 +2556,59 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                     ) : isImpression ? (
                         <>
                             <span className="font-bold underline uppercase">{title}</span>
-                            <div className="mt-1 space-y-1">
-                                            {points.map((point, i) => {
-                                                const isExplicitNoBullet = /^\[NO_BULLET\]\s*/i.test(point) ||
-                                                    /^NO_BULLET::\s*/i.test(point) ||
-                                                    /^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i.test(point);
-                                                let cleanPt = point
-                                                    .replace(/^\[NO_BULLET\]\s*/i, '')
-                                                    .replace(/^NO_BULLET::\s*/i, '')
-                                                    .replace(/^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i, '')
-                                                    .trim();
-                                                const textWithoutBullet = cleanPt.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
-                                                if (isExplicitNoBullet || isPureCorrelationOrRecommendation(textWithoutBullet) || /^findings\s+(?:are\s+)?s\/?o(?:\s*:)?$/i.test(textWithoutBullet)) {
-                                                    return (
-                                                        <div key={i} className="font-bold text-slate-800 dark:text-slate-100 my-1">
-                                                            {textWithoutBullet}
-                                                        </div>
-                                                    );
-                                                }
-                                                return (
-                                                    <div key={i} className="font-bold flex items-start gap-2.5 ml-4 sm:ml-6 my-1 text-slate-800 dark:text-slate-100 leading-relaxed">
-                                                        <span className="select-none text-slate-900 dark:text-slate-100 font-bold shrink-0">•</span>
-                                                        <span className="flex-1">{textWithoutBullet}</span>
-                                                    </div>
-                                                );
-                                            })}
+                            <div className="mt-2 space-y-1">
+                                {(() => {
+                                    const renderedNodes: React.ReactNode[] = [];
+                                    let currentList: { text: string; origIdx: number }[] = [];
+
+                                    const flushList = (key: string) => {
+                                        if (currentList.length > 0) {
+                                            renderedNodes.push(
+                                                <ul
+                                                    key={key}
+                                                    className="list-disc pl-7 sm:pl-8 space-y-1.5 my-1.5"
+                                                    style={{ listStyleType: 'disc', paddingLeft: '28px', margin: '4px 0 6px 0' }}
+                                                >
+                                                    {currentList.map((item, idx) => (
+                                                        <li
+                                                            key={idx}
+                                                            className="font-bold text-slate-800 dark:text-slate-100 leading-relaxed"
+                                                            style={{ fontWeight: 'bold', marginBottom: '3px' }}
+                                                        >
+                                                            {item.text}
+                                                        </li>
+                                                    ))}
+                                                </ul>
+                                            );
+                                            currentList = [];
+                                        }
+                                    };
+
+                                    points.forEach((point, i) => {
+                                        const isExplicitNoBullet = /^\[NO_BULLET\]\s*/i.test(point) ||
+                                            /^NO_BULLET::\s*/i.test(point) ||
+                                            /^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i.test(point);
+                                        let cleanPt = point
+                                            .replace(/^\[NO_BULLET\]\s*/i, '')
+                                            .replace(/^NO_BULLET::\s*/i, '')
+                                            .replace(/^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i, '')
+                                            .trim();
+                                        const textWithoutBullet = cleanPt.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
+                                        if (isExplicitNoBullet || isPureCorrelationOrRecommendation(textWithoutBullet) || /^findings\s+(?:are\s+)?s\/?o(?:\s*:)?$/i.test(textWithoutBullet)) {
+                                            flushList(`ul-${i}`);
+                                            renderedNodes.push(
+                                                <div key={`no-bullet-${i}`} className="font-bold text-slate-800 dark:text-slate-100 my-1">
+                                                    {textWithoutBullet}
+                                                </div>
+                                            );
+                                        } else {
+                                            currentList.push({ text: textWithoutBullet, origIdx: i });
+                                        }
+                                    });
+
+                                    flushList('ul-final');
+                                    return renderedNodes;
+                                })()}
                             </div>
                         </>
                     ) : isStructured ? (
