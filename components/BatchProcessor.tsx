@@ -3680,8 +3680,9 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                                                                 );
                                                                                             }
                                                                                             return (
-                                                                                                <div key={i} className="font-bold">
-                                                                                                    • {textWithoutBullet}
+                                                                                                <div key={i} className="font-bold flex items-start gap-2.5 ml-4 sm:ml-6 my-1 text-slate-800 dark:text-slate-100 leading-relaxed">
+                                                                                                    <span className="select-none text-slate-900 dark:text-slate-100 font-bold shrink-0">•</span>
+                                                                                                    <span className="flex-1">{textWithoutBullet}</span>
                                                                                                 </div>
                                                                                             );
                                                                                         })}

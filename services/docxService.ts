@@ -612,9 +612,9 @@ export function formatImpressionOutput(title: string, points: string[]): { plain
       return;
     }
 
-    // 4. Clinical finding (even with "Suggested clinical correlation..." appended) -> ALWAYS INCLUDE BULLET POINT
-    plainLines.push(`• ${textWithoutBullet}`);
-    htmlParagraphs.push(`<p><strong>• ${escapeHtml(textWithoutBullet)}</strong></p>`);
+    // 4. Clinical finding (even with "Suggested clinical correlation..." appended) -> ALWAYS INCLUDE BULLET POINT WITH INDENT & HANGING INDENT
+    plainLines.push(`   •   ${textWithoutBullet}`);
+    htmlParagraphs.push(`<p class="impression-bullet" style="margin-left: 36pt; text-indent: -18pt; margin-top: 2pt; margin-bottom: 3pt; line-height: 1.4;"><strong>•&nbsp;&nbsp;&nbsp;${escapeHtml(textWithoutBullet)}</strong></p>`);
   });
 
   return {
@@ -889,7 +889,8 @@ export function sanitizeHtmlForClipboard(html: string): string {
       items.forEach(li => {
         const p = document.createElement('p');
         let cleanLi = li.innerHTML.trim().replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
-        p.innerHTML = `<strong>• ${cleanLi}</strong>`;
+        p.setAttribute('style', 'margin-left: 36pt; text-indent: -18pt; margin-top: 2pt; margin-bottom: 3pt; line-height: 1.4;');
+        p.innerHTML = `<strong>•&nbsp;&nbsp;&nbsp;${cleanLi}</strong>`;
         list.parentNode?.insertBefore(p, list);
       });
       list.remove();
@@ -907,19 +908,26 @@ export function sanitizeHtmlForClipboard(html: string): string {
 
     const allEls = temp.querySelectorAll('*');
     allEls.forEach(el => {
+      const isBulletPara = (el.tagName.toLowerCase() === 'p' && (el.classList.contains('impression-bullet') || (el.textContent || '').trim().startsWith('•')));
+      const s = el.getAttribute('style') || '';
+      const isCenter = s.includes('text-align:center') || s.includes('text-align: center');
+      const hasBulletIndent = isBulletPara || (s.includes('text-indent') && s.includes('margin-left'));
+
       el.removeAttribute('class');
       el.removeAttribute('id');
-      const s = el.getAttribute('style');
-      if (s) {
+
+      if (hasBulletIndent) {
+        el.setAttribute('style', 'margin-left: 36pt; text-indent: -18pt; margin-top: 2pt; margin-bottom: 3pt; line-height: 1.4;');
+      } else if (isCenter) {
+        el.setAttribute('style', 'text-align:center;');
+      } else {
         let cleanStyle = s.replace(/border[^;]+;?/gi, '')
                           .replace(/margin[^;]+;?/gi, '')
                           .replace(/padding[^;]+;?/gi, '')
                           .replace(/color[^;]+;?/gi, '')
                           .replace(/background[^;]+;?/gi, '')
                           .trim();
-        if (cleanStyle.includes('text-align:center') || cleanStyle.includes('text-align: center')) {
-          el.setAttribute('style', 'text-align:center;');
-        } else if (cleanStyle) {
+        if (cleanStyle) {
           el.setAttribute('style', cleanStyle);
         } else {
           el.removeAttribute('style');
@@ -937,7 +945,7 @@ export function sanitizeHtmlForClipboard(html: string): string {
     .replace(/<h[2-6][^>]*>(.*?)<\/h[2-6]>/gi, '<p><strong>$1</strong></p>')
     .replace(/\sclass="[^"]*"/gi, '')
     .replace(/\sstyle="[^"]*border[^"]*"/gi, '')
-    .replace(/\sstyle="(?!(?:text-align:\s*center;?))[^"]*"/gi, '');
+    .replace(/\sstyle="(?!(?:text-align:\s*center;?|margin-left:[^"]*|text-indent:[^"]*))[^"]*"/gi, '');
 }
 
 /**
@@ -1175,15 +1183,27 @@ export function generateRtfDocument(htmlOrText: string, title = 'Radiology Repor
 
         if (el.classList.contains('impression-section')) {
           paragraphs.push(`\\pard\\sa80\\sb160\\b\\ul\\fs24 IMPRESSION:\\ul0\\b0\\par`);
+          const ps = el.querySelectorAll('p');
+          if (ps.length > 0) {
+            ps.forEach(p => {
+              const text = (p.innerText || p.textContent || '').trim();
+              if (!text || /^IMPRESSION:/i.test(text)) return;
+              if (text.startsWith('•') || p.classList.contains('impression-bullet') || p.getAttribute('style')?.includes('text-indent')) {
+                const clean = text.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
+                paragraphs.push(`\\pard\\fi-360\\li720\\sa80\\sl276\\slmult1\\fs22\\b\\bullet   ${escapeRtf(clean)}\\b0\\par`);
+              } else {
+                paragraphs.push(`\\pard\\sa120\\sl276\\slmult1\\fs22\\b ${escapeRtf(text)}\\b0\\par`);
+              }
+            });
+            return;
+          }
           const lis = el.querySelectorAll('li');
           if (lis.length > 0) {
             lis.forEach(li => {
-              let liRuns = '';
-              for (let i = 0; i < li.childNodes.length; i++) {
-                liRuns += processInlineRuns(li.childNodes[i]);
-              }
-              paragraphs.push(`\\pard\\fi-360\\li720\\sa80\\sl276\\slmult1\\fs22\\b\\bullet  ${liRuns.trim()}\\b0\\par`);
+              const clean = (li.innerText || li.textContent || '').replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
+              paragraphs.push(`\\pard\\fi-360\\li720\\sa80\\sl276\\slmult1\\fs22\\b\\bullet   ${escapeRtf(clean)}\\b0\\par`);
             });
+            return;
           }
           return;
         }
@@ -1237,6 +1257,9 @@ export function generateRtfDocument(htmlOrText: string, title = 'Radiology Repor
           const rawText = (el.innerText || el.textContent || '').trim();
           if (/^clinical\s*(profile|history):/i.test(rawText)) {
             paragraphs.push(`\\pard\\sa120\\sl276\\slmult1\\i\\fs22 ${escapeRtf(rawText)}\\i0\\par`);
+          } else if (rawText.startsWith('•') || el.classList.contains('impression-bullet') || el.getAttribute('style')?.includes('text-indent')) {
+            const clean = rawText.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
+            paragraphs.push(`\\pard\\fi-360\\li720\\sa80\\sl276\\slmult1\\fs22\\b\\bullet   ${escapeRtf(clean)}\\b0\\par`);
           } else {
             let pRuns = '';
             for (let i = 0; i < el.childNodes.length; i++) {
@@ -1278,6 +1301,9 @@ export function generateRtfDocument(htmlOrText: string, title = 'Radiology Repor
         paragraphs.push(`\\pard\\sa120\\sl276\\slmult1\\i\\fs22 ${escapeRtf(cleanProf)}\\i0\\par`);
       } else if (line.toUpperCase() === 'IMPRESSION:' || line.startsWith('IMPRESSION:')) {
         paragraphs.push(`\\pard\\sa80\\sb160\\b\\ul\\fs24 IMPRESSION:\\ul0\\b0\\par`);
+      } else if (line.startsWith('•') || line.startsWith('   •') || line.startsWith('\t•')) {
+        const clean = line.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
+        paragraphs.push(`\\pard\\fi-360\\li720\\sa80\\sl276\\slmult1\\fs22\\b\\bullet   ${escapeRtf(clean)}\\b0\\par`);
       } else {
         paragraphs.push(`\\pard\\sa120\\sl276\\slmult1\\fs22 ${escapeRtf(line)}\\par`);
       }
@@ -2029,21 +2055,44 @@ export async function generateDocxFromFindings(findings: string[], title = 'Radi
       );
       const parts = raw.replace('IMPRESSION:', '').split('###').map((p) => p.trim()).filter(Boolean);
       for (const pt of parts) {
-        paragraphs.push(
-          new Paragraph({
-            bullet: { level: 0 },
-            spacing: { after: 80, line: 276 },
-            children: [
-              new TextRun({
-                text: pt,
-                bold: true,
-                font: 'Calibri',
-                size: 22,
-                color: '0F172A',
-              }),
-            ],
-          })
-        );
+        const cleanPt = pt.replace(/^BOLD::/i, '').trim();
+        const textWithoutBullet = cleanPt.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
+        const isLeadIn = /^findings\s+(?:are\s+)?s\/?o(?:\s*:)?$/i.test(textWithoutBullet);
+        const isStandaloneCorr = isPureCorrelationOrRecommendation(textWithoutBullet);
+        const isExplicitNoBullet = /^\[NO_BULLET\]/i.test(cleanPt) || /^NO_BULLET::/i.test(cleanPt);
+
+        if (isLeadIn || isStandaloneCorr || isExplicitNoBullet) {
+          paragraphs.push(
+            new Paragraph({
+              spacing: { after: 80, line: 276 },
+              children: [
+                new TextRun({
+                  text: textWithoutBullet,
+                  bold: true,
+                  font: 'Calibri',
+                  size: 22,
+                  color: '0F172A',
+                }),
+              ],
+            })
+          );
+        } else {
+          paragraphs.push(
+            new Paragraph({
+              bullet: { level: 0 },
+              spacing: { after: 80, line: 276 },
+              children: [
+                new TextRun({
+                  text: textWithoutBullet,
+                  bold: true,
+                  font: 'Calibri',
+                  size: 22,
+                  color: '0F172A',
+                }),
+              ],
+            })
+          );
+        }
       }
       continue;
     }

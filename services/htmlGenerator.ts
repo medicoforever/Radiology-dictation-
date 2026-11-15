@@ -323,7 +323,7 @@ const getEmbeddedScript = () => `
                         if (isPureCorr || isLeadIn) {
                             return \`<div class="font-bold">\${cText}</div>\`;
                         }
-                        return \`<div class="font-bold">• \${cText}</div>\`;
+                        return \`<div class="font-bold flex items-start gap-2.5 ml-5 my-1 leading-relaxed"><span class="select-none shrink-0">•</span><span class="flex-1">\${cText}</span></div>\`;
                     }).join('')}</div>\`;
                 } else if (newParts.length > 1) {
                     textEl.className = 'finding-text text-slate-700 cursor-pointer';
@@ -1240,7 +1240,7 @@ const renderFindingsList = (findings: string[], batchId: string): string => {
                                 if (isPureCorr || isLeadIn) {
                                     return `<div class="font-bold">${cText}</div>`;
                                 }
-                                return `<div class="font-bold">• ${cText}</div>`;
+                                    return `<div class="font-bold flex items-start gap-2.5 ml-5 my-1 leading-relaxed"><span class="select-none shrink-0">•</span><span class="flex-1">${cText}</span></div>`;
                             }).join('')}
                         </div>
                     `;
