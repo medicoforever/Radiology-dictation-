@@ -1,0 +1,2221 @@
+// @ts-ignore
+import mammoth from 'mammoth';
+import {
+  Document,
+  Paragraph,
+  TextRun,
+  HeadingLevel,
+  AlignmentType,
+  Packer,
+  Table,
+  TableRow,
+  TableCell,
+  WidthType,
+} from 'docx';
+
+export interface ParsedDocxResult {
+  fileName: string;
+  text: string;
+  html: string;
+  fileSize: number;
+}
+
+export interface ZipEntry {
+  name: string;
+  data: Uint8Array;
+  method: number;
+  crc32: number;
+}
+
+// CRC32 table for ZIP creation
+const CRC_TABLE = new Uint32Array(256);
+for (let i = 0; i < 256; i++) {
+  let c = i;
+  for (let k = 0; k < 8; k++) {
+    c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+  }
+  CRC_TABLE[i] = c >>> 0;
+}
+
+function calculateCRC32(bytes: Uint8Array): number {
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) {
+    crc = (crc >>> 8) ^ CRC_TABLE[(crc ^ bytes[i]) & 0xFF];
+  }
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+async function compressDeflate(rawBytes: Uint8Array): Promise<Uint8Array> {
+  if (typeof CompressionStream !== 'undefined') {
+    const cs = new CompressionStream('deflate-raw');
+    const writer = cs.writable.getWriter();
+    writer.write(rawBytes);
+    writer.close();
+    const response = new Response(cs.readable);
+    const buffer = await response.arrayBuffer();
+    return new Uint8Array(buffer);
+  }
+  return rawBytes;
+}
+
+export function base64ToUint8Array(base64: string): Uint8Array {
+  const binaryString = atob(base64.replace(/[\r\n\s]/g, ''));
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
+
+export async function parseZip(buffer: ArrayBuffer | ArrayBufferLike): Promise<Map<string, ZipEntry>> {
+  const view = new DataView(buffer);
+  const bytes = new Uint8Array(buffer);
+  const entries = new Map<string, ZipEntry>();
+  let offset = 0;
+  const len = bytes.length;
+
+  while (offset + 30 <= len) {
+    const sig = view.getUint32(offset, true);
+    if (sig !== 0x04034b50) break;
+
+    const method = view.getUint16(offset + 8, true);
+    const crc32 = view.getUint32(offset + 14, true);
+    const compressedSize = view.getUint32(offset + 18, true);
+    const uncompressedSize = view.getUint32(offset + 22, true);
+    const nameLen = view.getUint16(offset + 26, true);
+    const extraLen = view.getUint16(offset + 28, true);
+
+    const nameBytes = bytes.slice(offset + 30, offset + 30 + nameLen);
+    const name = new TextDecoder('utf-8').decode(nameBytes);
+
+    const dataStart = offset + 30 + nameLen + extraLen;
+    const compressedData = bytes.slice(dataStart, dataStart + compressedSize);
+    let uncompressedData: Uint8Array = compressedData;
+
+    if (method === 8 && typeof DecompressionStream !== 'undefined') {
+      try {
+        const ds = new DecompressionStream('deflate-raw');
+        const writer = ds.writable.getWriter();
+        writer.write(compressedData);
+        writer.close();
+        const response = new Response(ds.readable);
+        const buf = await response.arrayBuffer();
+        uncompressedData = new Uint8Array(buf);
+      } catch (e) {
+        uncompressedData = compressedData;
+      }
+    }
+
+    entries.set(name, {
+      name,
+      data: uncompressedData,
+      method,
+      crc32,
+    });
+
+    offset = dataStart + compressedSize;
+  }
+
+  return entries;
+}
+
+export async function createZip(entries: Map<string, Uint8Array>): Promise<Blob> {
+  const localFileHeaders: Uint8Array[] = [];
+  const centralDirHeaders: Uint8Array[] = [];
+  let offset = 0;
+
+  for (const [name, rawData] of entries) {
+    const nameBytes = new TextEncoder().encode(name);
+    const crc32 = calculateCRC32(rawData);
+    const uncompressedSize = rawData.length;
+    const compressedData = await compressDeflate(rawData);
+    const compressedSize = compressedData.length;
+    const method = 8; // DEFLATE
+
+    // Local file header (30 bytes + filename length)
+    const localHeader = new Uint8Array(30 + nameBytes.length);
+    const lv = new DataView(localHeader.buffer);
+    lv.setUint32(0, 0x04034b50, true);
+    lv.setUint16(4, 20, true);
+    lv.setUint16(6, 0, true);
+    lv.setUint16(8, method, true);
+    lv.setUint16(10, 0, true);
+    lv.setUint16(12, 0, true);
+    lv.setUint32(14, crc32, true);
+    lv.setUint32(18, compressedSize, true);
+    lv.setUint32(22, uncompressedSize, true);
+    lv.setUint16(26, nameBytes.length, true);
+    lv.setUint16(28, 0, true);
+    localHeader.set(nameBytes, 30);
+
+    localFileHeaders.push(localHeader);
+    localFileHeaders.push(compressedData);
+
+    // Central directory header (46 bytes + filename length)
+    const cdHeader = new Uint8Array(46 + nameBytes.length);
+    const cv = new DataView(cdHeader.buffer);
+    cv.setUint32(0, 0x02014b50, true);
+    cv.setUint16(4, 20, true);
+    cv.setUint16(6, 20, true);
+    cv.setUint16(8, 0, true);
+    cv.setUint16(10, method, true);
+    cv.setUint16(12, 0, true);
+    cv.setUint16(14, 0, true);
+    cv.setUint32(16, crc32, true);
+    cv.setUint32(20, compressedSize, true);
+    cv.setUint32(24, uncompressedSize, true);
+    cv.setUint16(28, nameBytes.length, true);
+    cv.setUint16(30, 0, true);
+    cv.setUint16(32, 0, true);
+    cv.setUint16(34, 0, true);
+    cv.setUint16(36, 0, true);
+    cv.setUint32(38, 0, true);
+    cv.setUint32(42, offset, true);
+    cdHeader.set(nameBytes, 46);
+
+    centralDirHeaders.push(cdHeader);
+    offset += localHeader.length + compressedData.length;
+  }
+
+  const cdOffset = offset;
+  let cdSize = 0;
+  for (const cdh of centralDirHeaders) cdSize += cdh.length;
+
+  // End of central directory record (22 bytes)
+  const eocd = new Uint8Array(22);
+  const ev = new DataView(eocd.buffer);
+  ev.setUint32(0, 0x06054b50, true);
+  ev.setUint16(4, 0, true);
+  ev.setUint16(6, 0, true);
+  ev.setUint16(8, entries.size, true);
+  ev.setUint16(10, entries.size, true);
+  ev.setUint32(12, cdSize, true);
+  ev.setUint32(16, cdOffset, true);
+  ev.setUint16(20, 0, true);
+
+  const allChunks: BlobPart[] = [...localFileHeaders, ...centralDirHeaders, eocd];
+  return new Blob(allChunks, {
+    type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  });
+}
+
+/**
+ * Converts mammoth HTML into structured text where <table> elements
+ * are preserved as clean Markdown tables (| Col 1 | Col 2 |).
+ */
+export function htmlToTextWithMarkdownTables(html: string): string {
+  if (!html) return '';
+  if (!html.includes('<table')) {
+    if (typeof DOMParser !== 'undefined') {
+      try {
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        return (doc.body.innerText || doc.body.textContent || '').trim();
+      } catch {
+        // fallback
+      }
+    }
+    return html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+
+  if (typeof DOMParser === 'undefined') return html.replace(/<[^>]+>/g, ' ').trim();
+
+  try {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const blocks: string[] = [];
+
+    const processNode = (node: Node) => {
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        const el = node as HTMLElement;
+        const tag = el.tagName.toLowerCase();
+
+        if (tag === 'table') {
+          const rows: string[][] = [];
+          const trElements = Array.from(el.querySelectorAll('tr'));
+          trElements.forEach(tr => {
+            const cells = Array.from(tr.querySelectorAll('th, td')).map(cell => {
+              return (cell.textContent || '').trim().replace(/\|/g, '/').replace(/\s+/g, ' ');
+            });
+            if (cells.length > 0 && cells.some(c => c.length > 0)) {
+              rows.push(cells);
+            }
+          });
+
+          if (rows.length > 0) {
+            const maxCols = Math.max(...rows.map(r => r.length), 1);
+            const mdRows = rows.map(r => {
+              const padded = [...r];
+              while (padded.length < maxCols) padded.push('');
+              return `| ${padded.join(' | ')} |`;
+            });
+            blocks.push(mdRows.join('\n'));
+          }
+          return;
+        }
+
+        if (['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'li', 'blockquote'].includes(tag)) {
+          if (el.querySelector('table')) {
+            Array.from(el.childNodes).forEach(processNode);
+          } else {
+            const text = (el.textContent || '').trim();
+            if (text) {
+              blocks.push(text);
+            }
+          }
+          return;
+        }
+
+        Array.from(el.childNodes).forEach(processNode);
+      } else if (node.nodeType === Node.TEXT_NODE) {
+        const text = (node.textContent || '').trim();
+        if (text && (!node.parentElement || node.parentElement === doc.body)) {
+          blocks.push(text);
+        }
+      }
+    };
+
+    Array.from(doc.body.childNodes).forEach(processNode);
+    return blocks.join('\n\n').trim();
+  } catch (e) {
+    console.warn('Failed to parse HTML tables into markdown text:', e);
+    return html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+}
+
+/**
+ * Parses a .docx File or Blob or ArrayBuffer using mammoth in browser
+ */
+export async function parseDocx(fileOrBlob: File | Blob): Promise<ParsedDocxResult> {
+  const fileName = (fileOrBlob as File).name || 'template.docx';
+  const fileSize = fileOrBlob.size || 0;
+  const arrayBuffer = await fileOrBlob.arrayBuffer();
+
+  try {
+    const htmlResult = await mammoth.convertToHtml({ arrayBuffer });
+    const textResult = await mammoth.extractRawText({ arrayBuffer });
+
+    const html = htmlResult.value || '';
+    let text = textResult.value || '';
+
+    // If the DOCX contains tables, preserve them in clean Markdown table syntax (| Col 1 | Col 2 |)
+    if (html.includes('<table')) {
+      const textWithTables = htmlToTextWithMarkdownTables(html);
+      if (textWithTables && textWithTables.includes('|')) {
+        text = textWithTables;
+      }
+    }
+
+    return {
+      fileName,
+      text: text.trim(),
+      html: html.trim(),
+      fileSize,
+    };
+  } catch (err) {
+    console.error('Failed to parse docx with mammoth:', err);
+    throw new Error(err instanceof Error ? err.message : 'Failed to parse .docx file.');
+  }
+}
+
+export function cleanClinicalProfileText(text: string): string {
+  let inner = text.replace(/^BOLD::/i, '').replace(/^UNDERLINE::/i, '').replace(/^UNITALIC::/i, '').replace(/\[STYLE:[^\]]+\]/i, '').trim();
+  inner = inner.replace(/^[*_\s]+/, '');
+  inner = inner.replace(/[*_\s]+$/, '');
+  inner = inner.replace(/\.\*+$/, '.');
+  inner = inner.replace(/[*_]+$/, '').trim();
+  inner = inner.replace(/^Clinical\s*(Profile|History)\s*:?\s*/i, 'Clinical Profile: ');
+  inner = inner.replace(/^Clinical Profile:\s*\*+/i, 'Clinical Profile: ');
+  // Always strip any remaining trailing or leading asterisks/underscores
+  inner = inner.replace(/[*_\s]+$/, '').trim();
+  inner = inner.replace(/^[*_\s]+/, '').trim();
+  return inner.trim();
+}
+
+export interface ClinicalProfileStyle {
+  text: string;
+  bold: boolean;
+  underline: boolean;
+  italic: boolean;
+}
+
+export function isClinicalProfileFinding(text: string): boolean {
+  if (!text || typeof text !== 'string') return false;
+  const clean = text
+    .replace(/^BOLD::/i, '')
+    .replace(/^UNDERLINE::/i, '')
+    .replace(/^UNITALIC::/i, '')
+    .replace(/\[STYLE:[^\]]+\]/i, '')
+    .replace(/^[*_\s]+|[*_\s]+$/g, '')
+    .trim();
+  return /^clinical\s*(?:profile|history):/i.test(clean);
+}
+
+export function parseClinicalProfileStyle(rawText: string): ClinicalProfileStyle {
+  if (!rawText) return { text: 'Clinical Profile:', bold: false, underline: false, italic: true };
+
+  let str = rawText.trim();
+  let bold = false;
+  let underline = false;
+  let italic = true; // default is italic alone
+
+  // Check explicit markers/tags
+  if (/BOLD::/i.test(str)) { bold = true; str = str.replace(/BOLD::/gi, ''); }
+  if (/UNDERLINE::/i.test(str)) { underline = true; str = str.replace(/UNDERLINE::/gi, ''); }
+  if (/UNITALIC::|NOITALIC::|NOTITALIC::/i.test(str)) { italic = false; str = str.replace(/(?:UNITALIC|NOITALIC|NOTITALIC)::/gi, ''); }
+
+  // Check [STYLE:...] tag
+  const styleTagMatch = str.match(/\[STYLE:([^\]]+)\]/i);
+  if (styleTagMatch) {
+    const tagContent = styleTagMatch[1].toLowerCase();
+    if (tagContent.includes('bold')) bold = true;
+    if (tagContent.includes('underline')) underline = true;
+    if (tagContent.includes('unitalic') || tagContent.includes('noitalic') || tagContent.includes('notitalic')) italic = false;
+    str = str.replace(/\[STYLE:[^\]]+\]/gi, '');
+  }
+
+  // Check HTML tags
+  if (/<strong>|<b>/i.test(str)) bold = true;
+  if (/<u>/i.test(str)) underline = true;
+
+  // Spoken directives matching:
+  // e.g. "keep clinical profile sentence underlined bold and unitalic", "bold and underlined clinical profile", etc.
+  const spokenDirectiveRegex = /(?:,\s*)?(?:please\s*)?(?:keep\s+)?(?:clinical\s*profile\s*(?:sentence\s*)?)?(?:to\s+be\s+)?(?:underlined|underline|bold|bolded|unitalic|un-italic|not\s+italic|non-italic|no\s+italic|italic)(?:[\s,]+(?:and\s+)?(?:underlined|underline|bold|bolded|unitalic|un-italic|not\s+italic|non-italic|no\s+italic|italic))*(?:\s*(?:like\s+that|please))?/i;
+
+  const match = str.match(spokenDirectiveRegex);
+  if (match && match[0].trim().length > 6) {
+    const directiveStr = match[0].toLowerCase();
+    if (directiveStr.includes('bold')) bold = true;
+    if (directiveStr.includes('underline') || directiveStr.includes('underlined')) underline = true;
+    if (directiveStr.includes('unitalic') || directiveStr.includes('un-italic') || directiveStr.includes('not italic') || directiveStr.includes('non-italic') || directiveStr.includes('no italic')) {
+      italic = false;
+    }
+    str = str.replace(spokenDirectiveRegex, '');
+  }
+
+  // Also clean up any lingering conversational directive remnants
+  str = str.replace(/keep\s+clinical\s+profile\s+sentence[^\n.]*/gi, '')
+           .replace(/(?:underlined|bold|unitalic|not italic)\s+like\s+that/gi, '');
+
+  let cleanText = cleanClinicalProfileText(str);
+  return { text: cleanText, bold, underline, italic };
+}
+
+export function clinicalProfileStyleToHtml(style: ClinicalProfileStyle): string {
+  let inner = escapeHtml(style.text);
+  if (style.underline) inner = `<u>${inner}</u>`;
+  if (style.bold) inner = `<strong>${inner}</strong>`;
+  if (style.italic) inner = `<em>${inner}</em>`;
+  return `<p>${inner}</p>`;
+}
+
+export function parseTableRow(line: string): string[] {
+  let trimmed = line.trim();
+  if (trimmed.startsWith('|') && trimmed.endsWith('|') && trimmed.length > 2) {
+    trimmed = trimmed.slice(1, -1);
+  }
+  return trimmed.split('|').map(c => c.trim());
+}
+
+export function isTableRowFinding(text: string): boolean {
+  if (!text || typeof text !== 'string') return false;
+  const clean = text.replace(/^BOLD::/i, '').trim();
+  if (!clean) return false;
+  if (/^(clinical\s*(profile|history):|c\.t\.|mri|x-ray|usg)/i.test(clean)) return false;
+  if (clean.includes('<table') || clean.includes('</table>')) return true;
+  if (clean.includes('|')) {
+    if (clean.includes('###')) {
+      const rows = clean.split('###').map(r => r.trim()).filter(Boolean);
+      return rows.length >= 1 && rows.some(r => r.includes('|'));
+    }
+    const cells = parseTableRow(clean);
+    return cells.length >= 2;
+  }
+  return false;
+}
+
+/**
+ * Converts table row lines into clean tab-separated text (TSV) for clipboard/pasting.
+ */
+export function tableToPlainText(lines: string[]): string {
+  const tableRows: string[][] = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed.includes('|')) continue;
+    if (/^\|?(\s*:?-+:?\s*\|)+\s*$/.test(trimmed)) continue;
+    tableRows.push(parseTableRow(trimmed));
+  }
+  return tableRows.map(row => row.join('\t')).join('\n');
+}
+
+/**
+ * Parses consecutive markdown table lines (e.g. "| Col 1 | Col 2 |" or "Size | cm | cm") into semantic styled HTML table.
+ */
+export function parseMarkdownTable(lines: string[]): string {
+  const tableRows: string[][] = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed.includes('|')) continue;
+    // Skip separator line |---|---|
+    if (/^\|?(\s*:?-+:?\s*\|)+\s*$/.test(trimmed)) continue;
+
+    const cells = parseTableRow(trimmed);
+    if (cells.length > 0) {
+      tableRows.push(cells);
+    }
+  }
+
+  if (tableRows.length === 0) return '';
+
+  // Standardize column count across all rows
+  const maxCols = Math.max(...tableRows.map(r => r.length));
+  for (const r of tableRows) {
+    while (r.length < maxCols) {
+      r.push('');
+    }
+  }
+
+  const headerCells = tableRows[0];
+  const bodyRows = tableRows.slice(1);
+
+  let html = `<table border="1" cellpadding="6" cellspacing="0" style="width: 100%; border-collapse: collapse; margin: 16px 0; border: 1px solid #000000; font-family: 'Times New Roman', serif; font-size: 12pt;">\n`;
+  html += `  <thead>\n    <tr style="background-color: #f1f5f9;">\n`;
+  for (const h of headerCells) {
+    const isBold = h.startsWith('BOLD::');
+    const cleanH = h.replace(/^BOLD::/, '');
+    html += `      <th style="border: 1px solid #000000; padding: 6px 10px; text-align: left; font-weight: bold; color: #000000; font-family: 'Times New Roman', serif; font-size: 12pt;">${isBold ? `<strong>${escapeHtml(cleanH)}</strong>` : escapeHtml(cleanH)}</th>\n`;
+  }
+  html += `    </tr>\n  </thead>\n`;
+
+  if (bodyRows.length > 0) {
+    html += `  <tbody>\n`;
+    for (let rIdx = 0; rIdx < bodyRows.length; rIdx++) {
+      const row = bodyRows[rIdx];
+      const bg = rIdx % 2 === 1 ? ' background-color: #f8fafc;' : '';
+      html += `    <tr style="${bg}">\n`;
+      for (let cIdx = 0; cIdx < maxCols; cIdx++) {
+        const val = row[cIdx] || '';
+        const isBold = val.startsWith('BOLD::');
+        const cleanVal = val.replace(/^BOLD::/, '');
+        html += `      <td style="border: 1px solid #000000; padding: 6px 10px; text-align: left; color: #000000; font-family: 'Times New Roman', serif; font-size: 12pt;">${isBold ? `<strong>${escapeHtml(cleanVal)}</strong>` : escapeHtml(cleanVal)}</td>\n`;
+      }
+      html += `    </tr>\n`;
+    }
+    html += `  </tbody>\n`;
+  }
+  html += `</table>`;
+  return html;
+}
+
+/**
+ * Converts findings array into clean HTML suitable for rich text editor and Word/RTF.
+ * Strictly guarantees that exam heading contains ONLY the scan title without "Clinical profile".
+ */
+/**
+ * Generates 100% clean, standard PACS & RIS compliant HTML and plain text.
+ * In hospital PACS & RIS editors, any CSS borders, wrapper divs,
+ * or class names are parsed into Word/OpenXML paragraph borders (<w:pBdr>).
+ * While subtle during editing, the editor exports <w:pBdr> to the PDF generator on approval,
+ * causing solid black rectangular boxes around every affected section.
+ *
+ * This function guarantees:
+ * - Pure semantic <p> paragraphs with ZERO CSS classes, ZERO borders, and ZERO margin/color styling.
+ * - Exam Title centered, bold, underlined: <p style="text-align:center;"><strong><u>EXAM TITLE</u></strong></p>
+ * - Clinical Profile: <p><em>Clinical Profile: ...</em></p>
+ * - Anatomical Subheadings (e.g. C.T. SCAN OF BRAIN, C.T. SCAN OF NECK, etc.): centered, bold, underlined: <p style="text-align:center;"><strong><u>C.T. SCAN OF BRAIN</u></strong></p>
+ * - Dictated / Abnormal findings (marked with BOLD::): <p><strong>Finding text</strong></p>
+ * - Normal template findings: <p>Finding text</p>
+ * - Impression: <p><strong><u>IMPRESSION:</u></strong></p> followed by <p><strong>• Point 1</strong></p>
+ * - All multi-line and merged template findings are unpacked into atomic individual <p> lines.
+ * - Completely indistinguishable from manually pasting row-by-row, with ZERO boxes after report approval.
+ */
+
+/**
+ * Detects if an impression sentence is an overarching lead-in or summary statement
+ * (e.g., "findings are s/o...", "Features suggestive of...", "In summary...", etc.)
+ * which should start from the start of the row without a bullet point.
+ */
+export function isSummaryLeadIn(text: string): boolean {
+  if (!text) return false;
+  const clean = text.replace(/^BOLD::/i, '').replace(/[*_~`#]+/g, '').trim();
+  const patterns = [
+    /^(?:findings\s+(?:are\s+)?s\/o|features\s+(?:are\s+)?s\/o)/i,
+    /^(?:findings\s+(?:are\s+)?suggestive\s+of|features\s+(?:are\s+)?suggestive\s+of)/i,
+    /^(?:in\s+summary|overall\s+features|summary\s*:|impression\s*:)/i,
+    /^(?:suggestive\s+of\b|consistent\s+with\b)/i,
+    /^(?:no\s+significant\s+.*abnormality|study\s+within\s+normal\s+limits|normal\s+.*study)/i
+  ];
+  return patterns.some(p => p.test(clean));
+}
+
+/**
+ * Formats impression output with exact matching font style (<p> tags matching body paragraphs)
+ * and smart bulleting guided directly by the LLM prompt:
+ * - Single-Line / Lead-In Summaries: Statements such as "findings are s/o..." or single normal summary sentences start flush with the beginning of the line without any bullet point.
+ * - Discrete / Multi-Point Findings: When the impression consists of 2 or more discrete clinical findings, each individual finding is cleanly formatted with bullet points (• Point 1, • Point 2) starting from the left margin.
+ */
+export function isPureCorrelationOrRecommendation(str: string): boolean {
+  if (!str) return false;
+  const s = str.trim().replace(/[.]+$/, '').trim();
+  return /^(?:suggested\s+)?clinical\s+correlation(?:\s*[\/\&,]\s*review)?(?:\s+as\s+indicated)?$/i.test(s) ||
+         /^suggested\s+(?:clinical\s+correlation|review(?:\s+as\s+indicated)?)$/i.test(s) ||
+         /^(?:please\s+)?correlate\s+clinically$/i.test(s) ||
+         /^(?:clinical\s+review|clinical\s+follow-up)(?:\s+as\s+indicated)?$/i.test(s);
+}
+
+export function formatImpressionOutput(title: string, points: string[]): { plain: string; html: string } {
+  const cleanTitle = title.trim().toUpperCase() || 'IMPRESSION:';
+  const cleanPoints = points.map(p => p.replace(/^BOLD::/i, '').trim()).filter(Boolean);
+
+  if (cleanPoints.length === 0) {
+    return {
+      plain: cleanTitle,
+      html: `<p style="font-family: 'Times New Roman', serif; font-size: 12pt;"><strong style="font-family: 'Times New Roman', serif; font-size: 12pt; text-decoration: underline;">${cleanTitle}</strong></p>`
+    };
+  }
+
+  const plainLines = [cleanTitle];
+  const htmlParts: string[] = [`<p style="font-family: 'Times New Roman', serif; font-size: 12pt;"><strong style="font-family: 'Times New Roman', serif; font-size: 12pt; text-decoration: underline;">${cleanTitle}</strong></p>`];
+
+  let currentUlItems: string[] = [];
+
+  const flushUl = () => {
+    if (currentUlItems.length > 0) {
+      htmlParts.push(
+        `<ul style="list-style-type: disc; margin: 4pt 0 6pt 0; padding-left: 24pt;">` +
+        currentUlItems.map(item => `<li style="font-family: 'Times New Roman', serif; font-size: 12pt; margin-bottom: 3pt; line-height: 1.4;"><strong style="font-family: 'Times New Roman', serif; font-size: 12pt;">${escapeHtml(item)}</strong></li>`).join('') +
+        `</ul>`
+      );
+      currentUlItems = [];
+    }
+  };
+
+  cleanPoints.forEach(pt => {
+    // 1. Explicit no-bullet directive
+    const isExplicitNoBullet = /^\[NO_BULLET\]\s*/i.test(pt) ||
+      /^NO_BULLET::\s*/i.test(pt) ||
+      /^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i.test(pt);
+
+    let cleanPt = pt
+      .replace(/^\[NO_BULLET\]\s*/i, '')
+      .replace(/^NO_BULLET::\s*/i, '')
+      .replace(/^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i, '')
+      .trim();
+
+    // Strip ALL leading bullets (single, double, dashes, entities) and whitespace
+    const textWithoutBullet = cleanPt.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
+
+    if (isExplicitNoBullet) {
+      flushUl();
+      plainLines.push(textWithoutBullet);
+      htmlParts.push(`<p style="font-family: 'Times New Roman', serif; font-size: 12pt;"><strong style="font-family: 'Times New Roman', serif; font-size: 12pt;">${escapeHtml(textWithoutBullet)}</strong></p>`);
+      return;
+    }
+
+    // 2. Standalone correlation sentence alone on its own separate row -> KEPT WITHOUT BULLET
+    const isStandaloneCorrelation = isPureCorrelationOrRecommendation(textWithoutBullet);
+    if (isStandaloneCorrelation) {
+      flushUl();
+      plainLines.push(textWithoutBullet);
+      htmlParts.push(`<p style="font-family: 'Times New Roman', serif; font-size: 12pt;"><strong style="font-family: 'Times New Roman', serif; font-size: 12pt;">${escapeHtml(textWithoutBullet)}</strong></p>`);
+      return;
+    }
+
+    // 3. Standalone lead-in summary like "Findings are s/o:"
+    const isLeadIn = /^findings\s+(?:are\s+)?s\/?o(?:\s*:)?$/i.test(textWithoutBullet);
+    if (isLeadIn) {
+      flushUl();
+      plainLines.push(textWithoutBullet);
+      htmlParts.push(`<p style="font-family: 'Times New Roman', serif; font-size: 12pt;"><strong style="font-family: 'Times New Roman', serif; font-size: 12pt;">${escapeHtml(textWithoutBullet)}</strong></p>`);
+      return;
+    }
+
+    // 4. Clinical finding (even with "Suggested clinical correlation..." appended) -> ALWAYS INCLUDE BULLET POINT
+    plainLines.push(`• ${textWithoutBullet}`);
+    currentUlItems.push(textWithoutBullet);
+  });
+
+  flushUl();
+
+  return {
+    plain: plainLines.join('\n'),
+    html: htmlParts.join('')
+  };
+}
+
+export function escapeHtml(text: string): string {
+  if (!text) return '';
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+/**
+ * Detects whether a line is an anatomical subheading (e.g. C.T. SCAN OF BRAIN, MRI SPINE, etc.)
+ */
+export function isAnatomicalSubheading(text: string): boolean {
+  if (!text) return false;
+  const clean = text.replace(/^BOLD::/i, '').replace(/[*_~`#]+/g, '').trim();
+  if (!clean || clean.length > 90) return false;
+  // NEVER match IMPRESSION or Clinical Profile
+  if (/^IMPRESSION/i.test(clean) || /^Clinical\s*(Profile|History)/i.test(clean)) return false;
+  if (/^(?:C\.?T\.?\s*SCAN\s+OF|CT\s+SCAN\s+OF|MRI\s+OF|MRI\s+SCAN\s+OF|ULTRASOUND\s+OF|USG\s+OF|X-?RAY\s+OF)\s+[A-Z0-9\s\(\)\-\/\&]+$/i.test(clean)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Robustly detects if a line is the primary examination title / study heading.
+ * Handles all modality prefixes (CT, MRI, USG, X-Ray, etc.), contrast/plain variants,
+ * uppercase/mixed-case formatting, and anatomical scan study titles.
+ */
+export function isReportTitle(text: string, index: number = 0, allFindings?: string[]): boolean {
+  if (!text) return false;
+  const clean = text.replace(/^BOLD::/i, '').replace(/[*_~`#]+/g, '').trim();
+  if (!clean) return false;
+
+  // Never match IMPRESSION, Technique, Clinical Profile, or bullet points
+  if (/^(?:IMPRESSION|TECHNIQUE|CLINICAL\s*(?:PROFILE|HISTORY))/i.test(clean)) return false;
+  if (/^[•\-\*]\s+/i.test(clean)) return false;
+
+  // Check if this is the first non-profile finding in the report
+  let isEarlyLine = index === 0;
+  if (!isEarlyLine && allFindings && index === 1) {
+    const firstClean = allFindings[0]?.replace(/^BOLD::/i, '').replace(/[*_~`#]+/g, '').trim() || '';
+    if (/^Clinical\s*(Profile|History):/i.test(firstClean)) {
+      isEarlyLine = true;
+    }
+  }
+
+  // Exact known title match
+  if (clean.toUpperCase() === 'C.T.SCAN OF BRAIN (PLAIN)') return true;
+
+  // Any modality prefix (CT, C.T., MRI, MR, M.R.I., USG, ULTRASOUND, X-RAY, XRAY, NCCT, CECT, HRCT, PET-CT, PET/CT, DEXA, MAMMOGRAM)
+  if (/^(?:MRI|M\.R\.I\.|MR|CT|C\.?T\.?|USG|ULTRASOUND|X-?RAY|NCCT|CECT|HRCT|PET-?CT|PET\/CT|DEXA|MAMMOGRAM)\b/i.test(clean)) {
+    if (isEarlyLine || (clean.length < 110 && !clean.endsWith('.'))) {
+      return true;
+    }
+  }
+
+  // Modality descriptors at start (e.g. "Contrast CT", "Plain and Contrast CT", "High Resolution CT")
+  if (/^(?:PLAIN|CONTRAST|NON-?CONTRAST|CONTRAST\s+ENHANCED|HIGH\s+RESOLUTION)\s+(?:CT|C\.?T\.?|MRI|MR|SCAN)\b/i.test(clean)) {
+    if (isEarlyLine || clean.length < 110) return true;
+  }
+
+  // Phrases like "SCAN OF ...", "STUDY OF ...", "EXAMINATION OF ...", "... VIEW"
+  if (/^(?:SCAN\s+OF|STUDY\s+OF|EXAMINATION\s+OF)\b/i.test(clean)) {
+    if (isEarlyLine || clean.length < 110) return true;
+  }
+
+  // Anatomical scan titles (e.g. "CHEST PA VIEW", "KNEE AP AND LATERAL VIEW")
+  if (/VIEW\s*$/i.test(clean) && (isEarlyLine || clean.length < 80)) {
+    return true;
+  }
+
+  // All-caps heading at index 0 or early line
+  if (isEarlyLine && clean === clean.toUpperCase() && clean.length > 4 && clean.length < 110 && !clean.endsWith('.')) {
+    return true;
+  }
+
+  return false;
+}
+
+export function findingsToStandardHtml(findings: string[]): { html: string; plainText: string } {
+  if (!findings || findings.length === 0) {
+    return { html: '', plainText: '' };
+  }
+
+  const htmlParagraphs: string[] = [];
+  const plainParagraphs: string[] = [];
+
+  // Flatten multi-line findings while keeping IMPRESSION intact
+  const expandedFindings: { text: string; isBold: boolean; origIndex: number }[] = [];
+
+  findings.forEach((raw, idx) => {
+    if (!raw || typeof raw !== 'string') return;
+    const trimmed = raw.trim();
+    if (!trimmed) return;
+
+    // Check if line 0 has Clinical Profile glued to scan title
+    if (idx === 0) {
+      const matchGlued = trimmed.match(/^(.*?)(?:Clinical\s*profile:?|Clinical\s*history:?)\s*(.*)$/i);
+      if (matchGlued && matchGlued[1].trim().length > 0) {
+        const titlePart = matchGlued[1].trim().replace(/^BOLD::/i, '').replace(/[*_]+$/g, '').trim();
+        const profilePart = matchGlued[2].trim().replace(/^BOLD::/i, '').trim();
+        expandedFindings.push({ text: titlePart, isBold: false, origIndex: 0 });
+        expandedFindings.push({
+          text: profilePart ? `Clinical Profile: ${profilePart}` : 'Clinical Profile: Routine evaluation.',
+          isBold: false,
+          origIndex: 1
+        });
+        return;
+      }
+    }
+
+    // Keep IMPRESSION intact as one structured finding
+    if (trimmed.toUpperCase().startsWith('IMPRESSION:')) {
+      expandedFindings.push({ text: trimmed, isBold: false, origIndex: idx });
+      return;
+    }
+
+    // Check if finding is structured with ### (and not table)
+    if (trimmed.includes('###') && !trimmed.includes('|')) {
+      const parts = trimmed.split('###').map(p => p.trim()).filter(Boolean);
+      parts.forEach(p => {
+        const isBold = p.startsWith('BOLD::') || trimmed.startsWith('BOLD::');
+        expandedFindings.push({ text: p.replace(/^BOLD::/i, ''), isBold, origIndex: idx });
+      });
+      return;
+    }
+
+    // Check if finding has \n linebreaks (unless markdown table)
+    if (trimmed.includes('\n') && !trimmed.includes('|')) {
+      const parts = trimmed.split(/\r?\n/).map(p => p.trim()).filter(Boolean);
+      parts.forEach(p => {
+        const isBold = p.startsWith('BOLD::') || trimmed.startsWith('BOLD::');
+        expandedFindings.push({ text: p.replace(/^BOLD::/i, ''), isBold, origIndex: idx });
+      });
+      return;
+    }
+
+    const isBold = trimmed.startsWith('BOLD::');
+    expandedFindings.push({ text: trimmed.replace(/^BOLD::/i, ''), isBold, origIndex: idx });
+  });
+
+  for (let i = 0; i < expandedFindings.length; i++) {
+    const { text, isBold, origIndex } = expandedFindings[i];
+    const clean = text.replace(/^BOLD::/i, '').trim();
+    if (!clean) continue;
+
+    // 1. Clinical profile check
+    if (isClinicalProfileFinding(clean)) {
+      const profStyle = parseClinicalProfileStyle(clean);
+      plainParagraphs.push(profStyle.text);
+      htmlParagraphs.push(clinicalProfileStyleToHtml(profStyle));
+      continue;
+    }
+
+    // 1.5 Omit generic technique placeholder if template lacked technique
+    if (/^(?:Standard imaging protocol was performed|Standard protocol was followed)\.?$/i.test(clean)) {
+      continue;
+    }
+
+    // 2. Exam Title (first line or early line)
+    if (isReportTitle(clean, origIndex, findings)) {
+      const title = clean.replace(/[*_~`#]+/g, '').trim().toUpperCase();
+      plainParagraphs.push(title);
+      htmlParagraphs.push(`<p style="text-align:center; font-family: 'Times New Roman', serif; font-size: 12pt;"><strong><u>${escapeHtml(title)}</u></strong></p>`);
+      continue;
+    }
+
+    // 3. Anatomical Subheadings (C.T. SCAN OF BRAIN, C.T. SCAN OF NECK, etc.)
+    if (isAnatomicalSubheading(clean)) {
+      const sub = clean.replace(/[*_~`#]+/g, '').trim().toUpperCase();
+      plainParagraphs.push(sub);
+      htmlParagraphs.push(`<p style="text-align:center; font-family: 'Times New Roman', serif; font-size: 12pt;"><strong><u>${escapeHtml(sub)}</u></strong></p>`);
+      continue;
+    }
+
+    // 4. IMPRESSION section: Left-aligned, matching body font style, smart bullets
+    if (clean.toUpperCase().startsWith('IMPRESSION:')) {
+      const parts = clean.replace(/^IMPRESSION:\s*/i, '').split('###').map(p => p.trim()).filter(Boolean);
+      const imp = formatImpressionOutput('IMPRESSION:', parts);
+      plainParagraphs.push(imp.plain);
+      htmlParagraphs.push(imp.html);
+      continue;
+    }
+
+    // 5. Patient separator
+    if (clean.startsWith('--- PATIENT') || clean.startsWith('PATIENT:')) {
+      plainParagraphs.push(clean);
+      htmlParagraphs.push(`<p style="font-family: 'Times New Roman', serif; font-size: 12pt;"><strong><u>${escapeHtml(clean)}</u></strong></p>`);
+      continue;
+    }
+
+    // 6. Markdown table
+    if (clean.startsWith('|') && clean.endsWith('|')) {
+      const tableLines = [clean];
+      while (i + 1 < expandedFindings.length && expandedFindings[i + 1].text.trim().startsWith('|')) {
+        i++;
+        tableLines.push(expandedFindings[i].text.trim());
+      }
+      plainParagraphs.push(tableToPlainText(tableLines));
+      htmlParagraphs.push(parseMarkdownTable(tableLines));
+      continue;
+    }
+
+    // 7. Normal or Abnormal finding
+    plainParagraphs.push(clean);
+    if (isBold) {
+      htmlParagraphs.push(`<p style="font-family: 'Times New Roman', serif; font-size: 12pt;"><strong>${escapeHtml(clean)}</strong></p>`);
+    } else {
+      htmlParagraphs.push(`<p style="font-family: 'Times New Roman', serif; font-size: 12pt;">${escapeHtml(clean)}</p>`);
+    }
+  }
+
+  return {
+    html: htmlParagraphs.join('\n'),
+    plainText: plainParagraphs.join('\n\n')
+  };
+}
+
+export function sanitizeHtmlForClipboard(html: string): string {
+  if (!html) return '';
+
+  if (typeof document !== 'undefined') {
+    const temp = document.createElement('div');
+    temp.innerHTML = html;
+
+    const toRemove = temp.querySelectorAll('script, style, meta, link');
+    toRemove.forEach(el => el.remove());
+
+    const headings = temp.querySelectorAll('h1, h2, h3, h4');
+    headings.forEach(h => {
+      const p = document.createElement('p');
+      const text = h.textContent?.trim() || '';
+      if (/^IMPRESSION/i.test(text)) {
+        p.innerHTML = `<strong><u>${escapeHtml(text)}</u></strong>`;
+      } else if (h.tagName.toLowerCase() === 'h1' || text === text.toUpperCase()) {
+        p.setAttribute('style', 'text-align:center;');
+        p.innerHTML = `<strong><u>${escapeHtml(text)}</u></strong>`;
+      } else {
+        p.innerHTML = `<strong>${escapeHtml(text)}</strong>`;
+      }
+      h.replaceWith(p);
+    });
+
+    const wrappers = temp.querySelectorAll('div, section, article, header');
+    wrappers.forEach(wrap => {
+      const hasBlockChildren = wrap.querySelector('p, ul, ol, table');
+      if (!hasBlockChildren) {
+        const p = document.createElement('p');
+        p.innerHTML = wrap.innerHTML;
+        wrap.replaceWith(p);
+      } else {
+        while (wrap.firstChild) {
+          wrap.parentNode?.insertBefore(wrap.firstChild, wrap);
+        }
+        wrap.remove();
+      }
+    });
+
+    // 1. Group consecutive <p> elements that start with a bullet character into a semantic <ul>
+    const paras = Array.from(temp.querySelectorAll('p'));
+    let currentBulletGroup: HTMLElement[] = [];
+
+    const flushBulletGroup = () => {
+      if (currentBulletGroup.length > 0) {
+        const ul = document.createElement('ul');
+        ul.setAttribute('style', 'list-style-type: disc; margin: 4pt 0 6pt 0; padding-left: 24pt;');
+        currentBulletGroup[0].parentNode?.insertBefore(ul, currentBulletGroup[0]);
+
+        currentBulletGroup.forEach(p => {
+          const li = document.createElement('li');
+          li.setAttribute('style', "font-family: 'Times New Roman', serif; font-size: 12pt; margin-bottom: 3pt; line-height: 1.4;");
+          let inner = p.innerHTML.trim();
+          inner = inner.replace(/^(?:<strong>|<b>)?(?:\s*•\s*|\s*&bull;\s*|\s*&#8226;\s*|\s*[-*]\s*)+/i, (m) => {
+            return m.toLowerCase().includes('strong') ? '<strong>' : (m.toLowerCase().includes('b') ? '<b>' : '');
+          }).trim();
+          inner = inner.replace(/^<(strong|b)>\s*(?:•|&bull;|&#8226;|[-*])\s*/i, '<$1>');
+          if (!inner.startsWith('<strong>') && !inner.startsWith('<b>')) {
+            inner = `<strong style="font-family: 'Times New Roman', serif; font-size: 12pt;">${inner}</strong>`;
+          }
+          li.innerHTML = inner;
+          ul.appendChild(li);
+          p.remove();
+        });
+        currentBulletGroup = [];
+      }
+    };
+
+    paras.forEach(p => {
+      const text = p.textContent?.trim() || '';
+      if (/^(?:•|&bull;|&#8226;|[-*])\s+/.test(text) || /^•/.test(text)) {
+        currentBulletGroup.push(p);
+      } else {
+        flushBulletGroup();
+      }
+    });
+    flushBulletGroup();
+
+    // 2. Preserve native lists: standardize style and strip any duplicate literal text bullets inside <li>
+    const lists = temp.querySelectorAll('ul, ol');
+    lists.forEach(list => {
+      const isOrdered = list.tagName.toLowerCase() === 'ol';
+      list.setAttribute('style', `list-style-type: ${isOrdered ? 'decimal' : 'disc'}; margin: 4pt 0 6pt 0; padding-left: 24pt;`);
+      list.removeAttribute('class');
+      list.removeAttribute('id');
+
+      const items = list.querySelectorAll('li');
+      items.forEach(li => {
+        let cleanLi = li.innerHTML.trim().replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
+        cleanLi = cleanLi.replace(/^<(strong|b)>\s*(?:•|&bull;|&#8226;|[-*])\s*/i, '<$1>');
+        if (!cleanLi.startsWith('<strong>') && !cleanLi.startsWith('<b>')) {
+          cleanLi = `<strong style="font-family: 'Times New Roman', serif; font-size: 12pt;">${cleanLi}</strong>`;
+        }
+        li.innerHTML = cleanLi;
+        li.setAttribute('style', "font-family: 'Times New Roman', serif; font-size: 12pt; margin-bottom: 3pt; line-height: 1.4;");
+        li.removeAttribute('class');
+        li.removeAttribute('id');
+      });
+    });
+
+    const allParas = temp.querySelectorAll('p');
+    allParas.forEach(p => {
+      // Eliminate any duplicate or stacked bullets in paragraphs
+      p.innerHTML = p.innerHTML.replace(/(?:•\s*){2,}/g, '• ')
+                               .replace(/(?:&bull;\s*){2,}/g, '&bull; ')
+                               .replace(/(?:&#8226;\s*){2,}/g, '&#8226; ')
+                               .replace(/•\s*&bull;/g, '• ')
+                               .replace(/&bull;\s*•/g, '• ');
+      const s = p.getAttribute('style') || '';
+      const isCentered = s.includes('text-align:center') || s.includes('text-align: center');
+      p.setAttribute('style', `${isCentered ? 'text-align:center; ' : ''}font-family: 'Times New Roman', serif; font-size: 12pt; line-height: 1.5;`);
+    });
+
+    const allEls = temp.querySelectorAll('*');
+    allEls.forEach(el => {
+      el.removeAttribute('class');
+      el.removeAttribute('id');
+      const tag = el.tagName.toLowerCase();
+      if (tag !== 'p' && tag !== 'table' && tag !== 'th' && tag !== 'td' && tag !== 'ul' && tag !== 'ol' && tag !== 'li') {
+        el.removeAttribute('style');
+      }
+    });
+
+    return temp.innerHTML;
+  }
+
+  return html
+    .replace(/<div[^>]*>/gi, '<p style="font-family: \'Times New Roman\', serif; font-size: 12pt;">')
+    .replace(/<\/div>/gi, '</p>')
+    .replace(/<h1[^>]*>(.*?)<\/h1>/gi, '<p style="text-align:center; font-family: \'Times New Roman\', serif; font-size: 12pt;"><strong><u>$1</u></strong></p>')
+    .replace(/<h[2-6][^>]*>(.*?)<\/h[2-6]>/gi, '<p style="font-family: \'Times New Roman\', serif; font-size: 12pt;"><strong>$1</strong></p>')
+    .replace(/<p>/gi, '<p style="font-family: \'Times New Roman\', serif; font-size: 12pt;">')
+    .replace(/\sclass="[^"]*"/gi, '');
+}
+
+/**
+ * Converts findings array into clean HTML suitable for rich text editor and Word/RTF.
+ * Guaranteed border-free with clean inline styles and no border-inducing CSS.
+ */
+export function findingsToRichHtml(findings: string[]): string {
+  if (!findings || findings.length === 0) return '';
+
+  const htmlParts: string[] = [];
+  let isFirst = true;
+
+  for (let idx = 0; idx < findings.length; idx++) {
+    const finding = findings[idx];
+    const trimmed = finding.trim();
+    if (!trimmed) continue;
+
+    // Check if line 0 or early line has "Clinical profile:" glued to the scan title
+    if (idx === 0 || isFirst) {
+      const matchGlued = trimmed.match(/^(.*?)(?:Clinical\s*profile:?|Clinical\s*history:?)\s*(.*)$/i);
+      if (matchGlued && matchGlued[1].trim().length > 0) {
+        const titleText = matchGlued[1].trim().replace(/^BOLD::/i, '').replace(/[*_]+$/g, '').trim();
+        let profText = matchGlued[2].trim().replace(/^BOLD::/i, '').trim();
+        profText = profText ? cleanClinicalProfileText(`Clinical Profile: ${profText}`) : '';
+        htmlParts.push(`<h1 style="margin-bottom: 14px; font-size: 16pt; font-weight: bold; text-align: center; text-decoration: underline; color: #0f172a; font-family: 'Times New Roman', serif; text-transform: uppercase;">${escapeHtml(titleText)}</h1>`);
+        const profStyle = parseClinicalProfileStyle(profText || 'Clinical Profile: Routine evaluation.');
+        htmlParts.push(`<p class="clinical-profile" style="margin-bottom: 14px; color: #334155; font-family: 'Times New Roman', serif; font-size: 12pt;">${clinicalProfileStyleToHtml(profStyle).replace(/^<p[^>]*>|<\/p>$/g, '')}</p>`);
+        isFirst = false;
+        continue;
+      }
+    }
+
+    // 1. Clinical profile line
+    if (isClinicalProfileFinding(trimmed)) {
+      const profStyle = parseClinicalProfileStyle(trimmed);
+      htmlParts.push(`<p class="clinical-profile" style="margin-bottom: 14px; color: #334155; font-family: 'Times New Roman', serif; font-size: 12pt;">${clinicalProfileStyleToHtml(profStyle).replace(/^<p[^>]*>|<\/p>$/g, '')}</p>`);
+      isFirst = false;
+      continue;
+    }
+
+    // 2. Raw HTML Table
+    if (trimmed.startsWith('<table') || trimmed.includes('<table')) {
+      htmlParts.push(trimmed);
+      isFirst = false;
+      continue;
+    }
+
+    // 3. Multi-line Markdown Table encoded with ###
+    if (trimmed.includes('|') && trimmed.includes('###')) {
+      const lines = trimmed.split('###').map(l => l.trim()).filter(Boolean);
+      if (lines.length > 0 && lines.every(l => l.includes('|'))) {
+        const tableHtml = parseMarkdownTable(lines);
+        if (tableHtml) {
+          htmlParts.push(tableHtml);
+          isFirst = false;
+          continue;
+        }
+      }
+    }
+
+    // 4. Consecutive Table rows
+    if (isTableRowFinding(trimmed)) {
+      const tableLines: string[] = [trimmed];
+      while (idx + 1 < findings.length && isTableRowFinding(findings[idx + 1])) {
+        idx++;
+        tableLines.push(findings[idx].trim());
+      }
+      const tableHtml = parseMarkdownTable(tableLines);
+      if (tableHtml) {
+        htmlParts.push(tableHtml);
+        isFirst = false;
+        continue;
+      }
+    }
+
+    // 5. Impression section (starts with IMPRESSION:### or IMPRESSION:)
+    if (trimmed.startsWith('IMPRESSION:')) {
+      const parts = trimmed.replace(/^IMPRESSION:\s*/i, '').split('###').map(p => p.trim()).filter(Boolean);
+      const imp = formatImpressionOutput('IMPRESSION:', parts);
+      htmlParts.push(`<div class="impression-section" style="margin-top: 20px; margin-bottom: 16px; font-family: 'Times New Roman', serif; font-size: 12pt;">${imp.html}</div>`);
+      isFirst = false;
+      continue;
+    }
+
+    // 6. Patient separator
+    if (trimmed.startsWith('BOLD::--- PATIENT') || trimmed.startsWith('--- PATIENT')) {
+      const cleanTitle = trimmed.replace('BOLD::', '').trim();
+      htmlParts.push(`<h2 style="margin-top: 24px; margin-bottom: 12px; font-size: 14pt; font-weight: bold; border-bottom: 2px solid #3b82f6; padding-bottom: 4px; color: #1d4ed8; font-family: 'Times New Roman', serif;">${escapeHtml(cleanTitle)}</h2>`);
+      isFirst = false;
+      continue;
+    }
+
+    // 7. Report title (index 0 or all-caps header)
+    if (isFirst && (idx === 0 || (trimmed === trimmed.toUpperCase() && trimmed.length < 100 && !trimmed.startsWith('BOLD::')))) {
+      const cleanTitle = trimmed
+        .replace(/^BOLD::/i, '')
+        .replace(/\s*clinical\s*(profile|history)\s*:?.*$/i, '')
+        .trim();
+      htmlParts.push(`<h1 style="margin-bottom: 14px; font-size: 16pt; font-weight: bold; text-align: center; text-decoration: underline; color: #0f172a; font-family: 'Times New Roman', serif; text-transform: uppercase;">${escapeHtml(cleanTitle)}</h1>`);
+      isFirst = false;
+      continue;
+    }
+
+    // 8. Anatomical Subheadings (C.T. SCAN OF BRAIN, C.T. SCAN OF CHEST, etc.)
+    if (/^(?:C\.?T\.?\s*SCAN\s+OF|CT\s+SCAN\s+OF|MRI\s+OF|ULTRASOUND\s+OF|USG\s+OF|X-?RAY\s+OF)\s+[A-Z\s\(\)\-\/\&]+$/i.test(trimmed)) {
+      htmlParts.push(`<h2 style="margin-top: 20px; margin-bottom: 10px; font-size: 13pt; font-weight: bold; text-align: center; text-decoration: underline; color: #0f172a; font-family: 'Times New Roman', serif;">${escapeHtml(trimmed)}</h2>`);
+      isFirst = false;
+      continue;
+    }
+
+    // 9. Findings with BOLD:: (dictated modifications/abnormalities)
+    if (trimmed.startsWith('BOLD::')) {
+      const content = trimmed.replace(/^BOLD::/, '');
+      htmlParts.push(`<p style="margin-bottom: 10px; line-height: 1.6; color: #0f172a; font-family: 'Times New Roman', serif; font-size: 12pt;"><strong>${escapeHtml(content)}</strong></p>`);
+    } else {
+      // Normal template finding
+      htmlParts.push(`<p style="margin-bottom: 10px; line-height: 1.6; color: #334155; font-family: 'Times New Roman', serif; font-size: 12pt;">${escapeHtml(trimmed)}</p>`);
+    }
+    isFirst = false;
+  }
+
+  return htmlParts.join('\n');
+}
+
+export function escapeRtf(text: string): string {
+  if (!text) return '';
+  let out = '';
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    const code = text.charCodeAt(i);
+    if (c === '\\') {
+      out += '\\\\';
+    } else if (c === '{') {
+      out += '\\{';
+    } else if (c === '}') {
+      out += '\\}';
+    } else if (c === '\n' || c === '\r') {
+      out += ' ';
+    } else if (code < 128) {
+      out += c;
+    } else {
+      out += `\\u${code}?`;
+    }
+  }
+  return out;
+}
+
+/**
+ * Generates a clean, professional RTF 1.5 document matching PACS/RIS standards:
+ * - 1-inch margins
+ * - Calibri 11pt default font
+ * - Centered bold underlined exam title (guaranteed NO "Clinical profile" in heading)
+ * - Clean italic clinical profile paragraph
+ * - Bold abnormal findings and section headings
+ * - Indented bullet points for impression
+ * - NO unwanted watermarks or promotional text
+ */
+export function generateRtfDocument(htmlOrText: string, title = 'Radiology Report'): string {
+  const cleanTitle = (title || 'Radiology Report')
+    .replace(/^BOLD::/i, '')
+    .replace(/\s*clinical\s*(profile|history)\s*:?.*$/i, '')
+    .trim();
+
+  const paragraphs: string[] = [];
+
+  if (typeof document !== 'undefined') {
+    const tempDiv = document.createElement('div');
+    tempDiv.innerHTML = htmlOrText;
+
+    const processInlineRuns = (node: Node): string => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        return escapeRtf(node.textContent || '');
+      }
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        const el = node as HTMLElement;
+        const tag = el.tagName.toUpperCase();
+        let inner = '';
+        for (let i = 0; i < el.childNodes.length; i++) {
+          inner += processInlineRuns(el.childNodes[i]);
+        }
+        if (tag === 'STRONG' || tag === 'B') {
+          return `\\b ${inner.trim()}\\b0 `;
+        }
+        if (tag === 'EM' || tag === 'I') {
+          return `\\i ${inner.trim()}\\i0 `;
+        }
+        if (tag === 'U') {
+          return `\\ul ${inner.trim()}\\ul0 `;
+        }
+        return inner;
+      }
+      return '';
+    };
+
+    let seenH1 = false;
+
+    const processBlock = (node: Node) => {
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        const el = node as HTMLElement;
+        const tag = el.tagName.toUpperCase();
+
+        if (tag === 'H1') {
+          seenH1 = true;
+          const text = (el.innerText || el.textContent || '')
+            .replace(/^BOLD::/i, '')
+            .replace(/\s*clinical\s*(profile|history)\s*:?.*$/i, '')
+            .trim();
+          paragraphs.push(`\\pard\\qc\\sa180\\sb60\\b\\ul\\fs28 ${escapeRtf(text)}\\ul0\\b0\\par`);
+          return;
+        }
+
+        if (tag === 'H2' || tag === 'H3') {
+          const text = (el.innerText || el.textContent || '').trim();
+          paragraphs.push(`\\pard\\sa60\\sb140\\sl276\\slmult1\\b\\fs24 ${escapeRtf(text)}\\b0\\par`);
+          return;
+        }
+
+        if (el.classList.contains('clinical-profile')) {
+          const text = (el.innerText || el.textContent || '').trim();
+          paragraphs.push(`\\pard\\sa120\\sl276\\slmult1\\i\\fs22 ${escapeRtf(text)}\\i0\\par`);
+          return;
+        }
+
+        if (tag === 'UL' || tag === 'OL') {
+          const lis = el.querySelectorAll('li');
+          lis.forEach(li => {
+            let liRuns = '';
+            for (let i = 0; i < li.childNodes.length; i++) {
+              liRuns += processInlineRuns(li.childNodes[i]);
+            }
+            const cleanLi = liRuns.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
+            if (cleanLi) {
+              paragraphs.push(`\\pard\\fi-360\\li720\\sa80\\sl276\\slmult1\\f0\\fs24\\b\\bullet   ${cleanLi}\\b0\\par`);
+            }
+          });
+          return;
+        }
+
+        if (el.classList.contains('impression-section')) {
+          paragraphs.push(`\\pard\\sa80\\sb160\\f0\\b\\ul\\fs24 IMPRESSION:\\ul0\\b0\\par`);
+          const items = el.querySelectorAll('li, p');
+          if (items.length > 0) {
+            items.forEach(item => {
+              const raw = ((item as HTMLElement).innerText || item.textContent || '').trim();
+              if (/^IMPRESSION:?$/i.test(raw)) return; // Header already added
+              let itemRuns = '';
+              for (let i = 0; i < item.childNodes.length; i++) {
+                itemRuns += processInlineRuns(item.childNodes[i]);
+              }
+              const clean = itemRuns.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
+              if (clean) {
+                paragraphs.push(`\\pard\\fi-360\\li720\\sa80\\sl276\\slmult1\\f0\\fs24\\b\\bullet   ${clean}\\b0\\par`);
+              }
+            });
+          }
+          return;
+        }
+
+        if (tag === 'TABLE') {
+          const rows = el.querySelectorAll('tr');
+          if (rows.length > 0) {
+            let maxCols = 1;
+            rows.forEach(r => {
+              const cellCount = r.querySelectorAll('th, td').length;
+              if (cellCount > maxCols) maxCols = cellCount;
+            });
+
+            // Standard printable width in RTF twips (~9360 twips = 6.5 in)
+            const totalTwips = 9360;
+            const colTwips = Math.floor(totalTwips / maxCols);
+
+            rows.forEach(r => {
+              const cells = r.querySelectorAll('th, td');
+              if (cells.length === 0) return;
+
+              // 1. Table row definition with borders for each cell
+              let rowDef = `\\trowd\\trgaph108\\trleft0`;
+              let currentRight = 0;
+              cells.forEach(() => {
+                currentRight += colTwips;
+                rowDef += `\\clbrdrt\\brdrs\\brdrw10\\clbrdrl\\brdrs\\brdrw10\\clbrdrb\\brdrs\\brdrw10\\clbrdrr\\brdrs\\brdrw10\\cellx${currentRight}`;
+              });
+              paragraphs.push(rowDef);
+
+              // 2. Row cells content
+              let rowCells = '';
+              cells.forEach(c => {
+                const isHeader = c.tagName.toUpperCase() === 'TH';
+                let cellRuns = '';
+                for (let i = 0; i < c.childNodes.length; i++) {
+                  cellRuns += processInlineRuns(c.childNodes[i]);
+                }
+                const content = cellRuns.trim();
+                const formatted = isHeader ? `\\b ${content}\\b0 ` : content;
+                rowCells += `\\pard\\intbl\\sl276\\slmult1\\fs22 ${formatted || ' '}\\cell `;
+              });
+              rowCells += `\\row`;
+              paragraphs.push(rowCells);
+            });
+          }
+          return;
+        }
+
+        if (tag === 'P') {
+          const rawText = (el.innerText || el.textContent || '').trim();
+          if (/^clinical\s*(profile|history):/i.test(rawText)) {
+            paragraphs.push(`\\pard\\sa120\\sl276\\slmult1\\i\\fs22 ${escapeRtf(rawText)}\\i0\\par`);
+          } else {
+            let pRuns = '';
+            for (let i = 0; i < el.childNodes.length; i++) {
+              pRuns += processInlineRuns(el.childNodes[i]);
+            }
+            if (pRuns.trim()) {
+              paragraphs.push(`\\pard\\sa120\\sl276\\slmult1\\fs22 ${pRuns.trim()}\\par`);
+            }
+          }
+          return;
+        }
+
+        // For other container elements (e.g. div)
+        for (let i = 0; i < el.childNodes.length; i++) {
+          processBlock(el.childNodes[i]);
+        }
+      } else if (node.nodeType === Node.TEXT_NODE && node.textContent?.trim()) {
+        paragraphs.push(`\\pard\\sa120\\sl276\\slmult1\\fs22 ${escapeRtf(node.textContent.trim())}\\par`);
+      }
+    };
+
+    for (let i = 0; i < tempDiv.childNodes.length; i++) {
+      processBlock(tempDiv.childNodes[i]);
+    }
+
+    if (!seenH1 && cleanTitle) {
+      paragraphs.unshift(`\\pard\\qc\\sa180\\sb60\\b\\ul\\fs28 ${escapeRtf(cleanTitle)}\\ul0\\b0\\par`);
+    }
+  } else {
+    // Non-DOM fallback
+    const lines = htmlOrText.replace(/<[^>]+>/g, '\n').split('\n').map(l => l.trim()).filter(Boolean);
+    for (let idx = 0; idx < lines.length; idx++) {
+      const line = lines[idx];
+      if (idx === 0) {
+        const cleanH1 = line.replace(/\s*clinical\s*(profile|history)\s*:?.*$/i, '').trim();
+        paragraphs.push(`\\pard\\qc\\sa180\\sb60\\b\\ul\\fs28 ${escapeRtf(cleanH1)}\\ul0\\b0\\par`);
+      } else if (/^\*?\s*clinical\s*(profile|history):/i.test(line)) {
+        const cleanProf = cleanClinicalProfileText(line);
+        paragraphs.push(`\\pard\\sa120\\sl276\\slmult1\\i\\fs22 ${escapeRtf(cleanProf)}\\i0\\par`);
+      } else if (line.toUpperCase() === 'IMPRESSION:' || line.startsWith('IMPRESSION:')) {
+        paragraphs.push(`\\pard\\sa80\\sb160\\b\\ul\\fs24 IMPRESSION:\\ul0\\b0\\par`);
+      } else {
+        paragraphs.push(`\\pard\\sa120\\sl276\\slmult1\\fs22 ${escapeRtf(line)}\\par`);
+      }
+    }
+  }
+
+  const rtfBody = paragraphs.join('\n');
+
+  return `{\\rtf1\\ansi\\ansicpg1252\\deff0\\nouicompat\\deflang1033
+{\\fonttbl{\\f0\\froman\\fcharset0 Times New Roman;}{\\f1\\froman\\fcharset0 Times New Roman;}{\\f2\\fnil\\fcharset2 Symbol;}}
+{\\colortbl ;\\red0\\green0\\blue0;\\red30\\green64\\blue175;\\red15\\green23\\blue42;}
+\\viewkind4\\uc1
+\\paperw12240\\paperh15840\\margl1440\\margr1440\\margt1440\\margb1440
+\\f0\\fs24\\lang1033
+${rtfBody}
+}`;
+}
+
+/**
+ * Generates a full Microsoft Word-compatible HTML (.doc) document
+ */
+export function generateWordHtmlDoc(bodyHtml: string, title = 'Radiology Report'): string {
+  const cleanTitle = (title || 'Radiology Report')
+    .replace(/^BOLD::/i, '')
+    .replace(/\s*clinical\s*(profile|history)\s*:?.*$/i, '')
+    .trim();
+
+  return `<!DOCTYPE html>
+<html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'>
+<head>
+<meta charset='utf-8'>
+<title>${escapeHtml(cleanTitle)}</title>
+<!--[if gte mso 9]>
+<xml>
+<w:WordDocument>
+<w:View>Print</w:View>
+<w:Zoom>100</w:Zoom>
+<w:DoNotOptimizeForBrowser/>
+</w:WordDocument>
+</xml>
+<![endif]-->
+<style>
+  @page {
+    size: 8.5in 11.0in;
+    margin: 1.0in;
+  }
+  body {
+    font-family: 'Times New Roman', serif;
+    font-size: 11pt;
+    line-height: 1.5;
+    color: #111827;
+  }
+  h1 { font-size: 16pt; font-weight: bold; text-align: center; margin-bottom: 12pt; text-decoration: underline; }
+  h2 { font-size: 13pt; font-weight: bold; margin-top: 14pt; margin-bottom: 6pt; color: #1e40af; border-bottom: 1pt solid #cbd5e1; }
+  h3 { font-size: 12pt; font-weight: bold; margin-top: 12pt; margin-bottom: 4pt; }
+  p { margin-bottom: 8pt; }
+  strong { font-weight: bold; }
+  .clinical-profile { background-color: #f8fafc; padding: 6pt 10pt; border-left: 3pt solid #0284c7; font-style: italic; }
+  .impression-section { margin-top: 14pt; padding: 8pt 10pt; background-color: #f0fdf4; border: 1pt solid #bbf7d0; }
+  ul { margin-top: 4pt; margin-bottom: 8pt; padding-left: 18pt; }
+  li { margin-bottom: 4pt; }
+  table { width: 100%; border-collapse: collapse; margin: 12pt 0; border: 1pt solid #cbd5e1; }
+  th, td { border: 1pt solid #cbd5e1; padding: 6pt 8pt; text-align: left; }
+  th { background-color: #f1f5f9; font-weight: bold; }
+</style>
+</head>
+<body>
+${bodyHtml}
+</body>
+</html>`;
+}
+
+/**
+ * Triggers download of a string or blob as a file.
+ * Handles Android mobile browsers, Android APK WebViews, and desktop browsers safely.
+ */
+export function downloadFile(content: string | Blob, fileName: string, mimeType: string) {
+  const blob = typeof content === 'string' ? new Blob([content], { type: mimeType }) : content;
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+
+  setTimeout(() => {
+    try {
+      if (document.body.contains(a)) {
+        document.body.removeChild(a);
+      }
+      window.URL.revokeObjectURL(url);
+    } catch {
+      // Ignore cleanup error
+    }
+  }, 60000);
+}
+
+/**
+ * Helper to download a docx blob cleanly
+ */
+export function downloadDocxBlob(blob: Blob, filename: string): void {
+  downloadFile(blob, filename, 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+}
+
+/**
+ * Tokenizes markdown inline styles (**bold**, *italics*) into docx TextRuns
+ */
+function parseMarkdownRuns(text: string): TextRun[] {
+  const runs: TextRun[] = [];
+  const parts = text.split(/(\*\*.*?\*\*|\*.*?\*)/g);
+  for (const part of parts) {
+    if (!part) continue;
+    if (part.startsWith('**') && part.endsWith('**') && part.length >= 4) {
+      runs.push(
+        new TextRun({
+          text: part.slice(2, -2),
+          bold: true,
+          font: 'Times New Roman',
+          size: 22,
+          color: '0F172A',
+        })
+      );
+    } else if (part.startsWith('*') && part.endsWith('*') && part.length >= 2) {
+      runs.push(
+        new TextRun({
+          text: part.slice(1, -1),
+          italics: true,
+          font: 'Times New Roman',
+          size: 22,
+          color: '334155',
+        })
+      );
+    } else {
+      runs.push(
+        new TextRun({
+          text: part,
+          font: 'Times New Roman',
+          size: 22,
+          color: '334155',
+        })
+      );
+    }
+  }
+  return runs.length > 0 ? runs : [new TextRun({ text, font: 'Times New Roman', size: 22 })];
+}
+
+/**
+ * Generates an authentic binary Microsoft Word (.docx) file from Markdown text.
+ */
+export async function generateDocxFromMarkdown(markdown: string, title = 'Expert Notes'): Promise<Blob> {
+  const lines = markdown.split('\n');
+  const paragraphs: (Paragraph | Table)[] = [];
+
+  const cleanTitle = (title || 'Expert Notes')
+    .replace(/^BOLD::/i, '')
+    .replace(/\s*clinical\s*(profile|history)\s*:?.*$/i, '')
+    .trim();
+
+  if (cleanTitle) {
+    paragraphs.push(
+      new Paragraph({
+        heading: HeadingLevel.HEADING_1,
+        alignment: AlignmentType.CENTER,
+        spacing: { before: 200, after: 160 },
+        children: [
+          new TextRun({
+            text: cleanTitle,
+            bold: true,
+            size: 32,
+            font: 'Times New Roman',
+            color: '0F172A',
+          }),
+        ],
+      })
+    );
+  }
+
+  for (let idx = 0; idx < lines.length; idx++) {
+    const trimmed = lines[idx].trim();
+    if (!trimmed) continue;
+
+    // Handle Markdown Table Rows
+    if (isTableRowFinding(trimmed)) {
+      const tableLines: string[] = [trimmed];
+      while (idx + 1 < lines.length && isTableRowFinding(lines[idx + 1])) {
+        idx++;
+        tableLines.push(lines[idx].trim());
+      }
+
+      const tableRows: TableRow[] = [];
+      tableLines.forEach((tLine, rIdx) => {
+        const cells = parseTableRow(tLine);
+        const isHeader = rIdx === 0;
+        const tableCells = cells.map(c => {
+          const isBold = c.startsWith('BOLD::');
+          const clean = c.replace(/^BOLD::/, '');
+          return new TableCell({
+            children: [
+              new Paragraph({
+                spacing: { before: 80, after: 80 },
+                children: [
+                  new TextRun({
+                    text: clean,
+                    bold: isHeader || isBold,
+                    font: 'Times New Roman',
+                    size: 22,
+                    color: isHeader ? '0F172A' : '334155',
+                  }),
+                ],
+              }),
+            ],
+            shading: isHeader ? { fill: 'F1F5F9' } : undefined,
+          });
+        });
+        tableRows.push(new TableRow({ children: tableCells }));
+      });
+
+      if (tableRows.length > 0) {
+        paragraphs.push(
+          new Table({
+            width: { size: 100, type: WidthType.PERCENTAGE },
+            rows: tableRows,
+          })
+        );
+      }
+      continue;
+    }
+
+    if (trimmed.startsWith('# ')) {
+      paragraphs.push(
+        new Paragraph({
+          heading: HeadingLevel.HEADING_1,
+          spacing: { before: 240, after: 120 },
+          children: parseMarkdownRuns(trimmed.slice(2)),
+        })
+      );
+    } else if (trimmed.startsWith('## ')) {
+      paragraphs.push(
+        new Paragraph({
+          heading: HeadingLevel.HEADING_2,
+          spacing: { before: 200, after: 100 },
+          children: parseMarkdownRuns(trimmed.slice(3)),
+        })
+      );
+    } else if (trimmed.startsWith('### ')) {
+      paragraphs.push(
+        new Paragraph({
+          heading: HeadingLevel.HEADING_3,
+          spacing: { before: 160, after: 80 },
+          children: parseMarkdownRuns(trimmed.slice(4)),
+        })
+      );
+    } else if (trimmed.startsWith('- ') || trimmed.startsWith('* ')) {
+      paragraphs.push(
+        new Paragraph({
+          bullet: { level: 0 },
+          spacing: { after: 80, line: 276 },
+          children: parseMarkdownRuns(trimmed.slice(2)),
+        })
+      );
+    } else {
+      paragraphs.push(
+        new Paragraph({
+          spacing: { after: 120, line: 276 },
+          children: parseMarkdownRuns(trimmed),
+        })
+      );
+    }
+  }
+
+  const documentDoc = new Document({
+    sections: [
+      {
+        properties: {
+          page: {
+            margin: {
+              top: 1440,
+              right: 1440,
+              bottom: 1440,
+              left: 1440,
+            },
+          },
+        },
+        children: paragraphs,
+      },
+    ],
+  });
+
+  return await Packer.toBlob(documentDoc);
+}
+
+/**
+ * Generates an authentic binary Microsoft Word (.docx) file from HTML content.
+ */
+export async function generateDocxFromHtml(html: string, title = 'Radiology Report'): Promise<Blob> {
+  const paragraphs: (Paragraph | Table)[] = [];
+
+  const cleanTitle = (title || 'Radiology Report')
+    .replace(/^BOLD::/i, '')
+    .replace(/\s*clinical\s*(profile|history)\s*:?.*$/i, '')
+    .trim();
+
+  if (typeof document === 'undefined') {
+    return generateDocxFromMarkdown(html.replace(/<[^>]+>/g, '\n'), cleanTitle);
+  }
+
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, 'text/html');
+  const body = doc.body;
+
+  const hasH1 = !!body.querySelector('h1');
+  if (cleanTitle && !hasH1) {
+    paragraphs.push(
+      new Paragraph({
+        heading: HeadingLevel.HEADING_1,
+        alignment: AlignmentType.CENTER,
+        spacing: { before: 200, after: 140 },
+        children: [
+          new TextRun({
+            text: cleanTitle,
+            bold: true,
+            size: 32,
+            font: 'Times New Roman',
+            color: '0F172A',
+          }),
+        ],
+      })
+    );
+  }
+
+  function parseInlineRuns(
+    node: Node,
+    inheritedStyles: { bold?: boolean; italics?: boolean; underline?: boolean; color?: string } = {}
+  ): TextRun[] {
+    const runs: TextRun[] = [];
+
+    if (node.nodeType === Node.TEXT_NODE) {
+      const text = node.textContent || '';
+      if (!text) return runs;
+
+      if (text.includes('BOLD::')) {
+        const parts = text.split(/(BOLD::[^\n]*)/g);
+        for (const part of parts) {
+          if (part.startsWith('BOLD::')) {
+            runs.push(
+              new TextRun({
+                text: part.replace(/^BOLD::/, ''),
+                bold: true,
+                italics: inheritedStyles.italics,
+                underline: inheritedStyles.underline ? {} : undefined,
+                font: 'Times New Roman',
+                size: 22,
+                color: inheritedStyles.color || '0F172A',
+              })
+            );
+          } else if (part) {
+            runs.push(
+              new TextRun({
+                text: part,
+                bold: inheritedStyles.bold,
+                italics: inheritedStyles.italics,
+                underline: inheritedStyles.underline ? {} : undefined,
+                font: 'Times New Roman',
+                size: 22,
+                color: inheritedStyles.color || '334155',
+              })
+            );
+          }
+        }
+      } else {
+        runs.push(
+          new TextRun({
+            text,
+            bold: inheritedStyles.bold,
+            italics: inheritedStyles.italics,
+            underline: inheritedStyles.underline ? {} : undefined,
+            font: 'Times New Roman',
+            size: 22,
+            color: inheritedStyles.color || '334155',
+          })
+        );
+      }
+      return runs;
+    }
+
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      const el = node as HTMLElement;
+      const tag = el.tagName.toLowerCase();
+
+      const newStyles = { ...inheritedStyles };
+      if (tag === 'strong' || tag === 'b') newStyles.bold = true;
+      if (tag === 'em' || tag === 'i') newStyles.italics = true;
+      if (tag === 'u') newStyles.underline = true;
+
+      if (tag === 'br') {
+        runs.push(new TextRun({ break: 1 }));
+        return runs;
+      }
+
+      for (let i = 0; i < el.childNodes.length; i++) {
+        runs.push(...parseInlineRuns(el.childNodes[i], newStyles));
+      }
+    }
+
+    return runs;
+  }
+
+  function processBlockNode(node: Node) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const text = (node.textContent || '').trim();
+      if (text) {
+        paragraphs.push(
+          new Paragraph({
+            spacing: { after: 120, line: 276 },
+            children: [new TextRun({ text, font: 'Times New Roman', size: 22, color: '334155' })],
+          })
+        );
+      }
+      return;
+    }
+
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const el = node as HTMLElement;
+    const tag = el.tagName.toLowerCase();
+
+    // Headings
+    if (tag === 'h1') {
+      const rawText = (el.innerText || el.textContent || '')
+        .replace(/^BOLD::/i, '')
+        .replace(/\s*clinical\s*(profile|history)\s*:?.*$/i, '')
+        .trim();
+      paragraphs.push(
+        new Paragraph({
+          heading: HeadingLevel.HEADING_1,
+          alignment: AlignmentType.CENTER,
+          spacing: { before: 240, after: 120 },
+          children: [
+            new TextRun({
+              text: rawText,
+              bold: true,
+              size: 32,
+              font: 'Times New Roman',
+              color: '0F172A',
+            }),
+          ],
+        })
+      );
+      return;
+    }
+
+    if (tag === 'h2') {
+      const runs = parseInlineRuns(el, { bold: true, color: '1D4ED8' });
+      paragraphs.push(
+        new Paragraph({
+          heading: HeadingLevel.HEADING_2,
+          spacing: { before: 220, after: 100 },
+          children: runs,
+        })
+      );
+      return;
+    }
+
+    if (tag === 'h3') {
+      const runs = parseInlineRuns(el, { bold: true, color: '1E3A8A' });
+      paragraphs.push(
+        new Paragraph({
+          heading: HeadingLevel.HEADING_3,
+          spacing: { before: 180, after: 80 },
+          children: runs,
+        })
+      );
+      return;
+    }
+
+    // Lists
+    if (tag === 'ul' || tag === 'ol') {
+      const lis = el.querySelectorAll('li');
+      lis.forEach((li) => {
+        const runs = parseInlineRuns(li);
+        paragraphs.push(
+          new Paragraph({
+            bullet: { level: 0 },
+            spacing: { after: 80, line: 276 },
+            children: runs,
+          })
+        );
+      });
+      return;
+    }
+
+    // Clinical profile box
+    if (el.classList.contains('clinical-profile')) {
+      const runs = parseInlineRuns(el, { italics: true, bold: true, color: '334155' });
+      paragraphs.push(
+        new Paragraph({
+          spacing: { before: 120, after: 120 },
+          children: runs,
+        })
+      );
+      return;
+    }
+
+    // Impression section container
+    if (el.classList.contains('impression-section')) {
+      paragraphs.push(
+        new Paragraph({
+          heading: HeadingLevel.HEADING_3,
+          spacing: { before: 200, after: 100 },
+          children: [
+            new TextRun({
+              text: 'IMPRESSION:',
+              bold: true,
+              color: '0F172A',
+              font: 'Times New Roman',
+              size: 24,
+            }),
+          ],
+        })
+      );
+      for (let i = 0; i < el.childNodes.length; i++) {
+        processBlockNode(el.childNodes[i]);
+      }
+      return;
+    }
+
+    // Tables
+    if (tag === 'table') {
+      const rows = el.querySelectorAll('tr');
+      if (rows.length > 0) {
+        const tableRows: TableRow[] = [];
+        rows.forEach((r) => {
+          const cells = r.querySelectorAll('th, td');
+          if (cells.length === 0) return;
+          const tableCells: TableCell[] = [];
+          cells.forEach((c) => {
+            const isHeader = c.tagName.toLowerCase() === 'th';
+            const runs = parseInlineRuns(c, isHeader ? { bold: true, color: '0F172A' } : { color: '334155' });
+            tableCells.push(
+              new TableCell({
+                children: [
+                  new Paragraph({
+                    spacing: { before: 80, after: 80 },
+                    children: runs.length > 0 ? runs : [new TextRun({ text: ' ', font: 'Times New Roman' })],
+                  }),
+                ],
+                shading: isHeader ? { fill: 'F1F5F9' } : undefined,
+              })
+            );
+          });
+          tableRows.push(new TableRow({ children: tableCells }));
+        });
+        if (tableRows.length > 0) {
+          paragraphs.push(
+            new Table({
+              width: { size: 100, type: WidthType.PERCENTAGE },
+              rows: tableRows,
+            })
+          );
+        }
+      }
+      return;
+    }
+
+    const hasBlockChildren = Array.from(el.children).some((c) =>
+      ['p', 'div', 'h1', 'h2', 'h3', 'h4', 'ul', 'ol', 'section', 'article'].includes(c.tagName.toLowerCase())
+    );
+
+    if (hasBlockChildren) {
+      for (let i = 0; i < el.childNodes.length; i++) {
+        processBlockNode(el.childNodes[i]);
+      }
+    } else {
+      const runs = parseInlineRuns(el);
+      if (runs.length > 0) {
+        paragraphs.push(
+          new Paragraph({
+            spacing: { after: 120, line: 276 },
+            children: runs,
+          })
+        );
+      }
+    }
+  }
+
+  for (let i = 0; i < body.childNodes.length; i++) {
+    processBlockNode(body.childNodes[i]);
+  }
+
+  if (paragraphs.length === 0) {
+    paragraphs.push(
+      new Paragraph({
+        children: [new TextRun({ text: 'No report content', font: 'Times New Roman' })],
+      })
+    );
+  }
+
+  const documentDoc = new Document({
+    sections: [
+      {
+        properties: {
+          page: {
+            margin: {
+              top: 1440,
+              right: 1440,
+              bottom: 1440,
+              left: 1440,
+            },
+          },
+        },
+        children: paragraphs,
+      },
+    ],
+  });
+
+  return await Packer.toBlob(documentDoc);
+}
+
+/**
+ * Generates an authentic binary Microsoft Word (.docx) file from an array of findings.
+ * Includes proper OpenXML structure with 1-inch margins, centered bold underlined title,
+ * clean italic clinical profile, bold abnormal findings, and bulleted impression.
+ */
+export async function generateDocxFromFindings(findings: string[], title = 'Radiology Report'): Promise<Blob> {
+  const paragraphs: Paragraph[] = [];
+
+  const cleanTitle = (title || 'Radiology Report')
+    .replace(/^BOLD::/i, '')
+    .replace(/\s*clinical\s*(profile|history)\s*:?.*$/i, '')
+    .trim();
+
+  let hasEmittedTitle = false;
+
+  for (let idx = 0; idx < findings.length; idx++) {
+    const raw = (findings[idx] || '').trim();
+    if (!raw) continue;
+
+    // Check if line 0 has clinical profile attached
+    if (idx === 0) {
+      const matchGlued = raw.match(/^(.*?)(?:Clinical\s*profile:?|Clinical\s*history:?)\s*(.*)$/i);
+      if (matchGlued && matchGlued[1].trim().length > 0) {
+        const scanTitle = matchGlued[1].trim().replace(/^BOLD::/i, '').trim();
+        const prof = matchGlued[2].trim().replace(/^BOLD::/i, '').trim();
+
+        paragraphs.push(
+          new Paragraph({
+            heading: HeadingLevel.HEADING_1,
+            alignment: AlignmentType.CENTER,
+            spacing: { before: 200, after: 140 },
+            children: [
+              new TextRun({
+                text: scanTitle,
+                bold: true,
+                underline: {},
+                size: 32,
+                font: 'Times New Roman',
+                color: '0F172A',
+              }),
+            ],
+          })
+        );
+        hasEmittedTitle = true;
+
+        if (prof) {
+          paragraphs.push(
+            new Paragraph({
+              spacing: { before: 100, after: 120 },
+              children: [
+                new TextRun({
+                  text: `Clinical Profile: ${prof}`,
+                  italics: true,
+                  font: 'Times New Roman',
+                  size: 22,
+                  color: '334155',
+                }),
+              ],
+            })
+          );
+        }
+        continue;
+      }
+    }
+
+    // Title line at index 0
+    if (idx === 0 && !hasEmittedTitle) {
+      const examName = raw
+        .replace(/^BOLD::/i, '')
+        .replace(/\s*clinical\s*(profile|history)\s*:?.*$/i, '')
+        .trim();
+      paragraphs.push(
+        new Paragraph({
+          heading: HeadingLevel.HEADING_1,
+          alignment: AlignmentType.CENTER,
+          spacing: { before: 200, after: 140 },
+          children: [
+            new TextRun({
+              text: examName,
+              bold: true,
+              underline: {},
+              size: 32,
+              font: 'Times New Roman',
+              color: '0F172A',
+            }),
+          ],
+        })
+      );
+      hasEmittedTitle = true;
+      continue;
+    }
+
+    // Clinical profile
+    if (isClinicalProfileFinding(raw)) {
+      const profStyle = parseClinicalProfileStyle(raw);
+      paragraphs.push(
+        new Paragraph({
+          spacing: { before: 100, after: 120 },
+          children: [
+            new TextRun({
+              text: profStyle.text,
+              italics: profStyle.italic,
+              bold: profStyle.bold,
+              underline: profStyle.underline ? {} : undefined,
+              font: 'Times New Roman',
+              size: 22,
+              color: '334155',
+            }),
+          ],
+        })
+      );
+      continue;
+    }
+
+    // Impression
+    if (raw.startsWith('IMPRESSION:')) {
+      paragraphs.push(
+        new Paragraph({
+          heading: HeadingLevel.HEADING_3,
+          spacing: { before: 200, after: 100 },
+          children: [
+            new TextRun({
+              text: 'IMPRESSION:',
+              bold: true,
+              underline: {},
+              font: 'Times New Roman',
+              size: 24,
+              color: '0F172A',
+            }),
+          ],
+        })
+      );
+      const parts = raw.replace('IMPRESSION:', '').split('###').map((p) => p.trim()).filter(Boolean);
+      for (const pt of parts) {
+        const isExplicitNoBullet = /^\[NO_BULLET\]\s*/i.test(pt) ||
+          /^NO_BULLET::\s*/i.test(pt) ||
+          /^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i.test(pt);
+        let cleanPt = pt
+          .replace(/^\[NO_BULLET\]\s*/i, '')
+          .replace(/^NO_BULLET::\s*/i, '')
+          .replace(/^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i, '')
+          .trim();
+        const textWithoutBullet = cleanPt.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
+        if (!textWithoutBullet) continue;
+
+        const isStandaloneCorrelation = isPureCorrelationOrRecommendation(textWithoutBullet);
+        const isLeadIn = /^findings\s+(?:are\s+)?s\/?o(?:\s*:)?$/i.test(textWithoutBullet);
+
+        if (isExplicitNoBullet || isStandaloneCorrelation || isLeadIn) {
+          paragraphs.push(
+            new Paragraph({
+              spacing: { after: 80, line: 276 },
+              children: [
+                new TextRun({
+                  text: textWithoutBullet,
+                  bold: true,
+                  font: 'Times New Roman',
+                  size: 24,
+                  color: '0F172A',
+                }),
+              ],
+            })
+          );
+        } else {
+          paragraphs.push(
+            new Paragraph({
+              bullet: { level: 0 },
+              spacing: { after: 80, line: 276 },
+              children: [
+                new TextRun({
+                  text: textWithoutBullet,
+                  bold: true,
+                  font: 'Times New Roman',
+                  size: 24,
+                  color: '0F172A',
+                }),
+              ],
+            })
+          );
+        }
+      }
+      continue;
+    }
+
+    // Patient separator
+    if (raw.startsWith('BOLD::--- PATIENT') || raw.startsWith('--- PATIENT')) {
+      const cleanPatient = raw.replace('BOLD::', '').trim();
+      paragraphs.push(
+        new Paragraph({
+          heading: HeadingLevel.HEADING_2,
+          spacing: { before: 240, after: 120 },
+          children: [
+            new TextRun({
+              text: cleanPatient,
+              bold: true,
+              font: 'Times New Roman',
+              size: 26,
+              color: '1D4ED8',
+            }),
+          ],
+        })
+      );
+      continue;
+    }
+
+    // Findings with BOLD:: (dictated abnormality modifications)
+    if (raw.startsWith('BOLD::')) {
+      const content = raw.replace(/^BOLD::/, '');
+      paragraphs.push(
+        new Paragraph({
+          spacing: { after: 120, line: 276 },
+          children: [
+            new TextRun({
+              text: content,
+              bold: true,
+              font: 'Times New Roman',
+              size: 22,
+              color: '0F172A',
+            }),
+          ],
+        })
+      );
+    } else {
+      paragraphs.push(
+        new Paragraph({
+          spacing: { after: 120, line: 276 },
+          children: [
+            new TextRun({
+              text: raw,
+              font: 'Times New Roman',
+              size: 22,
+              color: '334155',
+            }),
+          ],
+        })
+      );
+    }
+  }
+
+  const documentDoc = new Document({
+    sections: [
+      {
+        properties: {
+          page: {
+            margin: {
+              top: 1440,
+              right: 1440,
+              bottom: 1440,
+              left: 1440,
+            },
+          },
+        },
+        children: paragraphs,
+      },
+    ],
+  });
+
+  return await Packer.toBlob(documentDoc);
+}

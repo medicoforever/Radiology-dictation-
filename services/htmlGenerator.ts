@@ -313,18 +313,24 @@ const getEmbeddedScript = () => `
                     findingEl.dataset.findingRaw = encodeURIComponent((isBold ? 'BOLD::' : '') + profText);
                 } else if (isImpression) {
                     textEl.className = 'finding-text text-slate-700 cursor-pointer';
-                    textEl.innerHTML = \`<strong class="underline uppercase">\${newParts[0]}</strong><div class="mt-1 space-y-1">\${newParts.slice(1).map(p => {
+                    let listHtml = '';
+                    let inUl = false;
+                    newParts.slice(1).forEach(p => {
                         const cleanP = p.replace(/^BOLD::/i, '').trim();
                         const isPureCorr = /^(?:suggested\\s+)?clinical\\s+correlation(?:\\s*[\\/\\&,]\\s*review)?(?:\\s+as\\s+indicated)?\\.?$/i.test(cleanP.replace(/[.]+$/, '')) ||
                                            /^suggested\\s+(?:clinical\\s+correlation|review(?:\\s+as\\s+indicated)?)\\.?$/i.test(cleanP.replace(/[.]+$/, ''));
                         const isLeadIn = /^findings\\s+(?:are\\s+)?s\\/?o(?:\\s*:)?$/i.test(cleanP);
-                        const m = cleanP.match(/^[•\\-\\*]\\s*(.+)/s);
                         const cText = cleanP.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
                         if (isPureCorr || isLeadIn) {
-                            return \`<div class="font-bold">\${cText}</div>\`;
+                            if (inUl) { listHtml += '</ul>'; inUl = false; }
+                            listHtml += \`<div class="font-bold">\${cText}</div>\`;
+                        } else {
+                            if (!inUl) { listHtml += '<ul class="list-disc pl-5 space-y-1 font-bold my-1">'; inUl = true; }
+                            listHtml += \`<li class="leading-relaxed">\${cText}</li>\`;
                         }
-                        return \`<div class="font-bold">• \${cText}</div>\`;
-                    }).join('')}</div>\`;
+                    });
+                    if (inUl) { listHtml += '</ul>'; }
+                    textEl.innerHTML = \`<strong class="underline uppercase">\${newParts[0]}</strong><div class="mt-1 space-y-1">\${listHtml}</div>\`;
                 } else if (newParts.length > 1) {
                     textEl.className = 'finding-text text-slate-700 cursor-pointer';
                     textEl.innerHTML = \`<strong class="font-bold">\${newParts[0]}</strong>\${newParts.slice(1).map(p => \`<span class="block font-semibold">\${p}</span>\`).join('')}\`;
@@ -1227,21 +1233,27 @@ const renderFindingsList = (findings: string[], batchId: string): string => {
                     findingContent = cleanClinicalProfileText(cleanFinding);
                     textContainerClasses = 'italic';
                 } else if (isImpression) {
+                    let listHtml = '';
+                    let inUl = false;
+                    points.forEach(p => {
+                        const cleanP = p.replace(/^BOLD::/i, '').trim();
+                        const isPureCorr = /^(?:suggested\s+)?clinical\s+correlation(?:\s*[\/\&,]\s*review)?(?:\s+as\s+indicated)?\.?$/i.test(cleanP.replace(/[.]+$/, '')) ||
+                                           /^suggested\s+(?:clinical\s+correlation|review(?:\s+as\s+indicated)?)\.?$/i.test(cleanP.replace(/[.]+$/, ''));
+                        const isLeadIn = /^findings\s+(?:are\s+)?s\/?o(?:\s*:)?$/i.test(cleanP);
+                        const cText = cleanP.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
+                        if (isPureCorr || isLeadIn) {
+                            if (inUl) { listHtml += '</ul>'; inUl = false; }
+                            listHtml += `<div class="font-bold">${cText}</div>`;
+                        } else {
+                            if (!inUl) { listHtml += '<ul class="list-disc pl-5 space-y-1 font-bold my-1">'; inUl = true; }
+                            listHtml += `<li class="leading-relaxed">${cText}</li>`;
+                        }
+                    });
+                    if (inUl) { listHtml += '</ul>'; }
                     findingContent = `
                         <strong class="underline uppercase">${title}</strong>
                         <div class="mt-1 space-y-1">
-                            ${points.map(p => {
-                                const cleanP = p.replace(/^BOLD::/i, '').trim();
-                                const isPureCorr = /^(?:suggested\s+)?clinical\s+correlation(?:\s*[\/\&,]\s*review)?(?:\s+as\s+indicated)?\.?$/i.test(cleanP.replace(/[.]+$/, '')) ||
-                                                   /^suggested\s+(?:clinical\s+correlation|review(?:\s+as\s+indicated)?)\.?$/i.test(cleanP.replace(/[.]+$/, ''));
-                                const isLeadIn = /^findings\s+(?:are\s+)?s\/?o(?:\s*:)?$/i.test(cleanP);
-                                const m = cleanP.match(/^[•\-\*]\s*(.+)/s);
-                                const cText = cleanP.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
-                                if (isPureCorr || isLeadIn) {
-                                    return `<div class="font-bold">${cText}</div>`;
-                                }
-                                return `<div class="font-bold">• ${cText}</div>`;
-                            }).join('')}
+                            ${listHtml}
                         </div>
                     `;
                 } else if (isStructured) {

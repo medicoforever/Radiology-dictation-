@@ -568,12 +568,25 @@ export function formatImpressionOutput(title: string, points: string[]): { plain
   if (cleanPoints.length === 0) {
     return {
       plain: cleanTitle,
-      html: `<p style="font-family: 'Times New Roman', serif; font-size: 12pt;"><strong style="text-decoration: underline;">${cleanTitle}</strong></p>`
+      html: `<p style="font-family: 'Times New Roman', serif; font-size: 12pt;"><strong style="font-family: 'Times New Roman', serif; font-size: 12pt; text-decoration: underline;">${cleanTitle}</strong></p>`
     };
   }
 
   const plainLines = [cleanTitle];
-  const htmlParagraphs = [`<p style="font-family: 'Times New Roman', serif; font-size: 12pt;"><strong style="text-decoration: underline;">${cleanTitle}</strong></p>`];
+  const htmlParts: string[] = [`<p style="font-family: 'Times New Roman', serif; font-size: 12pt;"><strong style="font-family: 'Times New Roman', serif; font-size: 12pt; text-decoration: underline;">${cleanTitle}</strong></p>`];
+
+  let currentUlItems: string[] = [];
+
+  const flushUl = () => {
+    if (currentUlItems.length > 0) {
+      htmlParts.push(
+        `<ul style="list-style-type: disc; margin: 4pt 0 6pt 0; padding-left: 24pt;">` +
+        currentUlItems.map(item => `<li style="font-family: 'Times New Roman', serif; font-size: 12pt; margin-bottom: 3pt; line-height: 1.4;"><strong style="font-family: 'Times New Roman', serif; font-size: 12pt;">${escapeHtml(item)}</strong></li>`).join('') +
+        `</ul>`
+      );
+      currentUlItems = [];
+    }
+  };
 
   cleanPoints.forEach(pt => {
     // 1. Explicit no-bullet directive
@@ -591,35 +604,40 @@ export function formatImpressionOutput(title: string, points: string[]): { plain
     const textWithoutBullet = cleanPt.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
 
     if (isExplicitNoBullet) {
+      flushUl();
       plainLines.push(textWithoutBullet);
-      htmlParagraphs.push(`<p style="font-family: 'Times New Roman', serif; font-size: 12pt;"><strong>${escapeHtml(textWithoutBullet)}</strong></p>`);
+      htmlParts.push(`<p style="font-family: 'Times New Roman', serif; font-size: 12pt;"><strong style="font-family: 'Times New Roman', serif; font-size: 12pt;">${escapeHtml(textWithoutBullet)}</strong></p>`);
       return;
     }
 
     // 2. Standalone correlation sentence alone on its own separate row -> KEPT WITHOUT BULLET
     const isStandaloneCorrelation = isPureCorrelationOrRecommendation(textWithoutBullet);
     if (isStandaloneCorrelation) {
+      flushUl();
       plainLines.push(textWithoutBullet);
-      htmlParagraphs.push(`<p style="font-family: 'Times New Roman', serif; font-size: 12pt;"><strong>${escapeHtml(textWithoutBullet)}</strong></p>`);
+      htmlParts.push(`<p style="font-family: 'Times New Roman', serif; font-size: 12pt;"><strong style="font-family: 'Times New Roman', serif; font-size: 12pt;">${escapeHtml(textWithoutBullet)}</strong></p>`);
       return;
     }
 
     // 3. Standalone lead-in summary like "Findings are s/o:"
     const isLeadIn = /^findings\s+(?:are\s+)?s\/?o(?:\s*:)?$/i.test(textWithoutBullet);
     if (isLeadIn) {
+      flushUl();
       plainLines.push(textWithoutBullet);
-      htmlParagraphs.push(`<p style="font-family: 'Times New Roman', serif; font-size: 12pt;"><strong>${escapeHtml(textWithoutBullet)}</strong></p>`);
+      htmlParts.push(`<p style="font-family: 'Times New Roman', serif; font-size: 12pt;"><strong style="font-family: 'Times New Roman', serif; font-size: 12pt;">${escapeHtml(textWithoutBullet)}</strong></p>`);
       return;
     }
 
     // 4. Clinical finding (even with "Suggested clinical correlation..." appended) -> ALWAYS INCLUDE BULLET POINT
     plainLines.push(`• ${textWithoutBullet}`);
-    htmlParagraphs.push(`<p style="font-family: 'Times New Roman', serif; font-size: 12pt;"><strong>• ${escapeHtml(textWithoutBullet)}</strong></p>`);
+    currentUlItems.push(textWithoutBullet);
   });
+
+  flushUl();
 
   return {
     plain: plainLines.join('\n'),
-    html: htmlParagraphs.join('')
+    html: htmlParts.join('')
   };
 }
 
@@ -883,16 +901,65 @@ export function sanitizeHtmlForClipboard(html: string): string {
       }
     });
 
+    // 1. Group consecutive <p> elements that start with a bullet character into a semantic <ul>
+    const paras = Array.from(temp.querySelectorAll('p'));
+    let currentBulletGroup: HTMLElement[] = [];
+
+    const flushBulletGroup = () => {
+      if (currentBulletGroup.length > 0) {
+        const ul = document.createElement('ul');
+        ul.setAttribute('style', 'list-style-type: disc; margin: 4pt 0 6pt 0; padding-left: 24pt;');
+        currentBulletGroup[0].parentNode?.insertBefore(ul, currentBulletGroup[0]);
+
+        currentBulletGroup.forEach(p => {
+          const li = document.createElement('li');
+          li.setAttribute('style', "font-family: 'Times New Roman', serif; font-size: 12pt; margin-bottom: 3pt; line-height: 1.4;");
+          let inner = p.innerHTML.trim();
+          inner = inner.replace(/^(?:<strong>|<b>)?(?:\s*•\s*|\s*&bull;\s*|\s*&#8226;\s*|\s*[-*]\s*)+/i, (m) => {
+            return m.toLowerCase().includes('strong') ? '<strong>' : (m.toLowerCase().includes('b') ? '<b>' : '');
+          }).trim();
+          inner = inner.replace(/^<(strong|b)>\s*(?:•|&bull;|&#8226;|[-*])\s*/i, '<$1>');
+          if (!inner.startsWith('<strong>') && !inner.startsWith('<b>')) {
+            inner = `<strong style="font-family: 'Times New Roman', serif; font-size: 12pt;">${inner}</strong>`;
+          }
+          li.innerHTML = inner;
+          ul.appendChild(li);
+          p.remove();
+        });
+        currentBulletGroup = [];
+      }
+    };
+
+    paras.forEach(p => {
+      const text = p.textContent?.trim() || '';
+      if (/^(?:•|&bull;|&#8226;|[-*])\s+/.test(text) || /^•/.test(text)) {
+        currentBulletGroup.push(p);
+      } else {
+        flushBulletGroup();
+      }
+    });
+    flushBulletGroup();
+
+    // 2. Preserve native lists: standardize style and strip any duplicate literal text bullets inside <li>
     const lists = temp.querySelectorAll('ul, ol');
     lists.forEach(list => {
+      const isOrdered = list.tagName.toLowerCase() === 'ol';
+      list.setAttribute('style', `list-style-type: ${isOrdered ? 'decimal' : 'disc'}; margin: 4pt 0 6pt 0; padding-left: 24pt;`);
+      list.removeAttribute('class');
+      list.removeAttribute('id');
+
       const items = list.querySelectorAll('li');
       items.forEach(li => {
-        const p = document.createElement('p');
         let cleanLi = li.innerHTML.trim().replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
-        p.innerHTML = `<strong>• ${cleanLi}</strong>`;
-        list.parentNode?.insertBefore(p, list);
+        cleanLi = cleanLi.replace(/^<(strong|b)>\s*(?:•|&bull;|&#8226;|[-*])\s*/i, '<$1>');
+        if (!cleanLi.startsWith('<strong>') && !cleanLi.startsWith('<b>')) {
+          cleanLi = `<strong style="font-family: 'Times New Roman', serif; font-size: 12pt;">${cleanLi}</strong>`;
+        }
+        li.innerHTML = cleanLi;
+        li.setAttribute('style', "font-family: 'Times New Roman', serif; font-size: 12pt; margin-bottom: 3pt; line-height: 1.4;");
+        li.removeAttribute('class');
+        li.removeAttribute('id');
       });
-      list.remove();
     });
 
     const allParas = temp.querySelectorAll('p');
@@ -912,7 +979,8 @@ export function sanitizeHtmlForClipboard(html: string): string {
     allEls.forEach(el => {
       el.removeAttribute('class');
       el.removeAttribute('id');
-      if (el.tagName.toLowerCase() !== 'p' && el.tagName.toLowerCase() !== 'table' && el.tagName.toLowerCase() !== 'th' && el.tagName.toLowerCase() !== 'td') {
+      const tag = el.tagName.toLowerCase();
+      if (tag !== 'p' && tag !== 'table' && tag !== 'th' && tag !== 'td' && tag !== 'ul' && tag !== 'ol' && tag !== 'li') {
         el.removeAttribute('style');
       }
     });
@@ -1157,7 +1225,10 @@ export function generateRtfDocument(htmlOrText: string, title = 'Radiology Repor
             for (let i = 0; i < li.childNodes.length; i++) {
               liRuns += processInlineRuns(li.childNodes[i]);
             }
-            paragraphs.push(`\\pard\\fi-360\\li720\\sa80\\sl276\\slmult1\\fs22\\b\\bullet  ${liRuns.trim()}\\b0\\par`);
+            const cleanLi = liRuns.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
+            if (cleanLi) {
+              paragraphs.push(`\\pard\\fi-360\\li720\\sa80\\sl276\\slmult1\\f0\\fs24\\b\\bullet   ${cleanLi}\\b0\\par`);
+            }
           });
           return;
         }
@@ -2023,21 +2094,52 @@ export async function generateDocxFromFindings(findings: string[], title = 'Radi
       );
       const parts = raw.replace('IMPRESSION:', '').split('###').map((p) => p.trim()).filter(Boolean);
       for (const pt of parts) {
-        paragraphs.push(
-          new Paragraph({
-            bullet: { level: 0 },
-            spacing: { after: 80, line: 276 },
-            children: [
-              new TextRun({
-                text: pt,
-                bold: true,
-                font: 'Times New Roman',
-                size: 22,
-                color: '0F172A',
-              }),
-            ],
-          })
-        );
+        const isExplicitNoBullet = /^\[NO_BULLET\]\s*/i.test(pt) ||
+          /^NO_BULLET::\s*/i.test(pt) ||
+          /^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i.test(pt);
+        let cleanPt = pt
+          .replace(/^\[NO_BULLET\]\s*/i, '')
+          .replace(/^NO_BULLET::\s*/i, '')
+          .replace(/^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i, '')
+          .trim();
+        const textWithoutBullet = cleanPt.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
+        if (!textWithoutBullet) continue;
+
+        const isStandaloneCorrelation = isPureCorrelationOrRecommendation(textWithoutBullet);
+        const isLeadIn = /^findings\s+(?:are\s+)?s\/?o(?:\s*:)?$/i.test(textWithoutBullet);
+
+        if (isExplicitNoBullet || isStandaloneCorrelation || isLeadIn) {
+          paragraphs.push(
+            new Paragraph({
+              spacing: { after: 80, line: 276 },
+              children: [
+                new TextRun({
+                  text: textWithoutBullet,
+                  bold: true,
+                  font: 'Times New Roman',
+                  size: 24,
+                  color: '0F172A',
+                }),
+              ],
+            })
+          );
+        } else {
+          paragraphs.push(
+            new Paragraph({
+              bullet: { level: 0 },
+              spacing: { after: 80, line: 276 },
+              children: [
+                new TextRun({
+                  text: textWithoutBullet,
+                  bold: true,
+                  font: 'Times New Roman',
+                  size: 24,
+                  color: '0F172A',
+                }),
+              ],
+            })
+          );
+        }
       }
       continue;
     }

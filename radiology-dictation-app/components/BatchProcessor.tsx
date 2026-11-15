@@ -1,9 +1,10 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useAudioRecorder } from '../hooks/useAudioRecorder';
 import { processAudio, createChat, blobToBase64, continueAudioDictation, base64ToBlob, modifyFindingWithAudio, modifyReportWithAudio, identifyPotentialErrors, runComplexImpressionGeneration, transcribeAudioForPrompt, detectAndExtractTemplate, mergeDictatedFindingsWithTemplate } from '../services/geminiService';
-import { saveAudioBlob, getAudioBlob, clearUnusedAudioBlobs } from '../services/audioStorage';
+import { saveAudioBlob, getAudioBlob, clearUnusedAudioBlobs, saveReportSession, getReportSession, deleteReportSession } from '../services/audioStorage';
 import { mergeMultipleAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
 import { ClipboardPaste, X, CheckSquare } from 'lucide-react';
+import { safeLocalStorage, markTabActive, getTabId, getBatchModeStorageKey } from '../services/storageService';
 import PasteTextModal from './PasteTextModal';
 import RichTextReportEditor from './RichTextReportEditor';
 import TemplateSelectionModal from './ui/TemplateSelectionModal';
@@ -37,7 +38,7 @@ import { AVAILABLE_MODELS, REPORT_TEMPLATES, ReportTemplate } from '../constants
 import WarningIcon from './icons/WarningIcon';
 import BrainIcon from './icons/BrainIcon';
 import { autoSaveBatchDictations, SaveResult, BatchFolderInfo, isDriveConnected, subscribeToAuth } from '../services/googleDriveService';
-import { generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText, formatImpressionOutput, findingsToStandardHtml, isPureCorrelationOrRecommendation, isReportTitle, isAnatomicalSubheading } from '../services/docxService';
+import { generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText, formatImpressionOutput, findingsToStandardHtml, isPureCorrelationOrRecommendation, isReportTitle, isAnatomicalSubheading, sanitizeHtmlForClipboard } from '../services/docxService';
 import { isClinicalProfileFinding, formatClinicalProfileText } from './ResultsDisplay';
 
 const BATCH_DRIVE_FOLDER_KEY = 'radiologyDictationBatchDriveFolder';
@@ -592,21 +593,47 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         driveSyncedBatchHashRef.current = driveSyncedBatchHash;
     }, [driveSyncedBatchHash]);
 
-     // Load state from localStorage & IndexedDB on initial render
+     // Load state from localStorage & IndexedDB on initial render (tab-isolated)
     useEffect(() => {
         const loadState = async () => {
             try {
-                const savedStateJSON = localStorage.getItem(BATCH_MODE_STORAGE_KEY);
-                if (savedStateJSON) {
-                    const savedBatches: SerializableBatch[] = JSON.parse(savedStateJSON);
-                    
+                const currentTabId = getTabId();
+                const curKey = getBatchModeStorageKey(currentTabId);
+                let savedBatches: SerializableBatch[] | null = await getReportSession(curKey);
+                if (!savedBatches || !Array.isArray(savedBatches) || savedBatches.length === 0) {
+                    const savedStateJSON = localStorage.getItem(curKey);
+                    if (savedStateJSON) {
+                        try {
+                            savedBatches = JSON.parse(savedStateJSON);
+                        } catch {
+                            savedBatches = null;
+                        }
+                    }
+                }
+                // Fallback to legacy global key once for existing sessions, and migrate to tab-scoped key
+                if (!savedBatches || !Array.isArray(savedBatches) || savedBatches.length === 0) {
+                    savedBatches = await getReportSession(BATCH_MODE_STORAGE_KEY);
+                    if (!savedBatches) {
+                        const legacyJSON = localStorage.getItem(BATCH_MODE_STORAGE_KEY);
+                        if (legacyJSON) {
+                            try { savedBatches = JSON.parse(legacyJSON); } catch {}
+                        }
+                    }
+                    if (savedBatches && Array.isArray(savedBatches) && savedBatches.length > 0) {
+                        await saveReportSession(curKey, savedBatches);
+                        await deleteReportSession(BATCH_MODE_STORAGE_KEY).catch(() => {});
+                        localStorage.removeItem(BATCH_MODE_STORAGE_KEY);
+                    }
+                }
+                if (savedBatches && Array.isArray(savedBatches) && savedBatches.length > 0) {
                     const restoredBatches: Batch[] = await Promise.all(savedBatches.map(async (savedBatch) => {
                         const audioBlobs: Blob[] = [];
 
-                        // 1. Load audio blobs from IndexedDB by key
+                        // 1. Load audio blobs from IndexedDB by tab-scoped key, falling back to legacy key
                         const count = savedBatch.audioCount ?? (savedBatch.audioBlobs ? savedBatch.audioBlobs.length : 0);
                         for (let idx = 0; idx < count; idx++) {
-                            const blob = await getAudioBlob(`batch_audio_${savedBatch.id}_${idx}`);
+                            const blob = (await getAudioBlob(`batch_audio_${currentTabId}_${savedBatch.id}_${idx}`)) ||
+                                         (await getAudioBlob(`batch_audio_${savedBatch.id}_${idx}`));
                             if (blob) {
                                 audioBlobs.push(blob);
                             } else if (savedBatch.audioBlobs && savedBatch.audioBlobs[idx]?.data) {
@@ -681,7 +708,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
 
         if (!batchSessionTimestampRef.current) {
             batchSessionTimestampRef.current = Date.now();
-            localStorage.setItem(BATCH_SESSION_TIMESTAMP_KEY, String(batchSessionTimestampRef.current));
+            safeLocalStorage.setRaw(BATCH_SESSION_TIMESTAMP_KEY, String(batchSessionTimestampRef.current));
         }
 
         const currentHash = completed.map(b => `${b.id}:${(b.findings || []).join('|')}`).join(';;;');
@@ -707,10 +734,10 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                 if (res.batchFolder) {
                     setDriveBatchFolder(res.batchFolder);
                     driveBatchFolderRef.current = res.batchFolder;
-                    localStorage.setItem(BATCH_DRIVE_FOLDER_KEY, JSON.stringify(res.batchFolder));
+                    safeLocalStorage.setItem(BATCH_DRIVE_FOLDER_KEY, res.batchFolder);
                 }
                 setDriveSyncedBatchHash(currentHash);
-                localStorage.setItem(BATCH_DRIVE_SYNCED_HASH_KEY, currentHash);
+                safeLocalStorage.setRaw(BATCH_DRIVE_SYNCED_HASH_KEY, currentHash);
 
                 if (onSaveToDrive) {
                     onSaveToDrive(res);
@@ -771,10 +798,14 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         if (!isRestored) return; // Do not overwrite or delete until initial restoration completes
 
         const saveState = async () => {
+            const currentTabId = getTabId();
+            const curKey = getBatchModeStorageKey(currentTabId);
+
             if (batches.length === 0) {
-                if (localStorage.getItem(BATCH_MODE_STORAGE_KEY)) {
-                    localStorage.removeItem(BATCH_MODE_STORAGE_KEY);
-                }
+                safeLocalStorage.removeItem(curKey);
+                safeLocalStorage.removeItem(BATCH_MODE_STORAGE_KEY);
+                await deleteReportSession(curKey).catch(() => {});
+                await deleteReportSession(BATCH_MODE_STORAGE_KEY).catch(() => {});
                 clearUnusedAudioBlobs([]).catch(() => {});
                 return;
             }
@@ -783,10 +814,10 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                 const usedKeys: string[] = [];
                 const serializableBatches: SerializableBatch[] = await Promise.all(
                     batches.map(async (batch) => {
-                        // Store audio blobs safely in IndexedDB
+                        // Store audio blobs safely in IndexedDB partitioned by tabId
                         await Promise.all(
                             batch.audioBlobs.map(async (blob, idx) => {
-                                const key = `batch_audio_${batch.id}_${idx}`;
+                                const key = `batch_audio_${currentTabId}_${batch.id}_${idx}`;
                                 usedKeys.push(key);
                                 await saveAudioBlob(key, blob);
                             })
@@ -801,7 +832,11 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                     })
                 );
 
-                localStorage.setItem(BATCH_MODE_STORAGE_KEY, JSON.stringify(serializableBatches));
+                // Save batch reports directly to IndexedDB isolated per tab (zero localStorage quota usage!)
+                await saveReportSession(curKey, serializableBatches);
+                safeLocalStorage.removeItem(curKey);
+                safeLocalStorage.removeItem(BATCH_MODE_STORAGE_KEY);
+                await deleteReportSession(BATCH_MODE_STORAGE_KEY).catch(() => {});
                 clearUnusedAudioBlobs(usedKeys).catch(() => {});
             } catch (error) {
                 console.error("Failed to save batch state:", error);
@@ -1021,25 +1056,31 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         setExpertNotesForBatches(prev => { const next = {...prev}; delete next[id]; return next; });
     };
 
-    const clearAllBatches = () => {
+    const clearAllBatches = async () => {
         if (isMainRecording) {
             alert("Please stop recording before clearing all batches.");
             return;
         }
-        if (batches.length > 0) {
-            setBatches([]);
-            // Clean up all associated state
-            setComplexInputs({});
-            setAgenticStates({});
-            setAgenticErrors({});
-            setExpertNotesForBatches({});
-            setDriveBatchFolder(null);
-            setDriveSyncedBatchHash(null);
-            batchSessionTimestampRef.current = null;
-            localStorage.removeItem(BATCH_DRIVE_FOLDER_KEY);
-            localStorage.removeItem(BATCH_SESSION_TIMESTAMP_KEY);
-            localStorage.removeItem(BATCH_DRIVE_SYNCED_HASH_KEY);
-        }
+        const currentTabId = getTabId();
+        const curKey = getBatchModeStorageKey(currentTabId);
+        setBatches([]);
+        // Clean up all associated state immediately
+        setComplexInputs({});
+        setAgenticStates({});
+        setAgenticErrors({});
+        setExpertNotesForBatches({});
+        setDriveBatchFolder(null);
+        setDriveSyncedBatchHash(null);
+        batchSessionTimestampRef.current = null;
+        safeLocalStorage.removeItem(BATCH_DRIVE_FOLDER_KEY);
+        safeLocalStorage.removeItem(BATCH_SESSION_TIMESTAMP_KEY);
+        safeLocalStorage.removeItem(BATCH_DRIVE_SYNCED_HASH_KEY);
+        // Explicitly wipe tab batch session and legacy session from both IndexedDB and localStorage
+        safeLocalStorage.removeItem(curKey);
+        safeLocalStorage.removeItem(BATCH_MODE_STORAGE_KEY);
+        await deleteReportSession(curKey).catch(() => {});
+        await deleteReportSession(BATCH_MODE_STORAGE_KEY).catch(() => {});
+        clearUnusedAudioBlobs([]).catch(() => {});
     };
 
 
@@ -1356,37 +1397,47 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         const batchesToProcess = batches.filter(b => (b.status === 'complete' || b.status === 'paused') && b.audioBlobs.length > 0 && !b.findings);
         if (batchesToProcess.length === 0) return;
 
+        markTabActive('processing');
+        const processingHeartbeatTimer = setInterval(() => {
+            markTabActive('processing');
+        }, 3000);
+
         batchesToProcess.forEach(b => {
             batchProcessingIdRef.current[b.id] = (batchProcessingIdRef.current[b.id] || 0) + 1;
         });
 
         setBatches(prev => prev.map(b => batchesToProcess.find(p => p.id === b.id) ? {...b, status: 'processing'} : b));
 
-        await Promise.all(batchesToProcess.map(async (batch) => {
-            if (batch.audioBlobs.length === 0) return;
-            const currentReqId = batchProcessingIdRef.current[batch.id];
-            try {
-                const mergedBlob = await mergeMultipleAudioBlobs(batch.audioBlobs);
-                const currentUpcoming = getUpcomingTemplate();
-                const effectivePrompt = batch.customPrompt || (currentUpcoming ? currentUpcoming.promptText : globalCustomPrompt);
-                const effectiveDocx = batch.customDocx || (currentUpcoming ? (currentUpcoming.docxData || null) : null);
-                const findings = await processAudio(mergedBlob, batch.selectedModel, effectivePrompt, batch.customImages, undefined, effectiveDocx);
-                
-                if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
+        try {
+            await Promise.all(batchesToProcess.map(async (batch) => {
+                if (batch.audioBlobs.length === 0) return;
+                const currentReqId = batchProcessingIdRef.current[batch.id];
+                try {
+                    const mergedBlob = await mergeMultipleAudioBlobs(batch.audioBlobs);
+                    const currentUpcoming = getUpcomingTemplate();
+                    const effectivePrompt = batch.customPrompt || (currentUpcoming ? currentUpcoming.promptText : globalCustomPrompt);
+                    const effectiveDocx = batch.customDocx || (currentUpcoming ? (currentUpcoming.docxData || null) : null);
+                    const findings = await processAudio(mergedBlob, batch.selectedModel, effectivePrompt, batch.customImages, undefined, effectiveDocx);
+                    
+                    if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
 
-                const chatSession = await createChat(mergedBlob, findings, effectivePrompt, batch.customImages, batch.selectedModel);
-                const aiGreeting = "I have reviewed the audio and transcript for this dictation. How can I help you further?";
-                const initialChatHistory = [{ author: 'AI' as const, text: `${findings.join('\n\n')}\n\n${aiGreeting}` }];
+                    const chatSession = await createChat(mergedBlob, findings, effectivePrompt, batch.customImages, batch.selectedModel);
+                    const aiGreeting = "I have reviewed the audio and transcript for this dictation. How can I help you further?";
+                    const initialChatHistory = [{ author: 'AI' as const, text: `${findings.join('\n\n')}\n\n${aiGreeting}` }];
 
-                if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
+                    if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
 
-                setBatches(prev => prev.map(b => b.id === batch.id ? { ...b, status: 'complete', findings, chat: chatSession, chatHistory: initialChatHistory, isChatting: false } : b));
-            } catch (err) {
-                if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
-                const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';
-                setBatches(prev => prev.map(b => b.id === batch.id ? { ...b, status: 'error', error: errorMessage } : b));
-            }
-        }));
+                    setBatches(prev => prev.map(b => b.id === batch.id ? { ...b, status: 'complete', findings, chat: chatSession, chatHistory: initialChatHistory, isChatting: false } : b));
+                } catch (err) {
+                    if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
+                    const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';
+                    setBatches(prev => prev.map(b => b.id === batch.id ? { ...b, status: 'error', error: errorMessage } : b));
+                }
+            }));
+        } finally {
+            clearInterval(processingHeartbeatTimer);
+            markTabActive('idle');
+        }
 
         // Automatically archive processed batch reports as HTML to Google Drive in hidden background
         setTimeout(() => {
@@ -1487,7 +1538,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
 
     const copyToClipboard = async (plainText: string, htmlText: string) => {
         try {
-          const cleanHtmlText = htmlText.replace(/(?:•\s*){2,}/g, '• ').replace(/(?:&bull;\s*){2,}/g, '&bull; ');
+          const cleanHtmlText = sanitizeHtmlForClipboard(htmlText);
           const cleanPlainText = plainText.replace(/(?:•\s*){2,}/g, '• ');
           const htmlBlob = new Blob([cleanHtmlText], { type: 'text/html' });
           const textBlob = new Blob([cleanPlainText], { type: 'text/plain' });
@@ -3444,7 +3495,24 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                     </div>
                                                 )}
 
-                                                <div className="space-y-3">
+                                                <div 
+                                                    className="space-y-3"
+                                                    onCopy={(e) => {
+                                                        const selection = window.getSelection();
+                                                        if (selection && selection.rangeCount > 0 && !selection.isCollapsed) {
+                                                            const range = selection.getRangeAt(0);
+                                                            const container = document.createElement('div');
+                                                            container.appendChild(range.cloneContents());
+                                                            const cleanHtml = sanitizeHtmlForClipboard(container.innerHTML);
+                                                            const plainText = selection.toString();
+                                                            e.preventDefault();
+                                                            if (e.clipboardData) {
+                                                                e.clipboardData.setData('text/html', cleanHtml);
+                                                                e.clipboardData.setData('text/plain', plainText);
+                                                            }
+                                                        }
+                                                    }}
+                                                >
                                                     {batch.findings.map((finding, index) => {
                                                         const isBold = finding.includes('BOLD::');
                                                         const cleanFinding = finding.replace(/BOLD::/g, '');
@@ -3641,29 +3709,49 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                                                 <>
                                                                                     <span className="font-bold underline uppercase">{title}</span>
                                                                                     <div className="mt-1 space-y-1">
-                                                                                        {points.map((point, i) => {
-                                                                                            const isExplicitNoBullet = /^\[NO_BULLET\]\s*/i.test(point) ||
-                                                                                                /^NO_BULLET::\s*/i.test(point) ||
-                                                                                                /^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i.test(point);
-                                                                                            let cleanPt = point
-                                                                                                .replace(/^\[NO_BULLET\]\s*/i, '')
-                                                                                                .replace(/^NO_BULLET::\s*/i, '')
-                                                                                                .replace(/^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i, '')
-                                                                                                .trim();
-                                                                                            const textWithoutBullet = cleanPt.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
-                                                                                            if (isExplicitNoBullet || isPureCorrelationOrRecommendation(textWithoutBullet) || /^findings\s+(?:are\s+)?s\/?o(?:\s*:)?$/i.test(textWithoutBullet)) {
-                                                                                                return (
-                                                                                                    <div key={i} className="font-bold">
-                                                                                                        {textWithoutBullet}
-                                                                                                    </div>
-                                                                                                );
-                                                                                            }
-                                                                                            return (
-                                                                                                <div key={i} className="font-bold">
-                                                                                                    • {textWithoutBullet}
-                                                                                                </div>
-                                                                                            );
-                                                                                        })}
+                                                                                        {(() => {
+                                                                                            const renderedElements: React.ReactNode[] = [];
+                                                                                            let currentList: { point: string; index: number }[] = [];
+
+                                                                                            const flushList = () => {
+                                                                                                if (currentList.length > 0) {
+                                                                                                    renderedElements.push(
+                                                                                                        <ul key={`ul-${currentList[0].index}`} className="list-disc pl-5 sm:pl-6 space-y-1 font-bold my-1 text-slate-800 dark:text-slate-100">
+                                                                                                            {currentList.map(item => (
+                                                                                                                <li key={item.index} className="leading-relaxed">
+                                                                                                                    {item.point}
+                                                                                                                </li>
+                                                                                                            ))}
+                                                                                                        </ul>
+                                                                                                    );
+                                                                                                    currentList = [];
+                                                                                                }
+                                                                                            };
+
+                                                                                            points.forEach((point, i) => {
+                                                                                                const isExplicitNoBullet = /^\[NO_BULLET\]\s*/i.test(point) ||
+                                                                                                    /^NO_BULLET::\s*/i.test(point) ||
+                                                                                                    /^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i.test(point);
+                                                                                                let cleanPt = point
+                                                                                                    .replace(/^\[NO_BULLET\]\s*/i, '')
+                                                                                                    .replace(/^NO_BULLET::\s*/i, '')
+                                                                                                    .replace(/^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i, '')
+                                                                                                    .trim();
+                                                                                                const textWithoutBullet = cleanPt.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
+                                                                                                if (isExplicitNoBullet || isPureCorrelationOrRecommendation(textWithoutBullet) || /^findings\s+(?:are\s+)?s\/?o(?:\s*:)?$/i.test(textWithoutBullet)) {
+                                                                                                    flushList();
+                                                                                                    renderedElements.push(
+                                                                                                        <div key={i} className="font-bold">
+                                                                                                            {textWithoutBullet}
+                                                                                                        </div>
+                                                                                                    );
+                                                                                                } else {
+                                                                                                    currentList.push({ point: textWithoutBullet, index: i });
+                                                                                                }
+                                                                                            });
+                                                                                            flushList();
+                                                                                            return renderedElements;
+                                                                                        })()}
                                                                                     </div>
                                                                                 </>
                                                                             ) : isTable ? (

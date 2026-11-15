@@ -28,7 +28,7 @@ import TemplateSelectionModal from './ui/TemplateSelectionModal';
 import { getTemplateDocxBase64 } from '../services/builtInTemplates';
 import ImageIcon from './icons/ImageIcon';
 import { mergeAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
-import {  generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText , isSummaryLeadIn, formatImpressionOutput, isReportTitle as isDocxReportTitle, isAnatomicalSubheading, isPureCorrelationOrRecommendation } from '../services/docxService';
+import {  generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText , isSummaryLeadIn, formatImpressionOutput, isReportTitle as isDocxReportTitle, isAnatomicalSubheading, isPureCorrelationOrRecommendation, sanitizeHtmlForClipboard } from '../services/docxService';
 import { stopRepeatingInterruptedAlert } from '../services/soundService';
 import RichTextReportEditor from './RichTextReportEditor';
 import type { DocxTemplateData } from './ui/CustomPromptInput';
@@ -652,7 +652,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   
   const copyToClipboard = async (plainText: string, htmlText: string) => {
     try {
-      const cleanHtmlText = htmlText.replace(/(?:•\s*){2,}/g, '• ').replace(/(?:&bull;\s*){2,}/g, '&bull; ');
+      const cleanHtmlText = sanitizeHtmlForClipboard(htmlText);
       const cleanPlainText = plainText.replace(/(?:•\s*){2,}/g, '• ');
       const htmlBlob = new Blob([cleanHtmlText], { type: 'text/html' });
       const textBlob = new Blob([cleanPlainText], { type: 'text/plain' });
@@ -2357,7 +2357,25 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         </div>
       )}
 
-      <div ref={findingsContainerRef} className="space-y-3 min-h-[150px]">
+      <div 
+        ref={findingsContainerRef} 
+        onCopy={(e) => {
+          const selection = window.getSelection();
+          if (selection && selection.rangeCount > 0 && !selection.isCollapsed) {
+            const range = selection.getRangeAt(0);
+            const container = document.createElement('div');
+            container.appendChild(range.cloneContents());
+            const cleanHtml = sanitizeHtmlForClipboard(container.innerHTML);
+            const plainText = selection.toString();
+            e.preventDefault();
+            if (e.clipboardData) {
+              e.clipboardData.setData('text/html', cleanHtml);
+              e.clipboardData.setData('text/plain', plainText);
+            }
+          }
+        }}
+        className="space-y-3 min-h-[150px]"
+      >
         {findings.map((finding, index) => {
           if (!finding && index === findings.length - 1) return null; // Don't render the trailing empty string from split
           
@@ -2557,29 +2575,49 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                         <>
                             <span className="font-bold underline uppercase">{title}</span>
                             <div className="mt-1 space-y-1">
-                                            {points.map((point, i) => {
-                                                const isExplicitNoBullet = /^\[NO_BULLET\]\s*/i.test(point) ||
-                                                    /^NO_BULLET::\s*/i.test(point) ||
-                                                    /^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i.test(point);
-                                                let cleanPt = point
-                                                    .replace(/^\[NO_BULLET\]\s*/i, '')
-                                                    .replace(/^NO_BULLET::\s*/i, '')
-                                                    .replace(/^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i, '')
-                                                    .trim();
-                                                const textWithoutBullet = cleanPt.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
-                                                if (isExplicitNoBullet || isPureCorrelationOrRecommendation(textWithoutBullet) || /^findings\s+(?:are\s+)?s\/?o(?:\s*:)?$/i.test(textWithoutBullet)) {
-                                                    return (
-                                                        <div key={i} className="font-bold">
-                                                            {textWithoutBullet}
-                                                        </div>
-                                                    );
-                                                }
-                                                return (
-                                                    <div key={i} className="font-bold">
-                                                        • {textWithoutBullet}
-                                                    </div>
-                                                );
-                                            })}
+                                {(() => {
+                                    const renderedElements: React.ReactNode[] = [];
+                                    let currentList: { point: string; index: number }[] = [];
+
+                                    const flushList = () => {
+                                        if (currentList.length > 0) {
+                                            renderedElements.push(
+                                                <ul key={`ul-${currentList[0].index}`} className="list-disc pl-5 sm:pl-6 space-y-1 font-bold my-1 text-slate-800 dark:text-slate-100">
+                                                    {currentList.map(item => (
+                                                        <li key={item.index} className="leading-relaxed">
+                                                            {item.point}
+                                                        </li>
+                                                    ))}
+                                                </ul>
+                                            );
+                                            currentList = [];
+                                        }
+                                    };
+
+                                    points.forEach((point, i) => {
+                                        const isExplicitNoBullet = /^\[NO_BULLET\]\s*/i.test(point) ||
+                                            /^NO_BULLET::\s*/i.test(point) ||
+                                            /^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i.test(point);
+                                        let cleanPt = point
+                                            .replace(/^\[NO_BULLET\]\s*/i, '')
+                                            .replace(/^NO_BULLET::\s*/i, '')
+                                            .replace(/^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*/i, '')
+                                            .trim();
+                                        const textWithoutBullet = cleanPt.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
+                                        if (isExplicitNoBullet || isPureCorrelationOrRecommendation(textWithoutBullet) || /^findings\s+(?:are\s+)?s\/?o(?:\s*:)?$/i.test(textWithoutBullet)) {
+                                            flushList();
+                                            renderedElements.push(
+                                                <div key={i} className="font-bold">
+                                                    {textWithoutBullet}
+                                                </div>
+                                            );
+                                        } else {
+                                            currentList.push({ point: textWithoutBullet, index: i });
+                                        }
+                                    });
+                                    flushList();
+                                    return renderedElements;
+                                })()}
                             </div>
                         </>
                     ) : isStructured ? (
