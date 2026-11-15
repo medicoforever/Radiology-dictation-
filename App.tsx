@@ -42,7 +42,7 @@ import MacrosAndDictionaryModal from './components/MacrosAndDictionaryModal';
 import { subscribeToMacroDictionary, syncMacrosWithGoogleDrive, expandMacrosInFindings } from './services/macroDictionaryService';
 import { FloatingNewDictationButton } from './components/FloatingNewDictationButton';
 import ErrorBoundary from './components/ErrorBoundary';
-import { safeLocalStorage, getTabId, markTabActive, isTabHeartbeatAlive } from './services/storageService';
+import { safeLocalStorage, getTabId, markTabActive, isTabHeartbeatAlive, getSingleModeStorageKey, getSingleModeAudioKey, getBatchModeStorageKey } from './services/storageService';
 
 interface ChatMessage {
   author: 'You' | 'AI';
@@ -270,15 +270,34 @@ const App: React.FC = () => {
   useEffect(() => {
     const loadState = async () => {
       try {
-        let savedState = await getReportSession<any>(SINGLE_MODE_STORAGE_KEY);
+        const currentTabId = getTabId();
+        const singleKey = getSingleModeStorageKey(currentTabId);
+        const audioKey = getSingleModeAudioKey(currentTabId);
+        let savedState = await getReportSession<any>(singleKey);
         if (!savedState) {
-          savedState = safeLocalStorage.getItem<any>(SINGLE_MODE_STORAGE_KEY, null);
+          savedState = safeLocalStorage.getItem<any>(singleKey, null);
+        }
+        // Fallback to legacy global key once, and adopt to tab-scoped key
+        if (!savedState) {
+          savedState = await getReportSession<any>(SINGLE_MODE_STORAGE_KEY);
+          if (!savedState) {
+            savedState = safeLocalStorage.getItem<any>(SINGLE_MODE_STORAGE_KEY, null);
+          }
+          if (savedState) {
+            await saveReportSession(singleKey, savedState);
+            await deleteReportSession(SINGLE_MODE_STORAGE_KEY).catch(() => {});
+            safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
+          }
         }
         if (savedState) {
           let blob: Blob | null = null;
 
-          // Try loading audio blob from IndexedDB first
-          blob = await getAudioBlob('single_mode_audio');
+          // Try loading audio blob from IndexedDB by tab key, fallback to legacy
+          blob = (await getAudioBlob(audioKey)) || (await getAudioBlob('single_mode_audio'));
+          if (blob && !(await getAudioBlob(audioKey))) {
+            await saveAudioBlob(audioKey, blob);
+            await deleteAudioBlob('single_mode_audio').catch(() => {});
+          }
 
           // Fallback to legacy inline base64 if present
           if (!blob && savedState.audio?.data) {
@@ -365,6 +384,10 @@ const App: React.FC = () => {
     if (!isRestored) return; // Do not save or clear until initial restoration finishes
 
     const saveState = async () => {
+      const currentTabId = getTabId();
+      const singleKey = getSingleModeStorageKey(currentTabId);
+      const audioKey = getSingleModeAudioKey(currentTabId);
+
       // Only save when we have a successful result to resume from
       if (status === AppStatus.Success && findings.length > 0) {
         try {
@@ -382,23 +405,29 @@ const App: React.FC = () => {
             driveSynced: isSynced,
             driveSyncedHash: driveSyncedHashRef.current,
           };
-          // Save full report state directly to IndexedDB (bypassing the 5MB localStorage limit completely!)
-          await saveReportSession(SINGLE_MODE_STORAGE_KEY, stateToSave);
-          // Purge from localStorage so localStorage remains 99.9% empty
+          // Save full report state directly to IndexedDB isolated per tab (bypassing the 5MB localStorage limit completely!)
+          await saveReportSession(singleKey, stateToSave);
+          // Purge from localStorage and legacy global keys so storage remains free
+          safeLocalStorage.removeItem(singleKey);
           safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
+          await deleteReportSession(SINGLE_MODE_STORAGE_KEY).catch(() => {});
 
           if (audioBlob) {
-            await saveAudioBlob('single_mode_audio', audioBlob);
+            await saveAudioBlob(audioKey, audioBlob);
           } else {
-            await deleteAudioBlob('single_mode_audio');
+            await deleteAudioBlob(audioKey);
           }
+          await deleteAudioBlob('single_mode_audio').catch(() => {});
         } catch (err) {
           console.error("Failed to save state:", err);
         }
       } else if (status === AppStatus.Idle && findings.length === 0) {
+        safeLocalStorage.removeItem(singleKey);
         safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
+        deleteAudioBlob(audioKey).catch(() => {});
         deleteAudioBlob('single_mode_audio').catch(() => {});
-      deleteReportSession(SINGLE_MODE_STORAGE_KEY).catch(() => {});
+        deleteReportSession(singleKey).catch(() => {});
+        deleteReportSession(SINGLE_MODE_STORAGE_KEY).catch(() => {});
       }
     };
     saveState();
@@ -961,17 +990,19 @@ const App: React.FC = () => {
       }, 1000);
     }
 
-    // 2. WIPE PERSISTENT STORAGE IMMEDIATELY AT SECOND 0!
+    // 2. WIPE PERSISTENT STORAGE IMMEDIATELY AT SECOND 0 FOR THIS TAB!
     try {
       const curTabId = getTabId();
+      const singleKey = getSingleModeStorageKey(curTabId);
+      const audioKey = getSingleModeAudioKey(curTabId);
+      safeLocalStorage.removeItem(singleKey);
       safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
+      deleteAudioBlob(audioKey).catch(() => {});
       deleteAudioBlob('single_mode_audio').catch(() => {});
+      deleteReportSession(singleKey).catch(() => {});
       deleteReportSession(SINGLE_MODE_STORAGE_KEY).catch(() => {});
-      deleteAudioBlob('in_flight_recording').catch(() => {});
       deleteAudioBlob(`in_flight_recording_${curTabId}`).catch(() => {});
-      safeLocalStorage.removeItem('in_flight_recording_meta');
       safeLocalStorage.removeItem(`in_flight_recording_meta_${curTabId}`);
-      safeLocalStorage.removeItem('has_unsaved_session');
       safeLocalStorage.removeItem(`has_unsaved_session_${curTabId}`);
     } catch (e) {
       console.warn("Storage wipe on reset:", e);
@@ -1044,9 +1075,14 @@ const App: React.FC = () => {
         isLive: prev.isLive,
         driveSyncedHash: prev.driveSyncedHash,
       };
-      safeLocalStorage.setItem(SINGLE_MODE_STORAGE_KEY, stateToSave);
+      const curTabId = getTabId();
+      const singleKey = getSingleModeStorageKey(curTabId);
+      const audioKey = getSingleModeAudioKey(curTabId);
+      await saveReportSession(singleKey, stateToSave);
+      safeLocalStorage.removeItem(singleKey);
+      safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
       if (prev.audioBlob) {
-        await saveAudioBlob('single_mode_audio', prev.audioBlob);
+        await saveAudioBlob(audioKey, prev.audioBlob);
       }
     } catch (e) {
       console.warn("Failed to re-persist undone session:", e);
@@ -1075,8 +1111,14 @@ const App: React.FC = () => {
     }
     setUndoSnackbar(null);
     try {
+      const curTabId = getTabId();
+      const singleKey = getSingleModeStorageKey(curTabId);
+      const audioKey = getSingleModeAudioKey(curTabId);
+      safeLocalStorage.removeItem(singleKey);
       safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
+      deleteAudioBlob(audioKey).catch(() => {});
       deleteAudioBlob('single_mode_audio').catch(() => {});
+      deleteReportSession(singleKey).catch(() => {});
       deleteReportSession(SINGLE_MODE_STORAGE_KEY).catch(() => {});
     } catch (e) {}
     previousSingleSessionRef.current = null;
@@ -1319,9 +1361,11 @@ const App: React.FC = () => {
             }}
             onApplyBatchReports={async (newBatches) => {
               try {
-                let currentBatches: any[] = (await getReportSession('radiologyDictationBatchMode')) || [];
+                const currentTabId = getTabId();
+                const curBatchKey = getBatchModeStorageKey(currentTabId);
+                let currentBatches: any[] = (await getReportSession(curBatchKey)) || (await getReportSession('radiologyDictationBatchMode')) || [];
                 if (!currentBatches || currentBatches.length === 0) {
-                  const currentBatchesRaw = localStorage.getItem('radiologyDictationBatchMode');
+                  const currentBatchesRaw = localStorage.getItem(curBatchKey) || localStorage.getItem('radiologyDictationBatchMode');
                   currentBatches = currentBatchesRaw ? JSON.parse(currentBatchesRaw) : [];
                 }
                 
@@ -1356,8 +1400,10 @@ const App: React.FC = () => {
                   };
                 });
                 const updated = [...currentBatches, ...formattedBatches];
-                await saveReportSession('radiologyDictationBatchMode', updated);
-                safeLocalStorage.setItem('radiologyDictationBatchMode', JSON.stringify(updated));
+                await saveReportSession(curBatchKey, updated);
+                safeLocalStorage.removeItem(curBatchKey);
+                safeLocalStorage.removeItem('radiologyDictationBatchMode');
+                await deleteReportSession('radiologyDictationBatchMode').catch(() => {});
               } catch (e) {
                 console.warn('Failed to append autonomous batches to storage:', e);
               }

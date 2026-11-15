@@ -36,6 +36,18 @@ export function getTabId(): string {
   }
 }
 
+export function getSingleModeStorageKey(tabId = getTabId()): string {
+  return `radiologyDictationSingleMode_${tabId}`;
+}
+
+export function getSingleModeAudioKey(tabId = getTabId()): string {
+  return `single_mode_audio_${tabId}`;
+}
+
+export function getBatchModeStorageKey(tabId = getTabId()): string {
+  return `radiologyDictationBatchMode_${tabId}`;
+}
+
 export interface TabHeartbeat {
   tabId: string;
   status: 'recording' | 'processing' | 'idle';

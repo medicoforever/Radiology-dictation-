@@ -881,9 +881,11 @@ export async function syncPendingLocalDictationsToDrive(): Promise<{
 
   // 1. Check Single Mode storage (IndexedDB first, fallback to localStorage)
   try {
-    let singleState = await getReportSession<any>('radiologyDictationSingleMode');
+    const curTabId = typeof window !== 'undefined' && window.sessionStorage?.getItem('raddoc_tab_id');
+    const tabSingleKey = curTabId ? `radiologyDictationSingleMode_${curTabId}` : 'radiologyDictationSingleMode';
+    let singleState = (await getReportSession<any>(tabSingleKey)) || (await getReportSession<any>('radiologyDictationSingleMode'));
     if (!singleState) {
-      const singleRaw = safeLocalStorage.getRaw('radiologyDictationSingleMode', '');
+      const singleRaw = safeLocalStorage.getRaw(tabSingleKey, safeLocalStorage.getRaw('radiologyDictationSingleMode', ''));
       if (singleRaw) singleState = JSON.parse(singleRaw);
     }
     if (
@@ -910,9 +912,11 @@ export async function syncPendingLocalDictationsToDrive(): Promise<{
 
   // 2. Check Batch Mode storage (IndexedDB first, fallback to localStorage)
   try {
-    let batches = await getReportSession<any[]>('radiologyDictationBatchMode');
+    const curTabId = typeof window !== 'undefined' && window.sessionStorage?.getItem('raddoc_tab_id');
+    const tabBatchKey = curTabId ? `radiologyDictationBatchMode_${curTabId}` : 'radiologyDictationBatchMode';
+    let batches = (await getReportSession<any[]>(tabBatchKey)) || (await getReportSession<any[]>('radiologyDictationBatchMode'));
     if (!batches) {
-      const batchRaw = safeLocalStorage.getRaw('radiologyDictationBatchMode', '');
+      const batchRaw = safeLocalStorage.getRaw(tabBatchKey, safeLocalStorage.getRaw('radiologyDictationBatchMode', ''));
       if (batchRaw) batches = JSON.parse(batchRaw);
     }
     if (Array.isArray(batches)) {

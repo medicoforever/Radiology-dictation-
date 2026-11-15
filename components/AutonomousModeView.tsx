@@ -24,7 +24,7 @@ import CopyIcon from './icons/CopyIcon';
 import PencilIcon from './icons/PencilIcon';
 import { ALL_RADNITO_TEMPLATES } from '../services/builtInTemplates';
 import { getDynamicTemplateStats } from '../services/templateStorage';
-import { markTabActive } from '../services/storageService';
+import { markTabActive, getTabId, getSingleModeStorageKey, getBatchModeStorageKey } from '../services/storageService';
 
 interface AutonomousModeViewProps {
   selectedModel: string;
@@ -126,8 +126,10 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
 
   // Sync workspace stats from localStorage
   useEffect(() => {
+    const curTabId = getTabId();
     try {
-      const rawBatches = localStorage.getItem('radiologyDictationBatchMode');
+      const curBatchKey = getBatchModeStorageKey(curTabId);
+      const rawBatches = localStorage.getItem(curBatchKey) || localStorage.getItem('radiologyDictationBatchMode');
       if (rawBatches) {
         const parsed = JSON.parse(rawBatches);
         if (Array.isArray(parsed)) {
@@ -141,7 +143,8 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
     }
 
     try {
-      const rawSingle = localStorage.getItem('radiologyDictationSingleMode');
+      const curSingleKey = getSingleModeStorageKey(curTabId);
+      const rawSingle = localStorage.getItem(curSingleKey) || localStorage.getItem('radiologyDictationSingleMode');
       if (rawSingle) {
         const parsed = JSON.parse(rawSingle);
         if (parsed && ((parsed.findings && parsed.findings.length > 0) || parsed.patientName || (parsed.impression && parsed.impression.length > 0))) {
