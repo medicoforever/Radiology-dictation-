@@ -28,7 +28,7 @@ import TemplateSelectionModal from './ui/TemplateSelectionModal';
 import { getTemplateDocxBase64 } from '../services/builtInTemplates';
 import ImageIcon from './icons/ImageIcon';
 import { mergeAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
-import {  generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText , isSummaryLeadIn, formatImpressionOutput, isReportTitle as isDocxReportTitle, isAnatomicalSubheading, isPureCorrelationOrRecommendation } from '../services/docxService';
+import {  generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText , isSummaryLeadIn, formatImpressionOutput, isReportTitle as isDocxReportTitle, isAnatomicalSubheading, isPureCorrelationOrRecommendation, sanitizeHtmlForClipboard } from '../services/docxService';
 import { stopRepeatingInterruptedAlert } from '../services/soundService';
 import RichTextReportEditor from './RichTextReportEditor';
 import type { DocxTemplateData } from './ui/CustomPromptInput';
@@ -652,11 +652,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   
   const copyToClipboard = async (plainText: string, htmlText: string) => {
     try {
-      const cleanHtmlText = htmlText
-        .replace(/(?:•\s*){2,}/g, '• ')
-        .replace(/(?:&bull;\s*){2,}/g, '&bull; ')
-        .replace(/font-family\s*:\s*[^;"]+;?/gi, '')
-        .replace(/font\s*:\s*[^;"]+;?/gi, '');
+      const cleanHtmlText = sanitizeHtmlForClipboard(htmlText);
       const cleanPlainText = plainText.replace(/(?:•\s*){2,}/g, '• ');
       const htmlBlob = new Blob([cleanHtmlText], { type: 'text/html' });
       const textBlob = new Blob([cleanPlainText], { type: 'text/plain' });
@@ -2361,7 +2357,25 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         </div>
       )}
 
-      <div ref={findingsContainerRef} className="space-y-3 min-h-[150px]">
+      <div 
+        ref={findingsContainerRef} 
+        onCopy={(e) => {
+          const selection = window.getSelection();
+          if (selection && selection.rangeCount > 0 && !selection.isCollapsed) {
+            const range = selection.getRangeAt(0);
+            const container = document.createElement('div');
+            container.appendChild(range.cloneContents());
+            const cleanHtml = sanitizeHtmlForClipboard(container.innerHTML);
+            const plainText = selection.toString();
+            e.preventDefault();
+            if (e.clipboardData) {
+              e.clipboardData.setData('text/html', cleanHtml);
+              e.clipboardData.setData('text/plain', plainText);
+            }
+          }
+        }}
+        className="space-y-3 min-h-[150px]"
+      >
         {findings.map((finding, index) => {
           if (!finding && index === findings.length - 1) return null; // Don't render the trailing empty string from split
           

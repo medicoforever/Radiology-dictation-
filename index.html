@@ -41,6 +41,9 @@
 
       // Auto-update service worker to guarantee immediate cache-refresh
       if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.addEventListener('controllerchange', function() {
+          window.location.reload();
+        });
         navigator.serviceWorker.getRegistrations().then(function(regs) {
           for (var reg of regs) {
             reg.update();
@@ -58,7 +61,7 @@
               '<p style="margin:0 0 16px 0;font-size:14px;color:#4c0519;line-height:1.5;">An unexpected script error occurred, but your dictated recordings and cache are preserved. Click below to refresh the view.</p>' +
               '<div style="display:flex;gap:10px;">' +
               '<button onclick="window.location.reload();" style="padding:8px 16px;background:#e11d48;color:#fff;border:none;border-radius:6px;font-weight:600;font-size:13px;cursor:pointer;">Reload App</button>' +
-              '<button onclick=\"try{localStorage.removeItem('radiologyDictationSingleMode');localStorage.removeItem('radiologyDictationBatchMode');}catch(_){}window.location.reload();\" style="padding:8px 16px;background:#475569;color:#fff;border:none;border-radius:6px;font-weight:600;font-size:13px;cursor:pointer;">Clear Cache & Reload</button>' +
+              '<button onclick=\"try{localStorage.removeItem(\'radiologyDictationSingleMode\');localStorage.removeItem(\'radiologyDictationBatchMode\');if(\'caches\' in window){caches.keys().then(function(keys){return Promise.all(keys.map(function(k){return caches.delete(k);}));});}}catch(_){}window.location.reload();\" style="padding:8px 16px;background:#475569;color:#fff;border:none;border-radius:6px;font-weight:600;font-size:13px;cursor:pointer;">Clear Cache & Reload</button>' +
               '</div></div>';
           }
         }, 100);

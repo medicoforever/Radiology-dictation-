@@ -38,7 +38,7 @@ import { AVAILABLE_MODELS, REPORT_TEMPLATES, ReportTemplate } from '../constants
 import WarningIcon from './icons/WarningIcon';
 import BrainIcon from './icons/BrainIcon';
 import { autoSaveBatchDictations, SaveResult, BatchFolderInfo, isDriveConnected, subscribeToAuth } from '../services/googleDriveService';
-import { generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText, formatImpressionOutput, findingsToStandardHtml, isPureCorrelationOrRecommendation, isReportTitle, isAnatomicalSubheading } from '../services/docxService';
+import { generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText, formatImpressionOutput, findingsToStandardHtml, isPureCorrelationOrRecommendation, isReportTitle, isAnatomicalSubheading, sanitizeHtmlForClipboard } from '../services/docxService';
 import { isClinicalProfileFinding, formatClinicalProfileText } from './ResultsDisplay';
 
 const BATCH_DRIVE_FOLDER_KEY = 'radiologyDictationBatchDriveFolder';
@@ -1538,11 +1538,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
 
     const copyToClipboard = async (plainText: string, htmlText: string) => {
         try {
-          const cleanHtmlText = htmlText
-            .replace(/(?:•\s*){2,}/g, '• ')
-            .replace(/(?:&bull;\s*){2,}/g, '&bull; ')
-            .replace(/font-family\s*:\s*[^;"]+;?/gi, '')
-            .replace(/font\s*:\s*[^;"]+;?/gi, '');
+          const cleanHtmlText = sanitizeHtmlForClipboard(htmlText);
           const cleanPlainText = plainText.replace(/(?:•\s*){2,}/g, '• ');
           const htmlBlob = new Blob([cleanHtmlText], { type: 'text/html' });
           const textBlob = new Blob([cleanPlainText], { type: 'text/plain' });
@@ -3499,7 +3495,24 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                     </div>
                                                 )}
 
-                                                <div className="space-y-3">
+                                                <div 
+                                                    className="space-y-3"
+                                                    onCopy={(e) => {
+                                                        const selection = window.getSelection();
+                                                        if (selection && selection.rangeCount > 0 && !selection.isCollapsed) {
+                                                            const range = selection.getRangeAt(0);
+                                                            const container = document.createElement('div');
+                                                            container.appendChild(range.cloneContents());
+                                                            const cleanHtml = sanitizeHtmlForClipboard(container.innerHTML);
+                                                            const plainText = selection.toString();
+                                                            e.preventDefault();
+                                                            if (e.clipboardData) {
+                                                                e.clipboardData.setData('text/html', cleanHtml);
+                                                                e.clipboardData.setData('text/plain', plainText);
+                                                            }
+                                                        }
+                                                    }}
+                                                >
                                                     {batch.findings.map((finding, index) => {
                                                         const isBold = finding.includes('BOLD::');
                                                         const cleanFinding = finding.replace(/BOLD::/g, '');

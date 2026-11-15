@@ -83,7 +83,7 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
       plainText = editorRef.current.innerText || editorRef.current.textContent || '';
     } else {
       const result = findingsToStandardHtml(findings);
-      cleanHtml = result.html;
+      cleanHtml = sanitizeHtmlForClipboard(result.html);
       plainText = result.plainText || editorRef.current.innerText || editorRef.current.textContent || '';
     }
     // Clean any stacked bullets
@@ -552,12 +552,15 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
               }
             }
           }}
-          className="w-full max-w-4xl mx-auto bg-white text-slate-900 border border-slate-300 rounded-xl p-6 sm:p-10 shadow-lg focus:outline-none focus:ring-2 focus:ring-blue-500 font-sans leading-relaxed text-sm sm:text-base selection:bg-blue-200 selection:text-blue-900 break-words"
+          className="w-full max-w-4xl mx-auto bg-white text-slate-900 border border-slate-300 rounded-xl p-6 sm:p-10 shadow-lg focus:outline-none focus:ring-2 focus:ring-blue-500 font-serif leading-relaxed text-sm sm:text-base selection:bg-blue-200 selection:text-blue-900 break-words"
           style={{ 
             minHeight: '380px', 
             height: 'auto',
             backgroundColor: '#ffffff', 
             color: '#0f172a',
+            fontFamily: "'Times New Roman', Times, serif",
+            fontSize: '12pt',
+            lineHeight: '1.5',
             boxSizing: 'border-box',
           }}
         />
