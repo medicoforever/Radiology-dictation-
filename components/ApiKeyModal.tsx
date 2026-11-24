@@ -12,6 +12,12 @@ import {
   Eye,
   EyeOff,
   Sparkles,
+  ExternalLink,
+  BookOpen,
+  ChevronDown,
+  ChevronUp,
+  Lock,
+  Unlock,
 } from 'lucide-react';
 import {
   getUserApiKeys,
@@ -19,10 +25,13 @@ import {
   removeUserApiKey,
   clearUserApiKeys,
   getDefaultApiKeys,
-  getPrimaryDefaultApiKey,
   getCandidateKeysForOperation,
   maskApiKey,
   testApiKeyValidity,
+  isBuiltinKeysUnlocked,
+  unlockBuiltinKeys,
+  lockBuiltinKeys,
+  syncApiKeysWithGoogleDrive,
   API_KEYS_UPDATED_EVENT,
 } from '../services/apiKeyService';
 
@@ -41,10 +50,14 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
   const [bannerMessage, setBannerMessage] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
   const [isTestingFailover, setIsTestingFailover] = useState(false);
   const [failoverTestResult, setFailoverTestResult] = useState<string | null>(null);
+  const [secretKeyInput, setSecretKeyInput] = useState('');
+  const [isUnlocked, setIsUnlocked] = useState(isBuiltinKeysUnlocked());
+  const [showGuide, setShowGuide] = useState(true);
 
   // Sync state from storage
   const refreshKeys = () => {
     setUserKeys(getUserApiKeys());
+    setIsUnlocked(isBuiltinKeysUnlocked());
   };
 
   useEffect(() => {
@@ -52,6 +65,8 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
       refreshKeys();
       setBannerMessage(null);
       setFailoverTestResult(null);
+      setSecretKeyInput('');
+      syncApiKeysWithGoogleDrive().then(() => refreshKeys()).catch(() => {});
     }
 
     const handleUpdate = () => refreshKeys();
@@ -107,15 +122,35 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
   };
 
   const handleClearAll = () => {
-    if (window.confirm('Are you sure you want to remove all custom API keys and revert to the default shared key pool?')) {
+    if (window.confirm('Are you sure you want to remove all your custom API keys?')) {
       clearUserApiKeys();
       refreshKeys();
       setKeyValidationStatus({});
       setBannerMessage({
         type: 'info',
-        text: 'All custom keys cleared. The app is now using the default shared high-availability key pool.',
+        text: 'All custom keys cleared.',
       });
     }
+  };
+
+  const handleUnlockSecretKey = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    const res = unlockBuiltinKeys(secretKeyInput);
+    if (res.success) {
+      setIsUnlocked(true);
+      setSecretKeyInput('');
+      refreshKeys();
+      setBannerMessage({ type: 'success', text: res.message });
+    } else {
+      setBannerMessage({ type: 'error', text: res.message });
+    }
+  };
+
+  const handleLockSecretKey = () => {
+    lockBuiltinKeys();
+    setIsUnlocked(false);
+    refreshKeys();
+    setBannerMessage({ type: 'info', text: 'Built-in keys deactivated.' });
   };
 
   const handleTestKey = async (key: string) => {
@@ -137,6 +172,10 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
     try {
       const startTime = Date.now();
       const { candidateKeys, isCustom } = getCandidateKeysForOperation();
+      if (!candidateKeys || candidateKeys.length === 0) {
+        setFailoverTestResult('No API keys currently configured. Add a Gemini API key or unlock with secret key.');
+        return;
+      }
       const firstKeyToTry = candidateKeys[0];
       const res = await testApiKeyValidity(firstKeyToTry);
       const elapsed = Date.now() - startTime;
@@ -145,10 +184,10 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
         setFailoverTestResult(
           isCustom
             ? `Success! Custom key ${maskApiKey(firstKeyToTry)} verified in ${elapsed}ms. Active model: ${selectedModel || 'gemini-3.5-flash'}.`
-            : `Success! Randomly selected key ${maskApiKey(firstKeyToTry)} is active & verified in ${elapsed}ms. Requests are load-balanced randomly across all ${defaultKeysCount} keys with retry timing delays.`
+            : `Success! Secret unlocked key ${maskApiKey(firstKeyToTry)} verified in ${elapsed}ms. Pool has ${defaultKeysCount} keys.`
         );
       } else {
-        setFailoverTestResult(`Key ${maskApiKey(firstKeyToTry)} responded: ${res.error}. Automatic failover will seamlessly wait and retry with next random key.`);
+        setFailoverTestResult(`Key ${maskApiKey(firstKeyToTry)} responded: ${res.error}.`);
       }
     } catch (e: any) {
       setFailoverTestResult(`Test encountered: ${e?.message || 'Error'}`);
@@ -214,14 +253,16 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
             className={`p-4 rounded-xl border transition-all ${
               isUsingCustomKeys
                 ? 'bg-gradient-to-br from-emerald-500/5 to-teal-500/10 border-emerald-500/30 dark:border-emerald-500/20'
-                : 'bg-gradient-to-br from-blue-500/5 to-indigo-500/10 border-blue-500/30 dark:border-blue-500/20'
+                : isUnlocked
+                ? 'bg-gradient-to-br from-purple-500/5 to-indigo-500/10 border-purple-500/30 dark:border-purple-500/20'
+                : 'bg-gradient-to-br from-amber-500/5 to-orange-500/10 border-amber-500/30 dark:border-amber-500/20'
             }`}
           >
             <div className="flex items-center justify-between mb-2">
               <div className="flex items-center gap-2">
                 <span
                   className={`w-2.5 h-2.5 rounded-full animate-pulse ${
-                    isUsingCustomKeys ? 'bg-emerald-500' : 'bg-blue-500'
+                    isUsingCustomKeys ? 'bg-emerald-500' : isUnlocked ? 'bg-purple-500' : 'bg-amber-500'
                   }`}
                 />
                 <span className="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
@@ -232,25 +273,148 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
                 className={`text-xs font-semibold px-2.5 py-0.5 rounded-full ${
                   isUsingCustomKeys
                     ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/50 dark:text-emerald-300'
-                    : 'bg-blue-100 text-blue-800 dark:bg-blue-900/50 dark:text-blue-300'
+                    : isUnlocked
+                    ? 'bg-purple-100 text-purple-800 dark:bg-purple-900/50 dark:text-purple-300'
+                    : 'bg-amber-100 text-amber-800 dark:bg-amber-900/50 dark:text-amber-300'
                 }`}
               >
                 {isUsingCustomKeys
                   ? `Custom Keys Active (${userKeys.length})`
-                  : `Default Shared Pool (${defaultKeysCount} keys)`}
+                  : isUnlocked
+                  ? `Secret Mode Active (9 Built-In Keys)`
+                  : `No API Key Configured`}
               </span>
             </div>
             <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
               {isUsingCustomKeys ? (
                 <>
-                  The app is currently using <strong>ONLY your custom API key(s)</strong>. Every dictation randomly picks from your keys, and if any key fails or hits a quota limit, it instantly retries with another random key without interrupting your work.
+                  The app is using <strong>ONLY your custom API key(s)</strong>. Every dictation randomly picks from your keys, and if any key fails or hits a quota limit, it automatically retries with another random key without interrupting your work.
+                </>
+              ) : isUnlocked ? (
+                <>
+                  Administrative Secret Mode is active! The app is <strong>load-balancing across all 9 built-in rotating keys</strong> on every request with automatic failover and zero interruptions.
                 </>
               ) : (
                 <>
-                  The app is configured to <strong>randomly load-balance across all {defaultKeysCount} default keys</strong> on every request. If any key encounters rate limits or errors, it pauses with a brief timing delay and seamlessly fails over to another random key.
+                  By default, <strong>no API key is active</strong>. Please follow the quick 1-minute step-by-step guide below to add your free Gemini API key, or enter a secret key if you have one.
                 </>
               )}
             </p>
+          </div>
+
+          {/* Step-by-Step AI Studio Visual Guide for Non-Tech Users */}
+          <div className="p-4 rounded-xl border border-blue-200 dark:border-blue-800/80 bg-blue-50/50 dark:bg-blue-950/20 space-y-3">
+            <div className="flex items-center justify-between cursor-pointer" onClick={() => setShowGuide(!showGuide)}>
+              <div className="flex items-center gap-2">
+                <BookOpen className="w-4 h-4 text-blue-600 dark:text-blue-400" />
+                <span className="text-xs sm:text-sm font-bold text-blue-900 dark:text-blue-200">
+                  📘 Step-by-Step Guide: How to Get Your FREE Gemini API Key (1 Minute)
+                </span>
+              </div>
+              <button type="button" className="text-blue-600 dark:text-blue-400">
+                {showGuide ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+              </button>
+            </div>
+
+            {showGuide && (
+              <div className="space-y-2.5 text-xs text-slate-700 dark:text-slate-300 pt-1">
+                <p className="font-medium text-slate-600 dark:text-slate-300 leading-relaxed">
+                  Google provides a generous <strong>100% free tier</strong> for Gemini with <strong>no credit card required</strong>. Anyone with a normal Google/Gmail account can get a key in under 60 seconds:
+                </p>
+                <ol className="list-decimal list-inside space-y-2 pl-1 leading-relaxed">
+                  <li>
+                    <strong>Open Google AI Studio:</strong> Click this direct link{' '}
+                    <a
+                      href="https://aistudio.google.com/app/apikey"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 font-bold text-blue-600 dark:text-blue-400 underline hover:text-blue-700"
+                    >
+                      aistudio.google.com/app/apikey <ExternalLink className="w-3 h-3" />
+                    </a>
+                  </li>
+                  <li>
+                    <strong>Sign In:</strong> Log in with your standard Google / Gmail account.
+                  </li>
+                  <li>
+                    <strong>Create Key:</strong> Click the blue button that says <strong>"Create API Key"</strong>. Choose "Create key in new project" (it creates automatically in 2 seconds).
+                  </li>
+                  <li>
+                    <strong>Copy & Paste:</strong> Click the copy icon next to your key string (starts with <code className="bg-slate-200 dark:bg-slate-800 px-1 py-0.5 rounded font-mono">AIzaSy...</code>), and paste it into the "Add Custom API Key" field below!
+                  </li>
+                </ol>
+
+                <div className="mt-3 p-3 rounded-lg bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/60 text-amber-900 dark:text-amber-200">
+                  <p className="font-bold flex items-center gap-1.5 text-xs">
+                    <span>💡</span> Pro-Tip for Unlimited Daily Dictations:
+                  </p>
+                  <p className="mt-1 leading-relaxed text-[11px] sm:text-xs text-amber-800 dark:text-amber-300">
+                    If you dictate high volumes of reports each day, you can open AI Studio with a <strong>different Gmail account</strong>, generate another free key, and paste it here too! You can add multiple keys from different Google accounts, and this app will automatically rotate and failover across all of them to multiply your total dictation capacity!
+                  </p>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Secret Key / Passcode 1198 Section */}
+          <div className="p-4 rounded-xl border border-purple-200 dark:border-purple-800/70 bg-purple-50/40 dark:bg-purple-950/20 space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <ShieldCheck className="w-4 h-4 text-purple-600 dark:text-purple-400" />
+                <span className="text-xs sm:text-sm font-bold text-purple-900 dark:text-purple-200">
+                  Administrative Secret Key (Unlock 9 Built-In Keys)
+                </span>
+              </div>
+              {isUnlocked && (
+                <span className="text-[10px] sm:text-xs font-bold px-2 py-0.5 rounded-full bg-purple-100 text-purple-800 dark:bg-purple-900/60 dark:text-purple-300">
+                  ✓ 9 Keys Unlocked
+                </span>
+              )}
+            </div>
+
+            {isUnlocked ? (
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 text-xs text-purple-800 dark:text-purple-300">
+                <p>
+                  The 9 built-in rotating API keys are currently <strong>unlocked and active</strong> on this device.
+                </p>
+                <button
+                  type="button"
+                  onClick={handleLockSecretKey}
+                  className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-purple-200 dark:bg-purple-900/60 text-purple-900 dark:text-purple-200 hover:bg-purple-300 transition-colors shrink-0 cursor-pointer self-start sm:self-auto"
+                >
+                  Lock / Deactivate
+                </button>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <p className="text-xs text-slate-600 dark:text-slate-300">
+                  If you have the administrative secret key (e.g. 1198), enter it below to activate the built-in pool of 9 rotating API keys:
+                </p>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="password"
+                    value={secretKeyInput}
+                    onChange={e => setSecretKeyInput(e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        handleUnlockSecretKey();
+                      }
+                    }}
+                    placeholder="Enter secret key..."
+                    className="flex-1 px-3 py-2 text-xs sm:text-sm bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-purple-500 font-mono"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => handleUnlockSecretKey()}
+                    disabled={!secretKeyInput.trim()}
+                    className="px-4 py-2 text-xs font-bold text-white bg-purple-600 hover:bg-purple-700 disabled:opacity-50 rounded-xl transition-colors cursor-pointer shrink-0"
+                  >
+                    Unlock Keys
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Add Key Input Form */}

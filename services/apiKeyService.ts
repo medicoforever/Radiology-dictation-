@@ -1,4 +1,5 @@
 import { GoogleGenAI } from "@google/genai";
+import { isDriveConnected, loadJsonFileFromRootFolder, saveJsonFileToRootFolder } from "./googleDriveService";
 
 // Obfuscated salt and keys to prevent raw API key string exposure in repo commits & secret scanners
 const KEY_SALT = "RADDOC_RADIOLOGY_SECURE_VAULT_2026";
@@ -20,6 +21,55 @@ const SECONDARY_OBFUSCATED_KEYS: string[] = [
 
 export const USER_KEYS_STORAGE_KEY = 'raddoc_user_gemini_api_keys';
 export const API_KEYS_UPDATED_EVENT = 'raddoc_api_keys_updated';
+export const SECRET_BUILTIN_KEYS_UNLOCKED_KEY = 'raddoc_builtin_keys_unlocked';
+export const SECRET_UNLOCK_PASSCODE = '1198';
+export const DRIVE_KEYS_FILE_NAME = 'raddoc_user_api_keys.json';
+
+/**
+ * Checks whether the administrative secret key (1198) has been entered to activate built-in keys.
+ */
+export function isBuiltinKeysUnlocked(): boolean {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return false;
+    return localStorage.getItem(SECRET_BUILTIN_KEYS_UNLOCKED_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Verifies the secret passcode (1198) and unlocks the 9 built-in keys if correct.
+ */
+export function unlockBuiltinKeys(code: string): { success: boolean; message: string } {
+  const clean = code.trim();
+  if (clean === SECRET_UNLOCK_PASSCODE) {
+    try {
+      localStorage.setItem(SECRET_BUILTIN_KEYS_UNLOCKED_KEY, 'true');
+      window.dispatchEvent(new CustomEvent(API_KEYS_UPDATED_EVENT));
+      return {
+        success: true,
+        message: 'Secret key verified! 9 built-in rotating API keys have been activated.'
+      };
+    } catch (e: any) {
+      return { success: false, message: e?.message || 'Storage error' };
+    }
+  }
+  return { success: false, message: 'Invalid secret key. Please enter the correct code.' };
+}
+
+/**
+ * Deactivates/locks the built-in keys.
+ */
+export function lockBuiltinKeys(): void {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      localStorage.removeItem(SECRET_BUILTIN_KEYS_UNLOCKED_KEY);
+      window.dispatchEvent(new CustomEvent(API_KEYS_UPDATED_EVENT));
+    }
+  } catch (e) {
+    console.error("Failed to lock built-in keys:", e);
+  }
+}
 
 function xorDeobfuscate(b64: string, salt: string): string {
   try {
@@ -39,16 +89,18 @@ function xorDeobfuscate(b64: string, salt: string): string {
 }
 
 /**
- * Retrieves the primary default API key (tried first on every request).
+ * Retrieves the primary default API key (only if unlocked with secret code 1198).
  */
 export function getPrimaryDefaultApiKey(): string {
+  if (!isBuiltinKeysUnlocked()) return '';
   return xorDeobfuscate(PRIMARY_DEFAULT_OBFUSCATED_KEY, KEY_SALT);
 }
 
 /**
- * Retrieves the secondary backup pool of API keys.
+ * Retrieves the secondary backup pool of API keys (only if unlocked with secret code 1198).
  */
 export function getSecondaryDefaultApiKeys(): string[] {
+  if (!isBuiltinKeysUnlocked()) return [];
   const envKey = (typeof process !== 'undefined' && (process.env?.GEMINI_API_KEY || process.env?.API_KEY)) || '';
   const decoded = SECONDARY_OBFUSCATED_KEYS
     .map(obf => xorDeobfuscate(obf, KEY_SALT))
@@ -62,8 +114,12 @@ export function getSecondaryDefaultApiKeys(): string[] {
 
 /**
  * Retrieves all default API keys: primary first, followed by secondaries.
+ * Returns an EMPTY array by default, unless unlocked with secret code 1198!
  */
 export function getDefaultApiKeys(): string[] {
+  if (!isBuiltinKeysUnlocked()) {
+    return [];
+  }
   const primary = getPrimaryDefaultApiKey();
   const secondaries = getSecondaryDefaultApiKeys();
   const all = primary ? [primary, ...secondaries.filter(k => k !== primary)] : secondaries;
@@ -98,7 +154,7 @@ export function hasUserApiKeys(): boolean {
 }
 
 /**
- * Saves user API keys to localStorage and dispatches an update event.
+ * Saves user API keys to localStorage and automatically syncs to Google Drive if connected.
  */
 export function setUserApiKeys(keys: string[]): void {
   try {
@@ -109,9 +165,46 @@ export function setUserApiKeys(keys: string[]): void {
         .filter((k, idx, arr) => arr.indexOf(k) === idx);
       localStorage.setItem(USER_KEYS_STORAGE_KEY, JSON.stringify(clean));
       window.dispatchEvent(new CustomEvent(API_KEYS_UPDATED_EVENT));
+
+      // Auto-save to Google Drive in background if connected
+      if (isDriveConnected()) {
+        saveJsonFileToRootFolder(DRIVE_KEYS_FILE_NAME, clean).catch(err => {
+          console.warn("Could not auto-save user API keys to Drive:", err);
+        });
+      }
     }
   } catch (e) {
     console.error("Failed to save user API keys:", e);
+  }
+}
+
+/**
+ * Syncs user API keys with Google Drive.
+ */
+export async function syncApiKeysWithGoogleDrive(): Promise<{ success: boolean; syncedCount?: number }> {
+  if (!isDriveConnected()) return { success: false };
+  try {
+    const driveKeys = await loadJsonFileFromRootFolder<string[]>(DRIVE_KEYS_FILE_NAME);
+    const localKeys = getUserApiKeys();
+    
+    let merged = [...localKeys];
+    if (driveKeys && Array.isArray(driveKeys)) {
+      for (const k of driveKeys) {
+        if (typeof k === 'string' && k.trim().length > 10 && !merged.includes(k.trim())) {
+          merged.push(k.trim());
+        }
+      }
+    }
+
+    if (merged.length !== localKeys.length) {
+      setUserApiKeys(merged);
+    } else if (localKeys.length > 0 && (!driveKeys || driveKeys.length === 0)) {
+      await saveJsonFileToRootFolder(DRIVE_KEYS_FILE_NAME, localKeys);
+    }
+    return { success: true, syncedCount: merged.length };
+  } catch (e) {
+    console.warn("Could not sync API keys with Google Drive:", e);
+    return { success: false };
   }
 }
 
@@ -144,6 +237,9 @@ export function clearUserApiKeys(): void {
     if (typeof window !== 'undefined' && window.localStorage) {
       localStorage.removeItem(USER_KEYS_STORAGE_KEY);
       window.dispatchEvent(new CustomEvent(API_KEYS_UPDATED_EVENT));
+      if (isDriveConnected()) {
+        saveJsonFileToRootFolder(DRIVE_KEYS_FILE_NAME, []).catch(() => {});
+      }
     }
   } catch (e) {
     console.error("Failed to clear user API keys:", e);
@@ -152,9 +248,9 @@ export function clearUserApiKeys(): void {
 
 /**
  * Returns the candidate keys in sequence for an operation:
- * 1. If user added custom keys: ONLY those custom keys are used (randomly shuffled with failover).
- * 2. If using default keys: The entire pool of keys is randomly shuffled each time so every request
- *    tries a random key first, load-balancing quota evenly across all keys.
+ * 1. If user added custom keys: ONLY those custom keys are used.
+ * 2. If unlocked with secret code 1198: The 9 built-in keys are shuffled and used.
+ * 3. Default: Empty array (user must add their key or unlock with 1198).
  */
 export function getCandidateKeysForOperation(): { candidateKeys: string[]; isCustom: boolean } {
   const userKeys = getUserApiKeys();
@@ -165,9 +261,16 @@ export function getCandidateKeysForOperation(): { candidateKeys: string[]; isCus
     };
   }
 
-  const defaultKeys = getDefaultApiKeys();
+  const defaultKeys = getDefaultApiKeys(); // [] unless unlocked with 1198
+  if (defaultKeys.length > 0) {
+    return {
+      candidateKeys: shuffle(defaultKeys),
+      isCustom: false
+    };
+  }
+
   return {
-    candidateKeys: shuffle(defaultKeys),
+    candidateKeys: [],
     isCustom: false
   };
 }
@@ -249,7 +352,7 @@ export async function executeWithApiKeyFailover<T>(
 ): Promise<T> {
   const { candidateKeys, isCustom } = getCandidateKeysForOperation();
   if (!candidateKeys || candidateKeys.length === 0) {
-    throw new Error("No Gemini API keys available. Please add a valid Gemini API key in Settings.");
+    throw new Error("No Gemini API key found. Please click 'API Keys' at the top to add your free Gemini API key, or enter the secret access key.");
   }
 
   const maxAttempts = options?.maxTries 
@@ -299,6 +402,9 @@ export async function executeWithApiKeyFailover<T>(
 export function getRandomAIClient(): GoogleGenAI {
   const { candidateKeys } = getCandidateKeysForOperation();
   const pool = candidateKeys.length > 0 ? candidateKeys : getDefaultApiKeys();
+  if (!pool || pool.length === 0) {
+    throw new Error("No Gemini API key found. Please add a valid Gemini API key in Settings or enter the secret key.");
+  }
   const key = pool[Math.floor(Math.random() * pool.length)];
   return getClientForApiKey(key);
 }

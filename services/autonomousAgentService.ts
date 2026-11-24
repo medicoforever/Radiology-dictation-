@@ -27,7 +27,6 @@ import {
   expandMacrosInFindings, 
   getMacroPromptContext 
 } from "./macroDictionaryService";
-import { autoSyncReport, checkAndAutoSyncReport } from "./workstationSync";
 import { getUserTemplates } from "./templateStorage";
 
 export interface AutonomousAttachedFile {
@@ -827,28 +826,8 @@ export async function executeAutonomousPlan(
       }
     }
 
-    // 3. Handle Spoken Workstation Sync
+    // 3. Workstation sync removed per user configuration
     let workstationSynced = false;
-    if (plan.globalDirectives.syncToWorkstation) {
-      const token = localStorage.getItem("workstation_sync_token");
-      const id = localStorage.getItem("workstation_gist_id");
-      if (token && id) {
-        try {
-          if (processedBatches.length > 0) {
-            await autoSyncReport(token, id, {
-              batches: processedBatches.map((b, idx) => ({ id: `auto_${idx}`, name: b.name, findings: b.findings }))
-            });
-          } else {
-            checkAndAutoSyncReport(100);
-          }
-          workstationSynced = true;
-        } catch (syncErr) {
-          console.warn("Spoken Workstation sync execution failed:", syncErr);
-        }
-      } else {
-        console.log("Workstation credentials not configured, skipping spoken sync.");
-      }
-    }
 
     // Play pleasant acoustic success chime
     playAutonomousSuccessSound();

@@ -30,12 +30,10 @@ import { autoSaveSingleDictation, autoSaveLiveDictation, SaveResult, syncPending
 import { DriveStatusBadge } from './components/DriveStatusBadge';
 import { DriveAutoSaveToast } from './components/DriveAutoSaveToast';
 import { DriveReportsModal } from './components/DriveReportsModal';
-import { RotateCcw, X, ExternalLink, Power, Sparkles, Trash2, Download, Settings, ShieldCheck, BookOpen, Key } from 'lucide-react';
-import WorkstationSyncModal from './components/WorkstationSyncModal';
-import { checkAndAutoSyncReport } from './services/workstationSync';
+import { RotateCcw, X, ExternalLink, Power, Sparkles, Trash2, Download, ShieldCheck, BookOpen, Key } from 'lucide-react';
 import { OwnershipModal } from './components/ui/OwnershipModal';
 import { ApiKeyModal } from './components/ApiKeyModal';
-import { getUserApiKeys, API_KEYS_UPDATED_EVENT } from './services/apiKeyService';
+import { getUserApiKeys, API_KEYS_UPDATED_EVENT, isBuiltinKeysUnlocked, unlockBuiltinKeys, syncApiKeysWithGoogleDrive } from './services/apiKeyService';
 import ThemeSelector from './components/ThemeSelector';
 import { getUpcomingTemplate, clearUpcomingTemplate, subscribeToUpcomingTemplate, UpcomingTemplateConfig } from './services/upcomingTemplateService';
 import MacrosAndDictionaryModal from './components/MacrosAndDictionaryModal';
@@ -154,15 +152,31 @@ const App: React.FC = () => {
   const [multipleFilesModal, setMultipleFilesModal] = useState<File[] | null>(null);
   const [pendingBatchFiles, setPendingBatchFiles] = useState<File[] | null>(null);
   const [isReportsModalOpen, setIsReportsModalOpen] = useState<boolean>(false);
-  const [isWorkstationSyncModalOpen, setIsWorkstationSyncModalOpen] = useState<boolean>(false);
   const [isOwnershipModalOpen, setIsOwnershipModalOpen] = useState<boolean>(false);
   const [isMacrosModalOpen, setIsMacrosModalOpen] = useState<boolean>(false);
   const [isApiKeyModalOpen, setIsApiKeyModalOpen] = useState<boolean>(false);
   const [activeMacrosCount, setActiveMacrosCount] = useState<number>(0);
   const [customKeysCount, setCustomKeysCount] = useState<number>(() => getUserApiKeys().length);
+  const [isSecretUnlocked, setIsSecretUnlocked] = useState<boolean>(() => isBuiltinKeysUnlocked());
+
+  const handleHeaderTitleClick = useCallback(() => {
+    const input = window.prompt("Enter secret key (e.g. 1198):");
+    if (input !== null && input.trim()) {
+      const res = unlockBuiltinKeys(input.trim());
+      if (res.success) {
+        setIsSecretUnlocked(true);
+        alert("Success: 9 Built-in API keys unlocked and activated!");
+      } else {
+        alert(res.message);
+      }
+    }
+  }, []);
 
   useEffect(() => {
-    const handleKeyUpdate = () => setCustomKeysCount(getUserApiKeys().length);
+    const handleKeyUpdate = () => {
+      setCustomKeysCount(getUserApiKeys().length);
+      setIsSecretUnlocked(isBuiltinKeysUnlocked());
+    };
     window.addEventListener(API_KEYS_UPDATED_EVENT, handleKeyUpdate);
     return () => window.removeEventListener(API_KEYS_UPDATED_EVENT, handleKeyUpdate);
   }, []);
@@ -173,20 +187,6 @@ const App: React.FC = () => {
     });
     return unsubscribe;
   }, []);
-  const [syncToastMessage, setSyncToastMessage] = useState<string | null>(null);
-  const syncToastTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-
-  const handleWorkstationSettingsSaved = useCallback(() => {
-    if (syncToastTimeoutRef.current) {
-      clearTimeout(syncToastTimeoutRef.current);
-    }
-    setSyncToastMessage('Settings saved to this device');
-    syncToastTimeoutRef.current = setTimeout(() => {
-      setSyncToastMessage(null);
-    }, 3500);
-
-    checkAndAutoSyncReport(300, findings.length > 0 ? { findings, timestamp: activeDictationTimestampRef.current || Date.now() } : undefined);
-  }, [findings]);
 
   const [driveSaveResult, setDriveSaveResult] = useState<SaveResult | null>(null);
   const processingRequestIdRef = useRef<number>(0);
@@ -450,17 +450,29 @@ const App: React.FC = () => {
     saveState();
   }, [status, findings, audioBlob, chatHistory, selectedModel, customPrompt, customImages, isRestored]);
 
-  // Listen for Google Drive auth reconnection to sync offline/pending dictations & macros dictionary
+  // Listen for Google Drive auth reconnection to sync offline/pending dictations, custom API keys & macros dictionary
   useEffect(() => {
     let wasConnected = isDriveConnected();
     if (wasConnected) {
       syncMacrosWithGoogleDrive().catch(() => {});
+      syncApiKeysWithGoogleDrive()
+        .then(() => {
+          setCustomKeysCount(getUserApiKeys().length);
+          setIsSecretUnlocked(isBuiltinKeysUnlocked());
+        })
+        .catch(err => console.warn('Drive API key sync notice:', err));
     }
     const unsubscribe = subscribeToAuth(async (user, token) => {
       const isNowConnected = Boolean(user && token && isDriveConnected());
       if (isNowConnected && !wasConnected) {
         wasConnected = true;
         syncMacrosWithGoogleDrive().catch(() => {});
+        syncApiKeysWithGoogleDrive()
+          .then(() => {
+            setCustomKeysCount(getUserApiKeys().length);
+            setIsSecretUnlocked(isBuiltinKeysUnlocked());
+          })
+          .catch(err => console.warn('Drive API key sync notice:', err));
         try {
           const syncResults = await syncPendingLocalDictationsToDrive();
           if (syncResults.singleResult && syncResults.singleResult.success) {
@@ -851,9 +863,6 @@ const App: React.FC = () => {
           setDriveSaveResult(result);
         }
       }).catch(err => console.warn('Drive auto-save background notice:', err));
-
-      // Trigger Hospital Workstation Auto-Sync if configured (pure report HTML)
-      checkAndAutoSyncReport(300, { findings: processedText, timestamp });
     } catch (err) {
       clearInterval(processingHeartbeatTimer);
       markTabActive('idle');
@@ -1007,9 +1016,6 @@ const App: React.FC = () => {
           }
         }).catch(err => console.warn('Drive live auto-save notice:', err));
 
-        // Trigger Hospital Workstation Auto-Sync if configured (pure report HTML)
-        checkAndAutoSyncReport(300, { findings: processedText, timestamp });
-
     } catch (err) {
         if (processingRequestIdRef.current !== reqId) return; // cancelled
         console.error(err);
@@ -1064,9 +1070,6 @@ const App: React.FC = () => {
           setDriveSaveResult(result);
         }
       }).catch(err => console.warn('Drive reprocess auto-save notice:', err));
-
-      // Trigger Hospital Workstation Auto-Sync if configured (pure report HTML)
-      checkAndAutoSyncReport(300, { findings: processedText, timestamp });
     } catch (err) {
       if (processingRequestIdRef.current !== reqId) return; // cancelled
       console.error(err);
@@ -1110,14 +1113,12 @@ const App: React.FC = () => {
       updatedFindingsToSync = updatedFindings;
       return updatedFindings;
     });
-    checkAndAutoSyncReport(400, { findings: updatedFindingsToSync, timestamp: activeDictationTimestampRef.current || Date.now() });
     debouncedDriveAutoSave(updatedFindingsToSync);
   };
 
   const handleAllFindingsUpdate = useCallback((newFindings: string[]) => {
     const expanded = expandMacrosInFindings(newFindings);
     setFindings(expanded);
-    checkAndAutoSyncReport(400, { findings: expanded, timestamp: activeDictationTimestampRef.current || Date.now() });
     debouncedDriveAutoSave(expanded);
   }, []);
 
@@ -1194,9 +1195,6 @@ const App: React.FC = () => {
           setDriveSaveResult(result);
         }
       }).catch(err => console.warn('Drive continuation auto-save notice:', err));
-
-      // Trigger Hospital Workstation Auto-Sync if configured (pure report HTML)
-      checkAndAutoSyncReport(300, { findings: updatedFindings, timestamp });
 
     } catch (err) {
       console.error("Error during dictation continuation:", err);
@@ -1878,7 +1876,6 @@ const App: React.FC = () => {
       success: true,
       fileName: reportName,
     });
-    checkAndAutoSyncReport(300, { findings: loadedFindings, timestamp: Date.now() });
   };
 
   return (
@@ -1920,29 +1917,36 @@ const App: React.FC = () => {
                   <BookOpen className="w-4 h-4" />
                 </button>
                 <button
-                  id="workstation-sync-header-btn-mobile"
-                  onClick={() => setIsWorkstationSyncModalOpen(true)}
-                  className="p-1.5 rounded-lg text-slate-500 dark:text-slate-400 bg-slate-100 dark:bg-slate-800 border border-slate-200/60 dark:border-slate-700/60 min-h-[34px] min-w-[34px] flex items-center justify-center cursor-pointer shadow-xs"
-                  aria-label="Workstation Sync"
-                  title="Workstation Sync"
-                >
-                  <Settings className="w-4 h-4 text-slate-600 dark:text-slate-300" />
-                </button>
-                <button
                   id="api-keys-header-btn-mobile"
                   onClick={() => setIsApiKeyModalOpen(true)}
                   className={`p-1.5 rounded-lg border min-h-[34px] min-w-[34px] flex items-center justify-center relative cursor-pointer shadow-xs ${
                     customKeysCount > 0
                       ? 'text-emerald-700 bg-emerald-50 dark:bg-emerald-950/40 border-emerald-300 dark:border-emerald-700/60'
-                      : 'text-slate-600 bg-slate-100 dark:bg-slate-800 border-slate-200/80 dark:border-slate-700/60'
+                      : isSecretUnlocked
+                      ? 'text-purple-700 bg-purple-50 dark:bg-purple-950/40 border-purple-300 dark:border-purple-700/60'
+                      : 'text-amber-700 bg-amber-50 dark:bg-amber-950/40 border-amber-300 dark:border-amber-700/60 animate-pulse'
                   }`}
                   aria-label="Gemini API Keys"
-                  title="Gemini API Keys"
+                  title={
+                    customKeysCount > 0
+                      ? `API Keys (${customKeysCount} active)`
+                      : isSecretUnlocked
+                      ? 'API Keys (Secret Mode: 9 built-in keys active)'
+                      : 'No API Key — Click to add your free Gemini API key'
+                  }
                 >
                   <Key className="w-4 h-4" />
-                  {customKeysCount > 0 && (
+                  {customKeysCount > 0 ? (
                     <span className="absolute -top-1 -right-1 w-3.5 h-3.5 bg-emerald-500 text-white rounded-full text-[9px] font-bold flex items-center justify-center">
                       {customKeysCount}
+                    </span>
+                  ) : isSecretUnlocked ? (
+                    <span className="absolute -top-1 -right-1 w-3.5 h-3.5 bg-purple-600 text-white rounded-full text-[9px] font-bold flex items-center justify-center">
+                      9
+                    </span>
+                  ) : (
+                    <span className="absolute -top-1 -right-1 w-3.5 h-3.5 bg-amber-500 text-white rounded-full text-[9px] font-bold flex items-center justify-center">
+                      !
                     </span>
                   )}
                 </button>
@@ -1966,7 +1970,11 @@ const App: React.FC = () => {
             </div>
 
             <div className="text-center py-0.5 w-full">
-              <h1 className="text-lg font-extrabold text-slate-800 dark:text-slate-100 tracking-tight flex items-center justify-center gap-1.5">
+              <h1 
+                onClick={handleHeaderTitleClick}
+                className="text-lg font-extrabold text-slate-800 dark:text-slate-100 tracking-tight flex items-center justify-center gap-1.5 cursor-pointer select-none"
+                title="RADDOC's Dictation app (Click to enter secret key)"
+              >
                 <YinYangMicIcon className="w-6 h-6 shrink-0 rounded-full shadow-xs inline-block" />
                 <span>RADDOC's Dictation app</span>
               </h1>
@@ -1983,7 +1991,11 @@ const App: React.FC = () => {
               />
             </div>
             <div className="justify-self-center text-center px-1 sm:px-4">
-              <h1 className="text-xl sm:text-2xl md:text-3xl font-extrabold text-slate-800 dark:text-slate-100 tracking-tight whitespace-nowrap flex items-center justify-center gap-2">
+              <h1 
+                onClick={handleHeaderTitleClick}
+                className="text-xl sm:text-2xl md:text-3xl font-extrabold text-slate-800 dark:text-slate-100 tracking-tight whitespace-nowrap flex items-center justify-center gap-2 cursor-pointer select-none"
+                title="RADDOC's Dictation app (Click to enter secret key)"
+              >
                 <YinYangMicIcon className="w-7 h-7 sm:w-8 sm:h-8 shrink-0 rounded-full shadow-xs inline-block" />
                 <span>RADDOC's Dictation app</span>
               </h1>
@@ -2002,33 +2014,49 @@ const App: React.FC = () => {
                 </span>
               </button>
               <button
-                id="workstation-sync-header-btn"
-                onClick={() => setIsWorkstationSyncModalOpen(true)}
-                className="p-2 sm:p-2.5 rounded-xl text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors shrink-0 shadow-sm border border-slate-200/60 dark:border-slate-700/60 cursor-pointer min-h-[36px] min-w-[36px] flex items-center justify-center gap-1.5"
-                aria-label="Workstation Sync"
-                title="Workstation Sync"
-              >
-                <Settings className="w-5 h-5 text-slate-600 dark:text-slate-300" />
-                <span className="text-xs font-semibold text-slate-700 dark:text-slate-200 hidden md:inline">Workstation Sync</span>
-              </button>
-              <button
                 id="api-keys-header-btn"
                 onClick={() => setIsApiKeyModalOpen(true)}
                 className={`p-2 sm:p-2.5 rounded-xl transition-colors shrink-0 shadow-sm border cursor-pointer min-h-[36px] min-w-[36px] flex items-center justify-center gap-1.5 relative ${
                   customKeysCount > 0
                     ? 'text-emerald-700 dark:text-emerald-300 bg-emerald-50 dark:bg-emerald-950/40 border-emerald-300 dark:border-emerald-700/60 hover:bg-emerald-100 dark:hover:bg-emerald-900/60'
-                    : 'text-slate-600 dark:text-slate-400 bg-slate-50 dark:bg-slate-800/60 border-slate-200/80 dark:border-slate-700/60 hover:bg-slate-200 dark:hover:bg-slate-700'
+                    : isSecretUnlocked
+                    ? 'text-purple-700 dark:text-purple-300 bg-purple-50 dark:bg-purple-950/40 border-purple-300 dark:border-purple-700/60 hover:bg-purple-100 dark:hover:bg-purple-900/60'
+                    : 'text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/40 border-amber-300 dark:border-amber-700/60 hover:bg-amber-100 dark:hover:bg-amber-900/60'
                 }`}
                 aria-label="Gemini API Keys & Failover"
-                title={customKeysCount > 0 ? `API Keys (${customKeysCount} custom keys active)` : 'API Keys (Default rotating pool active)'}
+                title={
+                  customKeysCount > 0
+                    ? `API Keys (${customKeysCount} custom keys active)`
+                    : isSecretUnlocked
+                    ? 'API Keys (Secret Mode: 9 rotating keys active)'
+                    : 'No API Key Configured — Click to Add Your Key'
+                }
               >
-                <Key className={`w-5 h-5 shrink-0 ${customKeysCount > 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-600 dark:text-slate-300'}`} />
+                <Key className={`w-5 h-5 shrink-0 ${
+                  customKeysCount > 0
+                    ? 'text-emerald-600 dark:text-emerald-400'
+                    : isSecretUnlocked
+                    ? 'text-purple-600 dark:text-purple-400'
+                    : 'text-amber-600 dark:text-amber-400'
+                }`} />
                 <span className="text-xs font-semibold hidden md:inline">
-                  {customKeysCount > 0 ? `Custom Keys (${customKeysCount})` : 'API Keys'}
+                  {customKeysCount > 0
+                    ? `Custom Keys (${customKeysCount})`
+                    : isSecretUnlocked
+                    ? 'Secret Keys (9)'
+                    : 'Add API Key (!)'}
                 </span>
-                {customKeysCount > 0 && (
+                {customKeysCount > 0 ? (
                   <span className="md:hidden absolute -top-1 -right-1 w-4 h-4 bg-emerald-500 text-white rounded-full text-[10px] font-bold flex items-center justify-center shadow-sm">
                     {customKeysCount}
+                  </span>
+                ) : isSecretUnlocked ? (
+                  <span className="md:hidden absolute -top-1 -right-1 w-4 h-4 bg-purple-600 text-white rounded-full text-[10px] font-bold flex items-center justify-center shadow-sm">
+                    9
+                  </span>
+                ) : (
+                  <span className="md:hidden absolute -top-1 -right-1 w-4 h-4 bg-amber-500 text-white rounded-full text-[10px] font-bold flex items-center justify-center shadow-sm">
+                    !
                   </span>
                 )}
               </button>
@@ -2267,7 +2295,6 @@ const App: React.FC = () => {
                 onClearInitialFiles={() => setPendingBatchFiles(null)}
                 onSaveToDrive={(res) => {
                   setDriveSaveResult(res);
-                  checkAndAutoSyncReport(300);
                 }}
                 onBack={() => {
                   setMode('single');
@@ -2288,7 +2315,6 @@ const App: React.FC = () => {
                 onNavigateToBatch={() => setMode('batch')}
                 onSaveToDrive={(res) => {
                   setDriveSaveResult(res);
-                  checkAndAutoSyncReport(300);
                 }}
               />
             </ErrorBoundary>
@@ -2582,13 +2608,6 @@ const App: React.FC = () => {
           </div>
         )}
 
-        {/* Workstation Sync Modal */}
-        <WorkstationSyncModal
-          isOpen={isWorkstationSyncModalOpen}
-          onClose={() => setIsWorkstationSyncModalOpen(false)}
-          onSaved={handleWorkstationSettingsSaved}
-        />
-
         {/* Ownership & Provenance Certificate Modal */}
         <OwnershipModal
           isOpen={isOwnershipModalOpen}
@@ -2620,23 +2639,6 @@ const App: React.FC = () => {
           mode={mode}
           onResetSingleMode={resetSingleMode}
         />
-
-        {/* Workstation Sync Saved Toast */}
-        {syncToastMessage && (
-          <div
-            id="workstation-sync-toast"
-            className="fixed bottom-5 left-5 z-50 max-w-sm bg-slate-900/95 dark:bg-slate-800/95 backdrop-blur-md text-white border border-slate-700/80 shadow-2xl rounded-2xl p-3.5 flex items-center gap-3 animate-in fade-in slide-in-from-bottom-3 duration-200"
-            role="status"
-            aria-live="polite"
-          >
-            <div className="w-7 h-7 rounded-full bg-emerald-500/20 text-emerald-400 flex items-center justify-center shrink-0 font-bold text-sm">
-              ✓
-            </div>
-            <p className="text-xs sm:text-sm font-semibold text-slate-100">
-              {syncToastMessage}
-            </p>
-          </div>
-        )}
       </div>
     </div>
   );
