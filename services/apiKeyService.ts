@@ -4,16 +4,18 @@ import { GoogleGenAI } from "@google/genai";
 const KEY_SALT = "RADDOC_RADIOLOGY_SECURE_VAULT_2026";
 
 // Primary default key (obfuscated with KEY_SALT)
-const PRIMARY_DEFAULT_OBFUSCATED_KEY = "ExBqBS17DRx3D38lAToYKBYHATNjZQEmbysCKhtsSEVTdwE0ChAucBQUIAwWGSMeJmFmZAQ=";
+const PRIMARY_DEFAULT_OBFUSCATED_KEY = "ExBqBS17DRx3DTN+eAkvLQcbPAEhAS06MA8gGiMHUAJCVxg5LAYaL3IUBxcFPQEpFWspPxQ=";
 
 // Secondary fallback keys (randomly selected if the primary key fails or reaches quota)
 const SECONDARY_OBFUSCATED_KEYS: string[] = [
-  "Ewg+JRw6HBpzB30MfyoTMmwEL3Q7CgMoOx4WHQMvA14HUAt0fAM4",
-  "Ewg+JRw6HWskN3gmIy5yDXI3HCU+Jhw8GwwsLTMrcFNYcSceKQos",
-  "Ewg+JRw6GwoKHjx4ewQdExhjCwIQGgEGBAcRexNqB3sEWg0bdSge",
-  "Ewg+JRw6HRwXMHEFCQxwaWsaHTsyERcbZBs0ACAdeUNlcx84PHQa",
-  "Ewg+JRw6GyYRITAMADwhEzsfAxUSFyYQbhUHJgQcC3NlXRYbHAg8",
-  "Ewg+JRw6HDsxFDl7BCR2Gh48fSgjYyglGiwGLzg4AUh3ewAXNw8W",
+  "ExBqBS17DRx3DTEmeAsvCxQYdy4jE3AbCXk5GGZyfkYCfmokAjM5dho2Lx0sHCIrEDByHBQ=",
+  "ExBqBS17DRx3Dz0fOjkLFDwcdhoBNnA5ZAJmJgQ5ZXpYQxcuFwV9MGdnFXQPCQAiIS4HYAQ=",
+  "ExBqBS17DRx3CAh9BxUyLWsMIAYQOBNtGhUffBcxf3ZzdWobPn1iL2YEMw0fDgR9djAtHSI=",
+  "ExBqBS17DRx3CAMIOTpwOApgcRoWOxcaLBs7JCw0eEhFcAt5PDMNFBskJxEHBgp2JTI9PSI=",
+  "ExBqBS17DRx3DwYXORcObG1lCSYdGykKHCwMAgRnC0dRXD0vFic1dmwEAyEvLCcCCnRyEDI=",
+  "ExBqBS17DRx3DwUnfyYFGDI/NQ8HHywHGQMDHwMtdEhBfRwbCix2MzRgDgV6eiItJTE3FQQ=",
+  "ExBqBS17DRx3DTwoLR4yYDMqCDISPQQWOjszGDIAA0RbACcuLXRiJwYNNgMmIB0aDQY7IjI=",
+  "ExBqBS17DRx3DiAIGR8vGCccE3YmImgmMHYNBgIbdWpHeiQxPnZiNAUlDS0dPgkEDSosFQQ=",
 ];
 
 export const USER_KEYS_STORAGE_KEY = 'raddoc_user_gemini_api_keys';
@@ -150,35 +152,24 @@ export function clearUserApiKeys(): void {
 
 /**
  * Returns the candidate keys in sequence for an operation:
- * 1. If user added custom keys: ONLY those custom keys are used (randomly rotated with failover).
- * 2. If using default keys: The primary default key is ALWAYS tried FIRST.
- *    If and only if it fails, a secondary key is chosen RANDOMLY with failover until success.
+ * 1. If user added custom keys: ONLY those custom keys are used (randomly shuffled with failover).
+ * 2. If using default keys: The entire pool of keys is randomly shuffled each time so every request
+ *    tries a random key first, load-balancing quota evenly across all keys.
  */
 export function getCandidateKeysForOperation(): { candidateKeys: string[]; isCustom: boolean } {
-  const specialKey = getPrimaryDefaultApiKey();
   const userKeys = getUserApiKeys();
-
   if (userKeys.length > 0) {
-    const otherUserKeys = shuffle(userKeys.filter(k => k !== specialKey));
-    if (otherUserKeys.length > 0) {
-      // First try one of the other keys; secondly try specialKey when any one of other key fails; then the remaining keys
-      return {
-        candidateKeys: [otherUserKeys[0], specialKey, ...otherUserKeys.slice(1)],
-        isCustom: true
-      };
-    }
-    return { candidateKeys: [specialKey], isCustom: true };
+    return {
+      candidateKeys: shuffle(userKeys),
+      isCustom: true
+    };
   }
 
-  const otherDefaultKeys = getSecondaryDefaultApiKeys().filter(k => k !== specialKey);
-  const shuffledOther = shuffle(otherDefaultKeys);
-
-  // First try one of the other keys; secondly try specialKey when any one of other key fails; then the remaining keys
-  const candidateKeys = shuffledOther.length > 0
-    ? [shuffledOther[0], specialKey, ...shuffledOther.slice(1)]
-    : [specialKey];
-
-  return { candidateKeys, isCustom: false };
+  const defaultKeys = getDefaultApiKeys();
+  return {
+    candidateKeys: shuffle(defaultKeys),
+    isCustom: false
+  };
 }
 
 /**
@@ -240,10 +231,10 @@ export async function testApiKeyValidity(key: string): Promise<{ valid: boolean;
 }
 
 /**
- * Universal executor with default primary priority, random backup rotation, and automatic failover.
+ * Universal executor with random API key load-balancing, inter-key timing delay, and automatic failover.
  * Requirements:
- * - Default primary key is ALWAYS tried first.
- * - If 1st try fails, immediately failover to a randomly selected secondary API key.
+ * - Always randomly selects an API key each time from the available pool.
+ * - If a key fails or reaches quota, pauses with a timing delay before retrying with another random key.
  * - If user provides their own key(s), ONLY user keys are used with random rotation/failover.
  * - The selected model MUST NOT change across key retries.
  * - Runs smoothly without errors interrupting the user as long as any candidate key works.
@@ -253,6 +244,7 @@ export async function executeWithApiKeyFailover<T>(
   options?: {
     selectedModel?: string;
     maxTries?: number;
+    delayMs?: number;
   }
 ): Promise<T> {
   const { candidateKeys, isCustom } = getCandidateKeysForOperation();
@@ -273,10 +265,10 @@ export async function executeWithApiKeyFailover<T>(
 
     try {
       if (attempt === 0) {
-        const keyRole = isCustom ? 'custom key' : 'default primary key';
+        const keyRole = isCustom ? 'custom key' : 'random pool key';
         console.info(`[API Execution] Attempt 1/${maxAttempts} using ${keyRole} ${masked} (Model: ${options?.selectedModel || 'selected'})...`);
       } else {
-        console.warn(`[API Failover] Attempt ${attempt + 1}/${maxAttempts} retrying with random secondary key ${masked} (Model: ${options?.selectedModel || 'selected'})...`);
+        console.warn(`[API Failover] Attempt ${attempt + 1}/${maxAttempts} retrying with random backup key ${masked} (Model: ${options?.selectedModel || 'selected'})...`);
       }
       const result = await operation(client, currentKey);
       return result;
@@ -287,8 +279,11 @@ export async function executeWithApiKeyFailover<T>(
         `[API Key Failover] Key ${masked} failed on attempt ${attempt + 1}/${maxAttempts} (${errMsg}). Evaluating next random key...`
       );
 
-      // If we still have candidate keys remaining, continue immediately to next key
+      // If we still have candidate keys remaining, wait with timing delay between trying different keys
       if (attempt < maxAttempts - 1) {
+        const retryDelayMs = options?.delayMs ?? 1000;
+        console.info(`[API Key Failover] Waiting ${retryDelayMs}ms before retrying with next random key...`);
+        await new Promise(resolve => setTimeout(resolve, retryDelayMs));
         continue;
       }
     }
@@ -299,11 +294,11 @@ export async function executeWithApiKeyFailover<T>(
 }
 
 /**
- * Returns a GoogleGenAI client instance:
- * Uses custom key if user provided, otherwise uses the default primary key.
+ * Returns a random GoogleGenAI client instance using the current active key pool.
  */
 export function getRandomAIClient(): GoogleGenAI {
   const { candidateKeys } = getCandidateKeysForOperation();
-  const key = candidateKeys[0] || getPrimaryDefaultApiKey();
+  const pool = candidateKeys.length > 0 ? candidateKeys : getDefaultApiKeys();
+  const key = pool[Math.floor(Math.random() * pool.length)];
   return getClientForApiKey(key);
 }

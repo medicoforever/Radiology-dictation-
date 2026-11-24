@@ -565,23 +565,25 @@ export function formatImpressionOutput(title: string, points: string[]): { plain
   const cleanTitle = title.trim().toUpperCase() || 'IMPRESSION:';
   const cleanPoints = points.map(p => p.replace(/^BOLD::/i, '').trim()).filter(Boolean);
 
+  const pStyle = "font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal; mso-line-height-rule: exactly;";
+
   if (cleanPoints.length === 0) {
     return {
       plain: cleanTitle,
-      html: `<p style="font-family: 'Times New Roman', serif; font-size: 12pt;"><strong style="font-family: 'Times New Roman', serif; font-size: 12pt; text-decoration: underline;">${cleanTitle}</strong></p>`
+      html: `<p style="${pStyle}"><strong style="font-family: 'Times New Roman', serif; font-size: 12pt; text-decoration: underline;">${cleanTitle}</strong></p>`
     };
   }
 
   const plainLines = [cleanTitle];
-  const htmlParts: string[] = [`<p style="font-family: 'Times New Roman', serif; font-size: 12pt;"><strong style="font-family: 'Times New Roman', serif; font-size: 12pt; text-decoration: underline;">${cleanTitle}</strong></p>`];
+  const htmlParts: string[] = [`<p style="${pStyle}"><strong style="font-family: 'Times New Roman', serif; font-size: 12pt; text-decoration: underline;">${cleanTitle}</strong></p>`];
 
   let currentUlItems: string[] = [];
 
   const flushUl = () => {
     if (currentUlItems.length > 0) {
       htmlParts.push(
-        `<ul style="list-style-type: disc; margin: 4pt 0 6pt 0; padding-left: 24pt;">` +
-        currentUlItems.map(item => `<li style="font-family: 'Times New Roman', serif; font-size: 12pt; margin-bottom: 3pt; line-height: 1.4;"><strong style="font-family: 'Times New Roman', serif; font-size: 12pt;"><font face="Times New Roman" size="3">${escapeHtml(item)}</font></strong></li>`).join('') +
+        `<ul style="list-style-type: disc; margin: 2pt 0 4pt 0; padding-left: 20pt;">` +
+        currentUlItems.map(item => `<li style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-bottom: 1pt; line-height: normal;"><strong style="font-family: 'Times New Roman', serif; font-size: 12pt;"><font face="Times New Roman" size="3">${escapeHtml(item)}</font></strong></li>`).join('') +
         `</ul>`
       );
       currentUlItems = [];
@@ -660,6 +662,8 @@ export function isAnatomicalSubheading(text: string): boolean {
   if (!clean || clean.length > 90) return false;
   // NEVER match IMPRESSION or Clinical Profile
   if (/^IMPRESSION/i.test(clean) || /^Clinical\s*(Profile|History)/i.test(clean)) return false;
+  // Never match lines ending with colon or containing lead-in verbs
+  if (/:$|\b(?:shows|reveals|demonstrates|noted|seen|evaluated|show):?$/i.test(clean)) return false;
   if (/^(?:C\.?T\.?\s*SCAN\s+OF|CT\s+SCAN\s+OF|MRI\s+OF|MRI\s+SCAN\s+OF|ULTRASOUND\s+OF|USG\s+OF|X-?RAY\s+OF)\s+[A-Z0-9\s\(\)\-\/\&]+$/i.test(clean)) {
     return true;
   }
@@ -676,17 +680,38 @@ export function isReportTitle(text: string, index: number = 0, allFindings?: str
   const clean = text.replace(/^BOLD::/i, '').replace(/[*_~`#]+/g, '').trim();
   if (!clean) return false;
 
-  // Never match IMPRESSION, Technique, Clinical Profile, or bullet points
+  // 1. Never match IMPRESSION, Technique, Clinical Profile, or bullet points
   if (/^(?:IMPRESSION|TECHNIQUE|CLINICAL\s*(?:PROFILE|HISTORY))/i.test(clean)) return false;
   if (/^[•\-\*]\s+/i.test(clean)) return false;
 
-  // Check if this is the first non-profile finding in the report
+  // 2. Never match intro clauses, lead-in statements, or findings ending with colon or verbs (e.g. "shows:", "reveals:", "demonstrates:", "sections show:")
+  if (/:$|\b(?:shows|reveals|demonstrates|noted|seen|evaluated|show):?$/i.test(clean)) return false;
+
+  // 3. Check if this is the first non-profile finding in the report (only index 0, or index 1 if index 0 was clinical profile/patient)
   let isEarlyLine = index === 0;
   if (!isEarlyLine && allFindings && index === 1) {
     const firstClean = allFindings[0]?.replace(/^BOLD::/i, '').replace(/[*_~`#]+/g, '').trim() || '';
-    if (/^Clinical\s*(Profile|History):/i.test(firstClean)) {
+    if (/^Clinical\s*(Profile|History):/i.test(firstClean) || /^--- PATIENT/i.test(firstClean)) {
       isEarlyLine = true;
     }
+  }
+
+  // 4. A single report can only have ONE primary exam title!
+  // If an earlier finding was already identified as a title, no subsequent line can be the report title.
+  if (allFindings && index > 0) {
+    for (let prev = 0; prev < index; prev++) {
+      const prevClean = allFindings[prev]?.replace(/^BOLD::/i, '').replace(/[*_~`#]+/g, '').trim() || '';
+      if (!prevClean) continue;
+      if (/^(?:IMPRESSION|TECHNIQUE|CLINICAL\s*(?:PROFILE|HISTORY))/i.test(prevClean)) continue;
+      if (isReportTitle(prevClean, prev)) {
+        return false;
+      }
+    }
+  }
+
+  // A primary report title MUST be an early line (at the top of the report)
+  if (!isEarlyLine) {
+    return false;
   }
 
   // Exact known title match
@@ -694,28 +719,28 @@ export function isReportTitle(text: string, index: number = 0, allFindings?: str
 
   // Any modality prefix (CT, C.T., MRI, MR, M.R.I., USG, ULTRASOUND, X-RAY, XRAY, NCCT, CECT, HRCT, PET-CT, PET/CT, DEXA, MAMMOGRAM)
   if (/^(?:MRI|M\.R\.I\.|MR|CT|C\.?T\.?|USG|ULTRASOUND|X-?RAY|NCCT|CECT|HRCT|PET-?CT|PET\/CT|DEXA|MAMMOGRAM)\b/i.test(clean)) {
-    if (isEarlyLine || (clean.length < 110 && !clean.endsWith('.'))) {
+    if (clean.length < 110 && !clean.endsWith('.')) {
       return true;
     }
   }
 
   // Modality descriptors at start (e.g. "Contrast CT", "Plain and Contrast CT", "High Resolution CT")
   if (/^(?:PLAIN|CONTRAST|NON-?CONTRAST|CONTRAST\s+ENHANCED|HIGH\s+RESOLUTION)\s+(?:CT|C\.?T\.?|MRI|MR|SCAN)\b/i.test(clean)) {
-    if (isEarlyLine || clean.length < 110) return true;
+    if (clean.length < 110 && !clean.endsWith('.')) return true;
   }
 
   // Phrases like "SCAN OF ...", "STUDY OF ...", "EXAMINATION OF ...", "... VIEW"
   if (/^(?:SCAN\s+OF|STUDY\s+OF|EXAMINATION\s+OF)\b/i.test(clean)) {
-    if (isEarlyLine || clean.length < 110) return true;
+    if (clean.length < 110 && !clean.endsWith('.')) return true;
   }
 
   // Anatomical scan titles (e.g. "CHEST PA VIEW", "KNEE AP AND LATERAL VIEW")
-  if (/VIEW\s*$/i.test(clean) && (isEarlyLine || clean.length < 80)) {
+  if (/VIEW\s*$/i.test(clean) && clean.length < 80) {
     return true;
   }
 
   // All-caps heading at index 0 or early line
-  if (isEarlyLine && clean === clean.toUpperCase() && clean.length > 4 && clean.length < 110 && !clean.endsWith('.')) {
+  if (clean === clean.toUpperCase() && clean.length > 4 && clean.length < 110 && !clean.endsWith('.')) {
     return true;
   }
 
@@ -729,9 +754,7 @@ export function findingsToStandardHtml(findings: string[]): { html: string; plai
 
   const htmlParagraphs: string[] = [];
   const plainParagraphs: string[] = [];
-
-  // Flatten multi-line findings while keeping IMPRESSION intact
-  const expandedFindings: { text: string; isBold: boolean; origIndex: number }[] = [];
+  const pStyle = "font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 8pt; padding: 0; line-height: normal; mso-line-height-rule: exactly;";
 
   findings.forEach((raw, idx) => {
     if (!raw || typeof raw !== 'string') return;
@@ -744,117 +767,91 @@ export function findingsToStandardHtml(findings: string[]): { html: string; plai
       if (matchGlued && matchGlued[1].trim().length > 0) {
         const titlePart = matchGlued[1].trim().replace(/^BOLD::/i, '').replace(/[*_]+$/g, '').trim();
         const profilePart = matchGlued[2].trim().replace(/^BOLD::/i, '').trim();
-        expandedFindings.push({ text: titlePart, isBold: false, origIndex: 0 });
-        expandedFindings.push({
-          text: profilePart ? `Clinical Profile: ${profilePart}` : 'Clinical Profile: Routine evaluation.',
-          isBold: false,
-          origIndex: 1
-        });
+        const titleUpper = titlePart.toUpperCase();
+        plainParagraphs.push(titleUpper);
+        htmlParagraphs.push(`<p style="text-align:center; font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-bottom: 12pt; line-height: normal;"><strong><u>${escapeHtml(titleUpper)}</u></strong></p>`);
+
+        const profStyle = parseClinicalProfileStyle(profilePart ? `Clinical Profile: ${profilePart}` : 'Clinical Profile: Routine evaluation.');
+        plainParagraphs.push(profStyle.text);
+        htmlParagraphs.push(clinicalProfileStyleToHtml(profStyle));
         return;
       }
     }
 
-    // Keep IMPRESSION intact as one structured finding
-    if (trimmed.toUpperCase().startsWith('IMPRESSION:')) {
-      expandedFindings.push({ text: trimmed, isBold: false, origIndex: idx });
-      return;
-    }
-
-    // Check if finding is structured with ### (and not table)
-    if (trimmed.includes('###') && !trimmed.includes('|')) {
-      const parts = trimmed.split('###').map(p => p.trim()).filter(Boolean);
-      parts.forEach(p => {
-        const isBold = p.startsWith('BOLD::') || trimmed.startsWith('BOLD::');
-        expandedFindings.push({ text: p.replace(/^BOLD::/i, ''), isBold, origIndex: idx });
-      });
-      return;
-    }
-
-    // Check if finding has \n linebreaks (unless markdown table)
-    if (trimmed.includes('\n') && !trimmed.includes('|')) {
-      const parts = trimmed.split(/\r?\n/).map(p => p.trim()).filter(Boolean);
-      parts.forEach(p => {
-        const isBold = p.startsWith('BOLD::') || trimmed.startsWith('BOLD::');
-        expandedFindings.push({ text: p.replace(/^BOLD::/i, ''), isBold, origIndex: idx });
-      });
-      return;
-    }
-
     const isBold = trimmed.startsWith('BOLD::');
-    expandedFindings.push({ text: trimmed.replace(/^BOLD::/i, ''), isBold, origIndex: idx });
-  });
-
-  for (let i = 0; i < expandedFindings.length; i++) {
-    const { text, isBold, origIndex } = expandedFindings[i];
-    const clean = text.replace(/^BOLD::/i, '').trim();
-    if (!clean) continue;
+    const clean = trimmed.replace(/^BOLD::/i, '').trim();
+    if (!clean) return;
 
     // 1. Clinical profile check
     if (isClinicalProfileFinding(clean)) {
       const profStyle = parseClinicalProfileStyle(clean);
       plainParagraphs.push(profStyle.text);
       htmlParagraphs.push(clinicalProfileStyleToHtml(profStyle));
-      continue;
+      return;
     }
 
     // 1.5 Omit generic technique placeholder if template lacked technique
     if (/^(?:Standard imaging protocol was performed|Standard protocol was followed)\.?$/i.test(clean)) {
-      continue;
+      return;
     }
 
     // 2. Exam Title (first line or early line)
-    if (isReportTitle(clean, origIndex, findings)) {
+    if (isReportTitle(clean, idx, findings)) {
       const title = clean.replace(/[*_~`#]+/g, '').trim().toUpperCase();
       plainParagraphs.push(title);
-      htmlParagraphs.push(`<p style="text-align:center; font-family: 'Times New Roman', serif; font-size: 12pt;"><strong><u>${escapeHtml(title)}</u></strong></p>`);
-      continue;
+      htmlParagraphs.push(`<p style="text-align:center; font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-bottom: 12pt; line-height: normal;"><strong><u>${escapeHtml(title)}</u></strong></p>`);
+      return;
     }
 
     // 3. Anatomical Subheadings (C.T. SCAN OF BRAIN, C.T. SCAN OF NECK, etc.)
     if (isAnatomicalSubheading(clean)) {
       const sub = clean.replace(/[*_~`#]+/g, '').trim().toUpperCase();
       plainParagraphs.push(sub);
-      htmlParagraphs.push(`<p style="text-align:center; font-family: 'Times New Roman', serif; font-size: 12pt;"><strong><u>${escapeHtml(sub)}</u></strong></p>`);
-      continue;
+      htmlParagraphs.push(`<p style="text-align:center; font-family: 'Times New Roman', serif; font-size: 12pt; margin-top: 12pt; margin-bottom: 6pt; line-height: normal;"><strong><u>${escapeHtml(sub)}</u></strong></p>`);
+      return;
     }
 
-    // 4. IMPRESSION section: Left-aligned, matching body font style, smart bullets
+    // 4. IMPRESSION section
     if (clean.toUpperCase().startsWith('IMPRESSION:')) {
       const parts = clean.replace(/^IMPRESSION:\s*/i, '').split('###').map(p => p.trim()).filter(Boolean);
       const imp = formatImpressionOutput('IMPRESSION:', parts);
       plainParagraphs.push(imp.plain);
       htmlParagraphs.push(imp.html);
-      continue;
+      return;
     }
 
     // 5. Patient separator
     if (clean.startsWith('--- PATIENT') || clean.startsWith('PATIENT:')) {
       plainParagraphs.push(clean);
-      htmlParagraphs.push(`<p style="font-family: 'Times New Roman', serif; font-size: 12pt;"><strong><u>${escapeHtml(clean)}</u></strong></p>`);
-      continue;
+      htmlParagraphs.push(`<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin-top: 14pt; margin-bottom: 6pt; line-height: normal;"><strong><u>${escapeHtml(clean)}</u></strong></p>`);
+      return;
     }
 
     // 6. Markdown table
     if (clean.startsWith('|') && clean.endsWith('|')) {
-      const tableLines = [clean];
-      while (i + 1 < expandedFindings.length && expandedFindings[i + 1].text.trim().startsWith('|')) {
-        i++;
-        tableLines.push(expandedFindings[i].text.trim());
-      }
+      const tableLines = clean.includes('###') ? clean.split('###').map(l => l.trim()).filter(Boolean) : [clean];
       plainParagraphs.push(tableToPlainText(tableLines));
       htmlParagraphs.push(parseMarkdownTable(tableLines));
-      continue;
+      return;
     }
 
-    // 7. Normal or Abnormal finding
-    plainParagraphs.push(clean);
-    if (isBold) {
-      htmlParagraphs.push(`<p style="font-family: 'Times New Roman', serif; font-size: 12pt;"><strong>${escapeHtml(clean)}</strong></p>`);
-    } else {
-      htmlParagraphs.push(`<p style="font-family: 'Times New Roman', serif; font-size: 12pt;">${escapeHtml(clean)}</p>`);
-    }
-  }
+    // 7. Multi-line or single-line finding within this single bar/box
+    // Inside this box: lines joined with single \n in plain text, and <br> in HTML (0 gap inside box)
+    const parts = clean.includes('###')
+      ? clean.split('###').map(p => p.trim()).filter(Boolean)
+      : clean.includes('\n')
+      ? clean.split(/\r?\n/).map(p => p.trim()).filter(Boolean)
+      : [clean];
 
+    plainParagraphs.push(parts.join('\n'));
+
+    const innerHtml = parts
+      .map(p => isBold ? `<strong>${escapeHtml(p)}</strong>` : escapeHtml(p))
+      .join('<br>');
+    htmlParagraphs.push(`<p style="${pStyle}">${innerHtml}</p>`);
+  });
+
+  // Double newline (\n\n) between separate boxes in plain text creates the 1-row empty gap
   return {
     html: htmlParagraphs.join('\n'),
     plainText: plainParagraphs.join('\n\n')
@@ -868,6 +865,27 @@ export function sanitizeHtmlForClipboard(html: string): string {
 p, li, ul, ol, span, strong, em, b, u, div, font {
   font-family: 'Times New Roman', Times, serif !important;
   font-size: 12pt !important;
+}
+p {
+  margin: 0 !important;
+  margin-top: 0 !important;
+  margin-bottom: 8pt !important;
+  padding: 0 !important;
+  line-height: normal !important;
+  mso-para-margin: 0 !important;
+  mso-para-margin-top: 0 !important;
+  mso-para-margin-bottom: 8pt !important;
+  mso-line-height-rule: exactly;
+}
+ul, ol {
+  margin-top: 2pt !important;
+  margin-bottom: 2pt !important;
+  padding-left: 20pt !important;
+}
+li {
+  margin-top: 0 !important;
+  margin-bottom: 1pt !important;
+  line-height: normal !important;
 }
 </style>`;
 
@@ -884,12 +902,12 @@ p, li, ul, ol, span, strong, em, b, u, div, font {
       const text = h.textContent?.trim() || '';
       if (/^IMPRESSION/i.test(text)) {
         p.innerHTML = `<strong style="font-family: 'Times New Roman', serif; font-size: 12pt;"><u style="font-family: 'Times New Roman', serif; font-size: 12pt;">${escapeHtml(text)}</u></strong>`;
-        p.setAttribute('style', "font-family: 'Times New Roman', serif; font-size: 12pt;");
+        p.setAttribute('style', "font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 8pt; padding: 0; line-height: normal;");
       } else if (h.tagName.toLowerCase() === 'h1' || text === text.toUpperCase()) {
-        p.setAttribute('style', "text-align:center; font-family: 'Times New Roman', serif; font-size: 12pt;");
+        p.setAttribute('style', "text-align:center; font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 6pt; padding: 0; line-height: normal;");
         p.innerHTML = `<strong style="font-family: 'Times New Roman', serif; font-size: 12pt;"><u style="font-family: 'Times New Roman', serif; font-size: 12pt;">${escapeHtml(text)}</u></strong>`;
       } else {
-        p.setAttribute('style', "font-family: 'Times New Roman', serif; font-size: 12pt;");
+        p.setAttribute('style', "font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 8pt; padding: 0; line-height: normal;");
         p.innerHTML = `<strong style="font-family: 'Times New Roman', serif; font-size: 12pt;">${escapeHtml(text)}</strong>`;
       }
       h.replaceWith(p);
@@ -981,7 +999,7 @@ p, li, ul, ol, span, strong, em, b, u, div, font {
                                .replace(/&bull;\s*•/g, '• ');
       const s = p.getAttribute('style') || '';
       const isCentered = s.includes('text-align:center') || s.includes('text-align: center');
-      p.setAttribute('style', `${isCentered ? 'text-align:center; ' : ''}font-family: 'Times New Roman', serif; font-size: 12pt; line-height: 1.5;`);
+      p.setAttribute('style', `${isCentered ? 'text-align:center; ' : ''}font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal; mso-line-height-rule: exactly;`);
     });
 
     const allEls = temp.querySelectorAll('*');
@@ -1002,7 +1020,7 @@ p, li, ul, ol, span, strong, em, b, u, div, font {
     .replace(/<\/div>/gi, '</p>')
     .replace(/<h1[^>]*>(.*?)<\/h1>/gi, '<p style="text-align:center; font-family: \'Times New Roman\', serif; font-size: 12pt;"><strong><u>$1</u></strong></p>')
     .replace(/<h[2-6][^>]*>(.*?)<\/h[2-6]>/gi, '<p style="font-family: \'Times New Roman\', serif; font-size: 12pt;"><strong>$1</strong></p>')
-    .replace(/<p>/gi, '<p style="font-family: \'Times New Roman\', serif; font-size: 12pt;">')
+    .replace(/<p>/gi, '<p style="font-family: \'Times New Roman\', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;">')
     .replace(/\sclass="[^"]*"/gi, '');
 }
 
@@ -1114,14 +1132,20 @@ export function findingsToRichHtml(findings: string[]): string {
       continue;
     }
 
-    // 9. Findings with BOLD:: (dictated modifications/abnormalities)
-    if (trimmed.startsWith('BOLD::')) {
-      const content = trimmed.replace(/^BOLD::/, '');
-      htmlParts.push(`<p style="margin-bottom: 10px; line-height: 1.6; color: #0f172a; font-family: 'Times New Roman', serif; font-size: 12pt;"><strong>${escapeHtml(content)}</strong></p>`);
-    } else {
-      // Normal template finding
-      htmlParts.push(`<p style="margin-bottom: 10px; line-height: 1.6; color: #334155; font-family: 'Times New Roman', serif; font-size: 12pt;">${escapeHtml(trimmed)}</p>`);
-    }
+    // 9. Findings with BOLD:: (dictated modifications/abnormalities) or normal template findings
+    const isBold = trimmed.startsWith('BOLD::');
+    const content = trimmed.replace(/^BOLD::/, '');
+    const parts = content.includes('###')
+      ? content.split('###').map(p => p.trim()).filter(Boolean)
+      : content.includes('\n')
+      ? content.split(/\r?\n/).map(p => p.trim()).filter(Boolean)
+      : [content];
+
+    const innerHtml = parts
+      .map(p => isBold ? `<strong>${escapeHtml(p)}</strong>` : escapeHtml(p))
+      .join('<br>');
+
+    htmlParts.push(`<p style="margin-top: 0; margin-bottom: 10px; line-height: normal; color: ${isBold ? '#0f172a' : '#334155'}; font-family: 'Times New Roman', serif; font-size: 12pt;">${innerHtml}</p>`);
     isFirst = false;
   }
 
@@ -1223,7 +1247,7 @@ export function generateRtfDocument(htmlOrText: string, title = 'Radiology Repor
 
         if (el.classList.contains('clinical-profile')) {
           const text = (el.innerText || el.textContent || '').trim();
-          paragraphs.push(`\\pard\\sa120\\sl276\\slmult1\\i\\fs22 ${escapeRtf(text)}\\i0\\par`);
+          paragraphs.push(`\\pard\\sa40\\sb0\\sl240\\slmult1\\i\\fs24 ${escapeRtf(text)}\\i0\\par`);
           return;
         }
 
@@ -1236,7 +1260,7 @@ export function generateRtfDocument(htmlOrText: string, title = 'Radiology Repor
             }
             const cleanLi = liRuns.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
             if (cleanLi) {
-              paragraphs.push(`\\pard\\fi-360\\li720\\sa80\\sl276\\slmult1\\f0\\fs24\\b\\bullet   ${cleanLi}\\b0\\par`);
+              paragraphs.push(`\\pard\\fi-360\\li720\\sa20\\sl240\\slmult1\\f0\\fs24\\b\\bullet   ${cleanLi}\\b0\\par`);
             }
           });
           return;
@@ -1255,7 +1279,7 @@ export function generateRtfDocument(htmlOrText: string, title = 'Radiology Repor
               }
               const clean = itemRuns.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim();
               if (clean) {
-                paragraphs.push(`\\pard\\fi-360\\li720\\sa80\\sl276\\slmult1\\f0\\fs24\\b\\bullet   ${clean}\\b0\\par`);
+                paragraphs.push(`\\pard\\fi-360\\li720\\sa20\\sl240\\slmult1\\f0\\fs24\\b\\bullet   ${clean}\\b0\\par`);
               }
             });
           }
@@ -1310,14 +1334,14 @@ export function generateRtfDocument(htmlOrText: string, title = 'Radiology Repor
         if (tag === 'P') {
           const rawText = (el.innerText || el.textContent || '').trim();
           if (/^clinical\s*(profile|history):/i.test(rawText)) {
-            paragraphs.push(`\\pard\\sa120\\sl276\\slmult1\\i\\fs22 ${escapeRtf(rawText)}\\i0\\par`);
+            paragraphs.push(`\\pard\\sa40\\sb0\\sl240\\slmult1\\i\\fs24 ${escapeRtf(rawText)}\\i0\\par`);
           } else {
             let pRuns = '';
             for (let i = 0; i < el.childNodes.length; i++) {
               pRuns += processInlineRuns(el.childNodes[i]);
             }
             if (pRuns.trim()) {
-              paragraphs.push(`\\pard\\sa120\\sl276\\slmult1\\fs22 ${pRuns.trim()}\\par`);
+              paragraphs.push(`\\pard\\sa0\\sb0\\sl240\\slmult1\\fs24 ${pRuns.trim()}\\par`);
             }
           }
           return;
@@ -1328,7 +1352,7 @@ export function generateRtfDocument(htmlOrText: string, title = 'Radiology Repor
           processBlock(el.childNodes[i]);
         }
       } else if (node.nodeType === Node.TEXT_NODE && node.textContent?.trim()) {
-        paragraphs.push(`\\pard\\sa120\\sl276\\slmult1\\fs22 ${escapeRtf(node.textContent.trim())}\\par`);
+        paragraphs.push(`\\pard\\sa0\\sb0\\sl240\\slmult1\\fs24 ${escapeRtf(node.textContent.trim())}\\par`);
       }
     };
 
@@ -1349,11 +1373,11 @@ export function generateRtfDocument(htmlOrText: string, title = 'Radiology Repor
         paragraphs.push(`\\pard\\qc\\sa180\\sb60\\b\\ul\\fs28 ${escapeRtf(cleanH1)}\\ul0\\b0\\par`);
       } else if (/^\*?\s*clinical\s*(profile|history):/i.test(line)) {
         const cleanProf = cleanClinicalProfileText(line);
-        paragraphs.push(`\\pard\\sa120\\sl276\\slmult1\\i\\fs22 ${escapeRtf(cleanProf)}\\i0\\par`);
+        paragraphs.push(`\\pard\\sa40\\sb0\\sl240\\slmult1\\i\\fs24 ${escapeRtf(cleanProf)}\\i0\\par`);
       } else if (line.toUpperCase() === 'IMPRESSION:' || line.startsWith('IMPRESSION:')) {
         paragraphs.push(`\\pard\\sa80\\sb160\\b\\ul\\fs24 IMPRESSION:\\ul0\\b0\\par`);
       } else {
-        paragraphs.push(`\\pard\\sa120\\sl276\\slmult1\\fs22 ${escapeRtf(line)}\\par`);
+        paragraphs.push(`\\pard\\sa0\\sb0\\sl240\\slmult1\\fs24 ${escapeRtf(line)}\\par`);
       }
     }
   }
@@ -1399,15 +1423,15 @@ export function generateWordHtmlDoc(bodyHtml: string, title = 'Radiology Report'
     margin: 1.0in;
   }
   body {
-    font-family: 'Times New Roman', serif;
-    font-size: 11pt;
-    line-height: 1.5;
+    font-family: 'Times New Roman', Times, serif;
+    font-size: 12pt;
+    line-height: normal;
     color: #111827;
   }
   h1 { font-size: 16pt; font-weight: bold; text-align: center; margin-bottom: 12pt; text-decoration: underline; }
   h2 { font-size: 13pt; font-weight: bold; margin-top: 14pt; margin-bottom: 6pt; color: #1e40af; border-bottom: 1pt solid #cbd5e1; }
   h3 { font-size: 12pt; font-weight: bold; margin-top: 12pt; margin-bottom: 4pt; }
-  p { margin-bottom: 8pt; }
+  p { margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal; mso-para-margin: 0; }
   strong { font-weight: bold; }
   .clinical-profile { background-color: #f8fafc; padding: 6pt 10pt; border-left: 3pt solid #0284c7; font-style: italic; }
   .impression-section { margin-top: 14pt; padding: 8pt 10pt; background-color: #f0fdf4; border: 1pt solid #bbf7d0; }
@@ -1470,7 +1494,7 @@ function parseMarkdownRuns(text: string): TextRun[] {
           text: part.slice(2, -2),
           bold: true,
           font: 'Times New Roman',
-          size: 22,
+          size: 24,
           color: '0F172A',
         })
       );
@@ -1480,7 +1504,7 @@ function parseMarkdownRuns(text: string): TextRun[] {
           text: part.slice(1, -1),
           italics: true,
           font: 'Times New Roman',
-          size: 22,
+          size: 24,
           color: '334155',
         })
       );
@@ -1489,7 +1513,7 @@ function parseMarkdownRuns(text: string): TextRun[] {
         new TextRun({
           text: part,
           font: 'Times New Roman',
-          size: 22,
+          size: 24,
           color: '334155',
         })
       );
@@ -1557,7 +1581,7 @@ export async function generateDocxFromMarkdown(markdown: string, title = 'Expert
                     text: clean,
                     bold: isHeader || isBold,
                     font: 'Times New Roman',
-                    size: 22,
+                    size: 24,
                     color: isHeader ? '0F172A' : '334155',
                   }),
                 ],
@@ -1608,14 +1632,14 @@ export async function generateDocxFromMarkdown(markdown: string, title = 'Expert
       paragraphs.push(
         new Paragraph({
           bullet: { level: 0 },
-          spacing: { after: 80, line: 276 },
+          spacing: { after: 20, line: 240 },
           children: parseMarkdownRuns(trimmed.slice(2)),
         })
       );
     } else {
       paragraphs.push(
         new Paragraph({
-          spacing: { after: 120, line: 276 },
+          spacing: { after: 120, before: 0, line: 240 },
           children: parseMarkdownRuns(trimmed),
         })
       );
@@ -1703,7 +1727,7 @@ export async function generateDocxFromHtml(html: string, title = 'Radiology Repo
                 italics: inheritedStyles.italics,
                 underline: inheritedStyles.underline ? {} : undefined,
                 font: 'Times New Roman',
-                size: 22,
+                size: 24,
                 color: inheritedStyles.color || '0F172A',
               })
             );
@@ -1715,7 +1739,7 @@ export async function generateDocxFromHtml(html: string, title = 'Radiology Repo
                 italics: inheritedStyles.italics,
                 underline: inheritedStyles.underline ? {} : undefined,
                 font: 'Times New Roman',
-                size: 22,
+                size: 24,
                 color: inheritedStyles.color || '334155',
               })
             );
@@ -1729,7 +1753,7 @@ export async function generateDocxFromHtml(html: string, title = 'Radiology Repo
             italics: inheritedStyles.italics,
             underline: inheritedStyles.underline ? {} : undefined,
             font: 'Times New Roman',
-            size: 22,
+            size: 24,
             color: inheritedStyles.color || '334155',
           })
         );
@@ -1765,8 +1789,8 @@ export async function generateDocxFromHtml(html: string, title = 'Radiology Repo
       if (text) {
         paragraphs.push(
           new Paragraph({
-            spacing: { after: 120, line: 276 },
-            children: [new TextRun({ text, font: 'Times New Roman', size: 22, color: '334155' })],
+            spacing: { after: 120, before: 0, line: 240 },
+            children: [new TextRun({ text, font: 'Times New Roman', size: 24, color: '334155' })],
           })
         );
       }
@@ -1834,7 +1858,7 @@ export async function generateDocxFromHtml(html: string, title = 'Radiology Repo
         paragraphs.push(
           new Paragraph({
             bullet: { level: 0 },
-            spacing: { after: 80, line: 276 },
+            spacing: { after: 20, line: 240 },
             children: runs,
           })
         );
@@ -1928,7 +1952,7 @@ export async function generateDocxFromHtml(html: string, title = 'Radiology Repo
       if (runs.length > 0) {
         paragraphs.push(
           new Paragraph({
-            spacing: { after: 120, line: 276 },
+            spacing: { after: 120, before: 0, line: 240 },
             children: runs,
           })
         );
@@ -2023,7 +2047,7 @@ export async function generateDocxFromFindings(findings: string[], title = 'Radi
                   text: `Clinical Profile: ${prof}`,
                   italics: true,
                   font: 'Times New Roman',
-                  size: 22,
+                  size: 24,
                   color: '334155',
                 }),
               ],
@@ -2074,7 +2098,7 @@ export async function generateDocxFromFindings(findings: string[], title = 'Radi
               bold: profStyle.bold,
               underline: profStyle.underline ? {} : undefined,
               font: 'Times New Roman',
-              size: 22,
+              size: 24,
               color: '334155',
             }),
           ],
@@ -2120,7 +2144,7 @@ export async function generateDocxFromFindings(findings: string[], title = 'Radi
         if (isExplicitNoBullet || isStandaloneCorrelation || isLeadIn) {
           paragraphs.push(
             new Paragraph({
-              spacing: { after: 80, line: 276 },
+              spacing: { after: 20, line: 240 },
               children: [
                 new TextRun({
                   text: textWithoutBullet,
@@ -2136,7 +2160,7 @@ export async function generateDocxFromFindings(findings: string[], title = 'Radi
           paragraphs.push(
             new Paragraph({
               bullet: { level: 0 },
-              spacing: { after: 80, line: 276 },
+              spacing: { after: 20, line: 240 },
               children: [
                 new TextRun({
                   text: textWithoutBullet,
@@ -2179,13 +2203,13 @@ export async function generateDocxFromFindings(findings: string[], title = 'Radi
       const content = raw.replace(/^BOLD::/, '');
       paragraphs.push(
         new Paragraph({
-          spacing: { after: 120, line: 276 },
+          spacing: { after: 120, before: 0, line: 240 },
           children: [
             new TextRun({
               text: content,
               bold: true,
               font: 'Times New Roman',
-              size: 22,
+              size: 24,
               color: '0F172A',
             }),
           ],
@@ -2194,12 +2218,12 @@ export async function generateDocxFromFindings(findings: string[], title = 'Radi
     } else {
       paragraphs.push(
         new Paragraph({
-          spacing: { after: 120, line: 276 },
+          spacing: { after: 120, before: 0, line: 240 },
           children: [
             new TextRun({
               text: raw,
               font: 'Times New Roman',
-              size: 22,
+              size: 24,
               color: '334155',
             }),
           ],

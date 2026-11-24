@@ -76,7 +76,7 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
       .filter(k => k.length > 10);
 
     if (keysToProcess.length === 0) {
-      setBannerMessage({ type: 'error', text: 'Please enter a valid Gemini API key (starts with AIzaSy...)' });
+      setBannerMessage({ type: 'error', text: 'Please enter a valid Gemini API key (e.g. starts with AIzaSy... or AQ.Ab8...)' });
       return;
     }
 
@@ -145,10 +145,10 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
         setFailoverTestResult(
           isCustom
             ? `Success! Custom key ${maskApiKey(firstKeyToTry)} verified in ${elapsed}ms. Active model: ${selectedModel || 'gemini-3.5-flash'}.`
-            : `Success! Default primary key ${maskApiKey(firstKeyToTry)} is active & verified in ${elapsed}ms. If it ever encounters quota limits, the system seamlessly failovers randomly across the backup pool.`
+            : `Success! Randomly selected key ${maskApiKey(firstKeyToTry)} is active & verified in ${elapsed}ms. Requests are load-balanced randomly across all ${defaultKeysCount} keys with retry timing delays.`
         );
       } else {
-        setFailoverTestResult(`Primary key ${maskApiKey(firstKeyToTry)} responded: ${res.error}. Automatic failover will seamlessly redirect requests to next backup key.`);
+        setFailoverTestResult(`Key ${maskApiKey(firstKeyToTry)} responded: ${res.error}. Automatic failover will seamlessly wait and retry with next random key.`);
       }
     } catch (e: any) {
       setFailoverTestResult(`Test encountered: ${e?.message || 'Error'}`);
@@ -247,7 +247,7 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
                 </>
               ) : (
                 <>
-                  The app is configured to use the <strong>default primary API key ({maskApiKey(getPrimaryDefaultApiKey())}) first</strong> on every request. If it ever encounters quota limits or errors, it instantly failovers by randomly selecting from the backup API key pool.
+                  The app is configured to <strong>randomly load-balance across all {defaultKeysCount} default keys</strong> on every request. If any key encounters rate limits or errors, it pauses with a brief timing delay and seamlessly fails over to another random key.
                 </>
               )}
             </p>

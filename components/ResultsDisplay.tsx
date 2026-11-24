@@ -459,6 +459,18 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   const dragItem = useRef<number | null>(null);
   const dragOverItem = useRef<number | null>(null);
   const [undoState, setUndoState] = useState<string[] | null>(null);
+  const [deleteUndoCountdown, setDeleteUndoCountdown] = useState<number>(0);
+  const [deleteUndoToastVisible, setDeleteUndoToastVisible] = useState<boolean>(false);
+  const deleteUndoTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const deleteUndoIntervalRef = useRef<NodeJS.Timeout | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (deleteUndoTimerRef.current) clearTimeout(deleteUndoTimerRef.current);
+      if (deleteUndoIntervalRef.current) clearInterval(deleteUndoIntervalRef.current);
+    };
+  }, []);
+
   const [isMakingSelection, setIsMakingSelection] = useState<boolean>(false);
 
   // States for extra file(s) / image(s) / text for Update Transcript
@@ -702,7 +714,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         const finding = findings[i];
         const isBold = finding.includes('BOLD::');
         const cleanFinding = finding.replace(/BOLD::/g, '');
-        const isTitle = isReportTitle(cleanFinding, i);
+        const isTitle = isReportTitle(cleanFinding, i, findings);
         const displayFinding = isTitle ? sanitizeTitleText(cleanFinding) : cleanFinding;
         const isClinicalProfile = isClinicalProfileFinding(displayFinding);
         const { isStructured, isTable, title, points, tableLines } = parseStructuredFinding(displayFinding);
@@ -816,7 +828,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     const findingToCopy = findings[index];
     const isBold = findingToCopy.includes('BOLD::');
     const cleanFinding = findingToCopy.replace(/BOLD::/g, '');
-    const isTitle = isReportTitle(cleanFinding, index);
+    const isTitle = isReportTitle(cleanFinding, index, findings);
     const displayFinding = isTitle ? sanitizeTitleText(cleanFinding) : cleanFinding;
     const isClinicalProfile = isClinicalProfileFinding(displayFinding);
     const { isStructured, isTable, title, points, tableLines } = parseStructuredFinding(displayFinding);
@@ -879,36 +891,44 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   const handleCopyAll = async () => {
     if (!findings || findings.length === 0) return;
 
-    const allTextPlain = findings.map((f, i) => {
+    const plainParts: string[] = [];
+    findings.forEach((f, i) => {
       const cleanFinding = f.replace(/BOLD::/g, '');
-      const isTitle = isReportTitle(cleanFinding, i);
+      const isTitle = isReportTitle(cleanFinding, i, findings);
       const displayFinding = isTitle ? sanitizeTitleText(cleanFinding) : cleanFinding;
       if (isClinicalProfileFinding(displayFinding)) {
-        return formatClinicalProfileText(displayFinding);
+        plainParts.push(formatClinicalProfileText(displayFinding));
+        return;
       }
       const { isStructured, isTable, title, points, tableLines } = parseStructuredFinding(displayFinding);
       const isImpression = isStructured && !isTable && title.trim().toUpperCase() === 'IMPRESSION:';
 
       if (isTable) {
-        return tableToPlainText(tableLines);
+        plainParts.push(tableToPlainText(tableLines));
+        return;
       }
       if (isImpression) {
-          const imp = formatImpressionOutput(title, points);
-          return imp.plain;
+        const imp = formatImpressionOutput(title, points);
+        plainParts.push(imp.plain);
+        return;
       }
       if (isStructured) {
-        return [title, ...points].join('\n');
+        plainParts.push([title, ...points].join('\n'));
+        return;
       }
       if (displayFinding.startsWith('*') && displayFinding.endsWith('*')) {
-        return displayFinding.replace(/^\*+|\*+$/g, '').trim();
+        plainParts.push(displayFinding.replace(/^\*+|\*+$/g, '').trim());
+        return;
       }
-      return displayFinding;
-    }).join('\n\n');
+      plainParts.push(displayFinding);
+    });
+
+    const allTextPlain = plainParts.join('\n\n');
 
     const allTextHtml = findings.map((f, i) => {
       const isBold = f.includes('BOLD::');
       const cleanFinding = f.replace(/BOLD::/g, '');
-      const isTitle = isReportTitle(cleanFinding, i);
+      const isTitle = isReportTitle(cleanFinding, i, findings);
       const displayFinding = isTitle ? sanitizeTitleText(cleanFinding) : cleanFinding;
       if (isClinicalProfileFinding(displayFinding)) {
         const profText = formatClinicalProfileText(displayFinding);
@@ -1085,6 +1105,29 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
       }
       return next;
     });
+
+    // 15-second undo retrieval window
+    if (deleteUndoTimerRef.current) clearTimeout(deleteUndoTimerRef.current);
+    if (deleteUndoIntervalRef.current) clearInterval(deleteUndoIntervalRef.current);
+
+    setDeleteUndoCountdown(15);
+    setDeleteUndoToastVisible(true);
+
+    deleteUndoIntervalRef.current = setInterval(() => {
+      setDeleteUndoCountdown(prev => {
+        if (prev <= 1) {
+          if (deleteUndoIntervalRef.current) clearInterval(deleteUndoIntervalRef.current);
+          setDeleteUndoToastVisible(false);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
+    deleteUndoTimerRef.current = setTimeout(() => {
+      setDeleteUndoToastVisible(false);
+      setDeleteUndoCountdown(0);
+    }, 15000);
   };
 
   const handleSaveEdit = () => {
@@ -1824,8 +1867,13 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   
   const handleUndo = () => {
     if (undoState) {
+      if (deleteUndoTimerRef.current) clearTimeout(deleteUndoTimerRef.current);
+      if (deleteUndoIntervalRef.current) clearInterval(deleteUndoIntervalRef.current);
+      setDeleteUndoCountdown(0);
+      setDeleteUndoToastVisible(false);
       onAllFindingsUpdate(undoState);
       setUndoState(null); // Can only undo once.
+      showNotification('Finding restored!');
     }
   };
 
@@ -1864,6 +1912,21 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
       {copyNotification.visible && (
         <div className="fixed bottom-20 right-5 bg-slate-800 text-white text-sm font-bold py-2 px-4 rounded-lg shadow-lg z-50 transition-all duration-300 ease-in-out" role="alert">
           {copyNotification.text}
+        </div>
+      )}
+
+      {deleteUndoToastVisible && deleteUndoCountdown > 0 && (
+        <div 
+          className="fixed bottom-20 left-1/2 -translate-x-1/2 z-50 bg-slate-900/95 text-white text-sm font-medium py-2.5 px-5 rounded-full shadow-2xl flex items-center gap-3 border border-slate-700 transition-all duration-300 ease-in-out backdrop-blur-sm"
+          role="alert"
+        >
+          <span>Finding deleted.</span>
+          <button
+            onClick={handleUndo}
+            className="bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold px-3 py-1 rounded-full text-xs shadow transition-colors flex items-center gap-1 cursor-pointer"
+          >
+            Undo ({deleteUndoCountdown}s)
+          </button>
         </div>
       )}
 
@@ -2244,10 +2307,14 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
               {undoState && (
                 <button
                   onClick={handleUndo}
-                  className="text-xs sm:text-sm font-semibold py-1.5 px-3 rounded-lg bg-yellow-400 text-yellow-900 hover:bg-yellow-500 transition-colors shadow-sm shrink-0"
+                  className={`text-xs sm:text-sm font-semibold py-1.5 px-3 rounded-lg transition-colors shadow-sm shrink-0 cursor-pointer ${
+                    deleteUndoCountdown > 0
+                      ? 'bg-amber-400 text-amber-950 hover:bg-amber-500 ring-2 ring-amber-300 animate-pulse'
+                      : 'bg-yellow-400 text-yellow-900 hover:bg-yellow-500'
+                  }`}
                   aria-label="Undo last modification"
                 >
-                  Undo
+                  {deleteUndoCountdown > 0 ? `Undo (${deleteUndoCountdown}s)` : 'Undo'}
                 </button>
               )}
               <QuickMacroInsertPopover
@@ -2381,7 +2448,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
           
           const isBold = finding.includes('BOLD::');
           const cleanFinding = finding.replace(/BOLD::/g, '');
-          const isTitle = isReportTitle(cleanFinding, index);
+          const isTitle = isReportTitle(cleanFinding, index, findings);
           const displayFinding = isTitle ? sanitizeTitleText(cleanFinding) : cleanFinding;
           const isClinicalProfile = isClinicalProfileFinding(displayFinding);
           const { isStructured, isTable, title, points, tableLines } = parseStructuredFinding(displayFinding);
@@ -3313,16 +3380,26 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                         </span>
                     </div>
                 </div>
-                {(mergedContinuationBlob || audioBlob) && (
+                <div className="flex items-center gap-2 flex-wrap w-full sm:w-auto justify-end">
                     <button
-                        onClick={() => handleDownloadMerged(mergedContinuationBlob || audioBlob)}
-                        className="flex items-center justify-center gap-2 bg-slate-700 hover:bg-slate-800 active:bg-slate-900 text-white font-bold py-2.5 px-4 rounded-lg focus:outline-none focus:ring-2 focus:ring-slate-400 transition-all shadow-sm text-sm whitespace-nowrap min-h-[40px] w-full sm:w-auto"
-                        title="Download the full merged audio file recorded so far"
+                        onClick={handleStartContinue}
+                        className="flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-700 active:bg-emerald-800 text-white font-bold py-2 px-4 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-400 transition-all shadow-sm text-sm whitespace-nowrap min-h-[40px] w-full sm:w-auto cursor-pointer"
+                        title="Dictate additional findings simultaneously while this is processing"
                     >
-                        <DownloadIcon className="w-4 h-4"/>
-                        Download Audio (Merged)
+                        <MicPlusIcon className="w-4 h-4"/>
+                        Dictate Next Concurrently
                     </button>
-                )}
+                    {(mergedContinuationBlob || audioBlob) && (
+                        <button
+                            onClick={() => handleDownloadMerged(mergedContinuationBlob || audioBlob)}
+                            className="flex items-center justify-center gap-2 bg-slate-700 hover:bg-slate-800 active:bg-slate-900 text-white font-bold py-2 px-4 rounded-lg focus:outline-none focus:ring-2 focus:ring-slate-400 transition-all shadow-sm text-sm whitespace-nowrap min-h-[40px] w-full sm:w-auto cursor-pointer"
+                            title="Download the full merged audio file recorded so far"
+                        >
+                            <DownloadIcon className="w-4 h-4"/>
+                            Download Audio (Merged)
+                        </button>
+                    )}
+                </div>
             </div>
         )}
           </div>

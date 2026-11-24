@@ -832,13 +832,18 @@ export const processAudio = async (
         }
         try {
           const parsed = JSON.parse(selectedTemplate.content);
-          return [
+          const findingsFallback: string[] = [
             parsed.title || "RADIOLOGY REPORT",
             "Clinical Profile: Routine evaluation.",
-            parsed.technique || "Standard imaging protocol was performed.",
-            ...(parsed.normal_findings || []).map((f: string) => `BOLD::${f}`),
-            `IMPRESSION:###${parsed.default_impression || parsed.impression || 'Study within normal limits.'}`
           ];
+          if (parsed.technique && parsed.technique.trim() && !/standard imaging protocol was performed/i.test(parsed.technique)) {
+            findingsFallback.push(parsed.technique.trim());
+          }
+          if (parsed.normal_findings && parsed.normal_findings.length > 0) {
+            findingsFallback.push(...parsed.normal_findings.map((f: string) => `BOLD::${f}`));
+          }
+          findingsFallback.push(`IMPRESSION:###${parsed.default_impression || parsed.impression || 'Study within normal limits.'}`);
+          return findingsFallback;
         } catch (e) {}
       }
     }
@@ -869,19 +874,47 @@ export const processAudio = async (
 export function applySpokenHeadingModifications(findings: string[], directives?: string): string[] {
   if (!findings || findings.length === 0) return findings;
 
+  const allDirectivesText = [directives || '', ...findings].join(' ');
+
+  // 1. Detect Clinical Profile spoken styling directives (e.g. "keep clinical profile sentence underlined bold and unitalic")
+  let profileBold = false;
+  let profileUnderline = false;
+  let profileUnitalic = false;
+  let hasProfileStyleDirective = false;
+
+  const profDirectiveMatch = allDirectivesText.match(/(?:keep\s+)?(?:clinical\s*profile\s*(?:sentence\s*)?)?(?:to\s+be\s+)?(?:underlined|underline|bold|bolded|unitalic|un-italic|not\s+italic|non-italic|no\s+italic|italic)(?:[\s,]+(?:and\s+)?(?:underlined|underline|bold|bolded|unitalic|un-italic|not\s+italic|non-italic|no\s+italic|italic))*(?:\s*like\s+that)?/i);
+  if (profDirectiveMatch && /clinical\s*profile/i.test(allDirectivesText) && /(?:underlined|underline|bold|bolded|unitalic|not italic|non-italic)/i.test(profDirectiveMatch[0])) {
+    const dStr = profDirectiveMatch[0].toLowerCase();
+    if (dStr.includes('bold')) profileBold = true;
+    if (dStr.includes('underline') || dStr.includes('underlined')) profileUnderline = true;
+    if (dStr.includes('unitalic') || dStr.includes('un-italic') || dStr.includes('not italic') || dStr.includes('non-italic') || dStr.includes('no italic')) {
+      profileUnitalic = true;
+    }
+    hasProfileStyleDirective = true;
+  }
+
+  // 2. Detect Spoken Impression "without bullet" directives
+  const noBulletPoints: string[] = [];
+  const noBulletMatches = allDirectivesText.matchAll(/(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?(?:\s*:)?\s*([^.,\n]+)/gi);
+  for (const m of noBulletMatches) {
+    if (m[1] && m[1].trim().length > 3) {
+      noBulletPoints.push(m[1].trim().toLowerCase());
+    }
+  }
+
   const candidates: string[] = [];
   if (directives) candidates.push(directives);
   findings.forEach(f => {
     if (
       /change\s+(?:the\s+)?.*heading/i.test(f) ||
       /change\s+(?:the\s+)?title/i.test(f) ||
-      /rename\s+(?:the\s+)?.*heading/i.test(f)
+      /rename\s+(?:the\s+)?.*heading/i.test(f) ||
+      /keep\s+clinical\s+profile/i.test(f) ||
+      /without\s+bullet/i.test(f)
     ) {
       candidates.push(f);
     }
   });
-
-  if (candidates.length === 0) return findings;
 
   let modified = [...findings];
 
@@ -918,11 +951,55 @@ export function applySpokenHeadingModifications(findings: string[], directives?:
     }
   }
 
+  // Apply Clinical Profile styling tag if commanded
+  if (hasProfileStyleDirective) {
+    modified = modified.map(line => {
+      const clean = line.replace(/^BOLD::/i, '').replace(/^UNDERLINE::/i, '').replace(/^UNITALIC::/i, '').replace(/\[STYLE:[^\]]+\]/i, '').trim();
+      if (/^clinical\s*(?:profile|history):/i.test(clean.replace(/^[*_\s]+/, ''))) {
+        const tags: string[] = [];
+        if (profileBold) tags.push('bold');
+        if (profileUnderline) tags.push('underline');
+        if (profileUnitalic) tags.push('unitalic');
+        const prefix = tags.length > 0 ? `[STYLE:${tags.join(',')}]` : '';
+        // Clean out any spoken directive phrase from the profile text
+        const cleanedText = clean.replace(/(?:keep\s+)?(?:clinical\s*profile\s*(?:sentence\s*)?)?(?:to\s+be\s+)?(?:underlined|underline|bold|bolded|unitalic|un-italic|not\s+italic|non-italic|no\s+italic|italic)(?:[\s,]+(?:and\s+)?(?:underlined|underline|bold|bolded|unitalic|un-italic|not\s+italic|non-italic|no\s+italic|italic))*(?:\s*like\s+that)?/gi, '').trim();
+        return `${prefix}${cleanedText}`;
+      }
+      return line;
+    });
+  }
+
+  // Apply Impression without-bullet handling if commanded
+  if (noBulletPoints.length > 0) {
+    modified = modified.map(line => {
+      if (line.toUpperCase().startsWith('IMPRESSION:')) {
+        const parts = line.split('###');
+        const newParts = parts.map((pt, pIdx) => {
+          if (pIdx === 0) return pt;
+          const ptLower = pt.toLowerCase();
+          for (const nb of noBulletPoints) {
+            if (ptLower.includes(nb)) {
+              // Strip bullet symbol
+              return pt.replace(/^[•\-\*]\s*/, '').trim();
+            }
+          }
+          return pt;
+        });
+        return newParts.join('###');
+      }
+      return line;
+    });
+  }
+
   return modified.filter(line => {
     const clean = line.replace(/^BOLD::/i, '').trim();
     if (/^change\s+(?:the\s+)?.*heading.*to\s+/i.test(clean)) return false;
     if (/^change\s+(?:the\s+)?title.*to\s+/i.test(clean)) return false;
     if (/^rename\s+(?:the\s+)?.*heading.*to\s+/i.test(clean)) return false;
+    if (/^(?:please\s*)?(?:keep\s+)?clinical\s*profile\s*sentence/i.test(clean)) return false;
+    if (/^(?:please\s*)?(?:add\s+this\s+point\s+without\s+bullet|add\s+without\s+bullet|without\s+bullet|no\s+bullet)(?:\s*(?:in|to)\s*impression)?/i.test(clean)) return false;
+    // Strip unnecessary generic technique placeholder if present
+    if (/^(?:standard imaging protocol was performed|standard protocol was followed)\.?$/i.test(clean)) return false;
     return true;
   });
 }
@@ -1062,12 +1139,25 @@ Carefully integrate these dictated findings into the "${templateName}" baseline 
     - REMOVE the spoken instruction from the clinical findings — NEVER leave meta-instruction sentences like "change CT extremity heading..." in the findings.
 - Any anatomical sections where the dictation describes pathology, abnormal lesions, or modifications must be updated with the dictated findings and prefixed with 'BOLD::'.
 - Any anatomical sections from the template that were normal or not mentioned in the dictation must remain present verbatim without 'BOLD::'.
-- Clinical profile if dictated or present must be preserved as its own line (*Clinical Profile: ...*).
+- TECHNIQUE / PROTOCOL DIRECTIVE:
+  * If the template lacks a Technique / Protocol section or sentence, do NOT add or invent "Standard imaging protocol was performed." or any placeholder. Omit it completely unless explicitly present in the template or dictated.
+- CLINICAL PROFILE FORMATTING & SPOKEN STYLE DIRECTIVES:
+  * Default style: wrapped in single asterisks (*Clinical Profile: ...*).
+  * If the radiologist dictates formatting instructions (e.g. "keep clinical profile sentence underlined bold and unitalic", "bold and underline clinical profile", "make clinical profile not italic", "underline clinical profile"):
+    1. Obey the requested formatting commands strictly!
+    2. Encode the requested styles at the beginning of the line: e.g. BOLD::UNDERLINE::UNITALIC::*Clinical Profile: ...* or [STYLE:bold,underline,unitalic]*Clinical Profile: ...*.
+    3. REMOVE the spoken instruction phrase completely from the clinical text so only the clinical history remains.
+- IMPRESSION & SPOKEN NO-BULLET DIRECTIVES:
+  * If the radiologist dictates to add a point without bullet (e.g. "add this point without bullet in impression", "in impression add without bullet: ...", "no bullet for this point"):
+    1. YOU MUST OBEY: Incorporate the dictated point into the IMPRESSION.
+    2. NO BULLET: Output that specific point WITHOUT any bullet symbol (no '•', '-', or '*'), starting flush from the margin.
+    3. Remove meta-instruction phrases like "add this point without bullet in impression" so only the clinical observation appears.
 - If the dictated findings contain previous or intermediate "IMPRESSION:" lines from continued dictation sessions, consolidate all findings into ONE single comprehensive final IMPRESSION at the end of the report (format: 'IMPRESSION:###point 1###point 2...'). Do NOT leave intermediate impressions scattered in the body of the report.
 - Generate a new, comprehensive IMPRESSION synthesizing all normal and abnormal findings starting with 'IMPRESSION:###'.
   * Smart Bullet Formatting in Impression:
+    - Explicit No-Bullet Points: Any point explicitly requested without bullet starts flush with the beginning of the line without any bullet symbol.
     - Single-Line / Lead-In Summaries: Statements such as "findings are s/o...", narrative summary paragraphs, or single normal summary sentences now start flush with the beginning of the line without any bullet point (e.g. "IMPRESSION:###Normal study without acute abnormality.").
-    - Discrete / Multi-Point Findings: When the impression consists of 2 or more discrete clinical findings, each individual finding is cleanly formatted with bullet points (• Point 1, • Point 2) starting from the left margin (e.g. "IMPRESSION:###• Point 1###• Point 2").
+    - Discrete / Multi-Point Findings: When the impression consists of 2 or more discrete clinical findings, each individual finding is cleanly formatted with bullet points (• Point 1, • Point 2) starting from the left margin, EXCEPT for points instructed without bullets.
 - Return ONLY a JSON object with the "findings" string array in the assembled report order.
 ================================================================================
 `;
@@ -2114,6 +2204,7 @@ STRICT RADIOLOGY TRANSCRIPTION & MEDICAL FORMATTING RULES:
    - Format dimensions like "8 mm into 9 mm" as "8 x 9 mm".
    - Comparative phrases: "right more than left" as "(R > L)", "left more than right" as "(L > R)".
    - Abbreviate "complaints of" to "C/o" and "history of" to "H/o".
+   - **Hyphenation Rule**: Do NOT add hyphens to compound modifiers or adjectives commonly written without hyphens in radiology reports. Write them as separate words with a space (e.g., write "age related" NOT "age-related", "age related neuro parenchymal atrophy", "well defined" NOT "well-defined", "ill defined" NOT "ill-defined", "ring enhancing" NOT "ring-enhancing", "contrast enhancing" NOT "contrast-enhancing", "non enhancing" NOT "non-enhancing", "soft tissue" NOT "soft-tissue", "flow void" NOT "flow-void", "fluid fluid level" NOT "fluid-fluid level", "fat fluid level" NOT "fat-fluid level"). Never insert unnecessary hyphens between adjacent words or between sentences. Only retain hyphens if strictly standard in medical nomenclature (such as "X-ray", "follow-up", "CT-guided", "T1-weighted", "T2-weighted"). When in doubt, prefer NO hyphen.
 3. **Prefix Marker for Findings**: You MUST prefix every standard finding line with the special marker \`BOLD::\` (unless template normal findings or custom instructions specify otherwise).
 4. **Clinical Profile**: If clinical history/profile is dictated, format as single paragraph without asterisks, e.g. "Clinical Profile: C/o RTA with TBI (GCS- 15/15)." (do not prefix with BOLD:: and do NOT add any trailing or extra asterisks).
 5. **Impression Section**: If an impression is dictated, combine title and points separated by '###', starting with "IMPRESSION:###point 1###point 2" (do not prefix with BOLD::).
@@ -2276,6 +2367,7 @@ Perform a comprehensive, holistic review pass over the draft to generate the fin
    - Every standard finding MUST start with \`BOLD::\` (unless the custom instruction or template specifies otherwise).
    - Dimensions standardized: "16 x 17 mm".
    - Shorthand normalized: "S/p", "C/o", "H/o", "(R > L)", "(L > R)".
+   - **Hyphenation Rule**: Do NOT add hyphens to compound modifiers or adjectives commonly written without hyphens in radiology reports. Write them as separate words with a space (e.g., write "age related" NOT "age-related", "age related neuro parenchymal atrophy", "well defined" NOT "well-defined", "ill defined" NOT "ill-defined", "ring enhancing" NOT "ring-enhancing", "contrast enhancing" NOT "contrast-enhancing", "non enhancing" NOT "non-enhancing", "soft tissue" NOT "soft-tissue", "flow void" NOT "flow-void", "fluid fluid level" NOT "fluid-fluid level", "fat fluid level" NOT "fat-fluid level"). Never insert unnecessary hyphens between adjacent words or between sentences. Only retain hyphens if strictly standard in medical nomenclature (such as "X-ray", "follow-up", "CT-guided", "T1-weighted", "T2-weighted"). When in doubt, prefer NO hyphen.
    - Clinical profile without asterisks and without BOLD:: (e.g., "Clinical Profile: C/o trauma.") and with no trailing or extra asterisks.
 6. **IMPRESSION**:
    - If an impression exists, ensure it is formatted as "IMPRESSION:###point 1###point 2".

@@ -239,6 +239,17 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     const touchDragRef = useRef<{ batchId: string; sourceIndex: number; startX: number; startY: number; isDragging: boolean } | null>(null);
     const [undoStates, setUndoStates] = useState<Record<string, string[]>>({});
     const [batchRtfViewIds, setBatchRtfViewIds] = useState<Record<string, boolean>>({});
+    const [deleteUndoCountdowns, setDeleteUndoCountdowns] = useState<Record<string, number>>({});
+    const [deleteToastBatchId, setDeleteToastBatchId] = useState<string | null>(null);
+    const deleteUndoTimersRef = useRef<Record<string, NodeJS.Timeout>>({});
+    const deleteUndoIntervalsRef = useRef<Record<string, NodeJS.Timeout>>({});
+
+    useEffect(() => {
+        return () => {
+            Object.values(deleteUndoTimersRef.current).forEach(t => clearTimeout(t));
+            Object.values(deleteUndoIntervalsRef.current).forEach(i => clearInterval(i));
+        };
+    }, []);
 
     const handleUpdateBatchFindings = (batchId: string, newFindings: string[]) => {
         setBatches(prev => prev.map(b => b.id === batchId ? { ...b, findings: newFindings } : b));
@@ -1722,19 +1733,26 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             plainText = imp.plain;
             htmlText = imp.html;
         } else if (isStructured) {
-            plainText = [title, ...points].join('\n');
-            let htmlContent = isBold ? `<p><strong>${title}</strong></p>` : `<p>${title}</p>`;
-            htmlContent += points.map(p => isBold ? `<p><strong>${p}</strong></p>` : `<p>${p}</p>`).join('');
-            htmlText = htmlContent;
-        } else {
-            if (isItalic) {
-                plainText = cleanFinding.slice(1, -1);
-                htmlText = `<p><em>${plainText}</em></p>`;
-            } else {
-                plainText = cleanFinding;
-                htmlText = isBold ? `<p><strong>${cleanFinding}</strong></p>` : `<p>${cleanFinding}</p>`;
-            }
-        }
+          const sublines = [title, ...points];
+          plainText = sublines.join('\n');
+          const innerHtml = sublines.map(p => isBold ? `<strong>${p}</strong>` : p).join('<br>');
+          htmlText = `<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; line-height: normal;">${innerHtml}</p>`;
+      } else if (cleanFinding.includes('\n')) {
+          const sublines = cleanFinding.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+          plainText = sublines.join('\n');
+          const innerHtml = sublines.map(l => isBold ? `<strong>${l}</strong>` : l).join('<br>');
+          htmlText = `<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; line-height: normal;">${innerHtml}</p>`;
+      } else {
+          if (isItalic) {
+              plainText = cleanFinding.slice(1, -1);
+              htmlText = `<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; line-height: normal;"><em>${plainText}</em></p>`;
+          } else {
+              plainText = cleanFinding;
+              htmlText = isBold
+                ? `<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; line-height: normal;"><strong>${cleanFinding}</strong></p>`
+                : `<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; line-height: normal;">${cleanFinding}</p>`;
+          }
+      }
 
         const success = await copyToClipboard(plainText, htmlText);
 
@@ -1875,6 +1893,31 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             }
             return { ...prev, [batchId]: next };
         });
+
+        // 15-second undo retrieval window
+        if (deleteUndoTimersRef.current[batchId]) clearTimeout(deleteUndoTimersRef.current[batchId]);
+        if (deleteUndoIntervalsRef.current[batchId]) clearInterval(deleteUndoIntervalsRef.current[batchId]);
+
+        setDeleteUndoCountdowns(prev => ({ ...prev, [batchId]: 15 }));
+        setDeleteToastBatchId(batchId);
+
+        deleteUndoIntervalsRef.current[batchId] = setInterval(() => {
+            setDeleteUndoCountdowns(prev => {
+                const cur = prev[batchId] ?? 0;
+                if (cur <= 1) {
+                    if (deleteUndoIntervalsRef.current[batchId]) clearInterval(deleteUndoIntervalsRef.current[batchId]);
+                    setDeleteToastBatchId(null);
+                    return { ...prev, [batchId]: 0 };
+                }
+                return { ...prev, [batchId]: cur - 1 };
+            });
+        }, 1000);
+
+        deleteUndoTimersRef.current[batchId] = setTimeout(() => {
+            setDeleteToastBatchId(null);
+            setDeleteUndoCountdowns(prev => ({ ...prev, [batchId]: 0 }));
+            delete deleteUndoTimersRef.current[batchId];
+        }, 15000);
     };
 
     const handleSaveEdit = () => {
@@ -2482,10 +2525,15 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     const handleUndo = (batchId: string) => {
         const findingsToRestore = undoStates[batchId];
         if (findingsToRestore) {
+            if (deleteUndoTimersRef.current[batchId]) clearTimeout(deleteUndoTimersRef.current[batchId]);
+            if (deleteUndoIntervalsRef.current[batchId]) clearInterval(deleteUndoIntervalsRef.current[batchId]);
+            setDeleteUndoCountdowns(prev => ({ ...prev, [batchId]: 0 }));
+            setDeleteToastBatchId(null);
             setBatches(prev => prev.map(b => 
                 b.id === batchId ? { ...b, findings: findingsToRestore } : b
             ));
             clearUndoStateForBatch(batchId);
+            showNotification('Finding restored!');
         }
     };
     
@@ -2588,6 +2636,21 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             {copyNotification.visible && (
                 <div className="fixed bottom-20 right-5 bg-slate-800 text-white text-sm font-bold py-2 px-4 rounded-lg shadow-lg z-50 transition-all duration-300 ease-in-out" role="alert">
                 {copyNotification.text}
+                </div>
+            )}
+
+            {deleteToastBatchId && (deleteUndoCountdowns[deleteToastBatchId] ?? 0) > 0 && (
+                <div 
+                    className="fixed bottom-20 left-1/2 -translate-x-1/2 z-50 bg-slate-900/95 text-white text-sm font-medium py-2.5 px-5 rounded-full shadow-2xl flex items-center gap-3 border border-slate-700 transition-all duration-300 ease-in-out backdrop-blur-sm"
+                    role="alert"
+                >
+                    <span>Finding deleted.</span>
+                    <button
+                        onClick={() => handleUndo(deleteToastBatchId)}
+                        className="bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold px-3 py-1 rounded-full text-xs shadow transition-colors flex items-center gap-1 cursor-pointer"
+                    >
+                        Undo ({deleteUndoCountdowns[deleteToastBatchId]}s)
+                    </button>
                 </div>
             )}
             <input type="file" ref={fileInputRef} onChange={handleFileSelect} className="hidden" accept="audio/*,video/*,image/*,.pdf,.doc,.docx,.txt,.csv,.rtf,.webm,.mp4,.mp3,.wav,.m4a,.png,.jpg,.jpeg" multiple aria-hidden="true" />
@@ -3344,10 +3407,16 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                                 {undoStates[batch.id] && (
                                                                     <button
                                                                         onClick={() => handleUndo(batch.id)}
-                                                                        className="text-sm font-semibold py-1 px-3 rounded-lg bg-yellow-400 text-yellow-900 hover:bg-yellow-500 transition-colors"
+                                                                        className={`text-sm font-semibold py-1 px-3 rounded-lg transition-colors cursor-pointer ${
+                                                                            (deleteUndoCountdowns[batch.id] ?? 0) > 0
+                                                                                ? 'bg-amber-400 text-amber-950 hover:bg-amber-500 ring-2 ring-amber-300 animate-pulse'
+                                                                                : 'bg-yellow-400 text-yellow-900 hover:bg-yellow-500'
+                                                                        }`}
                                                                         aria-label="Undo last modification for this batch"
                                                                     >
-                                                                        Undo
+                                                                        {(deleteUndoCountdowns[batch.id] ?? 0) > 0
+                                                                            ? `Undo (${deleteUndoCountdowns[batch.id]}s)`
+                                                                            : 'Undo'}
                                                                     </button>
                                                                 )}
                                                                  <button

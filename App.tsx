@@ -219,6 +219,13 @@ const App: React.FC = () => {
     size: number;
   } | null>(null);
 
+  // Simultaneous / Concurrent Dictation while loading
+  const [concurrentRecordingStatus, setConcurrentRecordingStatus] = useState<AppStatus>(AppStatus.Idle);
+  const queuedConcurrentAudioRef = useRef<Blob | Blob[] | null>(null);
+  const isConcurrentRecordingActiveRef = useRef<boolean>(false);
+  const [isSimultaneousQueued, setIsSimultaneousQueued] = useState<boolean>(false);
+  const handleContinueDictationRef = useRef<((newAudioBlob: Blob, premergedBlob?: Blob) => Promise<void>) | null>(null);
+
   useEffect(() => {
     const allThemeClasses = [
       'theme-light', 'theme-dark', 'theme-colourful', 'theme-magical', 
@@ -491,6 +498,10 @@ const App: React.FC = () => {
 
   const handleCancelProcessing = useCallback(() => {
     processingRequestIdRef.current++;
+    queuedConcurrentAudioRef.current = null;
+    setIsSimultaneousQueued(false);
+    isConcurrentRecordingActiveRef.current = false;
+    setConcurrentRecordingStatus(AppStatus.Idle);
     if (findings.length > 0) {
       setStatus(AppStatus.Success);
     } else {
@@ -556,6 +567,10 @@ const App: React.FC = () => {
     setStatus(AppStatus.Processing);
     setError(null);
     setFindings([]);
+    queuedConcurrentAudioRef.current = null;
+    setIsSimultaneousQueued(false);
+    setConcurrentRecordingStatus(AppStatus.Idle);
+    isConcurrentRecordingActiveRef.current = false;
     const primaryBlob = audioBlobs[0];
     setAudioBlob(audioBlobs.length > 1 ? audioBlobs : primaryBlob); // Preserve all input blobs (audio, text files, docx, etc.)
 
@@ -603,8 +618,24 @@ const App: React.FC = () => {
       activeDictationIsLiveRef.current = false;
       driveSyncedHashRef.current = processedText.join('|||');
 
-      setStatus(AppStatus.Success);
-      window.scrollTo({ top: 0, behavior: 'instant' });
+      // Check if user has queued audio or is still actively recording concurrently
+      if (isConcurrentRecordingActiveRef.current) {
+        // User is currently recording into the simultaneous recorder! Keep status in Processing so AudioRecorder doesn't unmount
+      } else if (queuedConcurrentAudioRef.current) {
+        const queuedBlob = queuedConcurrentAudioRef.current as Blob;
+        queuedConcurrentAudioRef.current = null;
+        setIsSimultaneousQueued(false);
+        setStatus(AppStatus.Success);
+        window.scrollTo({ top: 0, behavior: 'instant' });
+        if (handleContinueDictationRef.current) {
+          handleContinueDictationRef.current(queuedBlob).catch(err => {
+            console.error("Queued dictation error:", err);
+          });
+        }
+      } else {
+        setStatus(AppStatus.Success);
+        window.scrollTo({ top: 0, behavior: 'instant' });
+      }
 
       // Processing succeeded! Safely clear the temporary in-flight backup
       deleteAudioBlob(`in_flight_recording_${currentTabId}`).catch(() => {});
@@ -634,6 +665,31 @@ const App: React.FC = () => {
       // accidentally refreshes or closes the page on this Error screen, the audio is STILL preserved!
     }
   }, [selectedModel, customPrompt, customImages, customDocx]);
+
+  const handleConcurrentRecordingComplete = useCallback(async (newAudioInput: Blob | Blob[]) => {
+    isConcurrentRecordingActiveRef.current = false;
+    setConcurrentRecordingStatus(AppStatus.Idle);
+    const audioBlobs = Array.isArray(newAudioInput) ? newAudioInput : [newAudioInput];
+    if (audioBlobs.length === 0 || audioBlobs.every(b => !b || b.size === 0)) return;
+    const newBlob = audioBlobs[0];
+
+    // If initial dictation is still running processAudio:
+    if (status === AppStatus.Processing && findings.length === 0) {
+      queuedConcurrentAudioRef.current = newBlob;
+      setIsSimultaneousQueued(true);
+    } else {
+      // Findings are ready or status transitioned:
+      setStatus(AppStatus.Success);
+      window.scrollTo({ top: 0, behavior: 'instant' });
+      if (handleContinueDictationRef.current) {
+        try {
+          await handleContinueDictationRef.current(newBlob);
+        } catch (err) {
+          console.error("Concurrent dictation continuation error:", err);
+        }
+      }
+    }
+  }, [status, findings]);
   
   const handleLiveDictationComplete = useCallback(async (transcript: string, audioBlob: Blob | null) => {
     const reqId = ++processingRequestIdRef.current;
@@ -912,6 +968,7 @@ const App: React.FC = () => {
       throw err; // Propagate error to the UI component
     }
   }, [audioBlob, findings, selectedModel, customPrompt, customImages]);
+  handleContinueDictationRef.current = handleContinueDictation;
 
   const handleSendMessage = async (message: string | Blob) => {
     if (!chat || isChatting) return;
@@ -1182,31 +1239,58 @@ const App: React.FC = () => {
         );
       case AppStatus.Processing:
         return (
-          <div className="text-center p-8">
-            <Spinner />
-            <p className="text-slate-600 dark:text-slate-300 mt-4 text-lg font-medium">
-              Analyzing and correcting text...
-            </p>
-            <p className="text-slate-500 dark:text-slate-400 mt-2 text-sm">
-              This may take a moment.
-            </p>
-            <div className="mt-6 flex flex-wrap justify-center items-center gap-3">
-              <button
-                onClick={handleCancelProcessing}
-                className="inline-flex items-center gap-2 bg-red-100 text-red-700 hover:bg-red-200 dark:bg-red-900/40 dark:text-red-300 dark:hover:bg-red-900/70 font-semibold py-2 px-5 rounded-lg border border-red-300 dark:border-red-700 transition-colors shadow-sm text-sm"
-                aria-label="Cancel Analysis"
-              >
-                <StopIcon className="w-4 h-4" /> Cancel Analysis
-              </button>
-              {audioBlob && (
+          <div className="space-y-6 animate-fade-in">
+            <div className="bg-blue-50/90 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 rounded-2xl p-5 shadow-sm text-center">
+              <Spinner className="w-8 h-8 mx-auto text-blue-600 dark:text-blue-400" />
+              <p className="text-slate-800 dark:text-slate-100 mt-3 text-lg font-bold">
+                {isConcurrentRecordingActiveRef.current 
+                  ? 'First dictation processed! Still capturing your ongoing dictation...' 
+                  : 'Analyzing and correcting previous dictation...'}
+              </p>
+              <p className="text-slate-600 dark:text-slate-300 mt-1 text-sm font-medium">
+                {isSimultaneousQueued
+                  ? '✓ Next dictation captured and queued — will auto-merge as soon as processing completes.'
+                  : 'Simultaneous dictation active: You can dictate your next finding below right now while this is processing!'}
+              </p>
+              <div className="mt-4 flex flex-wrap justify-center items-center gap-3">
                 <button
-                  onClick={handleDownload}
-                  className="inline-flex items-center gap-2 bg-slate-600 text-white font-semibold py-2 px-5 rounded-lg hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-400 focus:ring-opacity-50 transition-colors shadow-sm text-sm"
-                  aria-label="Download Audio / File"
+                  onClick={handleCancelProcessing}
+                  className="inline-flex items-center gap-2 bg-red-100 text-red-700 hover:bg-red-200 dark:bg-red-900/40 dark:text-red-300 dark:hover:bg-red-900/70 font-semibold py-2 px-5 rounded-lg border border-red-300 dark:border-red-700 transition-colors shadow-sm text-sm cursor-pointer"
+                  aria-label="Cancel Analysis"
                 >
-                  <DownloadIcon className="w-4 h-4" /> Download Audio / File
+                  <StopIcon className="w-4 h-4" /> Cancel Analysis
                 </button>
-              )}
+                {audioBlob && (
+                  <button
+                    onClick={handleDownload}
+                    className="inline-flex items-center gap-2 bg-slate-600 text-white font-semibold py-2 px-5 rounded-lg hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-400 focus:ring-opacity-50 transition-colors shadow-sm text-sm cursor-pointer"
+                    aria-label="Download Audio / File"
+                  >
+                    <DownloadIcon className="w-4 h-4" /> Download Audio
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="border border-emerald-200 dark:border-emerald-800/60 bg-emerald-50/40 dark:bg-emerald-950/20 rounded-2xl p-4 sm:p-5 shadow-sm">
+              <div className="flex items-center justify-between mb-3 px-1">
+                <span className="text-sm font-bold text-emerald-800 dark:text-emerald-200 flex items-center gap-2">
+                  <MicIcon className="w-4 h-4 text-emerald-600 animate-pulse" />
+                  Simultaneous Dictation (Dictate while loading)
+                </span>
+                <span className="text-xs bg-emerald-200/70 dark:bg-emerald-900/60 text-emerald-800 dark:text-emerald-200 px-2.5 py-0.5 rounded-full font-semibold">
+                  Queue Active
+                </span>
+              </div>
+              <AudioRecorder
+                status={concurrentRecordingStatus}
+                setStatus={(newSt) => {
+                  setConcurrentRecordingStatus(newSt);
+                  isConcurrentRecordingActiveRef.current = (newSt === AppStatus.Recording);
+                }}
+                onRecordingComplete={handleConcurrentRecordingComplete}
+                onMultipleFilesUploaded={(files) => setMultipleFilesModal(files)}
+              />
             </div>
           </div>
         );

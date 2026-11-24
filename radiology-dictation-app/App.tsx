@@ -8,10 +8,11 @@ import { AppStatus, IdentifiedError } from './types';
 import { processAudio, createChat, blobToBase64, base64ToBlob, createChatFromText, identifyPotentialErrors } from './services/geminiService';
 import Spinner from './components/ui/Spinner';
 import { Chat } from '@google/genai';
-import { saveAudioBlob, getAudioBlob, deleteAudioBlob } from './services/audioStorage';
+import { saveAudioBlob, getAudioBlob, deleteAudioBlob, saveReportSession, getReportSession, deleteReportSession } from './services/audioStorage';
 // FIX: Changed import to a named import based on the error message.
 import { BatchProcessor } from './components/BatchProcessor';
 import LiveDictation from './components/LiveDictation';
+import AutonomousModeView from './components/AutonomousModeView';
 import MicIcon from './components/icons/MicIcon';
 import YinYangMicIcon from './components/icons/YinYangMicIcon';
 import WaveformIcon from './components/icons/WaveformIcon';
@@ -40,6 +41,8 @@ import { getUpcomingTemplate, clearUpcomingTemplate, subscribeToUpcomingTemplate
 import MacrosAndDictionaryModal from './components/MacrosAndDictionaryModal';
 import { subscribeToMacroDictionary, syncMacrosWithGoogleDrive, expandMacrosInFindings } from './services/macroDictionaryService';
 import { FloatingNewDictationButton } from './components/FloatingNewDictationButton';
+import ErrorBoundary from './components/ErrorBoundary';
+import { safeLocalStorage, getTabId, markTabActive, isTabHeartbeatAlive, getSingleModeStorageKey, getSingleModeAudioKey, getBatchModeStorageKey } from './services/storageService';
 
 interface ChatMessage {
   author: 'You' | 'AI';
@@ -97,7 +100,7 @@ const getCleanMimeType = (blob: Blob): string => {
 };
 
 const App: React.FC = () => {
-  const [mode, setMode] = useState<'single' | 'batch' | 'live'>('single');
+  const [mode, setMode] = useState<'single' | 'batch' | 'live' | 'autonomous'>('single');
   const [status, setStatus] = useState<AppStatus>(AppStatus.Idle);
   const [findings, setFindings] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -109,6 +112,7 @@ const App: React.FC = () => {
   const [customPrompt, setCustomPrompt] = useState<string>('');
   const [customImages, setCustomImages] = useState<Array<{ data: string; mimeType: string }>>([]);
   const [customDocx, setCustomDocx] = useState<DocxTemplateData | null>(null);
+  const [singleExtraFiles, setSingleExtraFiles] = useState<File[]>([]);
   const [upcomingTemplate, setUpcomingTemplateState] = useState<UpcomingTemplateConfig | null>(() => getUpcomingTemplate());
 
   useEffect(() => {
@@ -133,19 +137,18 @@ const App: React.FC = () => {
   const [identifiedErrors, setIdentifiedErrors] = useState<IdentifiedError[]>([]);
   const [errorCheckStatus, setErrorCheckStatus] = useState<'idle' | 'checking' | 'complete'>('idle');
   const [theme, setTheme] = useState(() => {
-    const storedTheme = localStorage.getItem('theme');
+    const storedTheme = safeLocalStorage.getRaw('theme', '');
     if (storedTheme) {
       return storedTheme;
     }
-    return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    return (typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
   });
   const [isErrorCheckEnabled, setIsErrorCheckEnabled] = useState(() => {
-    const saved = localStorage.getItem(ERROR_CHECK_ENABLED_KEY);
-    return saved ? JSON.parse(saved) : false; // Default is OFF
+    return safeLocalStorage.getItem<boolean>(ERROR_CHECK_ENABLED_KEY, false);
   });
   const [isPowerMode, setIsPowerMode] = useState<boolean>(() => {
-    const saved = localStorage.getItem(POWER_MODE_KEY);
-    return saved !== null ? saved === 'true' : true; // Default is ON
+    const saved = safeLocalStorage.getRaw(POWER_MODE_KEY, '');
+    return saved !== '' ? saved === 'true' : true;
   });
   const [multipleFilesModal, setMultipleFilesModal] = useState<File[] | null>(null);
   const [pendingBatchFiles, setPendingBatchFiles] = useState<File[] | null>(null);
@@ -216,6 +219,13 @@ const App: React.FC = () => {
     size: number;
   } | null>(null);
 
+  // Simultaneous / Concurrent Dictation while loading
+  const [concurrentRecordingStatus, setConcurrentRecordingStatus] = useState<AppStatus>(AppStatus.Idle);
+  const queuedConcurrentAudioRef = useRef<Blob | Blob[] | null>(null);
+  const isConcurrentRecordingActiveRef = useRef<boolean>(false);
+  const [isSimultaneousQueued, setIsSimultaneousQueued] = useState<boolean>(false);
+  const handleContinueDictationRef = useRef<((newAudioBlob: Blob, premergedBlob?: Blob) => Promise<void>) | null>(null);
+
   useEffect(() => {
     const allThemeClasses = [
       'theme-light', 'theme-dark', 'theme-colourful', 'theme-magical', 
@@ -233,11 +243,19 @@ const App: React.FC = () => {
     } else {
       document.documentElement.classList.remove('dark');
     }
-    localStorage.setItem('theme', theme);
+    safeLocalStorage.setRaw('theme', theme);
+
+    // Dynamically update mobile browser theme-color meta tag for Android status and navigation bar
+    try {
+      const themeColorMeta = document.querySelector('meta[name="theme-color"]');
+      if (themeColorMeta) {
+        themeColorMeta.setAttribute('content', isDarkVariant ? '#0f172a' : '#f8fafc');
+      }
+    } catch (_) {}
   }, [theme]);
   
   useEffect(() => {
-    localStorage.setItem(POWER_MODE_KEY, String(isPowerMode));
+    safeLocalStorage.setRaw(POWER_MODE_KEY, String(isPowerMode));
     if (!isPowerMode) {
       document.documentElement.classList.add('low-power-mode');
     } else {
@@ -246,7 +264,7 @@ const App: React.FC = () => {
   }, [isPowerMode]);
 
   useEffect(() => {
-    localStorage.setItem(ERROR_CHECK_ENABLED_KEY, JSON.stringify(isErrorCheckEnabled));
+    safeLocalStorage.setItem(ERROR_CHECK_ENABLED_KEY, isErrorCheckEnabled);
   }, [isErrorCheckEnabled]);
 
   const toggleTheme = () => {
@@ -259,13 +277,34 @@ const App: React.FC = () => {
   useEffect(() => {
     const loadState = async () => {
       try {
-        const savedStateJSON = localStorage.getItem(SINGLE_MODE_STORAGE_KEY);
-        if (savedStateJSON) {
-          const savedState = JSON.parse(savedStateJSON);
+        const currentTabId = getTabId();
+        const singleKey = getSingleModeStorageKey(currentTabId);
+        const audioKey = getSingleModeAudioKey(currentTabId);
+        let savedState = await getReportSession<any>(singleKey);
+        if (!savedState) {
+          savedState = safeLocalStorage.getItem<any>(singleKey, null);
+        }
+        // Fallback to legacy global key once, and adopt to tab-scoped key
+        if (!savedState) {
+          savedState = await getReportSession<any>(SINGLE_MODE_STORAGE_KEY);
+          if (!savedState) {
+            savedState = safeLocalStorage.getItem<any>(SINGLE_MODE_STORAGE_KEY, null);
+          }
+          if (savedState) {
+            await saveReportSession(singleKey, savedState);
+            await deleteReportSession(SINGLE_MODE_STORAGE_KEY).catch(() => {});
+            safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
+          }
+        }
+        if (savedState) {
           let blob: Blob | null = null;
 
-          // Try loading audio blob from IndexedDB first
-          blob = await getAudioBlob('single_mode_audio');
+          // Try loading audio blob from IndexedDB by tab key, fallback to legacy
+          blob = (await getAudioBlob(audioKey)) || (await getAudioBlob('single_mode_audio'));
+          if (blob && !(await getAudioBlob(audioKey))) {
+            await saveAudioBlob(audioKey, blob);
+            await deleteAudioBlob('single_mode_audio').catch(() => {});
+          }
 
           // Fallback to legacy inline base64 if present
           if (!blob && savedState.audio?.data) {
@@ -313,26 +352,33 @@ const App: React.FC = () => {
 
         // Check for any in-flight recording that was interrupted during processing, network disruption, or page reload
         try {
-          const inFlightBlob = await getAudioBlob('in_flight_recording');
-          if (inFlightBlob && inFlightBlob.size > 0) {
-            let meta: { timestamp: number; type: string; size: number } | null = null;
-            try {
-              const rawMeta = localStorage.getItem('in_flight_recording_meta');
-              if (rawMeta) meta = JSON.parse(rawMeta);
-            } catch (_) {}
+          const currentTabId = getTabId();
+          let meta: { tabId?: string; timestamp: number; type: string; size: number } | null = null;
+          try {
+            const rawMeta = safeLocalStorage.getRaw(`in_flight_recording_meta_${currentTabId}`, safeLocalStorage.getRaw('in_flight_recording_meta', ''));
+            if (rawMeta) meta = JSON.parse(rawMeta);
+          } catch (_) {}
 
-            setRecoveredInFlightAudio({
-              blob: inFlightBlob,
-              timestamp: meta?.timestamp || Date.now(),
-              size: inFlightBlob.size,
-            });
+          // Multi-tab protection: if this audio belongs to another active tab, never hijack or recover it in this tab
+          const isFromOtherTab = !!(meta?.tabId && meta.tabId !== currentTabId);
+          const isOtherActive = isFromOtherTab && isTabHeartbeatAlive(meta.tabId);
+
+          if (!isOtherActive && !isFromOtherTab) {
+            const inFlightBlob = (await getAudioBlob(`in_flight_recording_${currentTabId}`)) || (await getAudioBlob('in_flight_recording'));
+            if (inFlightBlob && inFlightBlob.size > 0 && (!meta?.tabId || meta.tabId === currentTabId)) {
+              setRecoveredInFlightAudio({
+                blob: inFlightBlob,
+                timestamp: meta?.timestamp || Date.now(),
+                size: inFlightBlob.size,
+              });
+            }
           }
         } catch (inFlightErr) {
           console.warn("Notice: could not check in-flight recording recovery:", inFlightErr);
         }
       } catch (err) {
         console.error("Failed to load state from localStorage:", err);
-        localStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
+        safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
       } finally {
         setIsRestored(true);
       }
@@ -345,6 +391,10 @@ const App: React.FC = () => {
     if (!isRestored) return; // Do not save or clear until initial restoration finishes
 
     const saveState = async () => {
+      const currentTabId = getTabId();
+      const singleKey = getSingleModeStorageKey(currentTabId);
+      const audioKey = getSingleModeAudioKey(currentTabId);
+
       // Only save when we have a successful result to resume from
       if (status === AppStatus.Success && findings.length > 0) {
         try {
@@ -362,19 +412,29 @@ const App: React.FC = () => {
             driveSynced: isSynced,
             driveSyncedHash: driveSyncedHashRef.current,
           };
-          localStorage.setItem(SINGLE_MODE_STORAGE_KEY, JSON.stringify(stateToSave));
+          // Save full report state directly to IndexedDB isolated per tab (bypassing the 5MB localStorage limit completely!)
+          await saveReportSession(singleKey, stateToSave);
+          // Purge from localStorage and legacy global keys so storage remains free
+          safeLocalStorage.removeItem(singleKey);
+          safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
+          await deleteReportSession(SINGLE_MODE_STORAGE_KEY).catch(() => {});
 
           if (audioBlob) {
-            await saveAudioBlob('single_mode_audio', audioBlob);
+            await saveAudioBlob(audioKey, audioBlob);
           } else {
-            await deleteAudioBlob('single_mode_audio');
+            await deleteAudioBlob(audioKey);
           }
+          await deleteAudioBlob('single_mode_audio').catch(() => {});
         } catch (err) {
           console.error("Failed to save state:", err);
         }
       } else if (status === AppStatus.Idle && findings.length === 0) {
-        localStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
+        safeLocalStorage.removeItem(singleKey);
+        safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
+        deleteAudioBlob(audioKey).catch(() => {});
         deleteAudioBlob('single_mode_audio').catch(() => {});
+        deleteReportSession(singleKey).catch(() => {});
+        deleteReportSession(SINGLE_MODE_STORAGE_KEY).catch(() => {});
       }
     };
     saveState();
@@ -438,6 +498,10 @@ const App: React.FC = () => {
 
   const handleCancelProcessing = useCallback(() => {
     processingRequestIdRef.current++;
+    queuedConcurrentAudioRef.current = null;
+    setIsSimultaneousQueued(false);
+    isConcurrentRecordingActiveRef.current = false;
+    setConcurrentRecordingStatus(AppStatus.Idle);
     if (findings.length > 0) {
       setStatus(AppStatus.Success);
     } else {
@@ -475,7 +539,10 @@ const App: React.FC = () => {
   const handleDiscardRecoveredAudio = useCallback(async () => {
     setRecoveredInFlightAudio(null);
     try {
+      const currentTabId = getTabId();
+      localStorage.removeItem(`in_flight_recording_meta_${currentTabId}`);
       localStorage.removeItem('in_flight_recording_meta');
+      await deleteAudioBlob(`in_flight_recording_${currentTabId}`);
       await deleteAudioBlob('in_flight_recording');
     } catch (e) {
       console.warn("Could not discard in-flight recording:", e);
@@ -500,27 +567,43 @@ const App: React.FC = () => {
     setStatus(AppStatus.Processing);
     setError(null);
     setFindings([]);
+    queuedConcurrentAudioRef.current = null;
+    setIsSimultaneousQueued(false);
+    setConcurrentRecordingStatus(AppStatus.Idle);
+    isConcurrentRecordingActiveRef.current = false;
     const primaryBlob = audioBlobs[0];
     setAudioBlob(audioBlobs.length > 1 ? audioBlobs : primaryBlob); // Preserve all input blobs (audio, text files, docx, etc.)
 
-    // Immediate Zero-Loss Pre-Save:
-    // Persist audio into IndexedDB BEFORE dispatching network requests to Gemini.
-    // If the server, browser tab, or network gets disrupted during processing,
-    // the audio is 100% safely persisted and can be recovered on reload.
-    saveAudioBlob('in_flight_recording', primaryBlob).catch(err => {
+    // Multi-tab isolated pre-save: pulse heartbeat and tag in_flight_recording_meta with current tabId
+    const currentTabId = getTabId();
+    markTabActive('processing');
+    const processingHeartbeatTimer = setInterval(() => {
+      markTabActive('processing');
+    }, 3000);
+
+    saveAudioBlob(`in_flight_recording_${currentTabId}`, primaryBlob).catch(err => {
       console.warn("Could not pre-save in-flight audio:", err);
     });
     try {
-      localStorage.setItem('in_flight_recording_meta', JSON.stringify({
+      safeLocalStorage.setItem(`in_flight_recording_meta_${currentTabId}`, {
+        tabId: currentTabId,
         timestamp: Date.now(),
         type: primaryBlob.type || 'audio/webm',
         size: primaryBlob.size,
-      }));
+      });
+      safeLocalStorage.setItem('in_flight_recording_meta', {
+        tabId: currentTabId,
+        timestamp: Date.now(),
+        type: primaryBlob.type || 'audio/webm',
+        size: primaryBlob.size,
+      });
     } catch (_) {}
     setRecoveredInFlightAudio(null);
 
     try {
       const processedText = await processAudio(audioBlobs, selectedModel, customPrompt, customImages, undefined, customDocx);
+      clearInterval(processingHeartbeatTimer);
+      markTabActive('idle');
       if (processingRequestIdRef.current !== reqId) return; // cancelled
       setFindings(processedText);
 
@@ -535,12 +618,30 @@ const App: React.FC = () => {
       activeDictationIsLiveRef.current = false;
       driveSyncedHashRef.current = processedText.join('|||');
 
-      setStatus(AppStatus.Success);
-      window.scrollTo({ top: 0, behavior: 'instant' });
+      // Check if user has queued audio or is still actively recording concurrently
+      if (isConcurrentRecordingActiveRef.current) {
+        // User is currently recording into the simultaneous recorder! Keep status in Processing so AudioRecorder doesn't unmount
+      } else if (queuedConcurrentAudioRef.current) {
+        const queuedBlob = queuedConcurrentAudioRef.current as Blob;
+        queuedConcurrentAudioRef.current = null;
+        setIsSimultaneousQueued(false);
+        setStatus(AppStatus.Success);
+        window.scrollTo({ top: 0, behavior: 'instant' });
+        if (handleContinueDictationRef.current) {
+          handleContinueDictationRef.current(queuedBlob).catch(err => {
+            console.error("Queued dictation error:", err);
+          });
+        }
+      } else {
+        setStatus(AppStatus.Success);
+        window.scrollTo({ top: 0, behavior: 'instant' });
+      }
 
       // Processing succeeded! Safely clear the temporary in-flight backup
+      deleteAudioBlob(`in_flight_recording_${currentTabId}`).catch(() => {});
       deleteAudioBlob('in_flight_recording').catch(() => {});
       try {
+        localStorage.removeItem(`in_flight_recording_meta_${currentTabId}`);
         localStorage.removeItem('in_flight_recording_meta');
       } catch (_) {}
 
@@ -554,6 +655,8 @@ const App: React.FC = () => {
       // Trigger Hospital Workstation Auto-Sync if configured (pure report HTML)
       checkAndAutoSyncReport(300, { findings: processedText, timestamp });
     } catch (err) {
+      clearInterval(processingHeartbeatTimer);
+      markTabActive('idle');
       if (processingRequestIdRef.current !== reqId) return; // cancelled
       console.error(err);
       setError(err instanceof Error ? err.message : 'An unknown error occurred during processing.');
@@ -562,6 +665,31 @@ const App: React.FC = () => {
       // accidentally refreshes or closes the page on this Error screen, the audio is STILL preserved!
     }
   }, [selectedModel, customPrompt, customImages, customDocx]);
+
+  const handleConcurrentRecordingComplete = useCallback(async (newAudioInput: Blob | Blob[]) => {
+    isConcurrentRecordingActiveRef.current = false;
+    setConcurrentRecordingStatus(AppStatus.Idle);
+    const audioBlobs = Array.isArray(newAudioInput) ? newAudioInput : [newAudioInput];
+    if (audioBlobs.length === 0 || audioBlobs.every(b => !b || b.size === 0)) return;
+    const newBlob = audioBlobs[0];
+
+    // If initial dictation is still running processAudio:
+    if (status === AppStatus.Processing && findings.length === 0) {
+      queuedConcurrentAudioRef.current = newBlob;
+      setIsSimultaneousQueued(true);
+    } else {
+      // Findings are ready or status transitioned:
+      setStatus(AppStatus.Success);
+      window.scrollTo({ top: 0, behavior: 'instant' });
+      if (handleContinueDictationRef.current) {
+        try {
+          await handleContinueDictationRef.current(newBlob);
+        } catch (err) {
+          console.error("Concurrent dictation continuation error:", err);
+        }
+      }
+    }
+  }, [status, findings]);
   
   const handleLiveDictationComplete = useCallback(async (transcript: string, audioBlob: Blob | null) => {
     const reqId = ++processingRequestIdRef.current;
@@ -712,6 +840,31 @@ const App: React.FC = () => {
     }
   }, [audioBlob, selectedModel, customPrompt, customImages, customDocx, findings]);
 
+  const driveEditDebounceTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  const debouncedDriveAutoSave = useCallback((updatedFindings: string[]) => {
+    if (!isDriveConnected() || updatedFindings.length === 0) return;
+    if (driveEditDebounceTimerRef.current) {
+      clearTimeout(driveEditDebounceTimerRef.current);
+    }
+    driveEditDebounceTimerRef.current = setTimeout(() => {
+      const timestamp = activeDictationTimestampRef.current || Date.now();
+      const currentHash = updatedFindings.join('|||');
+      if (currentHash === driveSyncedHashRef.current) return;
+      driveSyncedHashRef.current = currentHash;
+
+      const savePromise = activeDictationIsLiveRef.current
+        ? autoSaveLiveDictation(updatedFindings, timestamp)
+        : autoSaveSingleDictation(updatedFindings, undefined, timestamp);
+
+      savePromise.then(res => {
+        if (res.success) {
+          setDriveSaveResult(res);
+        }
+      }).catch(err => console.warn('Drive edit auto-save notice:', err));
+    }, 1500);
+  }, []);
+
   const handleUpdateFinding = (index: number, newText: string) => {
     let updatedFindingsToSync: string[] = [];
     setFindings(prevFindings => {
@@ -723,12 +876,14 @@ const App: React.FC = () => {
       return updatedFindings;
     });
     checkAndAutoSyncReport(400, { findings: updatedFindingsToSync, timestamp: activeDictationTimestampRef.current || Date.now() });
+    debouncedDriveAutoSave(updatedFindingsToSync);
   };
 
   const handleAllFindingsUpdate = useCallback((newFindings: string[]) => {
     const expanded = expandMacrosInFindings(newFindings);
     setFindings(expanded);
     checkAndAutoSyncReport(400, { findings: expanded, timestamp: activeDictationTimestampRef.current || Date.now() });
+    debouncedDriveAutoSave(expanded);
   }, []);
 
   const handleAudioBlobUpdate = useCallback((newBlob: Blob) => {
@@ -813,6 +968,7 @@ const App: React.FC = () => {
       throw err; // Propagate error to the UI component
     }
   }, [audioBlob, findings, selectedModel, customPrompt, customImages]);
+  handleContinueDictationRef.current = handleContinueDictation;
 
   const handleSendMessage = async (message: string | Blob) => {
     if (!chat || isChatting) return;
@@ -850,7 +1006,7 @@ const App: React.FC = () => {
   };
 
   const resetSingleMode = () => {
-    // If there was active session content, snapshot it for the Undo Snackbar
+    // 1. If there was active session content, hold it in RAM memory ONLY for the 15-second Undo window
     if (findings.length > 0 || audioBlob !== null) {
       previousSingleSessionRef.current = {
         findings: [...findings],
@@ -882,25 +1038,31 @@ const App: React.FC = () => {
           if (prev.secondsRemaining <= 1) {
             clearInterval(undoCountdownIntervalRef.current!);
             undoCountdownIntervalRef.current = null;
-            // Now finalize cleanup of persistent storage
-            try {
-              localStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
-              deleteAudioBlob('single_mode_audio').catch(() => {});
-            } catch (e) {}
+            // 15 seconds elapsed without undo: permanently discard RAM copy!
             previousSingleSessionRef.current = null;
             return null;
           }
           return { ...prev, secondsRemaining: prev.secondsRemaining - 1 };
         });
       }, 1000);
-    } else {
-      // Nothing to undo, perform instant cleanup
-      try {
-        localStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
-        deleteAudioBlob('single_mode_audio').catch(() => {});
-      } catch (error) {
-        console.error("Failed to remove item from localStorage:", error);
-      }
+    }
+
+    // 2. WIPE PERSISTENT STORAGE IMMEDIATELY AT SECOND 0 FOR THIS TAB!
+    try {
+      const curTabId = getTabId();
+      const singleKey = getSingleModeStorageKey(curTabId);
+      const audioKey = getSingleModeAudioKey(curTabId);
+      safeLocalStorage.removeItem(singleKey);
+      safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
+      deleteAudioBlob(audioKey).catch(() => {});
+      deleteAudioBlob('single_mode_audio').catch(() => {});
+      deleteReportSession(singleKey).catch(() => {});
+      deleteReportSession(SINGLE_MODE_STORAGE_KEY).catch(() => {});
+      deleteAudioBlob(`in_flight_recording_${curTabId}`).catch(() => {});
+      safeLocalStorage.removeItem(`in_flight_recording_meta_${curTabId}`);
+      safeLocalStorage.removeItem(`has_unsaved_session_${curTabId}`);
+    } catch (e) {
+      console.warn("Storage wipe on reset:", e);
     }
 
     // Reset workspace to idle immediately so user can record right away without confirmation friction
@@ -921,6 +1083,7 @@ const App: React.FC = () => {
       setCustomDocx(null);
     }
     setCustomImages([]);
+    setSingleExtraFiles([]);
     setIdentifiedErrors([]);
     setErrorCheckStatus('idle');
     activeDictationTimestampRef.current = null;
@@ -969,9 +1132,14 @@ const App: React.FC = () => {
         isLive: prev.isLive,
         driveSyncedHash: prev.driveSyncedHash,
       };
-      localStorage.setItem(SINGLE_MODE_STORAGE_KEY, JSON.stringify(stateToSave));
+      const curTabId = getTabId();
+      const singleKey = getSingleModeStorageKey(curTabId);
+      const audioKey = getSingleModeAudioKey(curTabId);
+      await saveReportSession(singleKey, stateToSave);
+      safeLocalStorage.removeItem(singleKey);
+      safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
       if (prev.audioBlob) {
-        await saveAudioBlob('single_mode_audio', prev.audioBlob);
+        await saveAudioBlob(audioKey, prev.audioBlob);
       }
     } catch (e) {
       console.warn("Failed to re-persist undone session:", e);
@@ -1000,8 +1168,15 @@ const App: React.FC = () => {
     }
     setUndoSnackbar(null);
     try {
-      localStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
+      const curTabId = getTabId();
+      const singleKey = getSingleModeStorageKey(curTabId);
+      const audioKey = getSingleModeAudioKey(curTabId);
+      safeLocalStorage.removeItem(singleKey);
+      safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
+      deleteAudioBlob(audioKey).catch(() => {});
       deleteAudioBlob('single_mode_audio').catch(() => {});
+      deleteReportSession(singleKey).catch(() => {});
+      deleteReportSession(SINGLE_MODE_STORAGE_KEY).catch(() => {});
     } catch (e) {}
     previousSingleSessionRef.current = null;
   };
@@ -1064,37 +1239,65 @@ const App: React.FC = () => {
         );
       case AppStatus.Processing:
         return (
-          <div className="text-center p-8">
-            <Spinner />
-            <p className="text-slate-600 dark:text-slate-300 mt-4 text-lg font-medium">
-              Analyzing and correcting text...
-            </p>
-            <p className="text-slate-500 dark:text-slate-400 mt-2 text-sm">
-              This may take a moment.
-            </p>
-            <div className="mt-6 flex flex-wrap justify-center items-center gap-3">
-              <button
-                onClick={handleCancelProcessing}
-                className="inline-flex items-center gap-2 bg-red-100 text-red-700 hover:bg-red-200 dark:bg-red-900/40 dark:text-red-300 dark:hover:bg-red-900/70 font-semibold py-2 px-5 rounded-lg border border-red-300 dark:border-red-700 transition-colors shadow-sm text-sm"
-                aria-label="Cancel Analysis"
-              >
-                <StopIcon className="w-4 h-4" /> Cancel Analysis
-              </button>
-              {audioBlob && (
+          <div className="space-y-6 animate-fade-in">
+            <div className="bg-blue-50/90 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 rounded-2xl p-5 shadow-sm text-center">
+              <Spinner className="w-8 h-8 mx-auto text-blue-600 dark:text-blue-400" />
+              <p className="text-slate-800 dark:text-slate-100 mt-3 text-lg font-bold">
+                {isConcurrentRecordingActiveRef.current 
+                  ? 'First dictation processed! Still capturing your ongoing dictation...' 
+                  : 'Analyzing and correcting previous dictation...'}
+              </p>
+              <p className="text-slate-600 dark:text-slate-300 mt-1 text-sm font-medium">
+                {isSimultaneousQueued
+                  ? '✓ Next dictation captured and queued — will auto-merge as soon as processing completes.'
+                  : 'Simultaneous dictation active: You can dictate your next finding below right now while this is processing!'}
+              </p>
+              <div className="mt-4 flex flex-wrap justify-center items-center gap-3">
                 <button
-                  onClick={handleDownload}
-                  className="inline-flex items-center gap-2 bg-slate-600 text-white font-semibold py-2 px-5 rounded-lg hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-400 focus:ring-opacity-50 transition-colors shadow-sm text-sm"
-                  aria-label="Download Audio / File"
+                  onClick={handleCancelProcessing}
+                  className="inline-flex items-center gap-2 bg-red-100 text-red-700 hover:bg-red-200 dark:bg-red-900/40 dark:text-red-300 dark:hover:bg-red-900/70 font-semibold py-2 px-5 rounded-lg border border-red-300 dark:border-red-700 transition-colors shadow-sm text-sm cursor-pointer"
+                  aria-label="Cancel Analysis"
                 >
-                  <DownloadIcon className="w-4 h-4" /> Download Audio / File
+                  <StopIcon className="w-4 h-4" /> Cancel Analysis
                 </button>
-              )}
+                {audioBlob && (
+                  <button
+                    onClick={handleDownload}
+                    className="inline-flex items-center gap-2 bg-slate-600 text-white font-semibold py-2 px-5 rounded-lg hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-400 focus:ring-opacity-50 transition-colors shadow-sm text-sm cursor-pointer"
+                    aria-label="Download Audio / File"
+                  >
+                    <DownloadIcon className="w-4 h-4" /> Download Audio
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="border border-emerald-200 dark:border-emerald-800/60 bg-emerald-50/40 dark:bg-emerald-950/20 rounded-2xl p-4 sm:p-5 shadow-sm">
+              <div className="flex items-center justify-between mb-3 px-1">
+                <span className="text-sm font-bold text-emerald-800 dark:text-emerald-200 flex items-center gap-2">
+                  <MicIcon className="w-4 h-4 text-emerald-600 animate-pulse" />
+                  Simultaneous Dictation (Dictate while loading)
+                </span>
+                <span className="text-xs bg-emerald-200/70 dark:bg-emerald-900/60 text-emerald-800 dark:text-emerald-200 px-2.5 py-0.5 rounded-full font-semibold">
+                  Queue Active
+                </span>
+              </div>
+              <AudioRecorder
+                status={concurrentRecordingStatus}
+                setStatus={(newSt) => {
+                  setConcurrentRecordingStatus(newSt);
+                  isConcurrentRecordingActiveRef.current = (newSt === AppStatus.Recording);
+                }}
+                onRecordingComplete={handleConcurrentRecordingComplete}
+                onMultipleFilesUploaded={(files) => setMultipleFilesModal(files)}
+              />
             </div>
           </div>
         );
       case AppStatus.Success:
         return (
-          <ResultsDisplay 
+          <ErrorBoundary sectionName="Results Display" onReset={resetSingleMode}>
+            <ResultsDisplay 
             findings={findings} 
             onReset={resetSingleMode} 
             audioBlob={audioBlob}
@@ -1115,10 +1318,12 @@ const App: React.FC = () => {
             onCustomImagesChange={setCustomImages}
             customDocx={customDocx}
             onCustomDocxChange={setCustomDocx}
+            initialExtraFiles={singleExtraFiles}
             identifiedErrors={identifiedErrors}
             errorCheckStatus={errorCheckStatus}
             onOpenMacrosModal={() => setIsMacrosModalOpen(true)}
-          />
+            />
+          </ErrorBoundary>
         );
       case AppStatus.Error:
         return (
@@ -1200,12 +1405,97 @@ const App: React.FC = () => {
     }
   };
 
+  const handleApplyAutonomousBatches = async (newBatches: Array<{
+    id?: string;
+    name: string;
+    findings: string[];
+    audioBlobs: Blob[];
+    selectedModel: string;
+    customPrompt?: string;
+    customDocx?: DocxTemplateData | null;
+    customImages?: Array<{ data: string; mimeType: string }>;
+    extraFiles?: File[];
+  }>) => {
+    try {
+      const currentTabId = getTabId();
+      const curBatchKey = getBatchModeStorageKey(currentTabId);
+      let currentBatches: any[] = (await getReportSession(curBatchKey)) || (await getReportSession('radiologyDictationBatchMode')) || [];
+      if (!currentBatches || currentBatches.length === 0) {
+        const currentBatchesRaw = localStorage.getItem(curBatchKey) || localStorage.getItem('radiologyDictationBatchMode');
+        currentBatches = currentBatchesRaw ? JSON.parse(currentBatchesRaw) : [];
+      }
+      
+      for (let idx = 0; idx < newBatches.length; idx++) {
+        const b = newBatches[idx];
+        const incomingName = (b.name || '').trim().toLowerCase();
+        
+        // Match existing batch by ID, or by patient name
+        const existingIdx = currentBatches.findIndex(existing => {
+          if (b.id && existing.id === b.id) return true;
+          const existName = (existing.name || '').trim().toLowerCase();
+          return existName === incomingName;
+        });
+
+        const batchId = existingIdx !== -1 
+          ? currentBatches[existingIdx].id 
+          : (b.id || `batch-auto-${Date.now()}-${idx}`);
+
+        // Save audio blobs to IndexedDB if provided
+        if (b.audioBlobs && b.audioBlobs.length > 0) {
+          for (let bIdx = 0; bIdx < b.audioBlobs.length; bIdx++) {
+            try {
+              await saveAudioBlob(`batch_audio_${currentTabId}_${batchId}_${bIdx}`, b.audioBlobs[bIdx]);
+              await saveAudioBlob(`batch_audio_${batchId}_${bIdx}`, b.audioBlobs[bIdx]);
+            } catch (e) {
+              console.warn('Failed to save batch audio blob to IndexedDB:', e);
+            }
+          }
+        }
+
+        const formattedBatch = {
+          id: batchId,
+          name: b.name,
+          audioCount: b.audioBlobs && b.audioBlobs.length > 0 
+            ? b.audioBlobs.length 
+            : (existingIdx !== -1 ? currentBatches[existingIdx].audioCount : 0),
+          findings: b.findings,
+          status: 'complete',
+          selectedModel: b.selectedModel || selectedModel,
+          customPrompt: b.customPrompt || (existingIdx !== -1 ? currentBatches[existingIdx].customPrompt : ''),
+          customDocx: b.customDocx !== undefined ? b.customDocx : (existingIdx !== -1 ? currentBatches[existingIdx].customDocx : null),
+          customImages: b.customImages || (existingIdx !== -1 ? currentBatches[existingIdx].customImages : []),
+          extraFiles: b.extraFiles || (existingIdx !== -1 ? currentBatches[existingIdx].extraFiles : []),
+        };
+
+        if (existingIdx !== -1) {
+          // Replace previous version in-place so modified version stays where it is
+          currentBatches[existingIdx] = {
+            ...currentBatches[existingIdx],
+            ...formattedBatch,
+          };
+        } else {
+          // New patient: append to batch queue
+          currentBatches.push(formattedBatch);
+        }
+      }
+
+      await saveReportSession(curBatchKey, currentBatches);
+      safeLocalStorage.removeItem(curBatchKey);
+      safeLocalStorage.removeItem('radiologyDictationBatchMode');
+      await deleteReportSession('radiologyDictationBatchMode').catch(() => {});
+    } catch (e) {
+      console.warn('Failed to save/update autonomous batches in storage:', e);
+    }
+  };
+
   const renderContent = () => {
     switch (mode) {
       case 'single':
         return renderSingleModeContent();
       case 'batch':
-        return <BatchProcessor 
+        return (
+          <ErrorBoundary sectionName="Batch Mode" onReset={() => setMode('single')}>
+            <BatchProcessor 
                     selectedModel={selectedModel} 
                     isErrorCheckEnabled={isErrorCheckEnabled}
                     initialFiles={pendingBatchFiles}
@@ -1218,28 +1508,70 @@ const App: React.FC = () => {
                         resetSingleMode();
                         setMode('single');
                     }} 
-                />;
+                />
+          </ErrorBoundary>
+        );
       case 'live':
-        return <LiveDictation onComplete={handleLiveDictationComplete} onBack={() => setMode('single')} onOpenMacrosModal={() => setIsMacrosModalOpen(true)} />;
+        return (
+          <ErrorBoundary sectionName="Live Dictation" onReset={() => setMode('single')}>
+            <LiveDictation onComplete={handleLiveDictationComplete} onBack={() => setMode('single')} onOpenMacrosModal={() => setIsMacrosModalOpen(true)} />
+          </ErrorBoundary>
+        );
+      case 'autonomous':
+        return null;
       default:
         return renderSingleModeContent();
     }
-  }
+  };
 
   const getPageDescription = () => {
+    if (mode === 'autonomous') return 'Dictate naturally to orchestrate Single Mode, Batch Mode, Templates, File Handovers, and Exports in one step.';
     if (mode === 'batch') return 'Manage and transcribe multiple dictations efficiently.';
     if (mode === 'live') return 'Dictate in real-time and get an instant, corrected transcript.';
     return 'Record your findings, and let AI provide a clean, corrected transcript.';
   };
 
+  const isWideView = mode === 'batch' || mode === 'autonomous' || status === AppStatus.Success;
 
-  const isWideView = mode === 'batch' || status === AppStatus.Success;
-
-  const handleLoadReportFindings = (loadedFindings: string[], reportName: string) => {
+  const handleLoadReportFindings = (
+    loadedFindings: string[], 
+    reportName: string, 
+    loadedAudioBlob?: Blob | null,
+    loadedImages?: Array<{ data: string; mimeType: string }>,
+    loadedExtraFiles?: File[],
+    loadedPrompt?: string,
+    loadedDocx?: DocxTemplateData | null,
+    templateUsed?: string
+  ) => {
     setFindings(loadedFindings);
     setStatus(AppStatus.Success);
     setMode('single');
-    setAudioBlob(null);
+    if (loadedAudioBlob) {
+      setAudioBlob(loadedAudioBlob);
+      try {
+        saveAudioBlob('single_audio_blob', loadedAudioBlob);
+      } catch (e) {
+        console.warn('Failed to save audio blob:', e);
+      }
+    } else {
+      setAudioBlob(null);
+    }
+    if (loadedImages && loadedImages.length > 0) {
+      setCustomImages(loadedImages);
+    }
+    if (loadedExtraFiles && loadedExtraFiles.length > 0) {
+      setSingleExtraFiles(loadedExtraFiles);
+    } else {
+      setSingleExtraFiles([]);
+    }
+    if (loadedPrompt) {
+      setCustomPrompt(loadedPrompt);
+    } else if (templateUsed) {
+      setCustomPrompt(`[TEMPLATE_ID: ${templateUsed}] Merged with template: ${templateUsed}`);
+    }
+    if (loadedDocx) {
+      setCustomDocx(loadedDocx);
+    }
     setError(null);
     setDriveSaveResult({
       success: true,
@@ -1463,12 +1795,25 @@ const App: React.FC = () => {
                 <WaveformIcon className="w-4 h-4 shrink-0" />
                 <span className="whitespace-nowrap">Live Stream</span>
               </button>
+              <button
+                type="button"
+                onClick={() => setMode('autonomous')}
+                className={`flex-1 sm:flex-initial flex items-center justify-center gap-1.5 sm:gap-2 px-3 sm:px-5 py-2 rounded-lg text-xs sm:text-sm font-semibold transition-all min-h-[44px] ${
+                  mode === 'autonomous'
+                    ? 'bg-gradient-to-r from-blue-600 via-indigo-600 to-purple-600 text-white shadow-md'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+                }`}
+                aria-label="Autonomous Mode"
+              >
+                <span className="text-sm shrink-0">⚡</span>
+                <span className="whitespace-nowrap font-bold">Autonomous</span>
+              </button>
             </nav>
           </div>
 
           {/* Settings Bar */}
           <div className="mt-4 flex flex-col sm:flex-row justify-center items-center gap-3 sm:gap-6 bg-slate-100/80 dark:bg-slate-800/60 p-2.5 sm:p-2.5 rounded-xl border border-slate-200/70 dark:border-slate-700/60 max-w-xl mx-auto">
-              {status === AppStatus.Idle && (mode === 'single' || mode === 'batch') && (
+              {status === AppStatus.Idle && (mode === 'single' || mode === 'batch' || mode === 'autonomous') && (
                   <div className="flex items-center gap-2 w-full sm:w-auto justify-between sm:justify-start">
                       <label htmlFor="model-select" className="text-xs sm:text-sm font-semibold text-slate-700 dark:text-slate-300 whitespace-nowrap">AI Model:</label>
                       <select 
@@ -1589,6 +1934,19 @@ const App: React.FC = () => {
 
         {/* Main Content Card */}
         <main className="bg-white dark:bg-slate-800 rounded-2xl shadow-xl p-3.5 sm:p-6 md:p-8 min-h-[300px] border border-slate-100 dark:border-slate-700/50 transition-all">
+          <div className={mode === 'autonomous' ? 'block' : 'hidden'}>
+            <ErrorBoundary sectionName="Autonomous Mode" onReset={() => setMode('single')}>
+              <AutonomousModeView
+                selectedModel={selectedModel}
+                onApplyBatchReports={handleApplyAutonomousBatches}
+                onNavigateToBatch={() => setMode('batch')}
+                onSaveToDrive={(res) => {
+                  setDriveSaveResult(res);
+                  checkAndAutoSyncReport(300);
+                }}
+              />
+            </ErrorBoundary>
+          </div>
           {renderContent()}
         </main>
         
