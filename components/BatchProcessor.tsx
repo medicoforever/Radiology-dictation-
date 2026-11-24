@@ -3,7 +3,7 @@ import { useAudioRecorder } from '../hooks/useAudioRecorder';
 import { processAudio, createChat, blobToBase64, continueAudioDictation, base64ToBlob, modifyFindingWithAudio, modifyReportWithAudio, identifyPotentialErrors, runComplexImpressionGeneration, transcribeAudioForPrompt, detectAndExtractTemplate, mergeDictatedFindingsWithTemplate } from '../services/geminiService';
 import { saveAudioBlob, getAudioBlob, clearUnusedAudioBlobs, saveReportSession, getReportSession, deleteReportSession } from '../services/audioStorage';
 import { mergeMultipleAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
-import { ClipboardPaste, X, CheckSquare } from 'lucide-react';
+import { ClipboardPaste, X, CheckSquare, Sparkles } from 'lucide-react';
 import { safeLocalStorage, markTabActive, getTabId, getBatchModeStorageKey } from '../services/storageService';
 import PasteTextModal from './PasteTextModal';
 import RichTextReportEditor from './RichTextReportEditor';
@@ -3153,6 +3153,38 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                     >
                                                         <StopIcon className="w-4 h-4" /> Cancel Analysis
                                                     </button>
+                                                </div>
+
+                                                {/* In-Flight Template Attachment in Batch Mode */}
+                                                <div className="mt-6 max-w-xl mx-auto border border-indigo-200 dark:border-indigo-800/70 bg-indigo-50/40 dark:bg-indigo-950/20 rounded-xl p-4 text-left shadow-sm">
+                                                    <div className="flex items-center justify-between mb-2">
+                                                        <span className="text-xs font-bold text-indigo-900 dark:text-indigo-200 flex items-center gap-1.5">
+                                                            <Sparkles className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
+                                                            Attach / Change Template for this In-Flight Batch
+                                                        </span>
+                                                        <span className="text-[11px] bg-indigo-100 dark:bg-indigo-900/60 text-indigo-800 dark:text-indigo-200 px-2 py-0.5 rounded-full font-semibold">
+                                                            Merge On-the-Fly
+                                                        </span>
+                                                    </div>
+                                                    <CustomPromptInput
+                                                        prompt={batch.customPrompt}
+                                                        onPromptChange={(p) => updateBatchCustomPrompt(batch.id, p)}
+                                                        images={batch.customImages || []}
+                                                        onImagesChange={(imgs) => updateBatchCustomImages(batch.id, imgs)}
+                                                        customDocx={batch.customDocx}
+                                                        onCustomDocxChange={(docx) => updateBatchCustomDocx(batch.id, docx)}
+                                                        selectedModel={batch.selectedModel || selectedModel}
+                                                        className="mb-3"
+                                                    />
+                                                    <div className="flex justify-end">
+                                                        <button
+                                                            onClick={() => handleReprocessBatch(batch.id)}
+                                                            className="flex items-center gap-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold py-2 px-4 rounded-xl shadow-sm transition-all cursor-pointer"
+                                                        >
+                                                            <Sparkles className="w-4 h-4" />
+                                                            Apply Template &amp; Re-process Batch Now
+                                                        </button>
+                                                    </div>
                                                 </div>
                                             </div>
                                         ) : batch.findings ? (
