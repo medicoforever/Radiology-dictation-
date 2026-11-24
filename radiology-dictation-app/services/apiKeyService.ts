@@ -360,8 +360,13 @@ export async function executeWithApiKeyFailover<T>(
     selectedModel?: string;
     maxTries?: number;
     delayMs?: number;
+    abortSignal?: AbortSignal;
   }
 ): Promise<T> {
+  if (options?.abortSignal?.aborted) {
+    throw new DOMException('Aborted by user', 'AbortError');
+  }
+
   const { candidateKeys, isCustom } = getCandidateKeysForOperation();
   if (!candidateKeys || candidateKeys.length === 0) {
     throw new Error("No Gemini API key found. Please click 'API Keys' at the top to add your free Gemini API key, or enter the secret access key.");
@@ -374,6 +379,10 @@ export async function executeWithApiKeyFailover<T>(
   let lastError: any = null;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (options?.abortSignal?.aborted) {
+      throw new DOMException('Aborted by user', 'AbortError');
+    }
+
     const currentKey = candidateKeys[attempt];
     const masked = maskApiKey(currentKey);
     const client = getClientForApiKey(currentKey);
@@ -388,6 +397,9 @@ export async function executeWithApiKeyFailover<T>(
       const result = await operation(client, currentKey);
       return result;
     } catch (err: any) {
+      if (err?.name === 'AbortError' || options?.abortSignal?.aborted) {
+        throw err;
+      }
       lastError = err;
       const errMsg = err?.message || String(err);
       console.warn(
@@ -396,9 +408,18 @@ export async function executeWithApiKeyFailover<T>(
 
       // If we still have candidate keys remaining, wait with timing delay between trying different keys
       if (attempt < maxAttempts - 1) {
+        if (options?.abortSignal?.aborted) {
+          throw new DOMException('Aborted by user', 'AbortError');
+        }
         const retryDelayMs = options?.delayMs ?? 1000;
         console.info(`[API Key Failover] Waiting ${retryDelayMs}ms before retrying with next random key...`);
-        await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+        await new Promise((resolve, reject) => {
+          const timeout = setTimeout(resolve, retryDelayMs);
+          options?.abortSignal?.addEventListener('abort', () => {
+            clearTimeout(timeout);
+            reject(new DOMException('Aborted by user', 'AbortError'));
+          }, { once: true });
+        });
         continue;
       }
     }

@@ -207,6 +207,12 @@ const App: React.FC = () => {
 
   const [driveSaveResult, setDriveSaveResult] = useState<SaveResult | null>(null);
   const processingRequestIdRef = useRef<number>(0);
+  const inFlightAbortControllerRef = useRef<AbortController | null>(null);
+  const handleRecordingCompleteRef = useRef<(audioInput: Blob | Blob[], overridePrompt?: string, overrideDocx?: any) => Promise<void>>(() => Promise.resolve());
+  const customPromptRef = useRef<string>(customPrompt);
+  customPromptRef.current = customPrompt;
+  const customDocxRef = useRef<DocxTemplateData | null>(customDocx);
+  customDocxRef.current = customDocx;
   const activeDictationTimestampRef = useRef<number | null>(null);
   const activeDictationIsLiveRef = useRef<boolean>(false);
   const driveSyncedHashRef = useRef<string | null>(null);
@@ -536,6 +542,12 @@ const App: React.FC = () => {
 
 
   const handleCancelProcessing = useCallback(() => {
+    if (inFlightAbortControllerRef.current) {
+      try {
+        inFlightAbortControllerRef.current.abort();
+      } catch (_) {}
+      inFlightAbortControllerRef.current = null;
+    }
     processingRequestIdRef.current++;
     queuedConcurrentAudiosRef.current = [];
     setQueuedAudiosCount(0);
@@ -561,7 +573,7 @@ const App: React.FC = () => {
     if (!audio) return;
     setRecoveredInFlightAudio(null);
     setMode('single');
-    handleRecordingComplete(audio);
+    handleRecordingCompleteRef.current(audio);
   }, [recoveredInFlightAudio]);
 
   const handleDownloadRecoveredAudio = useCallback(() => {
@@ -777,16 +789,20 @@ const App: React.FC = () => {
     }
   }, [selectedModel, customPrompt, customImages, customDocx]);
 
-  const handleApplyTemplateToInFlight = useCallback(async () => {
-    const audioToReprocess = firstDictationAudioRef.current || (Array.isArray(audioBlob) ? audioBlob[0] : audioBlob);
-    if (!audioToReprocess) return;
-    setTemplateMergeFeedback("✓ Template merged! Re-processing in-flight dictation with template layout...");
-    setTimeout(() => setTemplateMergeFeedback(null), 5000);
-    processingRequestIdRef.current++;
-    await handleRecordingComplete(audioToReprocess);
-  }, [audioBlob, handleRecordingComplete]);
+  const handleRecordingComplete = useCallback(async (
+    audioInput: Blob | Blob[],
+    overridePrompt?: string,
+    overrideDocx?: DocxTemplateData | null
+  ) => {
+    // 0. Immediately abort any active in-flight network request
+    if (inFlightAbortControllerRef.current) {
+      try {
+        inFlightAbortControllerRef.current.abort();
+      } catch (_) {}
+    }
+    const currentAbortController = new AbortController();
+    inFlightAbortControllerRef.current = currentAbortController;
 
-  const handleRecordingComplete = useCallback(async (audioInput: Blob | Blob[]) => {
     if (undoCountdownIntervalRef.current) {
       clearInterval(undoCountdownIntervalRef.current);
       undoCountdownIntervalRef.current = null;
@@ -846,11 +862,22 @@ const App: React.FC = () => {
     } catch (_) {}
     setRecoveredInFlightAudio(null);
 
+    const promptToUse = overridePrompt !== undefined ? overridePrompt : customPromptRef.current;
+    const docxToUse = overrideDocx !== undefined ? overrideDocx : customDocxRef.current;
+
     try {
-      const processedText = await processAudio(audioBlobs, selectedModel, customPrompt, customImages, undefined, customDocx);
+      const processedText = await processAudio(
+        audioBlobs,
+        selectedModel,
+        promptToUse,
+        customImages,
+        undefined,
+        docxToUse,
+        currentAbortController.signal
+      );
       clearInterval(processingHeartbeatTimer);
       markTabActive('idle');
-      if (processingRequestIdRef.current !== reqId) return; // cancelled or template re-triggered
+      if (currentAbortController.signal.aborted || processingRequestIdRef.current !== reqId) return; // cancelled or template re-triggered
 
       isFirstDictationProcessingRef.current = false;
       firstDictationFindingsRef.current = processedText;
@@ -873,7 +900,7 @@ const App: React.FC = () => {
       }
 
       try {
-        const chatSession = await createChat(audioBlobs, processedText, customPrompt, customImages, selectedModel);
+        const chatSession = await createChat(audioBlobs, processedText, promptToUse, customImages, selectedModel);
         if (processingRequestIdRef.current === reqId) {
           setChat(chatSession);
         }
@@ -906,11 +933,13 @@ const App: React.FC = () => {
           setDriveSaveResult(result);
         }
       }).catch(err => console.warn('Drive auto-save background notice:', err));
-    } catch (err) {
+    } catch (err: any) {
       clearInterval(processingHeartbeatTimer);
       markTabActive('idle');
       isFirstDictationProcessingRef.current = false;
-      if (processingRequestIdRef.current !== reqId) return; // cancelled
+      if (currentAbortController.signal.aborted || err?.name === 'AbortError' || processingRequestIdRef.current !== reqId) {
+        return; // cancelled / aborted, do not show error
+      }
       console.error(err);
 
       const errMessage = err instanceof Error ? err.message : 'An unknown error occurred during processing.';
@@ -937,7 +966,33 @@ const App: React.FC = () => {
       setError(errMessage);
       setStatus(AppStatus.Error);
     }
-  }, [selectedModel, customPrompt, customImages, customDocx, separateConcurrentDictationsToBatch]);
+  }, [selectedModel, customImages, separateConcurrentDictationsToBatch]);
+
+  handleRecordingCompleteRef.current = handleRecordingComplete;
+
+  const handleApplyTemplateToInFlight = useCallback(async (
+    overridePrompt?: string,
+    overrideDocx?: DocxTemplateData | null
+  ) => {
+    const audioToReprocess = firstDictationAudioRef.current || (Array.isArray(audioBlob) ? audioBlob[0] : audioBlob);
+    if (!audioToReprocess) return;
+
+    // Immediately abort any current in-flight network call
+    if (inFlightAbortControllerRef.current) {
+      try {
+        inFlightAbortControllerRef.current.abort();
+      } catch (_) {}
+      inFlightAbortControllerRef.current = null;
+    }
+
+    setTemplateMergeFeedback("✓ In-flight dictation aborted! Re-processing audio unified with selected template...");
+    setTimeout(() => setTemplateMergeFeedback(null), 6000);
+
+    const promptToUse = overridePrompt !== undefined ? overridePrompt : customPromptRef.current;
+    const docxToUse = overrideDocx !== undefined ? overrideDocx : customDocxRef.current;
+
+    await handleRecordingComplete(audioToReprocess, promptToUse, docxToUse);
+  }, [audioBlob, handleRecordingComplete]);
 
   const handleConcurrentRecordingComplete = useCallback(async (newAudioInput: Blob | Blob[]) => {
     isConcurrentRecordingActiveRef.current = false;
@@ -1763,12 +1818,15 @@ const App: React.FC = () => {
                   onImagesChange={setCustomImages}
                   customDocx={customDocx}
                   onCustomDocxChange={setCustomDocx}
+                  onTemplateApplied={(newPrompt, newDocx) => {
+                    handleApplyTemplateToInFlight(newPrompt, newDocx);
+                  }}
                   selectedModel={selectedModel}
                   className="mb-3"
                 />
                 <div className="flex justify-end">
                   <button
-                    onClick={handleApplyTemplateToInFlight}
+                    onClick={() => handleApplyTemplateToInFlight()}
                     className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-4 rounded-xl shadow-sm text-xs sm:text-sm transition-all cursor-pointer"
                   >
                     <Sparkles className="w-4 h-4" />

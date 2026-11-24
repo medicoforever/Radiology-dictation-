@@ -308,7 +308,8 @@ export async function generateContentWithJsonFallback(
   model: string,
   parts: any[],
   schema: any = responseSchema,
-  temperature: number = 0.1
+  temperature: number = 0.1,
+  abortSignal?: AbortSignal
 ): Promise<string> {
   const resolvedModel = resolveApiTargetModel(model);
 
@@ -360,7 +361,7 @@ export async function generateContentWithJsonFallback(
 
       return '';
     },
-    { selectedModel: resolvedModel }
+    { selectedModel: resolvedModel, abortSignal }
   );
 }
 
@@ -685,7 +686,8 @@ export const processAudio = async (
   customPrompt?: string,
   customImages?: Array<{ data: string; mimeType: string }> | null,
   existingFindings?: string[],
-  customDocx?: CustomDocxInput
+  customDocx?: CustomDocxInput,
+  abortSignal?: AbortSignal
 ): Promise<string[]> => {
   const audioBlobs = Array.isArray(audioBlob) ? audioBlob : [audioBlob];
   if (audioBlobs.length === 0) {
@@ -802,7 +804,7 @@ export const processAudio = async (
   const targetModel = resolveApiTargetModel(model);
 
   try {
-    const rawResponseText = await generateContentWithJsonFallback(targetModel, parts, responseSchema, 0.1);
+    const rawResponseText = await generateContentWithJsonFallback(targetModel, parts, responseSchema, 0.1, abortSignal);
     const findings = extractFindingsFromResponse(rawResponseText);
 
     if (findings && findings.length > 0) {
@@ -811,40 +813,24 @@ export const processAudio = async (
       throw new Error("Invalid data structure in API response. Expected a 'findings' array.");
     }
   } catch (error: any) {
+    if (error?.name === 'AbortError' || abortSignal?.aborted) {
+      throw error;
+    }
     console.warn("Gemini API call returned error, evaluating fallback:", error);
 
     // In MERGE MODE ALONE: If error is JSON mode unsupported or schema failure, retry cleanly with target model & raw JSON prompt
     if (templateInfo.isTemplateMode) {
       try {
-        const retryText = await generateContentWithJsonFallback(targetModel, parts, responseSchema, 0.1);
+        const retryText = await generateContentWithJsonFallback(targetModel, parts, responseSchema, 0.1, abortSignal);
         const parsedFindings = extractFindingsFromResponse(retryText);
         if (parsedFindings && parsedFindings.length > 0) {
           return parsedFindings;
         }
-      } catch (retryErr) {
-        console.warn("Merge mode fallback attempt error:", retryErr);
-      }
-
-      const selectedTemplate = findBuiltinTemplate(customPrompt);
-      if (selectedTemplate) {
-        if (selectedTemplate.lines && selectedTemplate.lines.length > 0) {
-          return selectedTemplate.lines;
+      } catch (retryErr: any) {
+        if (retryErr?.name === 'AbortError' || abortSignal?.aborted) {
+          throw retryErr;
         }
-        try {
-          const parsed = JSON.parse(selectedTemplate.content);
-          const findingsFallback: string[] = [
-            parsed.title || "RADIOLOGY REPORT",
-            "Clinical Profile: Routine evaluation.",
-          ];
-          if (parsed.technique && parsed.technique.trim() && !/standard imaging protocol was performed/i.test(parsed.technique)) {
-            findingsFallback.push(parsed.technique.trim());
-          }
-          if (parsed.normal_findings && parsed.normal_findings.length > 0) {
-            findingsFallback.push(...parsed.normal_findings.map((f: string) => `BOLD::${f}`));
-          }
-          findingsFallback.push(`IMPRESSION:###${parsed.default_impression || parsed.impression || 'Study within normal limits.'}`);
-          return findingsFallback;
-        } catch (e) {}
+        console.warn("Merge mode fallback attempt error:", retryErr);
       }
     }
 

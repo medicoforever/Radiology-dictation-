@@ -36,7 +36,8 @@ const CustomPromptInput: React.FC<{
   onCustomDocxChange?: (docx: DocxTemplateData | null) => void;
   isLiveMode?: boolean;
   selectedModel?: string;
-}> = ({ prompt, onPromptChange, className, images = [], onImagesChange, customDocx, onCustomDocxChange, isLiveMode = false, selectedModel }) => {
+  onTemplateApplied?: (prompt: string, docx?: DocxTemplateData | null) => void;
+}> = ({ prompt, onPromptChange, className, images = [], onImagesChange, customDocx, onCustomDocxChange, isLiveMode = false, selectedModel, onTemplateApplied }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const { isRecording, startRecording, stopRecording, error: recorderError } = useAudioRecorder();
@@ -239,13 +240,18 @@ const CustomPromptInput: React.FC<{
         }
       }
 
+      const combinedDocxObj: DocxTemplateData = {
+        name: `${template.map(t => t.name).join(' + ')}.docx`,
+        data: firstDocx,
+        size: firstDocx ? Math.round(firstDocx.length * 0.75) : 0,
+        extractedText: combinedExtractedText,
+      };
+
       if (onCustomDocxChange) {
-        onCustomDocxChange({
-          name: `${template.map(t => t.name).join(' + ')}.docx`,
-          data: firstDocx,
-          size: firstDocx ? Math.round(firstDocx.length * 0.75) : 0,
-          extractedText: combinedExtractedText,
-        });
+        onCustomDocxChange(combinedDocxObj);
+      }
+      if (onTemplateApplied) {
+        onTemplateApplied(promptText, combinedDocxObj);
       }
 
       setAppliedTemplateName(`Combined (${template.length}): ${template.map(t => t.name).join(' + ')}`);
@@ -269,14 +275,17 @@ const CustomPromptInput: React.FC<{
     }
 
     // 3. Always update customDocx so old template is guaranteed to be replaced!
+    const docxObj: DocxTemplateData = {
+      name: template.fileName || `${template.name}.docx`,
+      data: docx || '',
+      size: docx ? Math.round(docx.length * 0.75) : 0,
+      extractedText: template.lines ? template.lines.join('\n') : template.content,
+    };
     if (onCustomDocxChange) {
-      const extractedText = template.lines ? template.lines.join('\n') : template.content;
-      onCustomDocxChange({
-        name: template.fileName || `${template.name}.docx`,
-        data: docx || '',
-        size: docx ? Math.round(docx.length * 0.75) : 0,
-        extractedText,
-      });
+      onCustomDocxChange(docxObj);
+    }
+    if (onTemplateApplied) {
+      onTemplateApplied(promptText, docxObj);
     }
 
     setAppliedTemplateName(`Built-in ${template.name}`);
@@ -550,6 +559,9 @@ const CustomPromptInput: React.FC<{
     }
     if (onCustomDocxChange) {
       onCustomDocxChange(docxData);
+    }
+    if (onTemplateApplied) {
+      onTemplateApplied(promptText, docxData);
     }
     setAppliedTemplateName(forUpcoming ? `${template.name} (Active for Upcoming Reports)` : template.name);
     setTimeout(() => {
