@@ -1470,7 +1470,15 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     
     const handleReprocessBatch = async (batchId: string) => {
         const batch = batches.find(b => b.id === batchId);
-        const allBlobs = [...(batch?.audioBlobs || []), ...(batch?.extraFiles || [])];
+        let allBlobs = [...(batch?.audioBlobs || []), ...(batch?.extraFiles || [])];
+        if (!allBlobs.length && batch) {
+            const currentTabId = getTabId();
+            const storedBlob = (await getAudioBlob(`batch_audio_${currentTabId}_${batch.id}_0`)) ||
+                               (await getAudioBlob(`batch_audio_${batch.id}_0`));
+            if (storedBlob) {
+                allBlobs = [storedBlob];
+            }
+        }
         if (!batch || allBlobs.length === 0) return;
 
         if (batch && batch.findings) {
@@ -1837,9 +1845,18 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
 
 
     const handleDownload = async (batch: Batch) => {
-        if (!batch.audioBlobs.length) return;
+        let blobs = batch.audioBlobs;
+        if (!blobs || !blobs.length) {
+            const currentTabId = getTabId();
+            const storedBlob = (await getAudioBlob(`batch_audio_${currentTabId}_${batch.id}_0`)) ||
+                               (await getAudioBlob(`batch_audio_${batch.id}_0`));
+            if (storedBlob) {
+                blobs = [storedBlob];
+            }
+        }
+        if (!blobs || !blobs.length) return;
         try {
-            const mergedBlob = await mergeMultipleAudioBlobs(batch.audioBlobs);
+            const mergedBlob = await mergeMultipleAudioBlobs(blobs);
             triggerAudioDownload(mergedBlob, batch.name.replace(/\s+/g, '_'));
         } catch (err) {
             console.error('Failed to download audio:', err);
@@ -4172,7 +4189,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                 <h4 className="font-bold text-red-700 dark:text-red-300 text-base">An error occurred during processing</h4>
                                                 <p className="text-sm text-red-600 dark:text-red-400 mt-1 max-w-xl mx-auto font-medium">{batch.error || 'An unexpected error occurred.'}</p>
                                                 <p className="text-xs text-slate-600 dark:text-slate-300 mt-2">
-                                                    {batch.audioBlobs.length > 0 
+                                                    {(batch.audioBlobs.length > 0 || (batch.audioCount && batch.audioCount > 0))
                                                         ? 'Your audio is preserved. You can download the recorded audio file, re-upload an audio file to replace it, or choose a different AI model and retry.' 
                                                         : 'You can upload an audio file directly or record new audio for this batch.'}
                                                 </p>
@@ -4196,7 +4213,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
 
                                                 {/* Action buttons */}
                                                 <div className="mt-5 flex flex-wrap justify-center items-center gap-3">
-                                                    {batch.audioBlobs.length > 0 && (
+                                                    {(batch.audioBlobs.length > 0 || (batch.audioCount && batch.audioCount > 0)) && (
                                                         <button
                                                             onClick={() => handleReprocessBatch(batch.id)}
                                                             className="flex items-center gap-2 bg-blue-600 text-white font-bold py-2.5 px-5 rounded-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50 transition-colors shadow text-sm"
@@ -4205,7 +4222,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                         </button>
                                                     )}
 
-                                                    {batch.audioBlobs.length > 0 && (
+                                                    {(batch.audioBlobs.length > 0 || (batch.audioCount && batch.audioCount > 0)) && (
                                                         <button
                                                             onClick={() => handleDownload(batch)}
                                                             className="flex items-center gap-2 bg-slate-600 text-white font-bold py-2.5 px-5 rounded-lg hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-500 focus:ring-opacity-50 transition-colors shadow text-sm"

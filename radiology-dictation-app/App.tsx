@@ -5,7 +5,7 @@ import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react'
 import AudioRecorder from './components/AudioRecorder';
 import ResultsDisplay from './components/ResultsDisplay';
 import { AppStatus, IdentifiedError } from './types';
-import { processAudio, createChat, blobToBase64, base64ToBlob, createChatFromText, identifyPotentialErrors } from './services/geminiService';
+import { processAudio, createChat, blobToBase64, base64ToBlob, createChatFromText, identifyPotentialErrors, findBuiltinTemplates } from './services/geminiService';
 import Spinner from './components/ui/Spinner';
 import { Chat } from '@google/genai';
 import { saveAudioBlob, getAudioBlob, deleteAudioBlob, saveReportSession, getReportSession, deleteReportSession } from './services/audioStorage';
@@ -114,6 +114,20 @@ const App: React.FC = () => {
   const [singleExtraFiles, setSingleExtraFiles] = useState<File[]>([]);
   const [upcomingTemplate, setUpcomingTemplateState] = useState<UpcomingTemplateConfig | null>(() => getUpcomingTemplate());
 
+  const activeTemplateDisplayName = useMemo(() => {
+    if (customDocx && customDocx.name) {
+      return customDocx.name;
+    }
+    const matched = findBuiltinTemplates(customPrompt);
+    if (matched && matched.length > 0) {
+      return matched.map(t => t.name).join(' + ');
+    }
+    if (upcomingTemplate && upcomingTemplate.name) {
+      return upcomingTemplate.name;
+    }
+    return null;
+  }, [customPrompt, customDocx, upcomingTemplate]);
+
   useEffect(() => {
     const initialUpcoming = getUpcomingTemplate();
     if (initialUpcoming) {
@@ -159,6 +173,8 @@ const App: React.FC = () => {
   const [customKeysCount, setCustomKeysCount] = useState<number>(() => getUserApiKeys().length);
   const [isSecretUnlocked, setIsSecretUnlocked] = useState<boolean>(() => isBuiltinKeysUnlocked());
   const [hasMultipleSingleDictations, setHasMultipleSingleDictations] = useState<boolean>(false);
+  const [errorRecorderStatus, setErrorRecorderStatus] = useState<AppStatus>(AppStatus.Idle);
+  const [templateMergeFeedback, setTemplateMergeFeedback] = useState<string | null>(null);
 
   const handleHeaderTitleClick = useCallback(() => {
     const input = window.prompt("Enter secret key:");
@@ -618,11 +634,13 @@ const App: React.FC = () => {
         id: batch1Id,
         name: name1,
         audioCount: 1,
+        audioBlobs: [firstAudio],
         findings: firstErrorMsg ? [
           "BOLD::Previous dictation encountered an error during analysis.",
           `[Error: ${firstErrorMsg}]. Your recorded audio is preserved below. You can retry processing or view findings.`
         ] : firstFindings,
         status: firstErrorMsg ? ('error' as const) : ('complete' as const),
+        error: firstErrorMsg || undefined,
         selectedModel,
         customPrompt,
         customDocx: customDocx || null,
@@ -641,6 +659,7 @@ const App: React.FC = () => {
           id: batchId,
           name: `Report ${i + 2}`,
           audioCount: 1,
+          audioBlobs: [audio],
           findings: ['Processing audio with AI...'],
           status: 'processing' as const,
           selectedModel,
@@ -693,16 +712,20 @@ const App: React.FC = () => {
           const msg = err instanceof Error ? err.message : 'Error processing dictation';
           findings = [
             `BOLD::Error processing dictation #${i + 2}.`,
-            `[Error: ${msg}]. Audio preserved below.`
+            `[Error: ${msg}]. Audio preserved below. You can retry processing or download audio.`
           ];
         }
 
-        const reportName = getTitle(findings, `Report ${i + 2}`);
+        const reportName = itemStatus === 'error' ? `Report ${i + 2} (Error)` : getTitle(findings, `Report ${i + 2}`);
         const targetBatch = updatedBatches.find(b => b.id === batchId);
         if (targetBatch) {
           targetBatch.findings = findings;
           targetBatch.name = reportName;
           targetBatch.status = itemStatus;
+          targetBatch.audioBlobs = [audio];
+          if (itemStatus === 'error') {
+            targetBatch.error = findings[1] || 'Error processing dictation';
+          }
         }
 
         await saveReportSession(curBatchKey, updatedBatches);
@@ -740,10 +763,10 @@ const App: React.FC = () => {
       setIsSeparatingConcurrent(false);
       setHasMultipleSingleDictations(true);
 
-      // 8. Transition directly to Batch Mode with all reports side-by-side
+      // 8. Keep user in Single Dictation so they can continue dictating seamlessly without being forced out!
       setBatchModeInstanceKey(Date.now());
       setStatus(AppStatus.Idle);
-      setMode('batch');
+      // Keep user in Single Dictation (do NOT force setMode('batch')). The flashing banner guides the user to view Batch Mode when ready!
       window.scrollTo({ top: 0, behavior: 'instant' });
     } catch (err) {
       console.error('Error saving separated concurrent dictations:', err);
@@ -757,9 +780,11 @@ const App: React.FC = () => {
   const handleApplyTemplateToInFlight = useCallback(async () => {
     const audioToReprocess = firstDictationAudioRef.current || (Array.isArray(audioBlob) ? audioBlob[0] : audioBlob);
     if (!audioToReprocess) return;
+    setTemplateMergeFeedback("✓ Template merged! Re-processing in-flight dictation with template layout...");
+    setTimeout(() => setTemplateMergeFeedback(null), 5000);
     processingRequestIdRef.current++;
     await handleRecordingComplete(audioToReprocess);
-  }, [audioBlob]);
+  }, [audioBlob, handleRecordingComplete]);
 
   const handleRecordingComplete = useCallback(async (audioInput: Blob | Blob[]) => {
     if (undoCountdownIntervalRef.current) {
@@ -953,6 +978,63 @@ const App: React.FC = () => {
       );
     }
   }, [audioBlob, separateConcurrentDictationsToBatch]);
+
+  const handleSubsequentDictationAfterError = useCallback(async (newAudioInput: Blob | Blob[]) => {
+    // 1. Preserve the failed audio into Batch Mode first so no data is ever lost!
+    const failedAudio = firstDictationAudioRef.current || (Array.isArray(audioBlob) ? audioBlob[0] : audioBlob);
+    const failedErrMsg = error || firstDictationErrorRef.current || 'Processing error';
+    
+    if (failedAudio) {
+      try {
+        const curTabId = getTabId();
+        const now = Date.now();
+        const batchId = `batch-err-${now}`;
+        await saveAudioBlob(`batch_audio_${curTabId}_${batchId}_0`, failedAudio);
+        await saveAudioBlob(`batch_audio_${batchId}_0`, failedAudio);
+
+        const curBatchKey = getBatchModeStorageKey(curTabId);
+        const existingBatches: any[] = (await getReportSession(curBatchKey)) || safeLocalStorage.getItem(curBatchKey) || [];
+        
+        const failedBatchItem = {
+          id: batchId,
+          name: `Report 1 (Interrupted)`,
+          audioCount: 1,
+          audioBlobs: [failedAudio],
+          findings: [
+            "BOLD::Previous dictation encountered an error during analysis.",
+            `[Error: ${failedErrMsg}]. Your recorded audio is preserved below. You can retry processing or download audio.`
+          ],
+          status: 'error' as const,
+          error: failedErrMsg,
+          selectedModel,
+          customPrompt,
+          customDocx: customDocx || null,
+        };
+
+        const updated = [failedBatchItem, ...existingBatches.filter(b => b.id !== batchId)];
+        await saveReportSession(curBatchKey, updated);
+        safeLocalStorage.setItem(curBatchKey, updated);
+        await saveReportSession(BATCH_MODE_STORAGE_KEY, updated).catch(() => {});
+        safeLocalStorage.setItem(BATCH_MODE_STORAGE_KEY, updated);
+        window.dispatchEvent(new CustomEvent('raddoc_batch_mode_updated'));
+        setHasMultipleSingleDictations(true);
+      } catch (saveErr) {
+        console.warn("Could not save failed audio to batch mode:", saveErr);
+      }
+    }
+
+    // 2. Clear error state and start processing the new subsequent dictation!
+    setError(null);
+    firstDictationErrorRef.current = null;
+    setFirstDictationError(null);
+    setErrorRecorderStatus(AppStatus.Idle);
+    await handleRecordingComplete(newAudioInput);
+  }, [audioBlob, error, selectedModel, customPrompt, customDocx, handleRecordingComplete]);
+
+  const handleSubsequentFileSelectAfterError = useCallback(async (files: File[]) => {
+    if (!files || files.length === 0) return;
+    await handleSubsequentDictationAfterError(files);
+  }, [handleSubsequentDictationAfterError]);
   
   const handleLiveDictationComplete = useCallback(async (transcript: string, audioBlob: Blob | null) => {
     const reqId = ++processingRequestIdRef.current;
@@ -1491,8 +1573,30 @@ const App: React.FC = () => {
                 customDocx={customDocx}
                 onCustomDocxChange={setCustomDocx}
                 selectedModel={selectedModel}
-                className="mb-6"
+                className="mb-4"
             />
+            {activeTemplateDisplayName && (
+              <div className="mb-4 p-3 bg-gradient-to-r from-blue-500/10 via-indigo-500/10 to-purple-500/10 dark:from-blue-900/30 dark:via-indigo-900/30 dark:to-purple-900/30 border border-blue-300 dark:border-blue-700 rounded-xl flex items-center justify-between text-xs sm:text-sm shadow-xs animate-fade-in">
+                <div className="flex items-center gap-2 text-blue-950 dark:text-blue-100 font-medium">
+                  <Sparkles className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0" />
+                  <span>
+                    Attached Template: <strong className="font-bold underline text-blue-700 dark:text-blue-300">{activeTemplateDisplayName}</strong> — Dictation findings will be merged into this layout
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setCustomPrompt('');
+                    setCustomDocx(null);
+                    setCustomImages([]);
+                    clearUpcomingTemplate();
+                  }}
+                  className="text-xs text-rose-600 dark:text-rose-400 hover:text-rose-800 font-bold ml-2 underline cursor-pointer"
+                >
+                  Remove Template
+                </button>
+              </div>
+            )}
             <AudioRecorder
               status={status}
               setStatus={setStatus}
@@ -1642,6 +1746,16 @@ const App: React.FC = () => {
                     Merge On-the-Fly
                   </span>
                 </div>
+
+                {templateMergeFeedback && (
+                  <div className="mb-3 p-3 bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-300 dark:border-emerald-700 text-emerald-800 dark:text-emerald-200 rounded-xl text-xs sm:text-sm font-semibold flex items-center justify-between shadow-xs animate-fade-in">
+                    <div className="flex items-center gap-2">
+                      <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-ping" />
+                      <span>{templateMergeFeedback}</span>
+                    </div>
+                    <button type="button" onClick={() => setTemplateMergeFeedback(null)} className="text-emerald-600 hover:text-emerald-800 font-bold ml-2 text-base">×</button>
+                  </div>
+                )}
                 <CustomPromptInput
                   prompt={customPrompt}
                   onPromptChange={setCustomPrompt}
@@ -1779,76 +1893,105 @@ const App: React.FC = () => {
         );
       case AppStatus.Error:
         return (
-          <div className="p-6 sm:p-8 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-500/30 rounded-xl max-w-2xl mx-auto shadow-sm">
-            <div className="flex justify-center mb-3">
-              <div className="p-3 bg-red-100 dark:bg-red-900/40 rounded-full text-red-600 dark:text-red-400">
-                <WarningIcon className="w-8 h-8" />
+          <div className="space-y-6">
+            <div className="p-6 sm:p-8 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-500/30 rounded-xl max-w-2xl mx-auto shadow-sm">
+              <div className="flex justify-center mb-3">
+                <div className="p-3 bg-red-100 dark:bg-red-900/40 rounded-full text-red-600 dark:text-red-400">
+                  <WarningIcon className="w-8 h-8" />
+                </div>
+              </div>
+              <h3 className="text-xl font-bold text-center text-red-700 dark:text-red-300">An Error Occurred</h3>
+              <p className="text-red-600 dark:text-red-400 mt-2 text-center font-medium">{error}</p>
+              <p className="text-slate-600 dark:text-slate-300 mt-2 text-center text-xs sm:text-sm">
+                {audioBlob 
+                  ? 'Your recorded audio is preserved. You can download the audio file, re-upload an audio file to process, or choose a different AI model and retry.' 
+                  : 'You can re-upload an audio file directly to process, or start a new recording below.'}
+              </p>
+
+              {/* Model selector inside error card */}
+              <div className="mt-5 p-3 sm:p-4 bg-white dark:bg-slate-800 rounded-lg border border-slate-200 dark:border-slate-700 flex flex-col sm:flex-row items-center justify-between gap-3 shadow-sm">
+                <label htmlFor="error-model-select" className="text-sm font-semibold text-slate-700 dark:text-slate-300 whitespace-nowrap">
+                  Process with AI Model:
+                </label>
+                <select
+                  id="error-model-select"
+                  value={selectedModel}
+                  onChange={(e) => setSelectedModel(e.target.value)}
+                  className="bg-slate-50 border border-slate-300 text-slate-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block p-2 w-full sm:w-auto dark:bg-slate-700 dark:border-slate-600 dark:text-white"
+                >
+                  {AVAILABLE_MODELS.map((model) => (
+                    <option key={model.value} value={model.value}>{model.label}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Hidden file input for re-uploading and processing directly */}
+              <input
+                type="file"
+                ref={errorFileInputRef}
+                onChange={handleErrorFileUpload}
+                accept="audio/*,video/*,image/*,.pdf,.doc,.docx,.txt,.csv,.rtf,.webm,.mp4,.mp3,.wav,.m4a,.png,.jpg,.jpeg"
+                multiple
+                className="hidden"
+              />
+
+              <div className="mt-6 flex flex-wrap justify-center items-center gap-3">
+                {audioBlob && (
+                  <button
+                    onClick={() => handleRecordingComplete(audioBlob)}
+                    className="flex items-center gap-2 bg-blue-600 text-white font-bold py-2.5 px-5 rounded-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50 transition-colors shadow text-sm cursor-pointer"
+                  >
+                    Retry Processing Audio
+                  </button>
+                )}
+                {audioBlob && (
+                  <button
+                    onClick={handleDownload}
+                    className="flex items-center gap-2 bg-slate-600 text-white font-bold py-2.5 px-5 rounded-lg hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-500 focus:ring-opacity-50 transition-colors shadow text-sm cursor-pointer"
+                  >
+                    <DownloadIcon className="w-4 h-4" /> Download Audio File
+                  </button>
+                )}
+                <button
+                  onClick={() => errorFileInputRef.current?.click()}
+                  className="flex items-center gap-2 bg-emerald-600 text-white font-bold py-2.5 px-5 rounded-lg hover:bg-emerald-700 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-opacity-50 transition-colors shadow text-sm cursor-pointer"
+                >
+                  <UploadIcon className="w-4 h-4" /> Re-upload & Process Audio
+                </button>
+                <button
+                  onClick={resetSingleMode}
+                  className="bg-slate-200 text-slate-700 dark:bg-slate-700 dark:text-slate-200 font-bold py-2.5 px-5 rounded-lg hover:bg-slate-300 dark:hover:bg-slate-600 focus:outline-none focus:ring-2 focus:ring-slate-400 focus:ring-opacity-50 transition-colors text-sm cursor-pointer"
+                >
+                  Start New Recording
+                </button>
               </div>
             </div>
-            <h3 className="text-xl font-bold text-center text-red-700 dark:text-red-300">An Error Occurred</h3>
-            <p className="text-red-600 dark:text-red-400 mt-2 text-center font-medium">{error}</p>
-            <p className="text-slate-600 dark:text-slate-300 mt-2 text-center text-xs sm:text-sm">
-              {audioBlob 
-                ? 'Your recorded audio is preserved. You can download the audio file, re-upload an audio file to process, or choose a different AI model and retry.' 
-                : 'You can re-upload an audio file directly to process, or start a new recording.'}
-            </p>
 
-            {/* Model selector inside error card */}
-            <div className="mt-5 p-3 sm:p-4 bg-white dark:bg-slate-800 rounded-lg border border-slate-200 dark:border-slate-700 flex flex-col sm:flex-row items-center justify-between gap-3 shadow-sm">
-              <label htmlFor="error-model-select" className="text-sm font-semibold text-slate-700 dark:text-slate-300 whitespace-nowrap">
-                Process with AI Model:
-              </label>
-              <select
-                id="error-model-select"
-                value={selectedModel}
-                onChange={(e) => setSelectedModel(e.target.value)}
-                className="bg-slate-50 border border-slate-300 text-slate-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block p-2 w-full sm:w-auto dark:bg-slate-700 dark:border-slate-600 dark:text-white"
-              >
-                {AVAILABLE_MODELS.map((model) => (
-                  <option key={model.value} value={model.value}>{model.label}</option>
-                ))}
-              </select>
-            </div>
+            {/* Active Subsequent Dictation Section - Unlocked and NEVER forbidden */}
+            <div className="max-w-4xl mx-auto border-t-2 border-dashed border-slate-300 dark:border-slate-700 pt-6">
+              <div className="bg-gradient-to-r from-emerald-50 to-teal-50 dark:from-emerald-950/40 dark:to-teal-950/30 border border-emerald-300 dark:border-emerald-700/60 p-4 rounded-2xl mb-4 shadow-sm flex flex-col sm:flex-row items-center justify-between gap-3 text-center sm:text-left">
+                <div className="flex items-center gap-2.5">
+                  <span className="w-3 h-3 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+                  <div>
+                    <h4 className="text-sm font-bold text-emerald-900 dark:text-emerald-100">
+                      🎙️ Dictate Next Report Now (Subsequent Dictation Unlocked)
+                    </h4>
+                    <p className="text-xs text-emerald-700 dark:text-emerald-300 mt-0.5">
+                      Your prior audio is safely preserved above. You can speak or upload your next dictation right below without waiting!
+                    </p>
+                  </div>
+                </div>
+                <span className="bg-emerald-600 text-white font-bold text-xs px-3 py-1.5 rounded-xl shadow-xs shrink-0">
+                  Ready to Record
+                </span>
+              </div>
 
-            {/* Hidden file input for re-uploading and processing directly */}
-            <input
-              type="file"
-              ref={errorFileInputRef}
-              onChange={handleErrorFileUpload}
-              accept="audio/*,video/*,image/*,.pdf,.doc,.docx,.txt,.csv,.rtf,.webm,.mp4,.mp3,.wav,.m4a,.png,.jpg,.jpeg"
-              multiple
-              className="hidden"
-            />
-
-            <div className="mt-6 flex flex-wrap justify-center items-center gap-3">
-              {audioBlob && (
-                <button
-                  onClick={() => handleRecordingComplete(audioBlob)}
-                  className="flex items-center gap-2 bg-blue-600 text-white font-bold py-2.5 px-5 rounded-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50 transition-colors shadow text-sm"
-                >
-                  Retry Processing Audio
-                </button>
-              )}
-              {audioBlob && (
-                <button
-                  onClick={handleDownload}
-                  className="flex items-center gap-2 bg-slate-600 text-white font-bold py-2.5 px-5 rounded-lg hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-500 focus:ring-opacity-50 transition-colors shadow text-sm"
-                >
-                  <DownloadIcon className="w-4 h-4" /> Download Audio File
-                </button>
-              )}
-              <button
-                onClick={() => errorFileInputRef.current?.click()}
-                className="flex items-center gap-2 bg-emerald-600 text-white font-bold py-2.5 px-5 rounded-lg hover:bg-emerald-700 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-opacity-50 transition-colors shadow text-sm"
-              >
-                <UploadIcon className="w-4 h-4" /> Re-upload & Process Audio
-              </button>
-              <button
-                onClick={resetSingleMode}
-                className="bg-slate-200 text-slate-700 dark:bg-slate-700 dark:text-slate-200 font-bold py-2.5 px-5 rounded-lg hover:bg-slate-300 dark:hover:bg-slate-600 focus:outline-none focus:ring-2 focus:ring-slate-400 focus:ring-opacity-50 transition-colors text-sm"
-              >
-                Start New Recording
-              </button>
+              <AudioRecorder
+                status={errorRecorderStatus}
+                setStatus={setErrorRecorderStatus}
+                onRecordingComplete={handleSubsequentDictationAfterError}
+                onMultipleFilesUploaded={(files) => handleSubsequentFileSelectAfterError(files)}
+              />
             </div>
           </div>
         );

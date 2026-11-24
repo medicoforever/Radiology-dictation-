@@ -571,12 +571,33 @@ const CustomPromptInput: React.FC<{
         aria-expanded={isOpen}
         aria-controls="custom-prompt-container"
       >
-        <div className="flex items-center gap-2">
-            <SparklesIcon className="w-5 h-5 text-yellow-500" />
+        <div className="flex items-center gap-2 flex-wrap">
+            <SparklesIcon className="w-5 h-5 text-yellow-500 shrink-0" />
             <span className="font-semibold text-slate-800 dark:text-slate-200 text-sm">Custom Instructions & Templates</span>
+            {activeTemplateDisplayName && (
+              <span className="text-[11px] font-bold bg-blue-100 dark:bg-blue-900/60 text-blue-800 dark:text-blue-200 px-2.5 py-0.5 rounded-full border border-blue-300 dark:border-blue-700">
+                ✓ {activeTemplateDisplayName}
+              </span>
+            )}
         </div>
         <ChevronDownIcon className={`w-5 h-5 text-slate-500 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
       </button>
+
+      {appliedTemplateName && (
+        <div className="mt-2 p-2.5 text-xs text-green-800 bg-green-50 dark:bg-green-950/60 dark:text-green-200 rounded-xl border border-green-300 dark:border-green-800 flex justify-between items-center animate-fade-in shadow-xs">
+          <span className="flex items-center gap-2">
+            <span className="w-2 h-2 rounded-full bg-green-500 animate-ping shrink-0"></span>
+            <span>✓ Template <strong>"{appliedTemplateName}"</strong> loaded &amp; ready to merge with dictation!</span>
+          </span>
+          <button 
+            type="button" 
+            onClick={() => setAppliedTemplateName(null)}
+            className="text-green-600 hover:text-green-800 font-bold ml-2 text-sm cursor-pointer"
+          >
+            &times;
+          </button>
+        </div>
+      )}
       {isOpen && (
         <div 
             id="custom-prompt-container" 
