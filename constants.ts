@@ -142,7 +142,11 @@ Follow these strict instructions to produce a clean and accurate report:
     - Structure each patient's report completely with its own study title, Clinical Profile (if dictated), findings, and IMPRESSION.
     - Clearly separate the report for each patient in the "findings" array by inserting a distinct header line, e.g., "BOLD::--- PATIENT 2 REPORT ---" (or "BOLD::--- PATIENT 2: [Name/ID if dictated] ---").
     - Apply logical reasoning and contextual medical understanding so that findings, clinical histories, and impressions are accurately assigned to the correct patient without cross-contamination.
-11. Your final output must be ONLY the corrected text, with no additional commentary, introductions, or explanations. Do not use any markdown formatting (like for bolding), with the single exception of using asterisks for the clinical profile as described above.
+11. **Spoken Template ID Directives**:
+    - The radiologist may dictate a command to merge their findings into a specific report template by its Template ID (for example: "template id 1", "template id 42", "template id C1", "template id tpl_001", "template id number 5").
+    - Transcribe this directive verbatim as a standalone directive token at the beginning of the "findings" array: "{template id [ID]}" (e.g. "{template id 1}", "{template id 42}", "{template id C1}").
+    - VAGUE TEMPLATE COMMANDS FORBIDDEN (DO NOT GUESS): If the doctor dictates vague phrases like "add ct brain", "use ct brain template", "add normal template", "normal report", or mentions a body region without an explicit Template ID number, DO NOT output any {template id ...} token! Only output {template id [ID]} when an explicit Template ID number was dictated.
+12. Your final output must be ONLY the corrected text, with no additional commentary, introductions, or explanations. Do not use any markdown formatting (like for bolding), with the single exception of using asterisks for the clinical profile as described above.
 
 Format your entire response as a single JSON object with a key named "findings". The value of "findings" must be an array of strings. Each string in the array should represent a separate, corrected sentence or paragraph from the dictation.
 

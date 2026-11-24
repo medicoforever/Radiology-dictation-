@@ -174,7 +174,6 @@ const App: React.FC = () => {
   const [isSecretUnlocked, setIsSecretUnlocked] = useState<boolean>(() => isBuiltinKeysUnlocked());
   const [hasMultipleSingleDictations, setHasMultipleSingleDictations] = useState<boolean>(false);
   const [errorRecorderStatus, setErrorRecorderStatus] = useState<AppStatus>(AppStatus.Idle);
-  const [templateMergeFeedback, setTemplateMergeFeedback] = useState<string | null>(null);
 
   const handleHeaderTitleClick = useCallback(() => {
     const input = window.prompt("Enter secret key:");
@@ -970,30 +969,6 @@ const App: React.FC = () => {
 
   handleRecordingCompleteRef.current = handleRecordingComplete;
 
-  const handleApplyTemplateToInFlight = useCallback(async (
-    overridePrompt?: string,
-    overrideDocx?: DocxTemplateData | null
-  ) => {
-    const audioToReprocess = firstDictationAudioRef.current || (Array.isArray(audioBlob) ? audioBlob[0] : audioBlob);
-    if (!audioToReprocess) return;
-
-    // Immediately abort any current in-flight network call
-    if (inFlightAbortControllerRef.current) {
-      try {
-        inFlightAbortControllerRef.current.abort();
-      } catch (_) {}
-      inFlightAbortControllerRef.current = null;
-    }
-
-    setTemplateMergeFeedback("✓ In-flight dictation aborted! Re-processing audio unified with selected template...");
-    setTimeout(() => setTemplateMergeFeedback(null), 6000);
-
-    const promptToUse = overridePrompt !== undefined ? overridePrompt : customPromptRef.current;
-    const docxToUse = overrideDocx !== undefined ? overrideDocx : customDocxRef.current;
-
-    await handleRecordingComplete(audioToReprocess, promptToUse, docxToUse);
-  }, [audioBlob, handleRecordingComplete]);
-
   const handleConcurrentRecordingComplete = useCallback(async (newAudioInput: Blob | Blob[]) => {
     isConcurrentRecordingActiveRef.current = false;
     setConcurrentRecordingStatus(AppStatus.Idle);
@@ -1788,53 +1763,6 @@ const App: React.FC = () => {
                 )}
               </div>
             </div>
-
-            {/* In-Flight Template Attachment in Single Mode */}
-            {!isSeparatingConcurrent && (
-              <div className="border border-indigo-200 dark:border-indigo-800/60 bg-indigo-50/30 dark:bg-indigo-950/20 rounded-2xl p-4 sm:p-5 shadow-sm">
-                <div className="flex items-center justify-between mb-3 px-1">
-                  <span className="text-sm font-bold text-indigo-900 dark:text-indigo-200 flex items-center gap-2">
-                    <Sparkles className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
-                    Attach / Change Template for this In-Flight Dictation
-                  </span>
-                  <span className="text-xs bg-indigo-100 dark:bg-indigo-900/60 text-indigo-800 dark:text-indigo-200 px-2.5 py-0.5 rounded-full font-semibold">
-                    Merge On-the-Fly
-                  </span>
-                </div>
-
-                {templateMergeFeedback && (
-                  <div className="mb-3 p-3 bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-300 dark:border-emerald-700 text-emerald-800 dark:text-emerald-200 rounded-xl text-xs sm:text-sm font-semibold flex items-center justify-between shadow-xs animate-fade-in">
-                    <div className="flex items-center gap-2">
-                      <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-ping" />
-                      <span>{templateMergeFeedback}</span>
-                    </div>
-                    <button type="button" onClick={() => setTemplateMergeFeedback(null)} className="text-emerald-600 hover:text-emerald-800 font-bold ml-2 text-base">×</button>
-                  </div>
-                )}
-                <CustomPromptInput
-                  prompt={customPrompt}
-                  onPromptChange={setCustomPrompt}
-                  images={customImages}
-                  onImagesChange={setCustomImages}
-                  customDocx={customDocx}
-                  onCustomDocxChange={setCustomDocx}
-                  onTemplateApplied={(newPrompt, newDocx) => {
-                    handleApplyTemplateToInFlight(newPrompt, newDocx);
-                  }}
-                  selectedModel={selectedModel}
-                  className="mb-3"
-                />
-                <div className="flex justify-end">
-                  <button
-                    onClick={() => handleApplyTemplateToInFlight()}
-                    className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-4 rounded-xl shadow-sm text-xs sm:text-sm transition-all cursor-pointer"
-                  >
-                    <Sparkles className="w-4 h-4" />
-                    Apply Template &amp; Re-process In-Flight Audio Now
-                  </button>
-                </div>
-              </div>
-            )}
 
             {/* Always keep Simultaneous Dictation active & visible - never forbidden! */}
             <div className="border border-emerald-200 dark:border-emerald-800/60 bg-emerald-50/40 dark:bg-emerald-950/20 rounded-2xl p-4 sm:p-5 shadow-sm">

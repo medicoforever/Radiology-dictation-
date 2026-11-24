@@ -4,6 +4,7 @@ import { IdentifiedError } from "../types";
 import { isTableRowFinding } from "./docxService";
 import { expandMacrosInFindings, getMacroPromptContext } from "./macroDictionaryService";
 import { executeWithApiKeyFailover, getRandomAIClient, getClientForApiKey } from "./apiKeyService";
+import { findTemplateByIdOrNumber } from "./templateStorage";
 
 export const getAI = (): GoogleGenAI => {
   return getRandomAIClient();
@@ -680,6 +681,42 @@ CRITICAL TEMPLATE MERGE DIRECTIVES:
   };
 }
 
+/**
+ * Detects and extracts spoken template ID directive token: {template id [ID]}
+ * e.g. "{template id 1}", "{template id 42}", "{template id C1}", "{template id tpl_001}"
+ */
+export function extractSpokenTemplateDirective(findings: string[]): {
+  templateId: string | null;
+  cleanedFindings: string[];
+} {
+  if (!findings || findings.length === 0) {
+    return { templateId: null, cleanedFindings: [] };
+  }
+
+  let detectedId: string | null = null;
+  const cleaned: string[] = [];
+
+  const directiveRegex = /\{?\s*template\s+id\s*[:\s#]?\s*([a-zA-Z0-9_\-]+)\s*\}?/i;
+
+  for (const rawFinding of findings) {
+    if (!rawFinding) continue;
+    const content = rawFinding.replace(/^BOLD::/i, '').trim();
+
+    const match = content.match(directiveRegex);
+    if (match && !detectedId) {
+      detectedId = match[1];
+      const stripped = content.replace(directiveRegex, '').replace(/^[:\s\-.]+/, '').trim();
+      if (stripped.length > 0) {
+        cleaned.push(rawFinding.startsWith('BOLD::') ? `BOLD::${stripped}` : stripped);
+      }
+    } else {
+      cleaned.push(rawFinding);
+    }
+  }
+
+  return { templateId: detectedId, cleanedFindings: cleaned };
+}
+
 export const processAudio = async (
   audioBlob: Blob | Blob[], 
   model: string, 
@@ -808,6 +845,39 @@ export const processAudio = async (
     const findings = extractFindingsFromResponse(rawResponseText);
 
     if (findings && findings.length > 0) {
+      // Check if user spoke a template ID directive (e.g. "{template id 1}", "template id 42", "template id C1")
+      // and user had NOT already attached a template manually prior to dictation
+      if (!templateInfo.isTemplateMode) {
+        const { templateId, cleanedFindings } = extractSpokenTemplateDirective(findings);
+        if (templateId) {
+          console.info(`[Spoken Template Directive] Detected template ID "${templateId}" in audio dictation. Resolving template...`);
+          const matchedTemplate = await findTemplateByIdOrNumber(templateId);
+          if (matchedTemplate) {
+            console.info(`[Spoken Template Directive] Found matching template "${matchedTemplate.name}" (ID: ${matchedTemplate.templateId || templateId}). Merging dictated findings into template...`);
+            try {
+              const merged = await mergeDictatedFindingsWithTemplate(
+                cleanedFindings,
+                matchedTemplate,
+                targetModel,
+                audioBlobs,
+                customPrompt,
+                customDocx,
+                abortSignal
+              );
+              if (merged && merged.length > 0) {
+                return merged;
+              }
+            } catch (mergeErr: any) {
+              if (mergeErr?.name === 'AbortError' || abortSignal?.aborted) throw mergeErr;
+              console.warn("Spoken template merge error, falling back to cleaned findings:", mergeErr);
+            }
+          } else {
+            console.warn(`[Spoken Template Directive] No template found for ID "${templateId}". Proceeding with pure dictated findings.`);
+          }
+          return cleanedFindings;
+        }
+      }
+
       return findings;
     } else {
       throw new Error("Invalid data structure in API response. Expected a 'findings' array.");
@@ -1001,7 +1071,8 @@ export const mergeDictatedFindingsWithTemplate = async (
   model: string = DEFAULT_SELECTED_MODEL,
   audioBlob?: Blob | Blob[] | null,
   customPrompt?: string,
-  customDocx?: CustomDocxInput
+  customDocx?: CustomDocxInput,
+  abortSignal?: AbortSignal
 ): Promise<string[]> => {
   if (!dictatedFindings || dictatedFindings.length === 0) {
     throw new Error("No dictated findings available to merge with template.");
@@ -1184,7 +1255,7 @@ Carefully integrate these dictated findings into the "${templateName}" baseline 
   const targetModel = resolveApiTargetModel(model);
 
   try {
-    const rawResponseText = await generateContentWithJsonFallback(targetModel, parts, responseSchema, 0.1);
+    const rawResponseText = await generateContentWithJsonFallback(targetModel, parts, responseSchema, 0.1, abortSignal);
     const mergedFindings = extractFindingsFromResponse(rawResponseText);
 
     if (mergedFindings && mergedFindings.length > 0) {

@@ -185,7 +185,9 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
       const q = searchQuery.toLowerCase().trim();
       const parts = q.split(/\s+/).filter(Boolean);
       list = list.filter(t => {
-        const text = `${t.name} ${t.description} ${t.modality || ''} ${t.lines ? t.lines.join(' ') : ''}`.toLowerCase();
+        const displayId = (t.id || '').replace('tpl_', '').replace(/^0+/, '');
+        const idText = `id ${displayId} #${displayId} tpl_${displayId} ${t.id || ''}`.toLowerCase();
+        const text = `${t.name} ${t.description} ${t.modality || ''} ${idText} ${t.lines ? t.lines.join(' ') : ''}`.toLowerCase();
         return parts.every(part => text.includes(part));
       });
     }
@@ -650,6 +652,9 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
 
                         <div className="min-w-0 flex-1">
                           <div className="flex items-center gap-1.5 mb-1 flex-wrap">
+                            <span className="text-[10px] font-mono font-bold px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-800 dark:bg-indigo-950 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800" title={`Dictate "template id ${(template.id || '').replace('tpl_', '').replace(/^0+/, '') || '1'}" in audio to merge this template`}>
+                              ID: {(template.id || '').replace('tpl_', '').replace(/^0+/, '') || '1'}
+                            </span>
                             <span
                               className={`text-[9px] font-extrabold uppercase px-1.5 py-0.5 rounded tracking-wide ${
                                 isCT
@@ -672,8 +677,11 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
                               </span>
                             )}
                           </div>
-                          <p className="font-bold text-sm text-slate-800 dark:text-slate-100 break-words whitespace-normal leading-snug">
-                            {template.name}
+                          <p className="font-bold text-sm text-slate-800 dark:text-slate-100 break-words whitespace-normal leading-snug flex items-center gap-1.5 flex-wrap">
+                            <span>{template.name}</span>
+                            <span className="text-[11px] font-mono font-bold px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-700">
+                              #{(template.id || '').replace('tpl_', '').replace(/^0+/, '') || '1'}
+                            </span>
                           </p>
                           <p className="text-xs text-slate-500 dark:text-slate-400 line-clamp-1 mt-0.5">
                             {template.description}
@@ -916,7 +924,10 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
               <div className="flex-1 flex flex-col overflow-hidden p-4 sm:p-5">
                 <div className="flex items-start justify-between gap-3 pb-3 border-b border-slate-200 dark:border-slate-800 flex-shrink-0">
                   <div>
-                    <div className="flex items-center gap-2 mb-1">
+                    <div className="flex items-center gap-2 mb-1 flex-wrap">
+                      <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded bg-indigo-100 text-indigo-800 dark:bg-indigo-950 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800">
+                        Template ID: {(selectedPreview.id || '').replace('tpl_', '').replace(/^0+/, '') || '1'}
+                      </span>
                       <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-300 uppercase tracking-wide">
                         {selectedPreview.modality || 'Radiology Template'}
                       </span>
@@ -926,9 +937,15 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
                         </span>
                       )}
                     </div>
-                    <h3 className="text-base sm:text-lg font-bold text-slate-900 dark:text-slate-100">
-                      {parsedPreview.title}
+                    <h3 className="text-base sm:text-lg font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2 flex-wrap">
+                      <span>{parsedPreview.title}</span>
+                      <span className="text-xs font-mono font-bold px-2 py-0.5 rounded bg-indigo-50 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-700">
+                        #{(selectedPreview.id || '').replace('tpl_', '').replace(/^0+/, '') || '1'}
+                      </span>
                     </h3>
+                    <p className="text-xs text-indigo-600 dark:text-indigo-400 mt-0.5">
+                      💡 Voice shortcut: Dictate <strong className="font-mono">"template id {(selectedPreview.id || '').replace('tpl_', '').replace(/^0+/, '') || '1'}"</strong> in your audio to automatically merge this template!
+                    </p>
                   </div>
 
                   <button

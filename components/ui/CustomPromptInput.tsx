@@ -13,7 +13,7 @@ import ImageIcon from '../icons/ImageIcon';
 import CloseIcon from '../icons/CloseIcon';
 import TrashIcon from '../icons/TrashIcon';
 import SearchIcon from '../icons/SearchIcon';
-import { saveUserTemplate, getUserTemplates, deleteUserTemplate, UserTemplate } from '../../services/templateStorage';
+import { saveUserTemplate, getUserTemplates, deleteUserTemplate, UserTemplate, getTemplateDisplayId, allotNextCustomTemplateId } from '../../services/templateStorage';
 import { parseDocx } from '../../services/docxService';
 import { getTemplateDocxBase64 } from '../../services/builtInTemplates';
 import { getUpcomingTemplate, setUpcomingTemplate, clearUpcomingTemplate, subscribeToUpcomingTemplate, UpcomingTemplateConfig } from '../../services/upcomingTemplateService';
@@ -204,7 +204,11 @@ const CustomPromptInput: React.FC<{
     }
     if (savedSearchQuery.trim()) {
       const q = savedSearchQuery.toLowerCase().trim();
-      list = list.filter(t => t.name.toLowerCase().includes(q) || (t.text && t.text.toLowerCase().includes(q)));
+      list = list.filter(t => {
+        const dId = getTemplateDisplayId(t).toLowerCase();
+        const idSearch = `id ${dId} #${dId} ${dId} ${t.id}`.toLowerCase();
+        return t.name.toLowerCase().includes(q) || idSearch.includes(q) || (t.text && t.text.toLowerCase().includes(q));
+      });
     }
     return list;
   }, [savedTemplates, savedModalityFilter, savedSearchQuery]);
@@ -474,9 +478,11 @@ const CustomPromptInput: React.FC<{
 
     try {
       setTemplateSaveError(null);
-      const newId = `template_${Date.now()}`;
+      const nextInfo = allotNextCustomTemplateId(savedTemplates);
       await saveUserTemplate({
-        id: newId,
+        id: nextInfo.id,
+        templateId: nextInfo.templateId,
+        templateNumber: nextInfo.templateNumber,
         name: templateName.trim(),
         text: templateText.trim() || (templateDocx?.extractedText || ''),
         images: templateImages,
@@ -1040,8 +1046,11 @@ const CustomPromptInput: React.FC<{
                                     </span>
                                   )}
                                 </button>
-                                <h4 className="font-bold text-sm text-slate-800 dark:text-slate-100 break-words whitespace-normal leading-snug" title={tmpl.name}>
-                                  {tmpl.name}
+                                <h4 className="font-bold text-sm text-slate-800 dark:text-slate-100 break-words whitespace-normal leading-snug flex items-center gap-1.5 flex-wrap" title={tmpl.name}>
+                                  <span>{tmpl.name}</span>
+                                  <span className="text-[11px] font-mono font-bold px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700 dark:bg-indigo-950 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800 shrink-0" title={`Dictate "template id ${getTemplateDisplayId(tmpl)}" in audio to merge this template`}>
+                                    ID: {getTemplateDisplayId(tmpl)}
+                                  </span>
                                 </h4>
                               </div>
                               
@@ -1187,9 +1196,17 @@ const CustomPromptInput: React.FC<{
             {activeTab === 'create' && (
               <div className="space-y-3 bg-slate-50/50 dark:bg-slate-950/40 p-3 rounded-xl border border-slate-100 dark:border-slate-800 animate-fade-in">
                 <div>
-                  <label className="block text-[11px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-1">
-                    Template Name <span className="text-red-500">*</span>
-                  </label>
+                  <div className="flex items-center justify-between gap-2 flex-wrap mb-1">
+                    <label className="block text-[11px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                      Template Name <span className="text-red-500">*</span>
+                    </label>
+                    <span className="text-[11px] font-mono font-bold px-2 py-0.5 rounded bg-indigo-100 text-indigo-700 dark:bg-indigo-950 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800 flex items-center gap-1">
+                      Allotted ID: {allotNextCustomTemplateId(savedTemplates).templateId}
+                    </span>
+                  </div>
+                  <p className="text-[10px] text-indigo-600 dark:text-indigo-400 mb-1.5">
+                    🎙️ Voice shortcut: Once saved, dictate <strong className="font-mono">"template id {allotNextCustomTemplateId(savedTemplates).templateId}"</strong> in your audio to merge this template directly!
+                  </p>
                   <input
                     type="text"
                     value={templateName}
