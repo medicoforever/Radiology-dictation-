@@ -56,6 +56,7 @@ const formatFileSize = (bytes: number): string => {
 };
 
 const SINGLE_MODE_STORAGE_KEY = 'radiologyDictationSingleMode';
+const BATCH_MODE_STORAGE_KEY = 'radiologyDictationBatchMode';
 const ERROR_CHECK_ENABLED_KEY = 'radiologyErrorCheckEnabled';
 const POWER_MODE_KEY = 'radiologyPowerMode';
 
@@ -221,9 +222,15 @@ const App: React.FC = () => {
 
   // Simultaneous / Concurrent Dictation while loading
   const [concurrentRecordingStatus, setConcurrentRecordingStatus] = useState<AppStatus>(AppStatus.Idle);
-  const queuedConcurrentAudioRef = useRef<Blob | Blob[] | null>(null);
+  const queuedConcurrentAudioRef = useRef<Blob | null>(null);
   const isConcurrentRecordingActiveRef = useRef<boolean>(false);
   const [isSimultaneousQueued, setIsSimultaneousQueued] = useState<boolean>(false);
+  const [isSeparatingConcurrent, setIsSeparatingConcurrent] = useState<boolean>(false);
+  const isSeparatingConcurrentRef = useRef<boolean>(false);
+  const firstDictationFindingsRef = useRef<string[] | null>(null);
+  const firstDictationAudioRef = useRef<Blob | null>(null);
+  const isFirstDictationProcessingRef = useRef<boolean>(false);
+  const [batchModeInstanceKey, setBatchModeInstanceKey] = useState<number>(Date.now());
   const handleContinueDictationRef = useRef<((newAudioBlob: Blob, premergedBlob?: Blob) => Promise<void>) | null>(null);
 
   useEffect(() => {
@@ -499,6 +506,11 @@ const App: React.FC = () => {
   const handleCancelProcessing = useCallback(() => {
     processingRequestIdRef.current++;
     queuedConcurrentAudioRef.current = null;
+    firstDictationFindingsRef.current = null;
+    firstDictationAudioRef.current = null;
+    isFirstDictationProcessingRef.current = false;
+    isSeparatingConcurrentRef.current = false;
+    setIsSeparatingConcurrent(false);
     setIsSimultaneousQueued(false);
     isConcurrentRecordingActiveRef.current = false;
     setConcurrentRecordingStatus(AppStatus.Idle);
@@ -555,6 +567,8 @@ const App: React.FC = () => {
     secondAudio: Blob
   ) => {
     setStatus(AppStatus.Processing);
+    setIsSeparatingConcurrent(true);
+    isSeparatingConcurrentRef.current = true;
     setIsSimultaneousQueued(false);
     queuedConcurrentAudioRef.current = null;
     isConcurrentRecordingActiveRef.current = false;
@@ -562,9 +576,12 @@ const App: React.FC = () => {
 
     const curTabId = getTabId();
 
+    let secondFindings: string[] = [];
+    let secondStatus: 'complete' | 'error' = 'complete';
+
     try {
       // 1. Process second dictation audio separately to produce independent findings
-      const secondFindings = await processAudio(
+      secondFindings = await processAudio(
         secondAudio,
         selectedModel,
         customPrompt,
@@ -572,12 +589,22 @@ const App: React.FC = () => {
         undefined,
         customDocx
       );
+    } catch (err) {
+      console.error('Error transcribing second concurrent dictation:', err);
+      secondStatus = 'error';
+      const secondErrorMsg = err instanceof Error ? err.message : 'Error transcribing second dictation';
+      secondFindings = [
+        "BOLD::Error processing second dictation.",
+        `[Error: ${secondErrorMsg}]. Your recorded audio is preserved below. You can re-process or retry.`
+      ];
+    }
 
+    try {
       // 2. Derive titles for both reports
       const getTitle = (findingsList: string[], defaultName: string) => {
         if (!findingsList || findingsList.length === 0) return defaultName;
         const first = findingsList[0].replace(/^BOLD::/i, '').replace(/[*_#~`]+/g, '').trim();
-        if (first.length > 0 && first.length < 80 && !first.toLowerCase().startsWith('clinical')) {
+        if (first.length > 0 && first.length < 80 && !first.toLowerCase().startsWith('clinical') && !first.toLowerCase().startsWith('error')) {
           return first;
         }
         return defaultName;
@@ -612,7 +639,7 @@ const App: React.FC = () => {
         name: name2,
         audioCount: 1,
         findings: secondFindings,
-        status: 'complete' as const,
+        status: secondStatus,
         selectedModel,
         customPrompt,
         customDocx: customDocx || null,
@@ -631,11 +658,25 @@ const App: React.FC = () => {
         }
       } catch (_) {}
 
+      if (existingBatches.length === 0) {
+        try {
+          const storedLegacy = await getReportSession(BATCH_MODE_STORAGE_KEY);
+          if (storedLegacy && Array.isArray(storedLegacy)) {
+            existingBatches = storedLegacy;
+          } else {
+            const rawLegacy = localStorage.getItem(BATCH_MODE_STORAGE_KEY);
+            if (rawLegacy) existingBatches = JSON.parse(rawLegacy);
+          }
+        } catch (_) {}
+      }
+
       const updatedBatches = [...existingBatches, batch1, batch2];
 
-      // 6. Save updated batches to storage session & localStorage
+      // 6. Save updated batches to storage session & localStorage (both tab-scoped and fallback keys)
       await saveReportSession(curBatchKey, updatedBatches);
       safeLocalStorage.setItem(curBatchKey, updatedBatches);
+      await saveReportSession(BATCH_MODE_STORAGE_KEY, updatedBatches).catch(() => {});
+      safeLocalStorage.setItem(BATCH_MODE_STORAGE_KEY, updatedBatches);
 
       // 7. Clear single mode in-flight states
       deleteAudioBlob(`in_flight_recording_${curTabId}`).catch(() => {});
@@ -646,12 +687,20 @@ const App: React.FC = () => {
       } catch (_) {}
 
       // 8. Transition directly to Batch Mode with both independent reports
+      firstDictationFindingsRef.current = null;
+      firstDictationAudioRef.current = null;
+      isFirstDictationProcessingRef.current = false;
+      isSeparatingConcurrentRef.current = false;
+      setIsSeparatingConcurrent(false);
+      setBatchModeInstanceKey(Date.now());
       setStatus(AppStatus.Idle);
       setMode('batch');
       window.scrollTo({ top: 0, behavior: 'instant' });
     } catch (err) {
-      console.error('Error processing separated concurrent dictations:', err);
-      setError(err instanceof Error ? err.message : 'Error processing concurrent dictation.');
+      console.error('Error saving separated concurrent dictations:', err);
+      setIsSeparatingConcurrent(false);
+      isSeparatingConcurrentRef.current = false;
+      setError(err instanceof Error ? err.message : 'Error organizing separated dictations into Batch Mode.');
       setStatus(AppStatus.Error);
     }
   }, [selectedModel, customPrompt, customImages, customDocx]);
@@ -674,11 +723,17 @@ const App: React.FC = () => {
     setStatus(AppStatus.Processing);
     setError(null);
     setFindings([]);
+    firstDictationFindingsRef.current = null;
+    isFirstDictationProcessingRef.current = true;
     queuedConcurrentAudioRef.current = null;
     setIsSimultaneousQueued(false);
     setConcurrentRecordingStatus(AppStatus.Idle);
     isConcurrentRecordingActiveRef.current = false;
+    isSeparatingConcurrentRef.current = false;
+    setIsSeparatingConcurrent(false);
+
     const primaryBlob = audioBlobs[0];
+    firstDictationAudioRef.current = primaryBlob;
     setAudioBlob(audioBlobs.length > 1 ? audioBlobs : primaryBlob); // Preserve all input blobs (audio, text files, docx, etc.)
 
     // Multi-tab isolated pre-save: pulse heartbeat and tag in_flight_recording_meta with current tabId
@@ -712,11 +767,35 @@ const App: React.FC = () => {
       clearInterval(processingHeartbeatTimer);
       markTabActive('idle');
       if (processingRequestIdRef.current !== reqId) return; // cancelled
+
+      isFirstDictationProcessingRef.current = false;
+      firstDictationFindingsRef.current = processedText;
+      firstDictationAudioRef.current = primaryBlob;
       setFindings(processedText);
 
-      const chatSession = await createChat(audioBlobs, processedText, customPrompt, customImages, selectedModel);
-      if (processingRequestIdRef.current !== reqId) return; // cancelled
-      setChat(chatSession);
+      // Check if user has queued audio or is still actively recording concurrently
+      if (queuedConcurrentAudioRef.current) {
+        const queuedBlob = queuedConcurrentAudioRef.current as Blob;
+        queuedConcurrentAudioRef.current = null;
+        setIsSimultaneousQueued(false);
+        setIsSeparatingConcurrent(true);
+        isSeparatingConcurrentRef.current = true;
+        await separateConcurrentDictationsToBatch(processedText, primaryBlob, queuedBlob);
+        return;
+      } else if (isConcurrentRecordingActiveRef.current) {
+        // User is currently recording into the simultaneous recorder! Keep status in Processing so AudioRecorder doesn't unmount
+        return;
+      }
+
+      try {
+        const chatSession = await createChat(audioBlobs, processedText, customPrompt, customImages, selectedModel);
+        if (processingRequestIdRef.current === reqId) {
+          setChat(chatSession);
+        }
+      } catch (chatErr) {
+        console.warn("Follow-up AI chat initialization notice:", chatErr);
+      }
+
       const aiGreeting = "I have reviewed the audio and the transcript. How can I help you further?";
       setChatHistory([{ author: 'AI', text: `${processedText.join('\n\n')}\n\n${aiGreeting}` }]);
       
@@ -725,19 +804,8 @@ const App: React.FC = () => {
       activeDictationIsLiveRef.current = false;
       driveSyncedHashRef.current = processedText.join('|||');
 
-      // Check if user has queued audio or is still actively recording concurrently
-      if (isConcurrentRecordingActiveRef.current) {
-        // User is currently recording into the simultaneous recorder! Keep status in Processing so AudioRecorder doesn't unmount
-      } else if (queuedConcurrentAudioRef.current) {
-        const queuedBlob = queuedConcurrentAudioRef.current as Blob;
-        queuedConcurrentAudioRef.current = null;
-        setIsSimultaneousQueued(false);
-        await separateConcurrentDictationsToBatch(processedText, primaryBlob, queuedBlob);
-        return;
-      } else {
-        setStatus(AppStatus.Success);
-        window.scrollTo({ top: 0, behavior: 'instant' });
-      }
+      setStatus(AppStatus.Success);
+      window.scrollTo({ top: 0, behavior: 'instant' });
 
       // Processing succeeded! Safely clear the temporary in-flight backup
       deleteAudioBlob(`in_flight_recording_${currentTabId}`).catch(() => {});
@@ -759,12 +827,11 @@ const App: React.FC = () => {
     } catch (err) {
       clearInterval(processingHeartbeatTimer);
       markTabActive('idle');
+      isFirstDictationProcessingRef.current = false;
       if (processingRequestIdRef.current !== reqId) return; // cancelled
       console.error(err);
       setError(err instanceof Error ? err.message : 'An unknown error occurred during processing.');
       setStatus(AppStatus.Error);
-      // NOTE: We intentionally keep 'in_flight_recording' in IndexedDB so that even if the user
-      // accidentally refreshes or closes the page on this Error screen, the audio is STILL preserved!
     }
   }, [selectedModel, customPrompt, customImages, customDocx, separateConcurrentDictationsToBatch]);
 
@@ -775,27 +842,34 @@ const App: React.FC = () => {
     if (audioBlobs.length === 0 || audioBlobs.every(b => !b || b.size === 0)) return;
     const newBlob = audioBlobs[0];
 
-    // If initial dictation is still running processAudio:
-    if (status === AppStatus.Processing && findings.length === 0) {
+    // Check ref-based state:
+    if (isFirstDictationProcessingRef.current) {
+      // First dictation is still running its processAudio!
+      // Queue Dictation 2 so handleRecordingComplete will pick it up the moment processAudio returns
       queuedConcurrentAudioRef.current = newBlob;
       setIsSimultaneousQueued(true);
-    } else if (findings.length > 0 && audioBlob) {
-      // First dictation is ready with findings & audio: separate into two distinct reports in Batch Mode!
+    } else if (firstDictationFindingsRef.current && firstDictationFindingsRef.current.length > 0) {
+      // First dictation is already finished processing!
+      // Immediately separate into Batch Mode!
+      const firstFindings = firstDictationFindingsRef.current;
+      const firstBlob = firstDictationAudioRef.current || (Array.isArray(audioBlob) ? audioBlob[0] : audioBlob);
+      if (firstBlob) {
+        setIsSeparatingConcurrent(true);
+        isSeparatingConcurrentRef.current = true;
+        await separateConcurrentDictationsToBatch(firstFindings, firstBlob, newBlob);
+      }
+    } else if (findings && findings.length > 0 && audioBlob) {
+      // Fallback if findings were already in state:
       const firstBlob = Array.isArray(audioBlob) ? audioBlob[0] : audioBlob;
+      setIsSeparatingConcurrent(true);
+      isSeparatingConcurrentRef.current = true;
       await separateConcurrentDictationsToBatch(findings, firstBlob, newBlob);
     } else {
-      // Findings are ready or status transitioned:
-      setStatus(AppStatus.Success);
-      window.scrollTo({ top: 0, behavior: 'instant' });
-      if (handleContinueDictationRef.current) {
-        try {
-          await handleContinueDictationRef.current(newBlob);
-        } catch (err) {
-          console.error("Concurrent dictation continuation error:", err);
-        }
-      }
+      // If neither is ready, queue audio
+      queuedConcurrentAudioRef.current = newBlob;
+      setIsSimultaneousQueued(true);
     }
-  }, [status, findings, audioBlob, separateConcurrentDictationsToBatch]);
+  }, [audioBlob, findings, separateConcurrentDictationsToBatch]);
   
   const handleLiveDictationComplete = useCallback(async (transcript: string, audioBlob: Blob | null) => {
     const reqId = ++processingRequestIdRef.current;
@@ -1172,6 +1246,15 @@ const App: React.FC = () => {
     }
 
     // Reset workspace to idle immediately so user can record right away without confirmation friction
+    firstDictationFindingsRef.current = null;
+    firstDictationAudioRef.current = null;
+    isFirstDictationProcessingRef.current = false;
+    queuedConcurrentAudioRef.current = null;
+    isConcurrentRecordingActiveRef.current = false;
+    isSeparatingConcurrentRef.current = false;
+    setIsSeparatingConcurrent(false);
+    setIsSimultaneousQueued(false);
+    setConcurrentRecordingStatus(AppStatus.Idle);
     setStatus(AppStatus.Idle);
     setFindings([]);
     setError(null);
@@ -1349,14 +1432,18 @@ const App: React.FC = () => {
             <div className="bg-blue-50/90 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 rounded-2xl p-5 shadow-sm text-center">
               <Spinner className="w-8 h-8 mx-auto text-blue-600 dark:text-blue-400" />
               <p className="text-slate-800 dark:text-slate-100 mt-3 text-lg font-bold">
-                {isConcurrentRecordingActiveRef.current 
-                  ? 'First dictation processed! Still capturing your ongoing dictation...' 
-                  : 'Analyzing and correcting previous dictation...'}
+                {isSeparatingConcurrent
+                  ? 'Processing second dictation into a separate report...'
+                  : isConcurrentRecordingActiveRef.current 
+                    ? 'First dictation processed! Still capturing your ongoing dictation...' 
+                    : 'Analyzing and correcting dictation...'}
               </p>
               <p className="text-slate-600 dark:text-slate-300 mt-1 text-sm font-medium">
-                {isSimultaneousQueued
-                  ? '✓ Next dictation captured and queued — will auto-merge as soon as processing completes.'
-                  : 'Simultaneous dictation active: You can dictate your next finding below right now while this is processing!'}
+                {isSeparatingConcurrent
+                  ? 'Both dictations will be placed side-by-side as separate independent reports in Batch Mode momentarily.'
+                  : isSimultaneousQueued
+                    ? '✓ Second dictation captured! Separating into independent Batch Mode reports as soon as the first finishes.'
+                    : 'Simultaneous dictation active: You can dictate your next separate report below right now while this is processing!'}
               </p>
               <div className="mt-4 flex flex-wrap justify-center items-center gap-3">
                 <button
@@ -1366,7 +1453,7 @@ const App: React.FC = () => {
                 >
                   <StopIcon className="w-4 h-4" /> Cancel Analysis
                 </button>
-                {audioBlob && (
+                {audioBlob && !isSeparatingConcurrent && (
                   <button
                     onClick={handleDownload}
                     className="inline-flex items-center gap-2 bg-slate-600 text-white font-semibold py-2 px-5 rounded-lg hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-400 focus:ring-opacity-50 transition-colors shadow-sm text-sm cursor-pointer"
@@ -1378,26 +1465,28 @@ const App: React.FC = () => {
               </div>
             </div>
 
-            <div className="border border-emerald-200 dark:border-emerald-800/60 bg-emerald-50/40 dark:bg-emerald-950/20 rounded-2xl p-4 sm:p-5 shadow-sm">
-              <div className="flex items-center justify-between mb-3 px-1">
-                <span className="text-sm font-bold text-emerald-800 dark:text-emerald-200 flex items-center gap-2">
-                  <MicIcon className="w-4 h-4 text-emerald-600 animate-pulse" />
-                  Simultaneous Dictation (Dictate while loading)
-                </span>
-                <span className="text-xs bg-emerald-200/70 dark:bg-emerald-900/60 text-emerald-800 dark:text-emerald-200 px-2.5 py-0.5 rounded-full font-semibold">
-                  Queue Active
-                </span>
+            {!isSeparatingConcurrent && (
+              <div className="border border-emerald-200 dark:border-emerald-800/60 bg-emerald-50/40 dark:bg-emerald-950/20 rounded-2xl p-4 sm:p-5 shadow-sm">
+                <div className="flex items-center justify-between mb-3 px-1">
+                  <span className="text-sm font-bold text-emerald-800 dark:text-emerald-200 flex items-center gap-2">
+                    <MicIcon className="w-4 h-4 text-emerald-600 animate-pulse" />
+                    Simultaneous Dictation (Dictate next separate report while loading)
+                  </span>
+                  <span className="text-xs bg-emerald-200/70 dark:bg-emerald-900/60 text-emerald-800 dark:text-emerald-200 px-2.5 py-0.5 rounded-full font-semibold">
+                    Separate Report
+                  </span>
+                </div>
+                <AudioRecorder
+                  status={concurrentRecordingStatus}
+                  setStatus={(newSt) => {
+                    setConcurrentRecordingStatus(newSt);
+                    isConcurrentRecordingActiveRef.current = (newSt === AppStatus.Recording);
+                  }}
+                  onRecordingComplete={handleConcurrentRecordingComplete}
+                  onMultipleFilesUploaded={(files) => setMultipleFilesModal(files)}
+                />
               </div>
-              <AudioRecorder
-                status={concurrentRecordingStatus}
-                setStatus={(newSt) => {
-                  setConcurrentRecordingStatus(newSt);
-                  isConcurrentRecordingActiveRef.current = (newSt === AppStatus.Recording);
-                }}
-                onRecordingComplete={handleConcurrentRecordingComplete}
-                onMultipleFilesUploaded={(files) => setMultipleFilesModal(files)}
-              />
-            </div>
+            )}
           </div>
         );
       case AppStatus.Success:
@@ -1602,6 +1691,7 @@ const App: React.FC = () => {
         return (
           <ErrorBoundary sectionName="Batch Mode" onReset={() => setMode('single')}>
             <BatchProcessor 
+                    key={`batch-proc-${batchModeInstanceKey}`}
                     selectedModel={selectedModel} 
                     isErrorCheckEnabled={isErrorCheckEnabled}
                     initialFiles={pendingBatchFiles}
