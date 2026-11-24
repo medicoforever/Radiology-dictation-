@@ -61,7 +61,7 @@ function createBackgroundWorker(): Worker | null {
   }
 }
 
-export const useAudioRecorder = (): AudioRecorderResult => {
+export const useAudioRecorder = (sessionScope = 'single'): AudioRecorderResult => {
   const [isRecording, setIsRecording] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const [isRequestingMic, setIsRequestingMic] = useState(false);
@@ -69,6 +69,8 @@ export const useAudioRecorder = (): AudioRecorderResult => {
   const [error, setError] = useState<string | null>(null);
   const [interruptedNotice, setInterruptedNotice] = useState<string | null>(null);
   const [unsavedSession, setUnsavedSession] = useState<UnsavedSession | null>(null);
+  const unsavedSessionRef = useRef<UnsavedSession | null>(null);
+  unsavedSessionRef.current = unsavedSession;
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
@@ -94,10 +96,10 @@ export const useAudioRecorder = (): AudioRecorderResult => {
   // Check for unsaved session on hook load, playing alert if an interrupted session was detected
   const checkUnsavedSession = useCallback(async () => {
     try {
-      let session = await getUnsavedActiveSession();
-      if (!session && typeof window !== 'undefined' && localStorage.getItem('has_unsaved_session')) {
+      let session = await getUnsavedActiveSession(sessionScope);
+      if (!session && sessionScope === 'single' && typeof window !== 'undefined' && localStorage.getItem('has_unsaved_session')) {
         await new Promise(r => setTimeout(r, 300));
-        session = await getUnsavedActiveSession();
+        session = await getUnsavedActiveSession(sessionScope);
       }
       if (session && session.chunks.length > 0 && session.totalBytes > 0) {
         const currentTabId = getTabId();
@@ -106,6 +108,7 @@ export const useAudioRecorder = (): AudioRecorderResult => {
           stopRepeatingInterruptedAlert();
           return;
         }
+        unsavedSessionRef.current = session;
         setUnsavedSession(session);
         // Alert the user immediately and repeat every 10 seconds until an option is selected (only for this tab)
         if (!hasAlertedUnsavedRef.current) {
@@ -113,13 +116,16 @@ export const useAudioRecorder = (): AudioRecorderResult => {
           startRepeatingInterruptedAlert(10000);
         }
       } else {
+        unsavedSessionRef.current = null;
         setUnsavedSession(null);
-        stopRepeatingInterruptedAlert();
+        if (sessionScope === 'single') {
+          stopRepeatingInterruptedAlert();
+        }
       }
     } catch (err) {
       console.warn('Error checking unsaved audio session:', err);
     }
-  }, []);
+  }, [sessionScope]);
 
   useEffect(() => {
     checkUnsavedSession();
@@ -161,14 +167,16 @@ export const useAudioRecorder = (): AudioRecorderResult => {
     const currentChunks = [...audioChunksRef.current];
     if (currentChunks.length > 0) {
       const savedBlob = new Blob(currentChunks, { type: mimeTypeRef.current || 'audio/webm' });
-      await saveActiveSession(currentChunks, mimeTypeRef.current || 'audio/webm', sessionStartTimeRef.current);
+      await saveActiveSession(currentChunks, mimeTypeRef.current || 'audio/webm', sessionStartTimeRef.current, sessionScope);
       await saveCompletedRecording(savedBlob, mimeTypeRef.current || 'audio/webm');
-      setUnsavedSession({
+      const nextUnsaved: UnsavedSession = {
         timestamp: sessionStartTimeRef.current,
         mimeType: mimeTypeRef.current || 'audio/webm',
         chunks: currentChunks,
         totalBytes: savedBlob.size,
-      });
+      };
+      unsavedSessionRef.current = nextUnsaved;
+      setUnsavedSession(nextUnsaved);
     }
 
     // 3. Clean up tracks and reset state
@@ -177,6 +185,7 @@ export const useAudioRecorder = (): AudioRecorderResult => {
     });
     streamRef.current = null;
     mediaRecorderRef.current = null;
+    isRecordingRef.current = false;
     setIsRecording(false);
     setIsPaused(false);
     markTabActive('idle');
@@ -184,7 +193,7 @@ export const useAudioRecorder = (): AudioRecorderResult => {
     setInterruptedNotice(
       `Dictation stopped (${reason}). An alert sound was played, and your audio has been preserved in storage.`
     );
-  }, []);
+  }, [sessionScope]);
 
   // Worker-based un-throttled watchdog and timer
   useEffect(() => {
@@ -268,6 +277,13 @@ export const useAudioRecorder = (): AudioRecorderResult => {
   }, []);
 
   const startRecording = useCallback(async () => {
+    // Keep unsaved audio protected: do NOT allow starting an upcoming dictation while unresolved interrupted audio exists
+    if (unsavedSessionRef.current && unsavedSessionRef.current.totalBytes > 0) {
+      startRepeatingInterruptedAlert(10000);
+      setInterruptedNotice('Action required: Interrupted unsaved audio is preserved below. Restore, Save, or Discard it before starting a new dictation.');
+      throw new Error('UNSAVED_AUDIO_PENDING');
+    }
+
     setError(null);
     setInterruptedNotice(null);
     stopRepeatingInterruptedAlert();
@@ -298,7 +314,8 @@ export const useAudioRecorder = (): AudioRecorderResult => {
     }
 
     try {
-      clearActiveSession().catch(e => console.warn('Failed to clear active session:', e));
+      clearActiveSession(sessionScope).catch(e => console.warn('Failed to clear active session:', e));
+      unsavedSessionRef.current = null;
       setUnsavedSession(null);
 
       // Pre-warm audio contexts and request notification permissions while on user click
@@ -363,7 +380,7 @@ export const useAudioRecorder = (): AudioRecorderResult => {
           audioChunksRef.current.push(event.data);
           // Never persist active chunks if user already initiated stop
           if (isRecordingRef.current && !isUserInitiatedStopRef.current) {
-            saveActiveSession(audioChunksRef.current, mimeTypeRef.current, sessionStartTimeRef.current).catch((e) =>
+            saveActiveSession(audioChunksRef.current, mimeTypeRef.current, sessionStartTimeRef.current, sessionScope).catch((e) =>
               console.warn('Failed to auto-save active recording session:', e)
             );
           }
@@ -410,7 +427,7 @@ export const useAudioRecorder = (): AudioRecorderResult => {
       setError(errorMessage);
       throw new Error(errorMessage);
     }
-  }, [handleUnexpectedStop]);
+  }, [handleUnexpectedStop, sessionScope]);
 
   const pauseRecording = useCallback(() => {
     if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
@@ -463,7 +480,7 @@ export const useAudioRecorder = (): AudioRecorderResult => {
     isUserInitiatedStopRef.current = true;
     isRecordingRef.current = false;
     stopRepeatingInterruptedAlert();
-    clearActiveSession().catch(() => {});
+    clearActiveSession(sessionScope).catch(() => {});
     markTabActive('idle');
 
     if (workerRef.current) {
@@ -492,7 +509,8 @@ export const useAudioRecorder = (): AudioRecorderResult => {
           const newAudioBlob = new Blob(audioChunksRef.current, { type: mimeTypeRef.current });
           await cleanupAndSetState();
           await saveCompletedRecording(newAudioBlob, mimeTypeRef.current);
-          await clearActiveSession();
+          await clearActiveSession(sessionScope);
+          unsavedSessionRef.current = null;
           setUnsavedSession(null);
           resolve(newAudioBlob);
         }, { once: true });
@@ -508,20 +526,20 @@ export const useAudioRecorder = (): AudioRecorderResult => {
         } catch (stopErr) {
           console.warn('Error during recorder.stop():', stopErr);
           cleanupAndSetState().then(() => {
-            clearActiveSession().catch(() => {});
+            clearActiveSession(sessionScope).catch(() => {});
             const fallbackBlob = new Blob(audioChunksRef.current, { type: mimeTypeRef.current });
             resolve(fallbackBlob);
           });
         }
       } else {
-        clearActiveSession().catch(() => {});
+        clearActiveSession(sessionScope).catch(() => {});
         const fallbackBlob = new Blob(audioChunksRef.current, { type: mimeTypeRef.current });
         setIsRecording(false);
         setIsPaused(false);
         resolve(fallbackBlob);
       }
     });
-  }, []);
+  }, [sessionScope]);
 
   const getUnsavedSessionBlob = useCallback((): Blob | null => {
     if (!unsavedSession || unsavedSession.chunks.length === 0) return null;
@@ -533,18 +551,22 @@ export const useAudioRecorder = (): AudioRecorderResult => {
     if (!unsavedSession || unsavedSession.chunks.length === 0) return null;
     const recoveredBlob = new Blob(unsavedSession.chunks, { type: unsavedSession.mimeType || 'audio/webm' });
     await saveCompletedRecording(recoveredBlob, unsavedSession.mimeType);
-    await clearActiveSession();
+    await clearActiveSession(sessionScope);
+    unsavedSessionRef.current = null;
     setUnsavedSession(null);
     setInterruptedNotice(null);
+    hasAlertedUnsavedRef.current = false;
     return recoveredBlob;
-  }, [unsavedSession]);
+  }, [unsavedSession, sessionScope]);
 
   const discardUnsavedSession = useCallback(async () => {
     stopRepeatingInterruptedAlert();
-    await clearActiveSession();
+    await clearActiveSession(sessionScope);
+    unsavedSessionRef.current = null;
     setUnsavedSession(null);
     setInterruptedNotice(null);
-  }, []);
+    hasAlertedUnsavedRef.current = false;
+  }, [sessionScope]);
 
   useEffect(() => {
     return () => {

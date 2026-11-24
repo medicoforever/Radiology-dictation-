@@ -69,7 +69,7 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
     recordingDuration,
     startRecording,
     stopRecording,
-  } = useAudioRecorder();
+  } = useAudioRecorder('autonomous');
 
   const [recordedBlob, setRecordedBlob] = useState<Blob | null>(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
@@ -104,7 +104,7 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
   const audioUploadInputRef = useRef<HTMLInputElement>(null);
 
   // Dedicated recorder and state for Autonomous Feedback / Dictate Changes
-  const feedbackRecorder = useAudioRecorder();
+  const feedbackRecorder = useAudioRecorder('autonomous_feedback');
   const [feedbackRecordedBlob, setFeedbackRecordedBlob] = useState<Blob | null>(null);
   const [feedbackAudioUrl, setFeedbackAudioUrl] = useState<string | null>(null);
   const [feedbackTextInput, setFeedbackTextInput] = useState('');

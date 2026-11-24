@@ -199,9 +199,9 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         getUnsavedSessionBlob,
         recoverUnsavedSession,
         discardUnsavedSession
-    } = useAudioRecorder();
-    const { isRecording: isContinuationRecording, startRecording: startContinuationRecording, stopRecording: stopContinuationRecording, error: continuationRecorderError } = useAudioRecorder();
-    const { startRecording: startBatchContinuation, stopRecording: stopBatchContinuation, error: batchContinuationError } = useAudioRecorder();
+    } = useAudioRecorder('batch');
+    const { isRecording: isContinuationRecording, startRecording: startContinuationRecording, stopRecording: stopContinuationRecording, error: continuationRecorderError } = useAudioRecorder('batch_cont');
+    const { startRecording: startBatchContinuation, stopRecording: stopBatchContinuation, error: batchContinuationError } = useAudioRecorder('batch_append');
     const [continuationState, setContinuationState] = useState<{ batchId: string | null; status: 'idle' | 'recording' | 'processing'; error: string | null }>({ batchId: null, status: 'idle', error: null });
     const [isBusy, setIsBusy] = useState(false);
     const [openAccordion, setOpenAccordion] = useState<string | null>(null);
@@ -222,7 +222,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     const [dictateEditingState, setDictateEditingState] = useState<{ batchId: string; index: number } | null>(null);
     const [processingState, setProcessingState] = useState<{ batchId: string; index: number } | null>(null);
     const [continuationError, setContinuationError] = useState<{ batchId: string; index: number; message: string } | null>(null);
-    const modifyRecorder = useAudioRecorder();
+    const modifyRecorder = useAudioRecorder('batch_modify');
     
     // State for selection copier
     const [selectionSnippets, setSelectionSnippets] = useState<Record<string, Record<number, string>>>({});
@@ -375,7 +375,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     // State for 'Dictate Report Changes' feature
     const [modificationState, setModificationState] = useState<{ batchId: string | null; status: 'idle' | 'recording' | 'processing' }>({ batchId: null, status: 'idle' });
     const [modificationError, setModificationError] = useState<{ batchId: string | null; message: string | null }>({ batchId: null, message: null });
-    const modificationRecorder = useAudioRecorder();
+    const modificationRecorder = useAudioRecorder('batch_modification');
 
     // State for reordering entire batches
     const [isBatchReorderMode, setIsBatchReorderMode] = useState(false);
@@ -431,7 +431,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     const [agenticProgressTexts, setAgenticProgressTexts] = useState<Record<string, string>>({});
     const [expertNotesForBatches, setExpertNotesForBatches] = useState<Record<string, string | null>>({});
     const [isTranscribingComplex, setIsTranscribingComplex] = useState<Record<string, boolean>>({});
-    const complexInputRecorder = useAudioRecorder();
+    const complexInputRecorder = useAudioRecorder('batch_complex');
     
     // For triggering error checks
     const processedFindingsRef = useRef<Map<string, string>>(new Map());

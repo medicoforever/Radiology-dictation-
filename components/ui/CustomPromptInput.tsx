@@ -40,7 +40,7 @@ const CustomPromptInput: React.FC<{
 }> = ({ prompt, onPromptChange, className, images = [], onImagesChange, customDocx, onCustomDocxChange, isLiveMode = false, selectedModel, onTemplateApplied }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
-  const { isRecording, startRecording, stopRecording, error: recorderError } = useAudioRecorder();
+  const { isRecording, startRecording, stopRecording, error: recorderError } = useAudioRecorder('prompt_voice');
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [transcriptionError, setTranscriptionError] = useState<string | null>(null);
   const [isDraggingOver, setIsDraggingOver] = useState(false);

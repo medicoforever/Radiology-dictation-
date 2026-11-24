@@ -354,13 +354,13 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   const [dictatingIndex, setDictatingIndex] = useState<number | null>(null);
   const [processingIndex, setProcessingIndex] = useState<number | null>(null);
   const [continuationError, setContinuationError] = useState<{ index: number; message: string } | null>(null);
-  const modifyRecorder = useAudioRecorder();
+  const modifyRecorder = useAudioRecorder('results_modify');
   const { startRecording: startModifyRecording, stopRecording: stopModifyRecording, error: modifyRecorderError } = modifyRecorder;
-  const rowDictationRecorder = useAudioRecorder();
+  const rowDictationRecorder = useAudioRecorder('results_row');
   const { startRecording: startRowDictationRecording, stopRecording: stopRowDictationRecording, error: rowDictationRecorderError } = rowDictationRecorder;
 
   // State for 'Continue Dictation' feature
-  const continuationRecorder = useAudioRecorder();
+  const continuationRecorder = useAudioRecorder('results_cont');
   const { 
     startRecording: startContinuingRecording, 
     stopRecording: stopContinuingRecording, 
@@ -378,7 +378,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   // State for 'Dictate Report Changes' feature
   const [modificationState, setModificationState] = useState<'idle' | 'recording' | 'processing'>('idle');
   const [modificationError, setModificationError] = useState<string | null>(null);
-  const modificationRecorder = useAudioRecorder();
+  const modificationRecorder = useAudioRecorder('results_modification');
   const {
     startRecording: startGlobalModificationRecording,
     stopRecording: stopGlobalModificationRecording,
@@ -440,7 +440,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   const [agenticStatus, setAgenticStatus] = useState<'idle' | 'processing' | 'error'>('idle');
   const [agenticError, setAgenticError] = useState<string | null>(null);
   const [agenticProgressText, setAgenticProgressText] = useState<string>('');
-  const complexInputRecorder = useAudioRecorder();
+  const complexInputRecorder = useAudioRecorder('results_complex');
   const [expertNotes, setExpertNotes] = useState<string | null>(null);
   // FIX: Add state to handle transcription loading state for the complex impression mic.
   const [isTranscribingComplex, setIsTranscribingComplex] = useState(false);

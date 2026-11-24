@@ -21,7 +21,7 @@ interface ChatInterfaceProps {
 const ChatInterface: React.FC<ChatInterfaceProps> = ({ history, isChatting, onSendMessage, selectedModel }) => {
   const [input, setInput] = useState('');
   const messagesContainerRef = useRef<null | HTMLDivElement>(null);
-  const { isRecording, startRecording, stopRecording, error: recorderError } = useAudioRecorder();
+  const { isRecording, startRecording, stopRecording, error: recorderError } = useAudioRecorder('chat');
   const [recordingTime, setRecordingTime] = useState(0);
   const timerRef = useRef<number | null>(null);
 

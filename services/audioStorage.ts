@@ -207,19 +207,21 @@ export async function clearUnusedAudioBlobs(validKeys: string[]): Promise<void> 
 }
 
 /**
- * Saves active recording session chunks into IndexedDB (isolated per browser tab)
+ * Saves active recording session chunks into IndexedDB (isolated per browser tab and mode scope)
  */
-export async function saveActiveSession(chunks: Blob[], mimeType: string, timestamp?: number): Promise<void> {
+export async function saveActiveSession(chunks: Blob[], mimeType: string, timestamp?: number, scope = 'single'): Promise<void> {
   if (!chunks || chunks.length === 0) return;
   try {
     const db = await getDB();
     if (!db) return;
 
     const tabId = getTabId();
+    const recordId = `session_${tabId}_${scope}`;
     const combinedBlob = new Blob(chunks, { type: mimeType || 'audio/webm' });
     const record = {
-      id: `session_${tabId}`,
+      id: recordId,
       tabId,
+      scope,
       timestamp: timestamp || Date.now(),
       mimeType: mimeType || combinedBlob.type || 'audio/webm',
       chunks: [combinedBlob],
@@ -231,8 +233,9 @@ export async function saveActiveSession(chunks: Blob[], mimeType: string, timest
     store.put(record);
 
     try {
-      localStorage.setItem(`has_unsaved_session_${tabId}`, JSON.stringify({
+      localStorage.setItem(`has_unsaved_session_${tabId}_${scope}`, JSON.stringify({
         tabId,
+        scope,
         timestamp: record.timestamp,
         totalBytes: record.totalBytes,
         mimeType: record.mimeType,
@@ -244,10 +247,10 @@ export async function saveActiveSession(chunks: Blob[], mimeType: string, timest
 }
 
 /**
- * Checks for any unsaved active session chunks for THIS specific browser tab.
- * Isolated per tab to eliminate cross-tab audio alarms or overwriting.
+ * Checks for any unsaved active session chunks for THIS specific browser tab & scope.
+ * Isolated per tab and mode scope to eliminate cross-tab or single-vs-batch overwriting.
  */
-export async function getUnsavedActiveSession(): Promise<UnsavedSession | null> {
+export async function getUnsavedActiveSession(scope = 'single'): Promise<UnsavedSession | null> {
   try {
     const db = await getDB();
     if (!db) return null;
@@ -256,55 +259,58 @@ export async function getUnsavedActiveSession(): Promise<UnsavedSession | null> 
     const tx = db.transaction(STORE_CHUNKS, 'readonly');
     const store = tx.objectStore(STORE_CHUNKS);
 
+    const parseRecord = (data: any): UnsavedSession | null => {
+      if (!data) return null;
+      let chunks: Blob[] = [];
+      if (Array.isArray(data.chunks) && data.chunks.length > 0) {
+        chunks = data.chunks;
+      } else if (data.blob instanceof Blob) {
+        chunks = [data.blob];
+      }
+      if (chunks.length === 0) return null;
+      return {
+        timestamp: data.timestamp || Date.now(),
+        mimeType: data.mimeType || 'audio/webm',
+        chunks,
+        totalBytes: data.totalBytes || chunks.reduce((acc, c) => acc + c.size, 0),
+        tabId: data.tabId || tabId,
+      };
+    };
+
     return new Promise((resolve) => {
-      // 1. Check tab-scoped session first
-      const req = store.get(`session_${tabId}`);
+      // 1. Check tab+scope-scoped session first
+      const req = store.get(`session_${tabId}_${scope}`);
       req.onsuccess = () => {
-        const data = req.result;
-        if (data) {
-          let chunks: Blob[] = [];
-          if (Array.isArray(data.chunks) && data.chunks.length > 0) {
-            chunks = data.chunks;
-          } else if (data.blob instanceof Blob) {
-            chunks = [data.blob];
-          }
-          if (chunks.length > 0) {
-            resolve({
-              timestamp: data.timestamp || Date.now(),
-              mimeType: data.mimeType || 'audio/webm',
-              chunks: chunks,
-              totalBytes: data.totalBytes || chunks.reduce((acc, c) => acc + c.size, 0),
-              tabId: data.tabId || tabId,
-            });
-            return;
-          }
+        const parsed = parseRecord(req.result);
+        if (parsed) {
+          resolve(parsed);
+          return;
         }
 
-        // 2. Safe check on legacy key ONLY if it was created by this exact same tab
-        const legacyReq = store.get('current_session');
-        legacyReq.onsuccess = () => {
-          const legacyData = legacyReq.result;
-          if (legacyData && legacyData.tabId === tabId) {
-            let chunks: Blob[] = [];
-            if (Array.isArray(legacyData.chunks) && legacyData.chunks.length > 0) {
-              chunks = legacyData.chunks;
-            } else if (legacyData.blob instanceof Blob) {
-              chunks = [legacyData.blob];
-            }
-            if (chunks.length > 0) {
-              resolve({
-                timestamp: legacyData.timestamp || Date.now(),
-                mimeType: legacyData.mimeType || 'audio/webm',
-                chunks: chunks,
-                totalBytes: legacyData.totalBytes || chunks.reduce((acc, c) => acc + c.size, 0),
-                tabId: legacyData.tabId,
-              });
+        // 2. Fallback for 'single' scope: check previous unscoped tab key (`session_${tabId}`) or legacy `current_session`
+        if (scope === 'single') {
+          const unscopedReq = store.get(`session_${tabId}`);
+          unscopedReq.onsuccess = () => {
+            const unscopedParsed = parseRecord(unscopedReq.result);
+            if (unscopedParsed) {
+              resolve(unscopedParsed);
               return;
             }
-          }
+            const legacyReq = store.get('current_session');
+            legacyReq.onsuccess = () => {
+              const legacyData = legacyReq.result;
+              if (legacyData && legacyData.tabId === tabId) {
+                resolve(parseRecord(legacyData));
+                return;
+              }
+              resolve(null);
+            };
+            legacyReq.onerror = () => resolve(null);
+          };
+          unscopedReq.onerror = () => resolve(null);
+        } else {
           resolve(null);
-        };
-        legacyReq.onerror = () => resolve(null);
+        }
       };
       req.onerror = () => resolve(null);
     });
@@ -315,14 +321,17 @@ export async function getUnsavedActiveSession(): Promise<UnsavedSession | null> 
 }
 
 /**
- * Clears the active session from IndexedDB and localStorage for this tab.
+ * Clears the active session from IndexedDB and localStorage for this tab & scope.
  */
-export async function clearActiveSession(): Promise<void> {
+export async function clearActiveSession(scope = 'single'): Promise<void> {
   try {
     const tabId = getTabId();
     try {
-      localStorage.removeItem(`has_unsaved_session_${tabId}`);
-      localStorage.removeItem('has_unsaved_session');
+      localStorage.removeItem(`has_unsaved_session_${tabId}_${scope}`);
+      if (scope === 'single') {
+        localStorage.removeItem(`has_unsaved_session_${tabId}`);
+        localStorage.removeItem('has_unsaved_session');
+      }
     } catch {}
 
     const db = await getDB();
@@ -330,8 +339,11 @@ export async function clearActiveSession(): Promise<void> {
 
     const tx = db.transaction(STORE_CHUNKS, 'readwrite');
     const store = tx.objectStore(STORE_CHUNKS);
-    store.delete(`session_${tabId}`);
-    store.delete('current_session');
+    store.delete(`session_${tabId}_${scope}`);
+    if (scope === 'single') {
+      store.delete(`session_${tabId}`);
+      store.delete('current_session');
+    }
   } catch (err) {
     console.debug('Failed to clear active session from IndexedDB:', err);
   }

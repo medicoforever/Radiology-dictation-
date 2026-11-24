@@ -20,6 +20,7 @@ interface AudioRecorderProps {
   setStatus: (status: AppStatus) => void;
   onRecordingComplete: (audioBlob: Blob | Blob[]) => void;
   onMultipleFilesUploaded?: (files: File[]) => void;
+  onUnsavedStateChange?: (hasUnsaved: boolean) => void;
 }
 
 function formatDuration(totalSeconds: number): string {
@@ -33,7 +34,7 @@ function formatDuration(totalSeconds: number): string {
   return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
 }
 
-const AudioRecorder: React.FC<AudioRecorderProps> = ({ status, setStatus, onRecordingComplete, onMultipleFilesUploaded }) => {
+const AudioRecorder: React.FC<AudioRecorderProps> = ({ status, setStatus, onRecordingComplete, onMultipleFilesUploaded, onUnsavedStateChange }) => {
   const {
     isRecording,
     isPaused,
@@ -52,10 +53,23 @@ const AudioRecorder: React.FC<AudioRecorderProps> = ({ status, setStatus, onReco
     getUnsavedSessionBlob,
     recoverUnsavedSession,
     discardUnsavedSession,
-  } = useAudioRecorder();
+  } = useAudioRecorder('single');
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const unsavedCardRef = useRef<HTMLDivElement>(null);
   const [isDragging, setIsDragging] = React.useState(false);
+
+  // Ensure external parent status never stays stuck in Recording if the recorder stopped unexpectedly
+  useEffect(() => {
+    if (!isRecording && status === AppStatus.Recording) {
+      setStatus(AppStatus.Idle);
+    }
+  }, [isRecording, status, setStatus]);
+
+  // Notify parent whenever unresolved interrupted audio state changes
+  useEffect(() => {
+    onUnsavedStateChange?.(Boolean(unsavedSession && !isRecording));
+  }, [unsavedSession, isRecording, onUnsavedStateChange]);
   const [isStarting, setIsStarting] = React.useState(false);
   const [isPasteModalOpen, setIsPasteModalOpen] = useState(false);
   const [clipboardPastedText, setClipboardPastedText] = useState('');
@@ -140,12 +154,25 @@ const AudioRecorder: React.FC<AudioRecorderProps> = ({ status, setStatus, onReco
     }
   };
 
+  const guardUnsavedPending = () => {
+    if (unsavedSession && !isRecording) {
+      unsavedCardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return true;
+    }
+    return false;
+  };
+
   const handleStart = async () => {
+    if (guardUnsavedPending()) {
+      await startRecording().catch(() => {});
+      return;
+    }
     setIsStarting(true);
     try {
       await startRecording();
       setStatus(AppStatus.Recording);
     } catch (err) {
+      setStatus(AppStatus.Idle);
       console.warn("Start recording failed or permission denied:", err);
     } finally {
       setIsStarting(false);
@@ -189,11 +216,16 @@ const AudioRecorder: React.FC<AudioRecorderProps> = ({ status, setStatus, onReco
   };
 
   const handleStartStagedRecording = async () => {
+    if (guardUnsavedPending()) {
+      await startRecording().catch(() => {});
+      return;
+    }
     setIsStarting(true);
     try {
       await startRecording();
       setStatus(AppStatus.Recording);
     } catch (err) {
+      setStatus(AppStatus.Idle);
       console.warn("Start staged recording failed:", err);
     } finally {
       setIsStarting(false);
@@ -274,9 +306,17 @@ const AudioRecorder: React.FC<AudioRecorderProps> = ({ status, setStatus, onReco
   const handleRecover = async () => {
     stopRepeatingInterruptedAlert();
     const recoveredBlob = await recoverUnsavedSession();
+    setStatus(AppStatus.Idle);
+    onUnsavedStateChange?.(false);
     if (recoveredBlob && recoveredBlob.size > 0) {
       onRecordingComplete(recoveredBlob);
     }
+  };
+
+  const handleDiscardUnsaved = async () => {
+    await discardUnsavedSession();
+    setStatus(AppStatus.Idle);
+    onUnsavedStateChange?.(false);
   };
 
   const handleDownloadRecovered = () => {
@@ -375,22 +415,22 @@ const AudioRecorder: React.FC<AudioRecorderProps> = ({ status, setStatus, onReco
       )}
 
       {unsavedSession && !isRecording && (
-        <div className="w-full max-w-xl mb-6 p-4 rounded-xl border border-amber-300 bg-amber-50 dark:bg-amber-900/30 dark:border-amber-700/60 shadow-sm flex flex-col gap-3">
+        <div ref={unsavedCardRef} className="w-full max-w-xl mb-6 p-4 rounded-xl border-2 border-amber-400 bg-amber-50 dark:bg-amber-900/30 dark:border-amber-600/80 shadow-md flex flex-col gap-3">
           <div className="flex items-center gap-3 text-amber-800 dark:text-amber-200">
-            <WarningIcon className="w-6 h-6 shrink-0 text-amber-600 dark:text-amber-400" />
+            <WarningIcon className="w-6 h-6 shrink-0 text-amber-600 dark:text-amber-400 animate-pulse" />
             <div>
               <p className="font-semibold text-sm sm:text-base">
                 Interrupted Audio Recording Detected
               </p>
               <p className="text-xs sm:text-sm text-amber-700 dark:text-amber-300">
-                Found audio chunks auto-saved at {formattedTime} ({formattedSize}). Restore it to avoid losing your dictation.
+                Found audio chunks auto-saved at {formattedTime} ({formattedSize}). Restore, Save, or Discard it before recording the next dictation.
               </p>
             </div>
           </div>
           <div className="flex flex-wrap gap-2 pt-1 border-t border-amber-200 dark:border-amber-800/50 justify-end">
             <button
-              onClick={discardUnsavedSession}
-              className="px-3 py-1.5 text-xs sm:text-sm font-medium text-slate-600 dark:text-slate-300 hover:bg-amber-100 dark:hover:bg-amber-800/40 rounded-lg transition-colors"
+              onClick={handleDiscardUnsaved}
+              className="px-3 py-1.5 text-xs sm:text-sm font-medium text-slate-600 dark:text-slate-300 hover:bg-amber-100 dark:hover:bg-amber-800/40 rounded-lg transition-colors cursor-pointer"
             >
               Discard Backup
             </button>
@@ -690,8 +730,9 @@ const AudioRecorder: React.FC<AudioRecorderProps> = ({ status, setStatus, onReco
           <div className="flex flex-col sm:flex-row items-center justify-center gap-2.5 sm:gap-3 w-full flex-wrap">
               <button
                 onClick={handleStart}
-                disabled={status === AppStatus.Recording || isStarting || isRequestingMic}
-                className="w-full sm:w-auto flex items-center justify-center gap-2 bg-blue-600 text-white font-bold py-3.5 px-6 rounded-full hover:bg-blue-700 focus:outline-none focus:ring-4 focus:ring-blue-300 transition-all duration-300 ease-in-out transform hover:scale-105 shadow-lg disabled:opacity-75 disabled:hover:scale-100 disabled:cursor-wait min-h-[48px]"
+                disabled={status === AppStatus.Recording || isStarting || isRequestingMic || Boolean(unsavedSession && !isRecording)}
+                title={unsavedSession && !isRecording ? 'Resolve the interrupted unsaved audio above before starting a new dictation' : 'Start Recording'}
+                className="w-full sm:w-auto flex items-center justify-center gap-2 bg-blue-600 text-white font-bold py-3.5 px-6 rounded-full hover:bg-blue-700 focus:outline-none focus:ring-4 focus:ring-blue-300 transition-all duration-300 ease-in-out transform hover:scale-105 shadow-lg disabled:opacity-50 disabled:hover:scale-100 disabled:cursor-not-allowed min-h-[48px]"
                 aria-label="Start Recording"
               >
                 {(isStarting || isRequestingMic) ? (
