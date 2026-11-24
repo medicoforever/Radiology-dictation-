@@ -5,7 +5,8 @@ import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react'
 import AudioRecorder from './components/AudioRecorder';
 import ResultsDisplay from './components/ResultsDisplay';
 import { AppStatus, IdentifiedError } from './types';
-import { processAudio, createChat, blobToBase64, base64ToBlob, createChatFromText, identifyPotentialErrors, findBuiltinTemplates } from './services/geminiService';
+import { processAudio, createChat, blobToBase64, base64ToBlob, createChatFromText, findBuiltinTemplates, runClinicalQaErrorCheck, ClinicalQaAssessment } from './services/geminiService';
+import ClinicalQaPanel from './components/ui/ClinicalQaPanel';
 import Spinner from './components/ui/Spinner';
 import { Chat } from '@google/genai';
 import { saveAudioBlob, getAudioBlob, deleteAudioBlob, saveReportSession, getReportSession, deleteReportSession } from './services/audioStorage';
@@ -159,6 +160,7 @@ const App: React.FC = () => {
     return unsubscribe;
   }, []);
   const [identifiedErrors, setIdentifiedErrors] = useState<IdentifiedError[]>([]);
+  const [qaAssessment, setQaAssessment] = useState<ClinicalQaAssessment | null>(null);
   const [errorCheckStatus, setErrorCheckStatus] = useState<'idle' | 'checking' | 'complete'>('idle');
   const [theme, setTheme] = useState(() => {
     const storedTheme = safeLocalStorage.getRaw('theme', '');
@@ -237,6 +239,7 @@ const App: React.FC = () => {
     customDocx?: DocxTemplateData | null;
     selectedModel: string;
     identifiedErrors: IdentifiedError[];
+    qaAssessment?: ClinicalQaAssessment | null;
     errorCheckStatus: 'idle' | 'checking' | 'complete';
     timestamp: number | null;
     isLive: boolean;
@@ -258,12 +261,24 @@ const App: React.FC = () => {
   const queuedConcurrentAudiosRef = useRef<QueuedConcurrentItem[]>([]);
   const [queuedAudiosCount, setQueuedAudiosCount] = useState<number>(0);
   const isConcurrentRecordingActiveRef = useRef<boolean>(false);
+  const isConcurrentIntentActiveRef = useRef<boolean>(false);
   const [isSimultaneousQueued, setIsSimultaneousQueued] = useState<boolean>(false);
   const [isSeparatingConcurrent, setIsSeparatingConcurrent] = useState<boolean>(false);
   const isSeparatingConcurrentRef = useRef<boolean>(false);
+  const [isContinuousSessionReady, setIsContinuousSessionReady] = useState<boolean>(false);
+  const [activeConcurrentBatchesCount, setActiveConcurrentBatchesCount] = useState<number>(0);
   const hasConcurrentUnsavedAudioRef = useRef<boolean>(false);
   const activeConcurrentBatchesRef = useRef<any[]>([]);
   const activeConcurrentBatchTsRef = useRef<number | null>(null);
+  const currentFirstBatchAddedRef = useRef<boolean>(false);
+  const visitedBatchSinceLastConcurrentRef = useRef<boolean>(false);
+  const concurrentAbortControllerRef = useRef<AbortController | null>(null);
+  const firstDictationSuccessMetaRef = useRef<{
+    blobs: Blob[];
+    prompt: string;
+    images: Array<{ data: string; mimeType: string }>;
+    reqId: number;
+  } | null>(null);
   const flushQueuedConcurrentIfReadyRef = useRef<() => void>(() => {});
   const firstDictationFindingsRef = useRef<string[] | null>(null);
   const firstDictationAudioRef = useRef<Blob | null>(null);
@@ -272,6 +287,12 @@ const App: React.FC = () => {
   const isFirstDictationProcessingRef = useRef<boolean>(false);
   const [batchModeInstanceKey, setBatchModeInstanceKey] = useState<number>(Date.now());
   const handleContinueDictationRef = useRef<((newAudioBlob: Blob, premergedBlob?: Blob) => Promise<void>) | null>(null);
+
+  useEffect(() => {
+    if (mode === 'batch') {
+      visitedBatchSinceLastConcurrentRef.current = true;
+    }
+  }, [mode]);
 
   const [concurrentCustomPrompt, setConcurrentCustomPrompt] = useState<string>(() => getUpcomingTemplate()?.promptText || '');
   const concurrentCustomPromptRef = useRef<string>(concurrentCustomPrompt);
@@ -554,30 +575,49 @@ const App: React.FC = () => {
   }, []);
 
 
-  // useEffect to run error check in background
+  // useEffect to run Gemini Decision 1 clinical QA & conditional error check in background
   useEffect(() => {
+    const abortController = new AbortController();
+
     const checkForErrors = async () => {
         // Only run when enabled, processing is successful and we have findings
         if (isErrorCheckEnabled && status === AppStatus.Success && findings.length > 0) {
             setErrorCheckStatus('checking');
-            setIdentifiedErrors([]); // Clear previous errors
+            setIdentifiedErrors([]);
+            setQaAssessment(null);
             try {
-                const errors = await identifyPotentialErrors(findings, selectedModel);
-                setIdentifiedErrors(errors);
-            } catch (err) {
+                const { errors, qaAssessment: assessment } = await runClinicalQaErrorCheck(
+                  findings,
+                  selectedModel,
+                  abortController.signal
+                );
+                if (!abortController.signal.aborted) {
+                  setIdentifiedErrors(errors);
+                  setQaAssessment(assessment);
+                }
+            } catch (err: any) {
+                if (err?.name === 'AbortError' || abortController.signal.aborted) {
+                  return;
+                }
                 console.error("Failed to check for errors:", err);
                 // Don't show this error to the user, it's a background task.
             } finally {
-                setErrorCheckStatus('complete');
+                if (!abortController.signal.aborted) {
+                  setErrorCheckStatus('complete');
+                }
             }
         } else {
             // Clear errors if disabled, status is not 'Success', or there are no findings
             setIdentifiedErrors([]);
+            setQaAssessment(null);
             setErrorCheckStatus('idle');
         }
     };
 
     checkForErrors();
+    return () => {
+      abortController.abort();
+    };
   }, [findings, status, selectedModel, isErrorCheckEnabled]);
 
 
@@ -588,27 +628,37 @@ const App: React.FC = () => {
       } catch (_) {}
       inFlightAbortControllerRef.current = null;
     }
+    if (concurrentAbortControllerRef.current) {
+      try {
+        concurrentAbortControllerRef.current.abort();
+      } catch (_) {}
+      concurrentAbortControllerRef.current = null;
+    }
     processingRequestIdRef.current++;
 
     const hasQueuedOrActive =
       queuedConcurrentAudiosRef.current.length > 0 ||
       activeConcurrentBatchesRef.current.length > 0 ||
       isConcurrentRecordingActiveRef.current ||
+      isConcurrentIntentActiveRef.current ||
       hasConcurrentUnsavedAudioRef.current;
 
     if (hasQueuedOrActive) {
-      // Never lose already-dictated #1 or queued #2/#3 dictations when cancelling #1 analysis
-      const cancelMsg = 'Dictation #1 analysis was cancelled. Recorded audio has been preserved in Batch Mode.';
-      firstDictationErrorRef.current = cancelMsg;
-      setFirstDictationError(cancelMsg);
-      firstDictationFindingsRef.current = [
-        "BOLD::Dictation #1 analysis cancelled by user.",
-        `[${cancelMsg}]`
-      ];
-      isFirstDictationProcessingRef.current = false;
-      isSeparatingConcurrentRef.current = false;
-      setIsSeparatingConcurrent(false);
-      setTimeout(() => flushQueuedConcurrentIfReadyRef.current(), 0);
+      if (isFirstDictationProcessingRef.current) {
+        // Never lose already-dictated #1 or queued #2/#3 dictations when cancelling #1 analysis
+        const cancelMsg = 'Dictation #1 analysis was cancelled. Recorded audio has been preserved in Batch Mode.';
+        firstDictationErrorRef.current = cancelMsg;
+        setFirstDictationError(cancelMsg);
+        firstDictationFindingsRef.current = [
+          "BOLD::Dictation #1 analysis cancelled by user.",
+          `[${cancelMsg}]`
+        ];
+        isFirstDictationProcessingRef.current = false;
+      }
+      // Do not forcibly clear isSeparatingConcurrentRef while its async loop is unwinding from AbortError
+      if (!isSeparatingConcurrentRef.current) {
+        setTimeout(() => flushQueuedConcurrentIfReadyRef.current(), 0);
+      }
       return;
     }
 
@@ -617,11 +667,15 @@ const App: React.FC = () => {
     firstDictationFindingsRef.current = null;
     firstDictationAudioRef.current = null;
     firstDictationErrorRef.current = null;
+    firstDictationSuccessMetaRef.current = null;
     setFirstDictationError(null);
     isFirstDictationProcessingRef.current = false;
     isSeparatingConcurrentRef.current = false;
     setIsSeparatingConcurrent(false);
     setIsSimultaneousQueued(false);
+    setIsContinuousSessionReady(false);
+    setActiveConcurrentBatchesCount(0);
+    currentFirstBatchAddedRef.current = false;
     isConcurrentRecordingActiveRef.current = false;
     setConcurrentRecordingStatus(AppStatus.Idle);
     if (findings.length > 0) {
@@ -671,9 +725,58 @@ const App: React.FC = () => {
     }
   }, []);
 
+  const serializeBatchesForStorage = (batches: any[]) =>
+    batches.map(({ audioBlobs, chat, ...rest }) => ({
+      ...rest,
+      audioCount: Array.isArray(audioBlobs) ? audioBlobs.length : (rest.audioCount || 0),
+    }));
+
+  const finalizeFirstDictationSuccess = useCallback(async (
+    processedText: string[],
+    blobsForChat: Blob[],
+    promptToUse: string,
+    imagesToUse: Array<{ data: string; mimeType: string }>,
+    reqId: number
+  ) => {
+    try {
+      const chatSession = await createChat(blobsForChat, processedText, promptToUse, imagesToUse, selectedModel);
+      if (processingRequestIdRef.current === reqId) {
+        setChat(chatSession);
+      }
+    } catch (chatErr) {
+      console.warn("Follow-up AI chat initialization notice:", chatErr);
+    }
+
+    const aiGreeting = "I have reviewed the audio and the transcript. How can I help you further?";
+    setChatHistory([{ author: 'AI', text: `${processedText.join('\n\n')}\n\n${aiGreeting}` }]);
+
+    const timestamp = Date.now();
+    activeDictationTimestampRef.current = timestamp;
+    activeDictationIsLiveRef.current = false;
+    driveSyncedHashRef.current = processedText.join('|||');
+
+    setIsContinuousSessionReady(false);
+    setStatus(AppStatus.Success);
+    window.scrollTo({ top: 0, behavior: 'instant' });
+
+    const currentTabId = getTabId();
+    deleteAudioBlob(`in_flight_recording_${currentTabId}`).catch(() => {});
+    deleteAudioBlob('in_flight_recording').catch(() => {});
+    try {
+      localStorage.removeItem(`in_flight_recording_meta_${currentTabId}`);
+      localStorage.removeItem('in_flight_recording_meta');
+    } catch (_) {}
+
+    autoSaveSingleDictation(processedText, undefined, timestamp).then(result => {
+      if (result.success) {
+        setDriveSaveResult(result);
+      }
+    }).catch(err => console.warn('Drive auto-save background notice:', err));
+  }, [selectedModel]);
+
   const separateConcurrentDictationsToBatch = useCallback(async (
     firstFindings: string[],
-    firstAudio: Blob,
+    firstAudio: Blob | null,
     subsequentItems: QueuedConcurrentItem[],
     firstErrorMsg?: string | null
   ) => {
@@ -688,6 +791,7 @@ const App: React.FC = () => {
 
     isSeparatingConcurrentRef.current = true;
     setIsSeparatingConcurrent(true);
+    setIsContinuousSessionReady(false);
     setStatus(AppStatus.Processing);
     setIsSimultaneousQueued(false);
     isConcurrentRecordingActiveRef.current = false;
@@ -708,13 +812,32 @@ const App: React.FC = () => {
     };
 
     try {
-      // 1. Reuse accumulated session batches if continuing while recording #3+, or start fresh with Report #1
-      let updatedBatches: Array<any>;
-      if (activeConcurrentBatchesRef.current.length > 0) {
-        updatedBatches = [...activeConcurrentBatchesRef.current];
-      } else {
-        const batch1Id = `batch-sep-1-${now}`;
-        const name1 = firstErrorMsg ? 'Report 1 (Interrupted)' : getTitle(firstFindings, 'Report 1');
+      // 1. Reuse accumulated session batches if continuing while recording #3+, syncing if user edited/cleared Batch Mode
+      if (activeConcurrentBatchesRef.current.length > 0 && visitedBatchSinceLastConcurrentRef.current) {
+        visitedBatchSinceLastConcurrentRef.current = false;
+        const stored = await getReportSession<any[]>(curBatchKey);
+        if (!stored || stored.length === 0) {
+          activeConcurrentBatchesRef.current = [];
+        } else {
+          const storedById = new Map(stored.map(s => [s.id, s]));
+          activeConcurrentBatchesRef.current = activeConcurrentBatchesRef.current
+            .filter(b => storedById.has(b.id))
+            .map(b => {
+              const s = storedById.get(b.id);
+              return s ? { ...b, name: s.name || b.name, findings: s.findings || b.findings, status: s.status || b.status } : b;
+            });
+        }
+      }
+      visitedBatchSinceLastConcurrentRef.current = false;
+
+      let updatedBatches: Array<any> = activeConcurrentBatchesRef.current.length > 0
+        ? [...activeConcurrentBatchesRef.current]
+        : [];
+
+      if (!currentFirstBatchAddedRef.current && firstAudio) {
+        const firstReportNum = updatedBatches.length + 1;
+        const batch1Id = `batch-sep-${firstReportNum}-${now}`;
+        const name1 = firstErrorMsg ? `Report ${firstReportNum} (Interrupted)` : getTitle(firstFindings, `Report ${firstReportNum}`);
         await saveAudioBlob(`batch_audio_${curTabId}_${batch1Id}_0`, firstAudio);
         await saveAudioBlob(`batch_audio_${batch1Id}_0`, firstAudio);
 
@@ -734,19 +857,32 @@ const App: React.FC = () => {
           customImages,
           customDocx: customDocx || null,
         };
-        updatedBatches = [batch1];
+        updatedBatches.push(batch1);
+        currentFirstBatchAddedRef.current = true;
       }
 
       const pendingWork: Array<{ batchId: string; reportNumber: number; item: QueuedConcurrentItem }> = [];
+
+      const persistBatchesSnapshot = async (batchesToPersist: any[]) => {
+        activeConcurrentBatchesRef.current = [...batchesToPersist];
+        setActiveConcurrentBatchesCount(batchesToPersist.length);
+        const serializable = serializeBatchesForStorage(batchesToPersist);
+        await saveReportSession(curBatchKey, serializable);
+        safeLocalStorage.setItem(curBatchKey, serializable);
+        await saveReportSession(BATCH_MODE_STORAGE_KEY, serializable).catch(() => {});
+        safeLocalStorage.setItem(BATCH_MODE_STORAGE_KEY, serializable);
+        window.dispatchEvent(new CustomEvent('raddoc_batch_mode_updated'));
+      };
 
       const enqueueItemsToBatches = async (itemsToAdd: QueuedConcurrentItem[]) => {
         if (!itemsToAdd || itemsToAdd.length === 0) return;
         for (const item of itemsToAdd) {
           const reportNum = updatedBatches.length + 1;
-          const primarySubsequentBlob = item.audioBlobs[0];
           const batchId = `batch-sep-${reportNum}-${now + reportNum}-${Math.random().toString(36).slice(2, 6)}`;
-          await saveAudioBlob(`batch_audio_${curTabId}_${batchId}_0`, primarySubsequentBlob);
-          await saveAudioBlob(`batch_audio_${batchId}_0`, primarySubsequentBlob);
+          for (let bIdx = 0; bIdx < item.audioBlobs.length; bIdx++) {
+            await saveAudioBlob(`batch_audio_${curTabId}_${batchId}_${bIdx}`, item.audioBlobs[bIdx]);
+            await saveAudioBlob(`batch_audio_${batchId}_${bIdx}`, item.audioBlobs[bIdx]);
+          }
 
           updatedBatches.push({
             id: batchId,
@@ -763,12 +899,7 @@ const App: React.FC = () => {
           pendingWork.push({ batchId, reportNumber: reportNum, item });
         }
 
-        activeConcurrentBatchesRef.current = [...updatedBatches];
-        await saveReportSession(curBatchKey, updatedBatches);
-        safeLocalStorage.setItem(curBatchKey, updatedBatches);
-        await saveReportSession(BATCH_MODE_STORAGE_KEY, updatedBatches).catch(() => {});
-        safeLocalStorage.setItem(BATCH_MODE_STORAGE_KEY, updatedBatches);
-        window.dispatchEvent(new CustomEvent('raddoc_batch_mode_updated'));
+        await persistBatchesSnapshot(updatedBatches);
       };
 
       const drainLiveQueue = async () => {
@@ -793,9 +924,12 @@ const App: React.FC = () => {
       }
 
       // 2. Process every pending item serially; dynamically pick up any #3, #4, #5 dictated mid-transfer!
+      let wasCancelledByUser = false;
       for (let i = 0; i < pendingWork.length; i++) {
         await drainLiveQueue();
         const { batchId, reportNumber, item } = pendingWork[i];
+        const itemAbortController = new AbortController();
+        concurrentAbortControllerRef.current = itemAbortController;
 
         let findings: string[] = [];
         let itemStatus: 'complete' | 'error' = 'complete';
@@ -806,19 +940,35 @@ const App: React.FC = () => {
             item.customPrompt,
             item.customImages,
             undefined,
-            item.customDocx
+            item.customDocx,
+            itemAbortController.signal
           );
-        } catch (err) {
-          console.error(`Error transcribing concurrent dictation #${reportNumber}:`, err);
-          itemStatus = 'error';
-          const msg = err instanceof Error ? err.message : 'Error processing dictation';
-          findings = [
-            `BOLD::Error processing dictation #${reportNumber}.`,
-            `[Error: ${msg}]. Audio preserved below. You can retry processing or download audio.`
-          ];
+        } catch (err: any) {
+          if (err?.name === 'AbortError' || itemAbortController.signal.aborted) {
+            wasCancelledByUser = true;
+            itemStatus = 'error';
+            findings = [
+              `BOLD::Dictation #${reportNumber} analysis cancelled by user.`,
+              `[Cancelled by user. Audio preserved below in Batch Mode.]`
+            ];
+          } else {
+            console.error(`Error transcribing concurrent dictation #${reportNumber}:`, err);
+            itemStatus = 'error';
+            const msg = err instanceof Error ? err.message : 'Error processing dictation';
+            findings = [
+              `BOLD::Error processing dictation #${reportNumber}.`,
+              `[Error: ${msg}]. Audio preserved below. You can retry processing or download audio.`
+            ];
+          }
+        } finally {
+          if (concurrentAbortControllerRef.current === itemAbortController) {
+            concurrentAbortControllerRef.current = null;
+          }
         }
 
-        const reportName = itemStatus === 'error' ? `Report ${reportNumber} (Error)` : getTitle(findings, `Report ${reportNumber}`);
+        const reportName = itemStatus === 'error'
+          ? `Report ${reportNumber} (${wasCancelledByUser ? 'Cancelled' : 'Error'})`
+          : getTitle(findings, `Report ${reportNumber}`);
         const targetBatch = updatedBatches.find(b => b.id === batchId);
         if (targetBatch) {
           targetBatch.findings = findings;
@@ -830,12 +980,20 @@ const App: React.FC = () => {
           }
         }
 
-        activeConcurrentBatchesRef.current = [...updatedBatches];
-        await saveReportSession(curBatchKey, updatedBatches);
-        safeLocalStorage.setItem(curBatchKey, updatedBatches);
-        await saveReportSession(BATCH_MODE_STORAGE_KEY, updatedBatches).catch(() => {});
-        safeLocalStorage.setItem(BATCH_MODE_STORAGE_KEY, updatedBatches);
-        window.dispatchEvent(new CustomEvent('raddoc_batch_mode_updated'));
+        if (wasCancelledByUser) {
+          // Preserve any unstarted queued items cleanly as idle so none remain stuck in 'processing'
+          for (let j = i + 1; j < pendingWork.length; j++) {
+            const unstarted = updatedBatches.find(b => b.id === pendingWork[j].batchId);
+            if (unstarted) {
+              unstarted.status = 'idle' as const;
+              unstarted.findings = null;
+            }
+          }
+          await persistBatchesSnapshot(updatedBatches);
+          break;
+        }
+
+        await persistBatchesSnapshot(updatedBatches);
 
         if (isDriveConnected()) {
           autoSaveBatchDictations(updatedBatches, undefined, now).then(res => {
@@ -848,18 +1006,28 @@ const App: React.FC = () => {
         await drainLiveQueue();
       }
 
-      // If user is CURRENTLY still recording another consecutive dictation OR resolving an unsaved audio alarm,
+      // If user is CURRENTLY recording/opening mic for another consecutive dictation OR resolving an unsaved audio alarm,
       // stay in AppStatus.Processing with accumulated batches preserved so we never interrupt or lose it!
-      if (isConcurrentRecordingActiveRef.current || hasConcurrentUnsavedAudioRef.current || queuedConcurrentAudiosRef.current.length > 0) {
+      if (
+        isConcurrentRecordingActiveRef.current ||
+        isConcurrentIntentActiveRef.current ||
+        hasConcurrentUnsavedAudioRef.current ||
+        queuedConcurrentAudiosRef.current.length > 0
+      ) {
         isSeparatingConcurrentRef.current = false;
         setIsSeparatingConcurrent(false);
-        if (queuedConcurrentAudiosRef.current.length > 0 && !isConcurrentRecordingActiveRef.current && !hasConcurrentUnsavedAudioRef.current) {
+        if (
+          queuedConcurrentAudiosRef.current.length > 0 &&
+          !isConcurrentRecordingActiveRef.current &&
+          !isConcurrentIntentActiveRef.current &&
+          !hasConcurrentUnsavedAudioRef.current
+        ) {
           setTimeout(() => flushQueuedConcurrentIfReadyRef.current(), 0);
         }
         return;
       }
 
-      // 3. Clean up single mode in-flight states once entire consecutive sequence is complete
+      // 3. Clean up single mode in-flight states once queue finishes, while keeping continuous session ready!
       deleteAudioBlob(`in_flight_recording_${curTabId}`).catch(() => {});
       deleteAudioBlob('in_flight_recording').catch(() => {});
       try {
@@ -867,22 +1035,17 @@ const App: React.FC = () => {
         localStorage.removeItem('in_flight_recording_meta');
       } catch (_) {}
 
-      activeConcurrentBatchesRef.current = [];
-      activeConcurrentBatchTsRef.current = null;
+      activeConcurrentBatchesRef.current = [...updatedBatches];
+      setActiveConcurrentBatchesCount(updatedBatches.length);
       firstDictationFindingsRef.current = null;
-      firstDictationAudioRef.current = null;
-      firstDictationErrorRef.current = null;
-      setFirstDictationError(null);
+      firstDictationSuccessMetaRef.current = null;
       queuedConcurrentAudiosRef.current = [];
       setQueuedAudiosCount(0);
       isFirstDictationProcessingRef.current = false;
       isSeparatingConcurrentRef.current = false;
       setIsSeparatingConcurrent(false);
       setHasMultipleSingleDictations(true);
-
-      // Keep user in Single Dictation without unmounting BatchProcessor; flashing banner guides user to Batch Mode!
-      setStatus(AppStatus.Idle);
-      window.scrollTo({ top: 0, behavior: 'instant' });
+      setIsContinuousSessionReady(true);
     } catch (err) {
       console.error('Error saving separated concurrent dictations:', err);
       setIsSeparatingConcurrent(false);
@@ -897,6 +1060,7 @@ const App: React.FC = () => {
       isFirstDictationProcessingRef.current ||
       isSeparatingConcurrentRef.current ||
       isConcurrentRecordingActiveRef.current ||
+      isConcurrentIntentActiveRef.current ||
       hasConcurrentUnsavedAudioRef.current
     ) {
       return;
@@ -909,10 +1073,10 @@ const App: React.FC = () => {
       const firstFindings = firstDictationFindingsRef.current;
       const firstBlob = firstDictationAudioRef.current || (Array.isArray(audioBlob) ? audioBlob[0] : audioBlob);
       const firstErr = firstDictationErrorRef.current;
-      if (firstBlob) {
+      if (firstBlob || activeConcurrentBatchesRef.current.length > 0) {
         separateConcurrentDictationsToBatch(
           firstFindings || ["BOLD::Report 1"],
-          firstBlob,
+          firstBlob || null,
           queuedList,
           firstErr
         );
@@ -920,29 +1084,31 @@ const App: React.FC = () => {
       return;
     }
 
-    // If queue is empty and an earlier #1 finished/errored while user was recording #2 (which was later discarded):
+    // If queue is empty and an earlier #1 finished/errored while user was opening mic or recording #2 (which was later cancelled):
     if (status === AppStatus.Processing) {
       if (activeConcurrentBatchesRef.current.length > 0) {
-        activeConcurrentBatchesRef.current = [];
-        activeConcurrentBatchTsRef.current = null;
-        firstDictationFindingsRef.current = null;
-        firstDictationAudioRef.current = null;
-        firstDictationErrorRef.current = null;
-        setFirstDictationError(null);
+        setActiveConcurrentBatchesCount(activeConcurrentBatchesRef.current.length);
         setHasMultipleSingleDictations(true);
-        setStatus(AppStatus.Idle);
+        setIsContinuousSessionReady(true);
       } else if (firstDictationErrorRef.current) {
         setError(firstDictationErrorRef.current);
         firstDictationErrorRef.current = null;
         setFirstDictationError(null);
         setStatus(AppStatus.Error);
       } else if (firstDictationFindingsRef.current && firstDictationFindingsRef.current.length > 0) {
-        setFindings(firstDictationFindingsRef.current);
+        const restoredFindings = firstDictationFindingsRef.current;
+        const meta = firstDictationSuccessMetaRef.current;
         firstDictationFindingsRef.current = null;
-        setStatus(AppStatus.Success);
+        firstDictationSuccessMetaRef.current = null;
+        setFindings(restoredFindings);
+        if (meta) {
+          finalizeFirstDictationSuccess(restoredFindings, meta.blobs, meta.prompt, meta.images, meta.reqId);
+        } else {
+          setStatus(AppStatus.Success);
+        }
       }
     }
-  }, [audioBlob, status, separateConcurrentDictationsToBatch]);
+  }, [audioBlob, status, separateConcurrentDictationsToBatch, finalizeFirstDictationSuccess]);
 
   flushQueuedConcurrentIfReadyRef.current = flushQueuedConcurrentIfReady;
 
@@ -950,7 +1116,8 @@ const App: React.FC = () => {
     audioInput: Blob | Blob[],
     overridePrompt?: string,
     overrideDocx?: DocxTemplateData | null,
-    overrideImages?: Array<{ data: string; mimeType: string }>
+    overrideImages?: Array<{ data: string; mimeType: string }>,
+    options?: { preserveConcurrentSession?: boolean }
   ) => {
     // 0. Immediately abort any active in-flight network request
     if (inFlightAbortControllerRef.current) {
@@ -980,8 +1147,16 @@ const App: React.FC = () => {
     setFindings([]);
     firstDictationFindingsRef.current = null;
     firstDictationErrorRef.current = null;
+    firstDictationSuccessMetaRef.current = null;
     setFirstDictationError(null);
     isFirstDictationProcessingRef.current = true;
+    currentFirstBatchAddedRef.current = false;
+    setIsContinuousSessionReady(false);
+    if (!options?.preserveConcurrentSession) {
+      activeConcurrentBatchesRef.current = [];
+      activeConcurrentBatchTsRef.current = null;
+      setActiveConcurrentBatchesCount(0);
+    }
     queuedConcurrentAudiosRef.current = [];
     setQueuedAudiosCount(0);
     setIsSimultaneousQueued(false);
@@ -1042,55 +1217,33 @@ const App: React.FC = () => {
       isFirstDictationProcessingRef.current = false;
       firstDictationFindingsRef.current = processedText;
       firstDictationAudioRef.current = primaryBlob;
+      firstDictationSuccessMetaRef.current = {
+        blobs: audioBlobs,
+        prompt: promptToUse,
+        images: imagesToUse,
+        reqId,
+      };
       setFindings(processedText);
 
-      // Check if user has queued any concurrent audios, is actively recording, or has an unresolved unsaved audio alarm
-      if (queuedConcurrentAudiosRef.current.length > 0 && !isConcurrentRecordingActiveRef.current && !hasConcurrentUnsavedAudioRef.current) {
+      // Check if user has queued any concurrent audios, is opening mic/recording, or has an unresolved unsaved audio alarm
+      const isConcurrentBusy =
+        isConcurrentRecordingActiveRef.current ||
+        isConcurrentIntentActiveRef.current ||
+        hasConcurrentUnsavedAudioRef.current;
+
+      if (queuedConcurrentAudiosRef.current.length > 0 && !isConcurrentBusy) {
         const queuedList = [...queuedConcurrentAudiosRef.current];
         queuedConcurrentAudiosRef.current = [];
         setQueuedAudiosCount(0);
         setIsSimultaneousQueued(false);
         await separateConcurrentDictationsToBatch(processedText, primaryBlob, queuedList, null);
         return;
-      } else if (isConcurrentRecordingActiveRef.current || hasConcurrentUnsavedAudioRef.current || queuedConcurrentAudiosRef.current.length > 0) {
-        // User is recording/resolving unsaved audio in a concurrent dictation — keep status in Processing cleanly.
+      } else if (isConcurrentBusy || queuedConcurrentAudiosRef.current.length > 0) {
+        // User is recording, opening mic, staging files, or resolving unsaved audio — keep Processing mounted cleanly.
         return;
       }
 
-      try {
-        const chatSession = await createChat(audioBlobs, processedText, promptToUse, imagesToUse, selectedModel);
-        if (processingRequestIdRef.current === reqId) {
-          setChat(chatSession);
-        }
-      } catch (chatErr) {
-        console.warn("Follow-up AI chat initialization notice:", chatErr);
-      }
-
-      const aiGreeting = "I have reviewed the audio and the transcript. How can I help you further?";
-      setChatHistory([{ author: 'AI', text: `${processedText.join('\n\n')}\n\n${aiGreeting}` }]);
-      
-      const timestamp = Date.now();
-      activeDictationTimestampRef.current = timestamp;
-      activeDictationIsLiveRef.current = false;
-      driveSyncedHashRef.current = processedText.join('|||');
-
-      setStatus(AppStatus.Success);
-      window.scrollTo({ top: 0, behavior: 'instant' });
-
-      // Processing succeeded! Safely clear the temporary in-flight backup
-      deleteAudioBlob(`in_flight_recording_${currentTabId}`).catch(() => {});
-      deleteAudioBlob('in_flight_recording').catch(() => {});
-      try {
-        localStorage.removeItem(`in_flight_recording_meta_${currentTabId}`);
-        localStorage.removeItem('in_flight_recording_meta');
-      } catch (_) {}
-
-      // Auto-save single dictation HTML to Google Drive in hidden background
-      autoSaveSingleDictation(processedText, undefined, timestamp).then(result => {
-        if (result.success) {
-          setDriveSaveResult(result);
-        }
-      }).catch(err => console.warn('Drive auto-save background notice:', err));
+      await finalizeFirstDictationSuccess(processedText, audioBlobs, promptToUse, imagesToUse, reqId);
     } catch (err: any) {
       clearInterval(processingHeartbeatTimer);
       markTabActive('idle');
@@ -1103,16 +1256,20 @@ const App: React.FC = () => {
       const errMessage = err instanceof Error ? err.message : 'An unknown error occurred during processing.';
       firstDictationErrorRef.current = errMessage;
 
-      // If user is currently recording a concurrent dictation, has an unresolved unsaved audio alarm, OR has already queued audio:
-      const hasConcurrent = isConcurrentRecordingActiveRef.current || hasConcurrentUnsavedAudioRef.current || queuedConcurrentAudiosRef.current.length > 0;
+      // If user is currently opening mic/recording a concurrent dictation, has an unresolved unsaved audio alarm, OR has already queued audio:
+      const isConcurrentBusy =
+        isConcurrentRecordingActiveRef.current ||
+        isConcurrentIntentActiveRef.current ||
+        hasConcurrentUnsavedAudioRef.current;
+      const hasConcurrent = isConcurrentBusy || queuedConcurrentAudiosRef.current.length > 0;
       if (hasConcurrent) {
         setFirstDictationError(errMessage);
         firstDictationFindingsRef.current = [
           "BOLD::Previous dictation encountered an error during analysis.",
           `[Error: ${errMessage}]. Audio preserved.`
         ];
-        // If not actively recording/resolving alarm and has queued audios, dispatch them now!
-        if (queuedConcurrentAudiosRef.current.length > 0 && !isConcurrentRecordingActiveRef.current && !hasConcurrentUnsavedAudioRef.current) {
+        // If not actively recording/opening mic/resolving alarm and has queued audios, dispatch them now!
+        if (queuedConcurrentAudiosRef.current.length > 0 && !isConcurrentBusy) {
           const queuedList = [...queuedConcurrentAudiosRef.current];
           queuedConcurrentAudiosRef.current = [];
           setQueuedAudiosCount(0);
@@ -1124,7 +1281,7 @@ const App: React.FC = () => {
       setError(errMessage);
       setStatus(AppStatus.Error);
     }
-  }, [selectedModel, customImages, separateConcurrentDictationsToBatch]);
+  }, [selectedModel, customImages, separateConcurrentDictationsToBatch, finalizeFirstDictationSuccess, resetConcurrentCustomConfig]);
 
   handleRecordingCompleteRef.current = handleRecordingComplete;
 
@@ -1146,6 +1303,7 @@ const App: React.FC = () => {
     setQueuedAudiosCount(queuedConcurrentAudiosRef.current.length);
     setIsSimultaneousQueued(true);
     setHasMultipleSingleDictations(true);
+    setIsContinuousSessionReady(false);
     resetConcurrentCustomConfig();
 
     // If first dictation is still running its processAudio OR separation loop is already running OR another unsaved backup alarm needs resolving:
@@ -1153,18 +1311,18 @@ const App: React.FC = () => {
       return;
     }
 
-    // If first dictation has finished (either complete or error):
+    // If first dictation has finished (either complete or error) or continuous session already has accumulated batches:
     const firstFindings = firstDictationFindingsRef.current;
     const firstBlob = firstDictationAudioRef.current || (Array.isArray(audioBlob) ? audioBlob[0] : audioBlob);
     const firstErr = firstDictationErrorRef.current;
 
-    if (firstBlob) {
+    if (firstBlob || activeConcurrentBatchesRef.current.length > 0) {
       const queuedList = [...queuedConcurrentAudiosRef.current];
       queuedConcurrentAudiosRef.current = [];
       setQueuedAudiosCount(0);
       await separateConcurrentDictationsToBatch(
         firstFindings || ["BOLD::Report 1"],
-        firstBlob,
+        firstBlob || null,
         queuedList,
         firstErr
       );
@@ -1172,15 +1330,17 @@ const App: React.FC = () => {
   }, [audioBlob, separateConcurrentDictationsToBatch, resetConcurrentCustomConfig]);
 
   const handleSubsequentDictationAfterError = useCallback(async (newAudioInput: Blob | Blob[]) => {
-    // 1. Preserve the failed audio into Batch Mode first so no data is ever lost!
+    // 1. Preserve the failed audio into Batch Mode AND seed activeConcurrentBatchesRef so subsequent dictations never overwrite it!
     const failedAudio = firstDictationAudioRef.current || (Array.isArray(audioBlob) ? audioBlob[0] : audioBlob);
     const failedErrMsg = error || firstDictationErrorRef.current || 'Processing error';
     
     if (failedAudio) {
       try {
         const curTabId = getTabId();
-        const now = Date.now();
-        const batchId = `batch-err-${now}`;
+        const now = activeConcurrentBatchTsRef.current || Date.now();
+        activeConcurrentBatchTsRef.current = now;
+        const nextReportNum = activeConcurrentBatchesRef.current.length + 1;
+        const batchId = `batch-err-${now}-${nextReportNum}`;
         await saveAudioBlob(`batch_audio_${curTabId}_${batchId}_0`, failedAudio);
         await saveAudioBlob(`batch_audio_${batchId}_0`, failedAudio);
 
@@ -1189,7 +1349,7 @@ const App: React.FC = () => {
         
         const failedBatchItem = {
           id: batchId,
-          name: `Report 1 (Interrupted)`,
+          name: `Report ${nextReportNum} (Interrupted)`,
           audioCount: 1,
           audioBlobs: [failedAudio],
           findings: [
@@ -1203,11 +1363,19 @@ const App: React.FC = () => {
           customDocx: customDocx || null,
         };
 
-        const updated = [failedBatchItem, ...existingBatches.filter(b => b.id !== batchId)];
-        await saveReportSession(curBatchKey, updated);
-        safeLocalStorage.setItem(curBatchKey, updated);
-        await saveReportSession(BATCH_MODE_STORAGE_KEY, updated).catch(() => {});
-        safeLocalStorage.setItem(BATCH_MODE_STORAGE_KEY, updated);
+        const sessionBatches = [...activeConcurrentBatchesRef.current, failedBatchItem];
+        activeConcurrentBatchesRef.current = sessionBatches;
+        setActiveConcurrentBatchesCount(sessionBatches.length);
+        currentFirstBatchAddedRef.current = false;
+
+        const mergedStorageBatches = activeConcurrentBatchesRef.current.length > 1
+          ? sessionBatches
+          : [failedBatchItem, ...existingBatches.filter(b => b.id !== batchId)];
+        const serializable = serializeBatchesForStorage(mergedStorageBatches);
+        await saveReportSession(curBatchKey, serializable);
+        safeLocalStorage.setItem(curBatchKey, serializable);
+        await saveReportSession(BATCH_MODE_STORAGE_KEY, serializable).catch(() => {});
+        safeLocalStorage.setItem(BATCH_MODE_STORAGE_KEY, serializable);
         window.dispatchEvent(new CustomEvent('raddoc_batch_mode_updated'));
         setHasMultipleSingleDictations(true);
       } catch (saveErr) {
@@ -1223,12 +1391,12 @@ const App: React.FC = () => {
     setCustomImages(nextImages);
     setCustomDocx(nextDocx);
 
-    // 3. Clear error state and start processing the new subsequent dictation!
+    // 3. Clear error state and start processing the new subsequent dictation while preserving prior preserved batch(es)!
     setError(null);
     firstDictationErrorRef.current = null;
     setFirstDictationError(null);
     setErrorRecorderStatus(AppStatus.Idle);
-    await handleRecordingComplete(newAudioInput, nextPrompt, nextDocx, nextImages);
+    await handleRecordingComplete(newAudioInput, nextPrompt, nextDocx, nextImages, { preserveConcurrentSession: true });
   }, [audioBlob, error, selectedModel, customPrompt, customDocx, handleRecordingComplete]);
 
   const handleSubsequentFileSelectAfterError = useCallback(async (files: File[]) => {
@@ -1551,6 +1719,7 @@ const App: React.FC = () => {
         customDocx,
         selectedModel,
         identifiedErrors: [...identifiedErrors],
+        qaAssessment,
         errorCheckStatus,
         timestamp: activeDictationTimestampRef.current,
         isLive: activeDictationIsLiveRef.current,
@@ -1600,16 +1769,30 @@ const App: React.FC = () => {
     }
 
     // Reset workspace to idle immediately so user can record right away without confirmation friction
+    if (inFlightAbortControllerRef.current) {
+      try { inFlightAbortControllerRef.current.abort(); } catch (_) {}
+      inFlightAbortControllerRef.current = null;
+    }
+    if (concurrentAbortControllerRef.current) {
+      try { concurrentAbortControllerRef.current.abort(); } catch (_) {}
+      concurrentAbortControllerRef.current = null;
+    }
     firstDictationFindingsRef.current = null;
     firstDictationAudioRef.current = null;
     firstDictationErrorRef.current = null;
+    firstDictationSuccessMetaRef.current = null;
     setFirstDictationError(null);
     isFirstDictationProcessingRef.current = false;
     activeConcurrentBatchesRef.current = [];
     activeConcurrentBatchTsRef.current = null;
+    currentFirstBatchAddedRef.current = false;
+    visitedBatchSinceLastConcurrentRef.current = false;
+    setActiveConcurrentBatchesCount(0);
+    setIsContinuousSessionReady(false);
     queuedConcurrentAudiosRef.current = [];
     setQueuedAudiosCount(0);
     isConcurrentRecordingActiveRef.current = false;
+    isConcurrentIntentActiveRef.current = false;
     hasConcurrentUnsavedAudioRef.current = false;
     isSeparatingConcurrentRef.current = false;
     setIsSeparatingConcurrent(false);
@@ -1635,6 +1818,7 @@ const App: React.FC = () => {
     resetConcurrentCustomConfig();
     setSingleExtraFiles([]);
     setIdentifiedErrors([]);
+    setQaAssessment(null);
     setErrorCheckStatus('idle');
     activeDictationTimestampRef.current = null;
     activeDictationIsLiveRef.current = false;
@@ -1664,6 +1848,7 @@ const App: React.FC = () => {
       : DEFAULT_SELECTED_MODEL;
     setSelectedModel(restoredModel);
     setIdentifiedErrors(prev.identifiedErrors);
+    setQaAssessment(prev.qaAssessment ?? null);
     setErrorCheckStatus(prev.errorCheckStatus);
     activeDictationTimestampRef.current = prev.timestamp;
     activeDictationIsLiveRef.current = prev.isLive;
@@ -1846,10 +2031,76 @@ const App: React.FC = () => {
                       type="button"
                       onClick={async () => {
                         const blob = firstDictationAudioRef.current || (Array.isArray(audioBlob) ? audioBlob[0] : audioBlob);
-                        if (blob) {
-                          setFirstDictationError(null);
-                          firstDictationErrorRef.current = null;
+                        if (!blob) return;
+                        setFirstDictationError(null);
+                        firstDictationErrorRef.current = null;
+
+                        const hasConcurrentSession =
+                          activeConcurrentBatchesRef.current.length > 0 ||
+                          isConcurrentRecordingActiveRef.current ||
+                          isConcurrentIntentActiveRef.current ||
+                          queuedConcurrentAudiosRef.current.length > 0 ||
+                          hasConcurrentUnsavedAudioRef.current;
+
+                        if (!hasConcurrentSession) {
                           await handleRecordingComplete(blob);
+                          return;
+                        }
+
+                        // Retry Report #1 in-place without disrupting active recordings or Batch Mode entries
+                        if (activeConcurrentBatchesRef.current.length > 0) {
+                          const targetBatch = activeConcurrentBatchesRef.current[0];
+                          const retryBlob = (targetBatch.audioBlobs && targetBatch.audioBlobs[0]) || blob;
+                          try {
+                            const retriedFindings = await processAudio(
+                              retryBlob,
+                              selectedModel,
+                              targetBatch.customPrompt || customPromptRef.current,
+                              targetBatch.customImages || customImages,
+                              undefined,
+                              targetBatch.customDocx || customDocxRef.current
+                            );
+                            const firstLine = (retriedFindings[0] || '').replace(/^BOLD::/i, '').replace(/[*_#~`]+/g, '').trim();
+                            targetBatch.findings = retriedFindings;
+                            targetBatch.status = 'complete';
+                            targetBatch.error = undefined;
+                            targetBatch.name = (firstLine.length > 0 && firstLine.length < 80 && !firstLine.toLowerCase().startsWith('clinical'))
+                              ? firstLine
+                              : 'Report 1';
+                            const curTabId = getTabId();
+                            const curBatchKey = getBatchModeStorageKey(curTabId);
+                            const serializable = serializeBatchesForStorage(activeConcurrentBatchesRef.current);
+                            await saveReportSession(curBatchKey, serializable);
+                            safeLocalStorage.setItem(curBatchKey, serializable);
+                            await saveReportSession(BATCH_MODE_STORAGE_KEY, serializable).catch(() => {});
+                            safeLocalStorage.setItem(BATCH_MODE_STORAGE_KEY, serializable);
+                            window.dispatchEvent(new CustomEvent('raddoc_batch_mode_updated'));
+                          } catch (retryErr: any) {
+                            const msg = retryErr instanceof Error ? retryErr.message : 'Retry failed.';
+                            firstDictationErrorRef.current = msg;
+                            setFirstDictationError(msg);
+                          }
+                        } else {
+                          isFirstDictationProcessingRef.current = true;
+                          try {
+                            const retriedFindings = await processAudio(
+                              blob,
+                              selectedModel,
+                              customPromptRef.current,
+                              customImages,
+                              undefined,
+                              customDocxRef.current
+                            );
+                            isFirstDictationProcessingRef.current = false;
+                            firstDictationFindingsRef.current = retriedFindings;
+                            setFindings(retriedFindings);
+                            setTimeout(() => flushQueuedConcurrentIfReadyRef.current(), 0);
+                          } catch (retryErr: any) {
+                            isFirstDictationProcessingRef.current = false;
+                            const msg = retryErr instanceof Error ? retryErr.message : 'Retry failed.';
+                            firstDictationErrorRef.current = msg;
+                            setFirstDictationError(msg);
+                          }
                         }
                       }}
                       className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-bold transition-colors flex items-center gap-1.5 shadow-xs cursor-pointer"
@@ -1900,145 +2151,187 @@ const App: React.FC = () => {
               </div>
             )}
 
-            <div className="bg-blue-50/90 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 rounded-2xl p-5 shadow-sm text-center">
-              <Spinner className="w-8 h-8 mx-auto text-blue-600 dark:text-blue-400" />
-              <p className="text-slate-800 dark:text-slate-100 mt-3 text-lg font-bold">
-                {isSeparatingConcurrent
-                  ? 'Processing and organizing all dictations into Batch Mode...'
-                  : isConcurrentRecordingActiveRef.current 
-                    ? 'First dictation completed! Still capturing your ongoing dictation...' 
-                    : firstDictationError
-                      ? 'Simultaneous Dictation Active'
-                      : 'Analyzing and correcting dictation...'}
-              </p>
-              <p className="text-slate-600 dark:text-slate-300 mt-1 text-sm font-medium">
-                {isSeparatingConcurrent
-                  ? 'All dictations are being placed as separate independent reports in Batch Mode.'
-                  : queuedAudiosCount > 0
-                    ? `✓ ${queuedAudiosCount} additional dictation(s) queued! You can dictate even more below, or view in Batch Mode.`
-                    : 'Simultaneous dictation active: You can dictate your next separate report below right now while this is processing!'}
-              </p>
-              <div className="mt-4 flex flex-wrap justify-center items-center gap-3">
-                <button
-                  onClick={handleCancelProcessing}
-                  className="inline-flex items-center gap-2 bg-red-100 text-red-700 hover:bg-red-200 dark:bg-red-900/40 dark:text-red-300 dark:hover:bg-red-900/70 font-semibold py-2 px-5 rounded-lg border border-red-300 dark:border-red-700 transition-colors shadow-sm text-sm cursor-pointer"
-                  aria-label="Cancel Analysis"
-                >
-                  <StopIcon className="w-4 h-4" /> Cancel Analysis
-                </button>
-                {audioBlob && !isSeparatingConcurrent && (
-                  <button
-                    onClick={handleDownload}
-                    className="inline-flex items-center gap-2 bg-slate-600 text-white font-semibold py-2 px-5 rounded-lg hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-400 focus:ring-opacity-50 transition-colors shadow-sm text-sm cursor-pointer"
-                    aria-label="Download Audio / File"
-                  >
-                    <DownloadIcon className="w-4 h-4" /> Download Audio
-                  </button>
-                )}
-              </div>
-            </div>
-
-            {/* Always keep Simultaneous Dictation active & visible - never forbidden! */}
-            <div className="border border-emerald-200 dark:border-emerald-800/60 bg-emerald-50/40 dark:bg-emerald-950/20 rounded-2xl p-4 sm:p-5 shadow-sm">
-                <div className="flex items-center justify-between mb-3 px-1">
-                  <span className="text-sm font-bold text-emerald-800 dark:text-emerald-200 flex items-center gap-2">
-                    <MicIcon className="w-4 h-4 text-emerald-600 animate-pulse" />
-                    Simultaneous Dictation (Dictate {queuedAudiosCount > 0 ? `#${queuedAudiosCount + 2}` : 'next report'} while loading)
-                  </span>
-                  <div className="flex items-center gap-2">
-                    {queuedAudiosCount > 0 && (
-                      <span className="text-xs bg-blue-100 dark:bg-blue-900/60 text-blue-800 dark:text-blue-200 px-2.5 py-0.5 rounded-full font-bold">
-                        {queuedAudiosCount} in Queue
-                      </span>
+            {(() => {
+              const isActivelyBusy = isSeparatingConcurrent || isFirstDictationProcessingRef.current || queuedAudiosCount > 0;
+              const isSessionReady = isContinuousSessionReady && !isActivelyBusy;
+              const nextNum = (activeConcurrentBatchesCount > 0 ? activeConcurrentBatchesCount : 1) + queuedAudiosCount + 1;
+              return (
+                <>
+                  <div className={`rounded-2xl p-5 shadow-sm text-center border ${
+                    isSessionReady
+                      ? 'bg-emerald-50/90 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-800'
+                      : 'bg-blue-50/90 dark:bg-blue-950/40 border-blue-200 dark:border-blue-800'
+                  }`}>
+                    {!isSessionReady && (
+                      <Spinner className="w-8 h-8 mx-auto text-blue-600 dark:text-blue-400" />
                     )}
-                    <span className="text-xs bg-emerald-200/70 dark:bg-emerald-900/60 text-emerald-800 dark:text-emerald-200 px-2.5 py-0.5 rounded-full font-semibold">
-                      Unlimited Dictations Ready
-                    </span>
-                  </div>
-                </div>
-
-                {queuedAudiosCount > 0 && (
-                  <div className="mb-3 p-2.5 bg-blue-50/80 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800/50 rounded-xl text-xs text-blue-800 dark:text-blue-200 flex flex-wrap items-center justify-between gap-2">
-                    <span>
-                      ✓ {queuedAudiosCount} additional dictation{queuedAudiosCount > 1 ? 's' : ''} queued! You can continue dictating as many times as you like below.
-                    </span>
-                    {!isFirstDictationProcessingRef.current && !isSeparatingConcurrent && concurrentRecordingStatus !== AppStatus.Recording && (
-                      <button
-                        onClick={() => {
-                          if (hasConcurrentUnsavedAudioRef.current) {
-                            alert('Please recover or discard the interrupted simultaneous audio backup below first so nothing is lost before moving to Batch Mode.');
-                            return;
-                          }
-                          flushQueuedConcurrentIfReadyRef.current();
-                        }}
-                        className="bg-blue-600 hover:bg-blue-700 text-white font-bold py-1 px-3 rounded-lg text-xs transition-colors shrink-0 cursor-pointer"
-                      >
-                        Process in Batch Mode Now →
-                      </button>
-                    )}
-                  </div>
-                )}
-
-                <div className="mb-4">
-                  <div className="text-xs font-bold text-emerald-800 dark:text-emerald-200 mb-2 flex items-center gap-1.5">
-                    <Sparkles className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
-                    <span>Custom Instructions &amp; Templates (New Dictation #{queuedAudiosCount + 2})</span>
-                  </div>
-                  <CustomPromptInput
-                    key={`concurrent-prompt-${queuedAudiosCount}`}
-                    prompt={concurrentCustomPrompt}
-                    onPromptChange={setConcurrentCustomPrompt}
-                    images={concurrentCustomImages}
-                    onImagesChange={setConcurrentCustomImages}
-                    customDocx={concurrentCustomDocx}
-                    onCustomDocxChange={setConcurrentCustomDocx}
-                    selectedModel={selectedModel}
-                    className="mb-2"
-                  />
-                  {concurrentActiveTemplateDisplayName && (
-                    <div className="mb-2 p-2.5 bg-white/80 dark:bg-slate-900/70 border border-emerald-300 dark:border-emerald-700 rounded-xl flex items-center justify-between text-xs shadow-2xs animate-fade-in">
-                      <div className="flex items-center gap-2 text-emerald-950 dark:text-emerald-100 font-medium min-w-0">
-                        <Sparkles className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
-                        <span className="truncate">
-                          Template for Dictation #{queuedAudiosCount + 2}: <strong className="font-bold underline text-emerald-700 dark:text-emerald-300">{concurrentActiveTemplateDisplayName}</strong>
-                        </span>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setConcurrentCustomPrompt('');
-                          setConcurrentCustomDocx(null);
-                          setConcurrentCustomImages([]);
-                        }}
-                        className="text-xs text-rose-600 dark:text-rose-400 hover:text-rose-800 font-bold ml-2 underline cursor-pointer shrink-0"
-                      >
-                        Remove
-                      </button>
+                    <p className={`text-slate-800 dark:text-slate-100 ${isSessionReady ? '' : 'mt-3'} text-lg font-bold`}>
+                      {isSeparatingConcurrent
+                        ? 'Processing and organizing all dictations into Batch Mode...'
+                        : isConcurrentRecordingActiveRef.current
+                          ? (activeConcurrentBatchesCount > 0
+                              ? `Capturing Report #${nextNum}...`
+                              : isFirstDictationProcessingRef.current
+                                ? 'Analyzing Dictation #1 while capturing Dictation #2...'
+                                : firstDictationError
+                                  ? 'Capturing Dictation #2 (Dictation #1 error preserved above)...'
+                                  : 'First dictation completed! Still capturing your ongoing dictation...')
+                          : isSessionReady
+                            ? `✓ ${activeConcurrentBatchesCount} Report${activeConcurrentBatchesCount === 1 ? '' : 's'} Saved to Batch Mode — Continuous Dictation Ready`
+                            : firstDictationError
+                              ? 'Simultaneous Dictation Active'
+                              : 'Analyzing and correcting dictation...'}
+                    </p>
+                    <p className="text-slate-600 dark:text-slate-300 mt-1 text-sm font-medium">
+                      {isSeparatingConcurrent
+                        ? 'All dictations are being placed as separate independent reports in Batch Mode.'
+                        : isSessionReady
+                          ? 'Keep dictating unlimited reports below without interruption, open Batch Mode above to view them, or start a fresh single session.'
+                          : queuedAudiosCount > 0
+                            ? `✓ ${queuedAudiosCount} additional dictation(s) queued! You can dictate even more below, or view in Batch Mode.`
+                            : 'Simultaneous dictation active: You can dictate your next separate report below right now while this is processing!'}
+                    </p>
+                    <div className="mt-4 flex flex-wrap justify-center items-center gap-3">
+                      {isSessionReady ? (
+                        <button
+                          type="button"
+                          onClick={resetSingleMode}
+                          className="inline-flex items-center gap-2 bg-slate-200 text-slate-800 hover:bg-slate-300 dark:bg-slate-700 dark:text-slate-100 dark:hover:bg-slate-600 font-semibold py-2 px-5 rounded-lg border border-slate-300 dark:border-slate-600 transition-colors shadow-sm text-sm cursor-pointer"
+                        >
+                          <RotateCcw className="w-4 h-4" /> Start Fresh Single Report
+                        </button>
+                      ) : (
+                        <button
+                          onClick={handleCancelProcessing}
+                          className="inline-flex items-center gap-2 bg-red-100 text-red-700 hover:bg-red-200 dark:bg-red-900/40 dark:text-red-300 dark:hover:bg-red-900/70 font-semibold py-2 px-5 rounded-lg border border-red-300 dark:border-red-700 transition-colors shadow-sm text-sm cursor-pointer"
+                          aria-label="Cancel Analysis"
+                        >
+                          <StopIcon className="w-4 h-4" /> Cancel Analysis
+                        </button>
+                      )}
+                      {audioBlob && !isSeparatingConcurrent && !isSessionReady && (
+                        <button
+                          onClick={handleDownload}
+                          className="inline-flex items-center gap-2 bg-slate-600 text-white font-semibold py-2 px-5 rounded-lg hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-400 focus:ring-opacity-50 transition-colors shadow-sm text-sm cursor-pointer"
+                          aria-label="Download Audio / File"
+                        >
+                          <DownloadIcon className="w-4 h-4" /> Download Audio
+                        </button>
+                      )}
                     </div>
-                  )}
-                </div>
+                  </div>
 
-                <AudioRecorder
-                  status={concurrentRecordingStatus}
-                  setStatus={(newSt) => {
-                    const wasRecording = isConcurrentRecordingActiveRef.current;
-                    setConcurrentRecordingStatus(newSt);
-                    isConcurrentRecordingActiveRef.current = (newSt === AppStatus.Recording);
-                    if (wasRecording && newSt !== AppStatus.Recording) {
-                      setTimeout(() => flushQueuedConcurrentIfReadyRef.current(), 0);
-                    }
-                  }}
-                  onUnsavedStateChange={(hasUnsaved) => {
-                    const wasUnsaved = hasConcurrentUnsavedAudioRef.current;
-                    hasConcurrentUnsavedAudioRef.current = hasUnsaved;
-                    if (wasUnsaved && !hasUnsaved) {
-                      setTimeout(() => flushQueuedConcurrentIfReadyRef.current(), 0);
-                    }
-                  }}
-                  onRecordingComplete={handleConcurrentRecordingComplete}
-                  onMultipleFilesUploaded={(files) => setMultipleFilesModal(files)}
-                />
-              </div>
+                  {/* Always keep Simultaneous Dictation active & visible - never forbidden! */}
+                  <div className="border border-emerald-200 dark:border-emerald-800/60 bg-emerald-50/40 dark:bg-emerald-950/20 rounded-2xl p-4 sm:p-5 shadow-sm">
+                      <div className="flex items-center justify-between mb-3 px-1">
+                        <span className="text-sm font-bold text-emerald-800 dark:text-emerald-200 flex items-center gap-2">
+                          <MicIcon className="w-4 h-4 text-emerald-600 animate-pulse" />
+                          Simultaneous Dictation (Dictate {nextNum > 2 || queuedAudiosCount > 0 ? `#${nextNum}` : 'next report'} {isSessionReady ? 'continuously' : 'while loading'})
+                        </span>
+                        <div className="flex items-center gap-2">
+                          {queuedAudiosCount > 0 && (
+                            <span className="text-xs bg-blue-100 dark:bg-blue-900/60 text-blue-800 dark:text-blue-200 px-2.5 py-0.5 rounded-full font-bold">
+                              {queuedAudiosCount} in Queue
+                            </span>
+                          )}
+                          <span className="text-xs bg-emerald-200/70 dark:bg-emerald-900/60 text-emerald-800 dark:text-emerald-200 px-2.5 py-0.5 rounded-full font-semibold">
+                            Unlimited Dictations Ready
+                          </span>
+                        </div>
+                      </div>
+
+                      {queuedAudiosCount > 0 && (
+                        <div className="mb-3 p-2.5 bg-blue-50/80 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800/50 rounded-xl text-xs text-blue-800 dark:text-blue-200 flex flex-wrap items-center justify-between gap-2">
+                          <span>
+                            ✓ {queuedAudiosCount} additional dictation{queuedAudiosCount > 1 ? 's' : ''} queued! You can continue dictating as many times as you like below.
+                          </span>
+                          {!isFirstDictationProcessingRef.current && !isSeparatingConcurrent && concurrentRecordingStatus !== AppStatus.Recording && (
+                            <button
+                              onClick={() => {
+                                if (hasConcurrentUnsavedAudioRef.current) {
+                                  alert('Please recover or discard the interrupted simultaneous audio backup below first so nothing is lost before moving to Batch Mode.');
+                                  return;
+                                }
+                                flushQueuedConcurrentIfReadyRef.current();
+                              }}
+                              className="bg-blue-600 hover:bg-blue-700 text-white font-bold py-1 px-3 rounded-lg text-xs transition-colors shrink-0 cursor-pointer"
+                            >
+                              Process in Batch Mode Now →
+                            </button>
+                          )}
+                        </div>
+                      )}
+
+                      <div className="mb-4">
+                        <div className="text-xs font-bold text-emerald-800 dark:text-emerald-200 mb-2 flex items-center gap-1.5">
+                          <Sparkles className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+                          <span>Custom Instructions &amp; Templates (New Dictation #{nextNum})</span>
+                        </div>
+                        <CustomPromptInput
+                          key={`concurrent-prompt-${activeConcurrentBatchesCount}-${queuedAudiosCount}`}
+                          prompt={concurrentCustomPrompt}
+                          onPromptChange={setConcurrentCustomPrompt}
+                          images={concurrentCustomImages}
+                          onImagesChange={setConcurrentCustomImages}
+                          customDocx={concurrentCustomDocx}
+                          onCustomDocxChange={setConcurrentCustomDocx}
+                          selectedModel={selectedModel}
+                          className="mb-2"
+                        />
+                        {concurrentActiveTemplateDisplayName && (
+                          <div className="mb-2 p-2.5 bg-white/80 dark:bg-slate-900/70 border border-emerald-300 dark:border-emerald-700 rounded-xl flex items-center justify-between text-xs shadow-2xs animate-fade-in">
+                            <div className="flex items-center gap-2 text-emerald-950 dark:text-emerald-100 font-medium min-w-0">
+                              <Sparkles className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                              <span className="truncate">
+                                Template for Dictation #{nextNum}: <strong className="font-bold underline text-emerald-700 dark:text-emerald-300">{concurrentActiveTemplateDisplayName}</strong>
+                              </span>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setConcurrentCustomPrompt('');
+                                setConcurrentCustomDocx(null);
+                                setConcurrentCustomImages([]);
+                              }}
+                              className="text-xs text-rose-600 dark:text-rose-400 hover:text-rose-800 font-bold ml-2 underline cursor-pointer shrink-0"
+                            >
+                              Remove
+                            </button>
+                          </div>
+                        )}
+                      </div>
+
+                      <AudioRecorder
+                        status={concurrentRecordingStatus}
+                        setStatus={(newSt) => {
+                          const wasRecording = isConcurrentRecordingActiveRef.current;
+                          setConcurrentRecordingStatus(newSt);
+                          isConcurrentRecordingActiveRef.current = (newSt === AppStatus.Recording);
+                          if (wasRecording && newSt !== AppStatus.Recording) {
+                            setTimeout(() => flushQueuedConcurrentIfReadyRef.current(), 0);
+                          }
+                        }}
+                        onRecordingIntentChange={(hasIntent) => {
+                          const wasIntent = isConcurrentIntentActiveRef.current;
+                          isConcurrentIntentActiveRef.current = hasIntent;
+                          if (wasIntent && !hasIntent) {
+                            setTimeout(() => flushQueuedConcurrentIfReadyRef.current(), 0);
+                          }
+                        }}
+                        onUnsavedStateChange={(hasUnsaved) => {
+                          const wasUnsaved = hasConcurrentUnsavedAudioRef.current;
+                          hasConcurrentUnsavedAudioRef.current = hasUnsaved;
+                          if (wasUnsaved && !hasUnsaved) {
+                            setTimeout(() => flushQueuedConcurrentIfReadyRef.current(), 0);
+                          }
+                        }}
+                        onRecordingComplete={handleConcurrentRecordingComplete}
+                        onMultipleFilesUploaded={(files) => setMultipleFilesModal(files)}
+                      />
+                    </div>
+                </>
+              );
+            })()}
           </div>
         );
       case AppStatus.Success:
@@ -2069,6 +2362,14 @@ const App: React.FC = () => {
                   Open Batch Mode →
                 </span>
               </div>
+            )}
+            {isErrorCheckEnabled && (
+              <ClinicalQaPanel
+                assessment={qaAssessment}
+                errorCheckStatus={errorCheckStatus}
+                errorCount={identifiedErrors.length}
+                className="mb-4"
+              />
             )}
             <ResultsDisplay 
             findings={findings} 
@@ -2305,6 +2606,10 @@ const App: React.FC = () => {
           customDocx: b.customDocx !== undefined ? b.customDocx : (existingIdx !== -1 ? currentBatches[existingIdx].customDocx : null),
           customImages: b.customImages || (existingIdx !== -1 ? currentBatches[existingIdx].customImages : []),
           extraFiles: b.extraFiles || (existingIdx !== -1 ? currentBatches[existingIdx].extraFiles : []),
+          identifiedErrors: [],
+          qaAssessment: undefined,
+          qaFindingsHash: undefined,
+          errorCheckStatus: 'idle' as const,
         };
 
         if (existingIdx !== -1) {
@@ -2590,11 +2895,11 @@ const App: React.FC = () => {
 
           {/* Mode Switcher Tabs */}
           <div className="flex justify-center mt-5">
-            <nav className="inline-flex p-1 bg-slate-200/80 dark:bg-slate-800 rounded-xl shadow-inner border border-slate-300/60 dark:border-slate-700/60 w-full sm:w-auto" aria-label="Dictation modes">
+            <nav className="grid grid-cols-2 sm:inline-flex gap-1 p-1 bg-slate-200/80 dark:bg-slate-800 rounded-xl shadow-inner border border-slate-300/60 dark:border-slate-700/60 w-full sm:w-auto" aria-label="Dictation modes">
               <button
                 type="button"
                 onClick={() => setMode('single')}
-                className={`flex-1 sm:flex-initial flex items-center justify-center gap-1.5 sm:gap-2 px-3 sm:px-5 py-2 rounded-lg text-xs sm:text-sm font-semibold transition-all min-h-[44px] ${
+                className={`flex items-center justify-center gap-1.5 sm:gap-2 px-3 sm:px-5 py-2 rounded-lg text-xs sm:text-sm font-semibold transition-all min-h-[44px] cursor-pointer ${
                   mode === 'single'
                     ? 'bg-white dark:bg-slate-700 text-blue-600 dark:text-blue-400 shadow-sm'
                     : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
@@ -2611,7 +2916,7 @@ const App: React.FC = () => {
                   setMode('batch');
                   window.dispatchEvent(new CustomEvent('raddoc_batch_mode_updated'));
                 }}
-                className={`flex-1 sm:flex-initial flex items-center justify-center gap-1.5 sm:gap-2 px-3 sm:px-5 py-2 rounded-lg text-xs sm:text-sm font-semibold transition-all min-h-[44px] relative ${
+                className={`flex items-center justify-center gap-1.5 sm:gap-2 px-3 sm:px-5 py-2 rounded-lg text-xs sm:text-sm font-semibold transition-all min-h-[44px] relative cursor-pointer ${
                   mode === 'batch'
                     ? 'bg-white dark:bg-slate-700 text-blue-600 dark:text-blue-400 shadow-sm'
                     : (hasMultipleSingleDictations || queuedAudiosCount > 0 || isSeparatingConcurrent || isSimultaneousQueued)
@@ -2631,7 +2936,7 @@ const App: React.FC = () => {
               <button
                 type="button"
                 onClick={() => setMode('live')}
-                className={`flex-1 sm:flex-initial flex items-center justify-center gap-1.5 sm:gap-2 px-3 sm:px-5 py-2 rounded-lg text-xs sm:text-sm font-semibold transition-all min-h-[44px] ${
+                className={`flex items-center justify-center gap-1.5 sm:gap-2 px-3 sm:px-5 py-2 rounded-lg text-xs sm:text-sm font-semibold transition-all min-h-[44px] cursor-pointer ${
                   mode === 'live'
                     ? 'bg-white dark:bg-slate-700 text-emerald-600 dark:text-emerald-400 shadow-sm'
                     : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
@@ -2644,7 +2949,7 @@ const App: React.FC = () => {
               <button
                 type="button"
                 onClick={() => setMode('autonomous')}
-                className={`flex-1 sm:flex-initial flex items-center justify-center gap-1.5 sm:gap-2 px-3 sm:px-5 py-2 rounded-lg text-xs sm:text-sm font-semibold transition-all min-h-[44px] ${
+                className={`flex items-center justify-center gap-1.5 sm:gap-2 px-3 sm:px-5 py-2 rounded-lg text-xs sm:text-sm font-semibold transition-all min-h-[44px] cursor-pointer ${
                   mode === 'autonomous'
                     ? 'bg-gradient-to-r from-blue-600 via-indigo-600 to-purple-600 text-white shadow-md'
                     : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
@@ -2658,8 +2963,8 @@ const App: React.FC = () => {
           </div>
 
           {/* Settings Bar */}
-          <div className="mt-4 flex flex-col sm:flex-row justify-center items-center gap-3 sm:gap-6 bg-slate-100/80 dark:bg-slate-800/60 p-2.5 sm:p-2.5 rounded-xl border border-slate-200/70 dark:border-slate-700/60 max-w-xl mx-auto">
-              {status === AppStatus.Idle && (mode === 'single' || mode === 'batch' || mode === 'autonomous') && (
+          <div className="mt-4 flex flex-col sm:flex-row justify-center items-center gap-3 sm:gap-6 bg-slate-100/80 dark:bg-slate-800/60 p-2.5 sm:p-3 rounded-xl border border-slate-200/70 dark:border-slate-700/60 max-w-2xl mx-auto">
+              {(status === AppStatus.Idle || isContinuousSessionReady) && (mode === 'single' || mode === 'batch' || mode === 'autonomous') && (
                   <div className="flex items-center gap-2 w-full sm:w-auto justify-between sm:justify-start">
                       <label htmlFor="model-select" className="text-xs sm:text-sm font-semibold text-slate-700 dark:text-slate-300 whitespace-nowrap">AI Model:</label>
                       <select 
@@ -2675,8 +2980,15 @@ const App: React.FC = () => {
                   </div>
               )}
               <div className="flex items-center gap-2.5 w-full sm:w-auto justify-between sm:justify-start">
-                  <label htmlFor="error-check-toggle" className="text-xs sm:text-sm font-semibold text-slate-700 dark:text-slate-300 cursor-pointer">
-                      Automatic Error Finding
+                  <label
+                      htmlFor="error-check-toggle"
+                      className="text-xs sm:text-sm font-semibold text-slate-700 dark:text-slate-300 cursor-pointer flex items-center gap-1.5"
+                      title="Runs single-pass Gemini Decision-1 QA (laterality, contradictions, impression numbers, critical STAT alert & completeness score) before conditional explanation generation"
+                  >
+                      <span>Automatic Error Finding</span>
+                      <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-md bg-blue-100 text-blue-700 dark:bg-blue-900/60 dark:text-blue-300 border border-blue-200/70 dark:border-blue-800/60">
+                        Decision-1 QA
+                      </span>
                   </label>
                   <button
                       onClick={() => setIsErrorCheckEnabled(!isErrorCheckEnabled)}
@@ -2696,6 +3008,39 @@ const App: React.FC = () => {
               </div>
           </div>
         </header>
+
+        {/* Friendly Quick-Setup Callout when no Gemini API key is configured */}
+        {customKeysCount === 0 && !isSecretUnlocked && (
+          <div
+            onClick={() => setIsApiKeyModalOpen(true)}
+            role="button"
+            tabIndex={0}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                setIsApiKeyModalOpen(true);
+              }
+            }}
+            className="mb-4 max-w-2xl mx-auto p-3 sm:p-3.5 bg-gradient-to-r from-amber-50 to-orange-50 dark:from-amber-950/50 dark:to-orange-950/40 border border-amber-300 dark:border-amber-700/80 rounded-xl shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 cursor-pointer hover:border-amber-400 transition-all"
+          >
+            <div className="flex items-center gap-2.5 min-w-0">
+              <div className="p-2 rounded-lg bg-amber-100 dark:bg-amber-900/70 text-amber-700 dark:text-amber-300 shrink-0">
+                <Key className="w-4 h-4" />
+              </div>
+              <div className="min-w-0">
+                <p className="text-xs sm:text-sm font-bold text-amber-950 dark:text-amber-100">
+                  Gemini API Key Required to Transcribe
+                </p>
+                <p className="text-[11px] sm:text-xs text-amber-800 dark:text-amber-300">
+                  Free 1-minute setup in Google AI Studio (Create Project first → Create API Key → Paste any key format like AQ... or AIzaSy...).
+                </p>
+              </div>
+            </div>
+            <span className="inline-flex items-center justify-center px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs shadow-2xs shrink-0">
+              Add API Key →
+            </span>
+          </div>
+        )}
 
         {/* Active Upcoming Template Banner */}
         {upcomingTemplate && (

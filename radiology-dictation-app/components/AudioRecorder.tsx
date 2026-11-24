@@ -21,6 +21,7 @@ interface AudioRecorderProps {
   onRecordingComplete: (audioBlob: Blob | Blob[]) => void;
   onMultipleFilesUploaded?: (files: File[]) => void;
   onUnsavedStateChange?: (hasUnsaved: boolean) => void;
+  onRecordingIntentChange?: (hasIntent: boolean) => void;
 }
 
 function formatDuration(totalSeconds: number): string {
@@ -34,7 +35,7 @@ function formatDuration(totalSeconds: number): string {
   return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
 }
 
-const AudioRecorder: React.FC<AudioRecorderProps> = ({ status, setStatus, onRecordingComplete, onMultipleFilesUploaded, onUnsavedStateChange }) => {
+const AudioRecorder: React.FC<AudioRecorderProps> = ({ status, setStatus, onRecordingComplete, onMultipleFilesUploaded, onUnsavedStateChange, onRecordingIntentChange }) => {
   const {
     isRecording,
     isPaused,
@@ -80,6 +81,32 @@ const AudioRecorder: React.FC<AudioRecorderProps> = ({ status, setStatus, onReco
   const [stagedAudioBlob, setStagedAudioBlob] = useState<Blob | null>(null);
   const [stagedAudioUrl, setStagedAudioUrl] = useState<string | null>(null);
   const [isStagedMode, setIsStagedMode] = useState<boolean>(false);
+
+  const onRecordingIntentChangeRef = useRef(onRecordingIntentChange);
+  onRecordingIntentChangeRef.current = onRecordingIntentChange;
+  const lastIntentRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    const hasIntent = Boolean(
+      isRecording ||
+      isStarting ||
+      isRequestingMic ||
+      (isStagedMode && (stagedFiles.length > 0 || Boolean(stagedAudioBlob)))
+    );
+    if (hasIntent !== lastIntentRef.current) {
+      lastIntentRef.current = hasIntent;
+      onRecordingIntentChangeRef.current?.(hasIntent);
+    }
+  }, [isRecording, isStarting, isRequestingMic, isStagedMode, stagedFiles.length, stagedAudioBlob]);
+
+  useEffect(() => {
+    return () => {
+      if (lastIntentRef.current) {
+        lastIntentRef.current = false;
+        onRecordingIntentChangeRef.current?.(false);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (stagedAudioBlob) {

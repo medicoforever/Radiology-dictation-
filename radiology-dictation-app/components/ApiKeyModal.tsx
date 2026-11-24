@@ -84,14 +84,24 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
     const raw = newKeyInput.trim();
     if (!raw) return;
 
-    // Support comma or newline separated multi-key pasting
+    // Support comma or newline separated multi-key pasting, and normalize optional env prefixes/quotes
     const keysToProcess = raw
       .split(/[\n,;]+/)
-      .map(k => k.trim())
-      .filter(k => k.length > 10);
+      .map(k =>
+        k
+          .trim()
+          .replace(/^(?:export\s+)?(?:GEMINI_API_KEY|GOOGLE_API_KEY|API_KEY)\s*=\s*/i, '')
+          .replace(/^Bearer\s+/i, '')
+          .replace(/^['"`]+|['"`]+$/g, '')
+          .trim()
+      )
+      .filter(k => k.length >= 10);
 
     if (keysToProcess.length === 0) {
-      setBannerMessage({ type: 'error', text: 'Please enter a valid Gemini API key (e.g. starts with AIzaSy... or AQ.Ab8...)' });
+      setBannerMessage({
+        type: 'error',
+        text: 'Please enter a valid Gemini API key (any valid key format is accepted, such as AQ...., AIzaSy..., etc.)',
+      });
       return;
     }
 
@@ -317,13 +327,33 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
             </div>
 
             {showGuide && (
-              <div className="space-y-2.5 text-xs text-slate-700 dark:text-slate-300 pt-1">
+              <div className="space-y-3 text-xs text-slate-700 dark:text-slate-300 pt-1">
                 <p className="font-medium text-slate-600 dark:text-slate-300 leading-relaxed">
-                  Google provides a generous <strong>100% free tier</strong> for Gemini with <strong>no credit card required</strong>. Anyone with a normal Google/Gmail account can get a key in under 60 seconds:
+                  Google provides a generous <strong>100% free tier</strong> for Gemini with <strong>no credit card required</strong>. Follow these 4 simple steps in order:
                 </p>
-                <ol className="list-decimal list-inside space-y-2 pl-1 leading-relaxed">
-                  <li>
-                    <strong>Open Google AI Studio:</strong> Click this direct link{' '}
+
+                {/* Visual Quick-Flow Pills */}
+                <div className="flex flex-wrap items-center gap-1.5 text-[11px] font-bold">
+                  <span className="px-2 py-1 rounded-lg bg-white dark:bg-slate-800 border border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-300">
+                    1. Open AI Studio
+                  </span>
+                  <span className="text-slate-400">→</span>
+                  <span className="px-2 py-1 rounded-lg bg-indigo-600 text-white shadow-2xs">
+                    2. Create Project FIRST
+                  </span>
+                  <span className="text-slate-400">→</span>
+                  <span className="px-2 py-1 rounded-lg bg-white dark:bg-slate-800 border border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-300">
+                    3. Create API Key
+                  </span>
+                  <span className="text-slate-400">→</span>
+                  <span className="px-2 py-1 rounded-lg bg-emerald-600 text-white shadow-2xs">
+                    4. Copy &amp; Paste Below
+                  </span>
+                </div>
+
+                <ol className="space-y-2.5 leading-relaxed">
+                  <li className="p-2.5 rounded-lg bg-white/80 dark:bg-slate-900/60 border border-slate-200/80 dark:border-slate-700/70">
+                    <span className="font-bold text-slate-900 dark:text-white">1. Open Google AI Studio &amp; Sign In:</span> Click{' '}
                     <a
                       href="https://aistudio.google.com/app/apikey"
                       target="_blank"
@@ -331,16 +361,26 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
                       className="inline-flex items-center gap-1 font-bold text-blue-600 dark:text-blue-400 underline hover:text-blue-700"
                     >
                       aistudio.google.com/app/apikey <ExternalLink className="w-3 h-3" />
-                    </a>
+                    </a>{' '}
+                    and sign in with any normal Google / Gmail account.
                   </li>
-                  <li>
-                    <strong>Sign In:</strong> Log in with your standard Google / Gmail account.
+
+                  <li className="p-2.5 rounded-lg bg-indigo-50/90 dark:bg-indigo-950/40 border border-indigo-300 dark:border-indigo-700/80">
+                    <span className="font-bold text-indigo-950 dark:text-indigo-200">2. Create a Project FIRST (Required):</span> Inside Google AI Studio, click <strong>&quot;Create project&quot;</strong> (or <strong>&quot;+ Create a new project&quot;</strong> / import an existing Google Cloud project), enter any simple name (e.g. <code className="bg-white/80 dark:bg-slate-800 px-1 py-0.5 rounded font-mono">My Dictation</code>), and save it.
+                    <span className="block mt-1 text-[11px] font-semibold text-indigo-800 dark:text-indigo-300">
+                      ⚠️ Important: The &quot;Create API key&quot; option only becomes available AFTER you create or select a project there!
+                    </span>
                   </li>
-                  <li>
-                    <strong>Create Key:</strong> Click the blue button that says <strong>"Create API Key"</strong>. Choose "Create key in new project" (it creates automatically in 2 seconds).
+
+                  <li className="p-2.5 rounded-lg bg-white/80 dark:bg-slate-900/60 border border-slate-200/80 dark:border-slate-700/70">
+                    <span className="font-bold text-slate-900 dark:text-white">3. Create Your API Key Inside That Project:</span> Once your project is created and selected, click the <strong>&quot;Create API key&quot;</strong> button, select your new project, and generate your key.
                   </li>
-                  <li>
-                    <strong>Copy & Paste:</strong> Click the copy icon next to your key string (starts with <code className="bg-slate-200 dark:bg-slate-800 px-1 py-0.5 rounded font-mono">AIzaSy...</code>), and paste it into the "Add Custom API Key" field below!
+
+                  <li className="p-2.5 rounded-lg bg-emerald-50/70 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800/70">
+                    <span className="font-bold text-emerald-950 dark:text-emerald-200">4. Copy &amp; Paste Any Key Format Below:</span> Click the copy icon next to your newly created key and paste it into the <strong>&quot;Add Custom API Key(s)&quot;</strong> field below, then click <strong>Add</strong>.
+                    <span className="block mt-1 text-[11px] text-emerald-800 dark:text-emerald-300">
+                      ✓ <strong>All Gemini key formats work:</strong> Google API keys may start with <code className="bg-white/90 dark:bg-slate-800 px-1 py-0.5 rounded font-mono font-bold">AQ.</code> (e.g. <code className="bg-white/90 dark:bg-slate-800 px-1 py-0.5 rounded font-mono">AQ.Ab8...</code>), <code className="bg-white/90 dark:bg-slate-800 px-1 py-0.5 rounded font-mono font-bold">AIzaSy...</code>, or any other prefix — every valid Gemini API key works here!
+                    </span>
                   </li>
                 </ol>
 
@@ -349,7 +389,7 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
                     <span>💡</span> Pro-Tip for Unlimited Daily Dictations:
                   </p>
                   <p className="mt-1 leading-relaxed text-[11px] sm:text-xs text-amber-800 dark:text-amber-300">
-                    If you dictate high volumes of reports each day, you can open AI Studio with a <strong>different Gmail account</strong>, generate another free key, and paste it here too! You can add multiple keys from different Google accounts, and this app will automatically rotate and failover across all of them to multiply your total dictation capacity!
+                    If you dictate high volumes of reports each day, you can create keys under different Google / Gmail accounts and paste all of them below! This app will automatically rotate and failover across all of them to multiply your total dictation capacity.
                   </p>
                 </div>
               </div>
@@ -433,7 +473,7 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
                     handleAddKey();
                   }
                 }}
-                placeholder="Paste Gemini API key (e.g. AIzaSy... or multiple separated by commas)"
+                placeholder="Paste any Gemini API key (e.g. AQ...., AIzaSy..., or comma-separated keys)"
                 className="w-full px-3.5 py-2.5 pr-20 text-xs sm:text-sm bg-slate-50 dark:bg-slate-800/60 border border-slate-300 dark:border-slate-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 text-slate-900 dark:text-slate-100 placeholder-slate-400 font-mono"
               />
               <button
@@ -455,7 +495,7 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
               </button>
             </div>
             <p className="text-[11px] text-slate-500 dark:text-slate-400">
-              💡 Tip: You can paste one key or multiple keys separated by newlines or commas.
+              💡 Accepts any Gemini key format (<code className="font-mono bg-slate-100 dark:bg-slate-800 px-1 rounded">AQ....</code>, <code className="font-mono bg-slate-100 dark:bg-slate-800 px-1 rounded">AIzaSy...</code>, etc.). Paste one key or multiple separated by newlines or commas.
             </p>
           </div>
 
@@ -548,7 +588,7 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
               </button>
             </div>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              Verifies load balancing across active keys. Model selected: <span className="font-semibold text-blue-600 dark:text-blue-400">{selectedModel || 'gemini-3.8-flash'}</span>.
+              Verifies load balancing across active keys. Model selected: <span className="font-semibold text-blue-600 dark:text-blue-400">{selectedModel || 'gemini-4-hydrogen'}</span>.
             </p>
             {failoverTestResult && (
               <div className="mt-2 p-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-xs font-mono text-slate-700 dark:text-slate-300">

@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useAudioRecorder } from '../hooks/useAudioRecorder';
-import { processAudio, createChat, blobToBase64, continueAudioDictation, base64ToBlob, modifyFindingWithAudio, modifyReportWithAudio, identifyPotentialErrors, runComplexImpressionGeneration, transcribeAudioForPrompt, detectAndExtractTemplate, mergeDictatedFindingsWithTemplate } from '../services/geminiService';
+import { processAudio, createChat, blobToBase64, continueAudioDictation, base64ToBlob, modifyFindingWithAudio, modifyReportWithAudio, runComplexImpressionGeneration, transcribeAudioForPrompt, detectAndExtractTemplate, mergeDictatedFindingsWithTemplate, runClinicalQaErrorCheck, ClinicalQaAssessment } from '../services/geminiService';
+import ClinicalQaPanel, { getUrgencyBadgeMeta } from './ui/ClinicalQaPanel';
 import { saveAudioBlob, getAudioBlob, clearUnusedAudioBlobs, saveReportSession, getReportSession, deleteReportSession } from '../services/audioStorage';
 import { mergeMultipleAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
 import { ClipboardPaste, X, CheckSquare } from 'lucide-react';
@@ -69,6 +70,8 @@ interface Batch {
     chatHistory?: ChatMessage[];
     isChatting?: boolean;
     identifiedErrors?: IdentifiedError[];
+    qaAssessment?: ClinicalQaAssessment | null;
+    qaFindingsHash?: string;
     errorCheckStatus?: 'idle' | 'checking' | 'complete';
 }
 
@@ -247,8 +250,8 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
 
     useEffect(() => {
         return () => {
-            Object.values(deleteUndoTimersRef.current).forEach(t => clearTimeout(t));
-            Object.values(deleteUndoIntervalsRef.current).forEach(i => clearInterval(i));
+            (Object.values(deleteUndoTimersRef.current) as NodeJS.Timeout[]).forEach(t => clearTimeout(t));
+            (Object.values(deleteUndoIntervalsRef.current) as NodeJS.Timeout[]).forEach(i => clearInterval(i));
         };
     }, []);
 
@@ -878,41 +881,68 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     }, [globalCustomImages]);
 
 
-    // useEffect to run error check in background for batches
+    // useEffect to run Gemini Decision 1 clinical QA & conditional error check in background for batches
     useEffect(() => {
         // If globally disabled, clear all errors and stop
         if (!isErrorCheckEnabled) {
-            const needsClearing = batches.some(b => b.identifiedErrors && b.identifiedErrors.length > 0);
+            const needsClearing = batches.some(
+                b => (b.identifiedErrors && b.identifiedErrors.length > 0) || b.qaAssessment || b.qaFindingsHash || b.errorCheckStatus !== 'idle'
+            );
             if (needsClearing) {
-                setBatches(prev => prev.map(b => ({ ...b, identifiedErrors: [], errorCheckStatus: 'idle' })));
+                setBatches(prev => prev.map(b => ({ ...b, identifiedErrors: [], qaAssessment: null, qaFindingsHash: undefined, errorCheckStatus: 'idle' })));
             }
             processedFindingsRef.current.clear();
             return;
         }
 
         batches.forEach(batch => {
-            if (batch.findings && batch.findings.length > 0) {
+            const canCheck =
+                batch.status !== 'processing' &&
+                batch.status !== 'error' &&
+                batch.findings &&
+                batch.findings.length > 0;
+
+            if (canCheck) {
                 const findingsKey = JSON.stringify(batch.findings);
                 const lastProcessedKey = processedFindingsRef.current.get(batch.id);
 
+                if (
+                    lastProcessedKey === undefined &&
+                    batch.errorCheckStatus === 'complete' &&
+                    batch.qaAssessment !== undefined &&
+                    batch.qaFindingsHash === findingsKey
+                ) {
+                    processedFindingsRef.current.set(batch.id, findingsKey);
+                    return;
+                }
+
                 if (findingsKey !== lastProcessedKey) {
-                    // Findings have changed, run the check
+                    // Findings have changed, run Decision-1 QA battery + conditional explanation
                     processedFindingsRef.current.set(batch.id, findingsKey);
 
-                    // Set status to checking
-                    setBatches(prev => prev.map(b => b.id === batch.id ? { ...b, errorCheckStatus: 'checking', identifiedErrors: [] } : b));
-                    
-                    identifyPotentialErrors(batch.findings, batch.selectedModel)
-                    .then(errors => {
-                        setBatches(prev => prev.map(b => b.id === batch.id ? { ...b, identifiedErrors: errors, errorCheckStatus: 'complete' } : b));
-                    })
-                    .catch(err => {
-                        console.error(`Error check failed for batch ${batch.id}:`, err);
-                        setBatches(prev => prev.map(b => b.id === batch.id ? { ...b, errorCheckStatus: 'complete' } : b));
-                    });
+                    setBatches(prev =>
+                        prev.map(b => b.id === batch.id ? { ...b, errorCheckStatus: 'checking', identifiedErrors: [], qaAssessment: null, qaFindingsHash: undefined } : b)
+                    );
+
+                    runClinicalQaErrorCheck(batch.findings!, batch.selectedModel)
+                        .then(({ errors, qaAssessment }) => {
+                            if (processedFindingsRef.current.get(batch.id) !== findingsKey) return;
+                            setBatches(prev =>
+                                prev.map(b =>
+                                    b.id === batch.id
+                                        ? { ...b, identifiedErrors: errors, qaAssessment, qaFindingsHash: findingsKey, errorCheckStatus: 'complete' }
+                                        : b
+                                )
+                            );
+                        })
+                        .catch(err => {
+                            console.error(`Error check failed for batch ${batch.id}:`, err);
+                            setBatches(prev =>
+                                prev.map(b => b.id === batch.id ? { ...b, errorCheckStatus: 'complete' } : b)
+                            );
+                        });
                 }
             } else if (processedFindingsRef.current.has(batch.id)) {
-                // Findings were cleared, remove from tracking
                 processedFindingsRef.current.delete(batch.id);
             }
         });
@@ -3037,7 +3067,24 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                             )}
                                             {batch.findings && (
                                                 <div className="flex items-center gap-2 flex-wrap">
-                                                    <span className="text-blue-600 dark:text-blue-400 font-semibold text-sm">Processed</span>
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => {
+                                                            setOpenAccordion(batch.id);
+                                                            setTimeout(() => {
+                                                                document.getElementById(`batch-transcript-${batch.id}`)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                                                            }, 50);
+                                                        }}
+                                                        className="inline-flex items-center gap-1 text-blue-700 dark:text-blue-300 bg-blue-50 hover:bg-blue-100 dark:bg-blue-950/50 dark:hover:bg-blue-900/60 border border-blue-200 dark:border-blue-800 px-2.5 py-1 rounded-lg font-semibold text-xs transition-colors cursor-pointer"
+                                                        title="Jump to this processed transcript below"
+                                                    >
+                                                        <span>View Transcript ↓</span>
+                                                    </button>
+                                                    {batch.qaAssessment && (batch.qaAssessment.criticalUrgency.level === 'critical_stat' || batch.qaAssessment.criticalUrgency.level === 'urgent') && (
+                                                        <span className={`text-[10px] font-extrabold px-2 py-0.5 rounded-full border ${getUrgencyBadgeMeta(batch.qaAssessment.criticalUrgency.level).pillClass}`}>
+                                                            {getUrgencyBadgeMeta(batch.qaAssessment.criticalUrgency.level).shortLabel}
+                                                        </span>
+                                                    )}
                                                     {continuationState.status === 'recording' && continuationState.batchId === batch.id ? (
                                                         <div className="flex items-center gap-2 bg-red-100 dark:bg-red-900/20 px-2.5 py-1 rounded-lg">
                                                             <div className="w-2.5 h-2.5 bg-red-500 rounded-full animate-ping"></div>
@@ -3164,9 +3211,75 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             
             {hasAnyResults && (
                 <div ref={findingsContainerRef} className="mt-8 border-t dark:border-slate-700 pt-6">
-                    <div className="flex justify-between items-center mb-4">
+                    <div className="flex flex-wrap justify-between items-center gap-2 mb-4">
                         <h3 className="text-2xl font-bold text-slate-800 dark:text-slate-100">Processed Transcripts</h3>
+                        {openAccordion && (
+                            <button
+                                type="button"
+                                onClick={() => setOpenAccordion(null)}
+                                className="text-xs font-semibold px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700 transition-colors cursor-pointer"
+                            >
+                                Collapse Active Transcript
+                            </button>
+                        )}
                     </div>
+                    {isErrorCheckEnabled && (() => {
+                        const completedReports = batches.filter(b => b.findings && b.status !== 'processing' && b.status !== 'error');
+                        const assessed = completedReports.filter(b => b.qaAssessment);
+                        if (completedReports.length === 0) return null;
+                        const criticalBatches = assessed.filter(b => b.qaAssessment!.criticalUrgency.level === 'critical_stat');
+                        const urgentBatches = assessed.filter(b => b.qaAssessment!.criticalUrgency.level === 'urgent');
+                        const flaggedBatches = completedReports.filter(b => (b.identifiedErrors && b.identifiedErrors.length > 0) || (b.qaAssessment?.triggeredRules.length ?? 0) > 0);
+                        const checkingCount = completedReports.filter(b => b.errorCheckStatus === 'checking').length;
+                        const cleanSkippedCount = assessed.filter(b => !b.qaAssessment!.invokedDetailedGenerator && b.qaAssessment!.triggeredRules.length === 0).length;
+                        const firstAttentionBatch = criticalBatches[0] || urgentBatches[0] || flaggedBatches[0];
+                        return (
+                            <div className="mb-4 p-3 rounded-xl border border-slate-200 dark:border-slate-700/80 bg-slate-50/90 dark:bg-slate-900/50 flex flex-wrap items-center justify-between gap-2 text-xs">
+                                <div className="flex flex-wrap items-center gap-2">
+                                    <span className="font-bold text-slate-700 dark:text-slate-200">Decision-1 Batch QA Triage:</span>
+                                    {checkingCount > 0 && (
+                                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-blue-100 text-blue-800 dark:bg-blue-900/50 dark:text-blue-200 font-semibold">
+                                            <Spinner className="w-3 h-3" /> {checkingCount} checking
+                                        </span>
+                                    )}
+                                    {criticalBatches.length > 0 && (
+                                        <span className="px-2 py-0.5 rounded-full bg-rose-600 text-white font-extrabold animate-pulse">
+                                            {criticalBatches.length} Critical STAT
+                                        </span>
+                                    )}
+                                    {urgentBatches.length > 0 && (
+                                        <span className="px-2 py-0.5 rounded-full bg-amber-500 text-slate-950 font-bold">
+                                            {urgentBatches.length} Urgent
+                                        </span>
+                                    )}
+                                    {flaggedBatches.length > 0 && (
+                                        <span className="px-2 py-0.5 rounded-full bg-amber-100 text-amber-900 dark:bg-amber-950/60 dark:text-amber-200 border border-amber-300 dark:border-amber-700 font-semibold">
+                                            {flaggedBatches.length} Flagged
+                                        </span>
+                                    )}
+                                    {cleanSkippedCount > 0 && (
+                                        <span className="px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800 font-semibold">
+                                            {cleanSkippedCount} Clean (0 output tokens)
+                                        </span>
+                                    )}
+                                </div>
+                                {firstAttentionBatch && (
+                                    <button
+                                        type="button"
+                                        onClick={() => {
+                                            setOpenAccordion(firstAttentionBatch.id);
+                                            setTimeout(() => {
+                                                document.getElementById(`batch-transcript-${firstAttentionBatch.id}`)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                                            }, 50);
+                                        }}
+                                        className="px-2.5 py-1 rounded-lg bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs shadow-2xs transition-colors cursor-pointer"
+                                    >
+                                        Open Priority Report →
+                                    </button>
+                                )}
+                            </div>
+                        );
+                    })()}
                     {hasAnyErrors && <ErrorLegend />}
                     {hasAnyResults && (
                         <div className="flex justify-end mb-4">
@@ -3179,11 +3292,42 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                         </div>
                     )}
                      <div className="space-y-2">
-                        {batches.filter(b => b.findings || (b.status === 'error' && b.findings === null)).map(batch => (
-                             <div key={batch.id} className="border dark:border-slate-700 rounded-lg overflow-hidden">
-                                <button onClick={() => setOpenAccordion(openAccordion === batch.id ? null : batch.id)} className="w-full text-left p-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-700/50 dark:hover:bg-slate-700 flex justify-between items-center">
-                                    <span className="font-semibold text-slate-800 dark:text-slate-200">{batch.name}</span>
-                                    <span className={`transition-transform transform ${openAccordion === batch.id ? 'rotate-180' : ''}`}><ChevronDownIcon /></span>
+                        {batches.filter(b => b.findings || (b.status === 'error' && b.findings === null)).map(batch => {
+                             const qa = batch.qaAssessment;
+                             const urgencyMeta = qa ? getUrgencyBadgeMeta(qa.criticalUrgency.level) : null;
+                             const errCount = batch.identifiedErrors?.length || 0;
+                             return (
+                             <div key={batch.id} id={`batch-transcript-${batch.id}`} className="border dark:border-slate-700 rounded-lg overflow-hidden">
+                                <button onClick={() => setOpenAccordion(openAccordion === batch.id ? null : batch.id)} className="w-full text-left p-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-700/50 dark:hover:bg-slate-700 flex justify-between items-center gap-2 cursor-pointer">
+                                    <div className="flex flex-wrap items-center gap-2 min-w-0">
+                                        <span className="font-semibold text-slate-800 dark:text-slate-200 truncate">{batch.name}</span>
+                                        {batch.errorCheckStatus === 'checking' && (
+                                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-blue-100 text-blue-700 dark:bg-blue-900/50 dark:text-blue-300">
+                                                <Spinner className="w-3 h-3" /> Checking QA
+                                            </span>
+                                        )}
+                                        {urgencyMeta && (qa!.criticalUrgency.level === 'critical_stat' || qa!.criticalUrgency.level === 'urgent') && (
+                                            <span className={`px-2 py-0.5 rounded-full text-[10px] font-extrabold border ${urgencyMeta.pillClass}`}>
+                                                {urgencyMeta.shortLabel}
+                                            </span>
+                                        )}
+                                        {qa && (
+                                            <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-600 text-slate-600 dark:text-slate-300">
+                                                Completeness {qa.reportCompleteness.score.toFixed(1)}/3
+                                            </span>
+                                        )}
+                                        {batch.errorCheckStatus === 'complete' && errCount > 0 && (
+                                            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-900 dark:bg-amber-950/60 dark:text-amber-200 border border-amber-300 dark:border-amber-700">
+                                                {errCount} QA {errCount === 1 ? 'issue' : 'issues'}
+                                            </span>
+                                        )}
+                                        {batch.errorCheckStatus === 'complete' && qa && errCount === 0 && !qa.invokedDetailedGenerator && (
+                                            <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-100 text-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800">
+                                                QA Clean
+                                            </span>
+                                        )}
+                                    </div>
+                                    <span className={`transition-transform transform shrink-0 ${openAccordion === batch.id ? 'rotate-180' : ''}`}><ChevronDownIcon /></span>
                                 </button>
                                 {openAccordion === batch.id && (
                                      <div className="p-4 bg-white dark:bg-slate-800">
@@ -3207,7 +3351,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                             </div>
                                         ) : batch.findings ? (
                                             <>
-                                                <div className="flex justify-between items-center mb-4">
+                                                <div className="flex justify-between items-center mb-3">
                                                   <div className="flex items-center gap-2">
                                                     <h4 className="text-lg font-bold text-slate-800 dark:text-slate-200">Transcript</h4>
                                                     {batch.errorCheckStatus === 'checking' && (
@@ -3218,6 +3362,15 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                     )}
                                                   </div>
                                                 </div>
+
+                                                {isErrorCheckEnabled && (
+                                                    <ClinicalQaPanel
+                                                        assessment={batch.qaAssessment}
+                                                        errorCheckStatus={batch.errorCheckStatus}
+                                                        errorCount={batch.identifiedErrors?.length || 0}
+                                                        className="mb-4"
+                                                    />
+                                                )}
 
                                                 {mergingBatchId === batch.id && (
                                                     <div className="mb-4 p-3.5 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-300 dark:border-emerald-700/80 flex items-center gap-3 animate-fade-in shadow-xs" role="status">
@@ -4225,7 +4378,8 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                      </div>
                                 )}
                              </div>
-                        ))}
+                             );
+                        })}
                      </div>
                 </div>
             )}

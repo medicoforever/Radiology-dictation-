@@ -150,7 +150,7 @@ export function getUserApiKeys(): string[] {
     if (Array.isArray(parsed)) {
       return parsed
         .map((k: any) => (typeof k === 'string' ? k.trim() : ''))
-        .filter((k: string) => k.length > 10);
+        .filter((k: string) => k.length >= 10);
     }
   } catch (e) {
     console.warn("Could not read user API keys from localStorage:", e);
@@ -173,7 +173,7 @@ export function setUserApiKeys(keys: string[]): void {
     if (typeof window !== 'undefined' && window.localStorage) {
       const clean = keys
         .map(k => k.trim())
-        .filter(k => k.length > 10)
+        .filter(k => k.length >= 10)
         .filter((k, idx, arr) => arr.indexOf(k) === idx);
       localStorage.setItem(USER_KEYS_STORAGE_KEY, JSON.stringify(clean));
       window.dispatchEvent(new CustomEvent(API_KEYS_UPDATED_EVENT));
@@ -202,7 +202,7 @@ export async function syncApiKeysWithGoogleDrive(): Promise<{ success: boolean; 
     let merged = [...localKeys];
     if (driveKeys && Array.isArray(driveKeys)) {
       for (const k of driveKeys) {
-        if (typeof k === 'string' && k.trim().length > 10 && !merged.includes(k.trim())) {
+        if (typeof k === 'string' && k.trim().length >= 10 && !merged.includes(k.trim())) {
           merged.push(k.trim());
         }
       }
@@ -398,6 +398,9 @@ export async function executeWithApiKeyFailover<T>(
       return result;
     } catch (err: any) {
       if (err?.name === 'AbortError' || options?.abortSignal?.aborted) {
+        throw err;
+      }
+      if (err?.isNonRetryable === true) {
         throw err;
       }
       lastError = err;

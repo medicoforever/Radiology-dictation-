@@ -111,11 +111,103 @@ export function resolveApiTargetModel(model?: string): string {
   return model;
 }
 
+function getErrorStatusCode(err: any): number | undefined {
+  const raw = err?.status ?? err?.code ?? err?.error?.code;
+  return typeof raw === 'number' ? raw : undefined;
+}
+
+function isTransientOrKeyError(err: any): boolean {
+  if (!err) return false;
+  const status = getErrorStatusCode(err);
+  if (status === 401 || status === 403 || status === 429 || (status !== undefined && status >= 500)) {
+    return true;
+  }
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return (
+    msg.includes('api key') ||
+    msg.includes('api_key') ||
+    msg.includes('permission_denied') ||
+    msg.includes('unauthenticated') ||
+    msg.includes('resource_exhausted') ||
+    msg.includes('quota') ||
+    msg.includes('rate limit') ||
+    msg.includes('too many requests') ||
+    msg.includes('overloaded') ||
+    msg.includes('timeout') ||
+    msg.includes('timed out') ||
+    msg.includes('failed to fetch') ||
+    msg.includes('network')
+  );
+}
+
+/**
+ * Determines if an error is caused by invalid/corrupt/unsupported media or audio input
+ * rather than API key quota or JSON schema mode differences.
+ */
+export function isNonRetryableMediaError(err: any): boolean {
+  if (!err || isTransientOrKeyError(err)) return false;
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  if (
+    msg.includes('invalid audio') ||
+    msg.includes('unable to submit request') ||
+    msg.includes('unable to process input') ||
+    msg.includes('could not decode') ||
+    msg.includes('unsupported audio') ||
+    msg.includes('unsupported mime') ||
+    msg.includes('invalid mime') ||
+    msg.includes('empty audio') ||
+    msg.includes('no audio') ||
+    msg.includes('audio file') ||
+    msg.includes('corrupt')
+  ) {
+    return true;
+  }
+  return (
+    msg.includes('invalid argument') &&
+    (msg.includes('audio') || msg.includes('media') || msg.includes('mime') || msg.includes('file') || msg.includes('payload'))
+  );
+}
+
+async function detectAudioMimeFromHeader(blob: Blob): Promise<string | null> {
+  try {
+    if (blob.size < 4) return null;
+    const headerBuf = await blob.slice(0, 12).arrayBuffer();
+    const bytes = new Uint8Array(headerBuf);
+    // RIFF....WAVE -> audio/wav
+    if (bytes.length >= 12 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
+        bytes[8] === 0x57 && bytes[9] === 0x41 && bytes[10] === 0x56 && bytes[11] === 0x45) {
+      return 'audio/wav';
+    }
+    // EBML header -> audio/webm
+    if (bytes[0] === 0x1A && bytes[1] === 0x45 && bytes[2] === 0xDF && bytes[3] === 0xA3) {
+      return 'audio/webm';
+    }
+    // OggS -> audio/ogg
+    if (bytes[0] === 0x4F && bytes[1] === 0x67 && bytes[2] === 0x67 && bytes[3] === 0x53) {
+      return 'audio/ogg';
+    }
+    // fLaC -> audio/flac
+    if (bytes[0] === 0x66 && bytes[1] === 0x4C && bytes[2] === 0x61 && bytes[3] === 0x43) {
+      return 'audio/flac';
+    }
+    // ISO Base Media (ftyp) -> audio/mp4
+    if (bytes.length >= 8 && bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70) {
+      return 'audio/mp4';
+    }
+    // ID3 or MP3 frame sync -> audio/mp3
+    if ((bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33) ||
+        (bytes[0] === 0xFF && (bytes[1] & 0xE0) === 0xE0)) {
+      return 'audio/mp3';
+    }
+  } catch {}
+  return null;
+}
+
 /**
  * Determines if an error thrown by the Gemini API is caused by lack of JSON mode support or schema rejection.
  */
 export function isJsonModeUnsupportedError(err: any): boolean {
-  if (!err) return false;
+  if (!err || isNonRetryableMediaError(err)) return false;
   const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
   return (
     msg.includes('json mode is not enabled') ||
@@ -331,6 +423,13 @@ export async function generateContentWithJsonFallback(
         const text = response.text?.trim() || '';
         if (text) return text;
       } catch (err: any) {
+        if (err?.name === 'AbortError' || abortSignal?.aborted) {
+          throw err;
+        }
+        if (isNonRetryableMediaError(err)) {
+          (err as any).isNonRetryable = true;
+          throw err;
+        }
         // Strategy 2: If JSON mode unsupported or schema error, retry prompt-only on the SAME selected model
         if (isJsonModeUnsupportedError(err) || (err?.message && err.message.toLowerCase().includes('schema'))) {
           console.warn(`[Gemini API] Primary JSON mode call failed on model ${resolvedModel} (${err?.message || err}). Attempting prompt-only fallback without schema config on SAME model...`);
@@ -352,6 +451,14 @@ export async function generateContentWithJsonFallback(
             if (retryText) return retryText;
           } catch (retryErr: any) {
             console.warn(`[Gemini API] Prompt-only retry on ${resolvedModel} failed:`, retryErr);
+            const retryMsg = (retryErr instanceof Error ? retryErr.message : String(retryErr)).toLowerCase();
+            if (
+              isNonRetryableMediaError(retryErr) ||
+              (!isTransientOrKeyError(retryErr) && (getErrorStatusCode(retryErr) === 400 || retryMsg.includes('invalid argument')))
+            ) {
+              (retryErr as any).isNonRetryable = true;
+              throw retryErr;
+            }
           }
         }
 
@@ -800,7 +907,13 @@ export const processAudio = async (
   for (let i = 0; i < audioBlobs.length; i++) {
     const blob = audioBlobs[i];
     const base64Audio = await blobToBase64(blob);
-    const cleanMime = getCleanMimeType(blob);
+    let cleanMime = getCleanMimeType(blob);
+    if (!blob.type || blob.type === 'application/octet-stream' || cleanMime === 'audio/ogg' || cleanMime === 'audio/webm') {
+      const detectedAudioMime = await detectAudioMimeFromHeader(blob);
+      if (detectedAudioMime) {
+        cleanMime = detectedAudioMime;
+      }
+    }
     const isAudio = cleanMime.startsWith('audio/');
     const isVideo = cleanMime.startsWith('video/');
     const isPdf = cleanMime === 'application/pdf';
@@ -896,7 +1009,12 @@ export const processAudio = async (
     console.warn("Gemini API call returned error, evaluating fallback:", error);
 
     // In MERGE MODE ALONE: If error is JSON mode unsupported or schema failure, retry cleanly with target model & raw JSON prompt
-    if (templateInfo.isTemplateMode) {
+    const isMediaOrNonRetryable = Boolean((error as any)?.isNonRetryable) || isNonRetryableMediaError(error);
+    const isSchemaOrParseError =
+      !isMediaOrNonRetryable &&
+      (isJsonModeUnsupportedError(error) ||
+        (error instanceof Error && error.message.includes("Expected a 'findings' array")));
+    if (templateInfo.isTemplateMode && isSchemaOrParseError) {
       try {
         const retryText = await generateContentWithJsonFallback(targetModel, parts, responseSchema, 0.1, abortSignal);
         const parsedFindings = extractFindingsFromResponse(retryText);
@@ -1850,20 +1968,456 @@ const errorSchema = {
     }
 };
 
-export const identifyPotentialErrors = async (findings: string[], model: string): Promise<IdentifiedError[]> => {
+export const identifyPotentialErrors = async (
+  findings: string[],
+  model: string,
+  options?: {
+    triggeredRules?: ClinicalQaRuleResult[];
+    abortSignal?: AbortSignal;
+  }
+): Promise<IdentifiedError[]> => {
+    const triggeredHint = options?.triggeredRules && options.triggeredRules.length > 0
+      ? `\n\nPre-screening QA alerts flagged the following high-probability issue(s) to inspect and explain concisely per findingIndex:\n${options.triggeredRules
+          .map(r => `- ${r.label} (${r.id}, P=${(r.probability * 100).toFixed(0)}%)`)
+          .join('\n')}\nNote: Include violations of the "NO numerical values or measurements in IMPRESSION" rule as severity 'WARNING' (findingIndex = IMPRESSION row index) if present in the IMPRESSION section.`
+      : '';
+
     const textPart = {
-        text: `${ERROR_IDENTIFIER_PROMPT}\n\nReport to analyze:\n${JSON.stringify({ findings })}`,
+        text: `${ERROR_IDENTIFIER_PROMPT}${triggeredHint}\n\nReport to analyze:\n${JSON.stringify({ findings })}`,
     };
 
     try {
         const targetModel = resolveApiTargetModel(model);
-        const rawResponseText = await generateContentWithJsonFallback(targetModel, [textPart], errorSchema, 0.1);
+        const rawResponseText = await generateContentWithJsonFallback(
+          targetModel,
+          [textPart],
+          errorSchema,
+          0.1,
+          options?.abortSignal
+        );
         return extractErrorsFromResponse(rawResponseText);
-    } catch (error) {
+    } catch (error: any) {
+        if (error?.name === 'AbortError' || options?.abortSignal?.aborted) {
+            throw error;
+        }
         console.error("Error calling Gemini API for error identification:", error);
         // Don't throw, just return empty array as this is a background task.
         return [];
     }
+};
+
+// --- Gemini Decision 1 Multi-Rule Clinical QA, Critical Findings Alert & Completeness Check ---
+
+export const GEMINI_DECISION_MODEL = 'gemini-decision-1';
+export const QA_NOUL_THRESHOLD = 0.70;
+
+export type ClinicalQaRuleId =
+  | 'has_laterality_contradiction'
+  | 'has_normal_vs_abnormal_contradiction'
+  | 'impression_contradicts_or_omits_finding'
+  | 'impression_contains_numbers';
+
+export type CriticalUrgencyLevel = 'routine' | 'prompt_follow_up' | 'urgent' | 'critical_stat';
+
+export interface ClinicalQaRuleResult {
+  id: ClinicalQaRuleId;
+  label: string;
+  probability: number;
+  confidence: number;
+  triggered: boolean;
+}
+
+export interface ClinicalQaAssessment {
+  decisionModel: string;
+  rules: ClinicalQaRuleResult[];
+  triggeredRules: ClinicalQaRuleResult[];
+  criticalUrgency: {
+    level: CriticalUrgencyLevel;
+    label: string;
+    expectedScore: number;
+    topLevelIndex: number;
+    confidence: number;
+    probabilities: Record<string, number>;
+  };
+  reportCompleteness: {
+    score: number;
+    levelIndex: number;
+    label: string;
+    confidence: number;
+    probabilities: Record<string, number>;
+  };
+  invokedDetailedGenerator: boolean;
+  skippedDetailedReason?: string;
+  usage?: {
+    totalInputTokens?: number;
+    totalOutputTokens?: number;
+  };
+  decisionLatencyMs: number;
+}
+
+export interface AutomaticErrorCheckResult {
+  errors: IdentifiedError[];
+  qaAssessment: ClinicalQaAssessment | null;
+}
+
+const QA_RULE_LABELS: Record<ClinicalQaRuleId, string> = {
+  has_laterality_contradiction: 'Laterality Consistency',
+  has_normal_vs_abnormal_contradiction: 'Normal vs. Abnormal',
+  impression_contradicts_or_omits_finding: 'Impression Sync',
+  impression_contains_numbers: 'No Numbers in Impression',
+};
+
+const COMPLETENESS_LEVEL_LABELS = ['Incomplete', 'Minimal', 'Adequate', 'Complete'];
+
+const PLACEHOLDER_FINDING_PATTERNS = [
+  /^processing audio with ai\.{0,3}$/i,
+  /^previous dictation encountered an error/i,
+  /^dictation #\d+ analysis cancelled/i,
+  /^error processing dictation/i,
+];
+
+function isPlaceholderReport(findings: string[]): boolean {
+  const nonEmpty = findings.map(f => (f || '').replace(/^BOLD::/i, '').trim()).filter(Boolean);
+  if (nonEmpty.length === 0) return true;
+  if (nonEmpty.length <= 2 && nonEmpty.every(line => PLACEHOLDER_FINDING_PATTERNS.some(rx => rx.test(line)) || line.startsWith('[Error:'))) {
+    return true;
+  }
+  return false;
+}
+
+function formatFindingsForDecisionQa(findings: string[]): { text: string; impressionIndex: number } {
+  let impressionIndex = -1;
+  const formattedLines = findings.map((raw, idx) => {
+    const clean = (raw || '')
+      .replace(/^BOLD::/i, '')
+      .replace(/\[NO_BULLET\]\s*/gi, '')
+      .replace(/NO_BULLET::\s*/gi, '')
+      .trim();
+
+    if (!clean) return `[${idx}] (empty)`;
+
+    if (clean.includes('###')) {
+      const parts = clean.split('###').map(p => p.trim()).filter(Boolean);
+      const header = parts[0] || '';
+      if (header.toUpperCase().startsWith('IMPRESSION')) {
+        impressionIndex = idx;
+      }
+      const subLines = parts.slice(1).map(p => `  • ${p.replace(/^(?:•|&bull;|&#8226;|[-*]|\s)+/, '').trim()}`);
+      return `[${idx}] ${header}\n${subLines.join('\n')}`;
+    }
+
+    if (/^\s*IMPRESSION\s*:/i.test(clean)) {
+      impressionIndex = idx;
+    }
+    return `[${idx}] ${clean}`;
+  });
+
+  return {
+    text: formattedLines.join('\n'),
+    impressionIndex,
+  };
+}
+
+function getArgMaxLevelIndex(probabilities?: Record<string, number>): number {
+  if (!probabilities) return 0;
+  let bestIdx = 0;
+  let bestProb = -1;
+  for (const [k, v] of Object.entries(probabilities)) {
+    const idx = Number(k);
+    if (!Number.isNaN(idx) && typeof v === 'number' && v > bestProb) {
+      bestProb = v;
+      bestIdx = idx;
+    }
+  }
+  return bestIdx;
+}
+
+async function callDecisionsApi(
+  input: string,
+  questions: Record<string, any>,
+  abortSignal?: AbortSignal
+): Promise<any> {
+  return await executeWithApiKeyFailover(
+    async (_client, apiKey) => {
+      const res = await fetch('https://generativelanguage.googleapis.com/v1beta/decisions', {
+        method: 'POST',
+        headers: {
+          'x-goog-api-key': apiKey,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: GEMINI_DECISION_MODEL,
+          input,
+          questions,
+        }),
+        signal: abortSignal,
+      });
+
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        const msg = errBody?.error?.message || `Decisions API HTTP ${res.status}: ${res.statusText}`;
+        const err: any = new Error(msg);
+        err.status = res.status;
+        if (res.status === 400 && !isTransientOrKeyError(err)) {
+          err.isNonRetryable = true;
+        }
+        throw err;
+      }
+
+      const data = await res.json();
+      if (data?.prompt_feedback?.block_reason) {
+        const blockedErr: any = new Error(`Decisions API blocked input: ${data.prompt_feedback.block_reason}`);
+        blockedErr.isNonRetryable = true;
+        throw blockedErr;
+      }
+      return data;
+    },
+    {
+      selectedModel: GEMINI_DECISION_MODEL,
+      abortSignal,
+    }
+  );
+}
+
+/**
+ * Evaluates a completed radiology report in a single zero-output-token pass via Gemini Decision 1.
+ */
+export async function evaluateClinicalQaDecisions(
+  findings: string[],
+  abortSignal?: AbortSignal
+): Promise<{ assessment: ClinicalQaAssessment; impressionIndex: number } | null> {
+  if (!findings || isPlaceholderReport(findings)) {
+    return null;
+  }
+
+  const { text: formattedReport, impressionIndex } = formatFindingsForDecisionQa(findings);
+  const startTime = Date.now();
+
+  const questions = {
+    has_laterality_contradiction: {
+      type: 'noul',
+      instructions:
+        'Does this radiology report contain a left vs. right laterality contradiction or anatomically wrong side (for example, describing right-sided pathology in findings when the clinical history or impression states left-sided, or placing a lateralized organ like spleen/liver/appendix on the wrong side)?',
+      criteria: {
+        true_description:
+          'Conflicting left vs. right laterality is stated for the same finding/organ, clinical indication conflicts with the reported side, or a strictly unilateral organ is placed on the wrong anatomical side.',
+        false_description:
+          'All laterality references (left, right, bilateral, midline) and anatomical locations are internally consistent.',
+      },
+    },
+    has_normal_vs_abnormal_contradiction: {
+      type: 'noul',
+      instructions:
+        'Does this radiology report contain a direct clinical contradiction where a structure or organ is explicitly called normal, clear, or unremarkable in one finding while another finding in the same report describes pathology in that same structure or organ?',
+      criteria: {
+        true_description:
+          'The report simultaneously claims the same organ, region, or system is normal/clear/unremarkable and also abnormal/pathologic (e.g., "lungs are clear" alongside "right lower lobe consolidation").',
+        false_description:
+          'Findings are clinically consistent without calling the same structure both normal and abnormal.',
+      },
+    },
+    impression_contradicts_or_omits_finding: {
+      type: 'noul',
+      instructions:
+        'Does the IMPRESSION section contradict any finding described in the report body OR omit a significant abnormal finding reported in the body above it?',
+      criteria: {
+        true_description:
+          'An IMPRESSION section is present and either contradicts a body finding, misstates its diagnosis/location, or fails to mention a clinically significant abnormality reported in the findings.',
+        false_description:
+          'Either the IMPRESSION accurately summarizes and matches all significant body findings, or there is no separate IMPRESSION section.',
+      },
+    },
+    impression_contains_numbers: {
+      type: 'noul',
+      instructions:
+        'Inspect ONLY the IMPRESSION section lines (ignore all numbers, measurements, dates, or GCS scores in Clinical Profile or body FINDINGS lines above IMPRESSION). Does the IMPRESSION section text itself contain any digits or numerical values (such as 8 mm, 2.5 cm, 3 lesions, Grade 2, 15 HU, 50%)?',
+      criteria: {
+        true_description:
+          'The IMPRESSION section itself contains one or more numerical digits, measurements, counts, grades, percentages, or dimensions.',
+        false_description:
+          'The IMPRESSION section contains zero digits or numerical measurements, or no IMPRESSION section exists in the report.',
+      },
+    },
+    critical_finding_urgency: {
+      type: 'score',
+      instructions:
+        'Rate the clinical acuity and communication urgency of the most serious finding anywhere in this radiology report.',
+      criteria: [
+        'Routine: Normal study, stable chronic changes, or benign incidental findings needing routine communication.',
+        'Prompt follow-up: Significant non-emergent abnormality (such as indeterminate nodule, suspicious mass, moderate chronic effusion) warranting timely outpatient follow-up.',
+        'Urgent: Acute symptomatic or non-immediately fatal finding (such as acute appendicitis, uncomplicated cholecystitis, acute fracture, small bowel obstruction without ischemia) requiring same-day management.',
+        'Critical STAT alert: Immediately life-threatening or time-critical emergency finding requiring STAT notification (such as subarachnoid hemorrhage/SAH, acute ischemic/hemorrhagic stroke, herniation or significant midline shift, tension or large pneumothorax, aortic dissection, massive PE, free intraperitoneal air/perforation, spinal cord compression).',
+      ],
+    },
+    report_completeness: {
+      type: 'score',
+      instructions:
+        'Rate the structural and clinical completeness of this radiology report from 0 (incomplete fragment) to 3 (complete cohesive report).',
+      criteria: [
+        '0 - Incomplete: Fragmentary or truncated notes lacking coherent diagnostic observations.',
+        '1 - Minimal: Basic findings only without an IMPRESSION section or lacking key clinical characterization.',
+        '2 - Adequate: Contains findings and an IMPRESSION, with minor omissions or lack of specificity.',
+        '3 - Complete: Comprehensive, clear radiology report with organized findings and a cohesive, consistent IMPRESSION.',
+      ],
+    },
+  };
+
+  const data = await callDecisionsApi(formattedReport, questions, abortSignal);
+  const answers = data?.answers || {};
+  const elapsedMs = Date.now() - startTime;
+
+  const ruleIds: ClinicalQaRuleId[] = [
+    'has_laterality_contradiction',
+    'has_normal_vs_abnormal_contradiction',
+    'impression_contradicts_or_omits_finding',
+    'impression_contains_numbers',
+  ];
+
+  const rules: ClinicalQaRuleResult[] = ruleIds.map((id) => {
+    const ans = answers[id];
+    const prob = typeof ans?.noul === 'number' ? ans.noul : 0;
+    const conf = typeof ans?.confidence === 'number' ? ans.confidence : Math.max(prob, 1 - prob);
+    return {
+      id,
+      label: QA_RULE_LABELS[id],
+      probability: prob,
+      confidence: conf,
+      triggered: prob >= QA_NOUL_THRESHOLD,
+    };
+  });
+
+  const urgencyAns = answers.critical_finding_urgency;
+  const urgencyProbs: Record<string, number> = urgencyAns?.probabilities || {};
+  const urgencyExpectedScore = typeof urgencyAns?.score === 'number' ? urgencyAns.score : 0;
+  const urgencyTopLevel = getArgMaxLevelIndex(urgencyProbs);
+  const pCritical = urgencyProbs['3'] ?? 0;
+  const pUrgentOrHigher = (urgencyProbs['2'] ?? 0) + pCritical;
+
+  let urgencyLevel: CriticalUrgencyLevel = 'routine';
+  let urgencyLabel = 'Routine';
+  if (urgencyTopLevel === 3 || pCritical >= 0.45 || urgencyExpectedScore >= 2.35) {
+    urgencyLevel = 'critical_stat';
+    urgencyLabel = 'Critical STAT Alert';
+  } else if (urgencyTopLevel === 2 || pUrgentOrHigher >= 0.55 || urgencyExpectedScore >= 1.65) {
+    urgencyLevel = 'urgent';
+    urgencyLabel = 'Urgent Finding';
+  } else if (urgencyTopLevel === 1 || urgencyExpectedScore >= 0.85) {
+    urgencyLevel = 'prompt_follow_up';
+    urgencyLabel = 'Prompt Follow-up';
+  }
+
+  const completenessAns = answers.report_completeness;
+  const completenessProbs: Record<string, number> = completenessAns?.probabilities || {};
+  const completenessScore = Math.min(3, Math.max(0, typeof completenessAns?.score === 'number' ? completenessAns.score : 0));
+  const completenessLevelIndex = Math.min(3, Math.max(0, Math.round(completenessScore)));
+
+  const assessment: ClinicalQaAssessment = {
+    decisionModel: GEMINI_DECISION_MODEL,
+    rules,
+    triggeredRules: rules.filter((r) => r.triggered),
+    criticalUrgency: {
+      level: urgencyLevel,
+      label: urgencyLabel,
+      expectedScore: urgencyExpectedScore,
+      topLevelIndex: urgencyTopLevel,
+      confidence: typeof urgencyAns?.confidence === 'number' ? urgencyAns.confidence : 0,
+      probabilities: urgencyProbs,
+    },
+    reportCompleteness: {
+      score: completenessScore,
+      levelIndex: completenessLevelIndex,
+      label: COMPLETENESS_LEVEL_LABELS[completenessLevelIndex] || 'Adequate',
+      confidence: typeof completenessAns?.confidence === 'number' ? completenessAns.confidence : 0,
+      probabilities: completenessProbs,
+    },
+    invokedDetailedGenerator: false,
+    usage: data?.usage
+      ? {
+          totalInputTokens: data.usage.total_input_tokens,
+          totalOutputTokens: data.usage.total_output_tokens ?? 0,
+        }
+      : undefined,
+    decisionLatencyMs: elapsedMs,
+  };
+
+  return { assessment, impressionIndex };
+}
+
+/**
+ * Automatic Error Finding powered by Gemini Decision 1 single-pass QA battery.
+ * Runs 6 calibrated checks at 0 output tokens and invokes `identifyPotentialErrors`
+ * ONLY when any error rule crosses the calibrated probability threshold (>= 0.70).
+ */
+export const runClinicalQaErrorCheck = async (
+  findings: string[],
+  model: string,
+  abortSignal?: AbortSignal
+): Promise<AutomaticErrorCheckResult> => {
+  if (!findings || isPlaceholderReport(findings)) {
+    return { errors: [], qaAssessment: null };
+  }
+
+  try {
+    const decisionResult = await evaluateClinicalQaDecisions(findings, abortSignal);
+    if (!decisionResult) {
+      return { errors: [], qaAssessment: null };
+    }
+
+    const { assessment, impressionIndex } = decisionResult;
+
+    if (assessment.triggeredRules.length === 0) {
+      assessment.invokedDetailedGenerator = false;
+      assessment.skippedDetailedReason = 'All QA error rules < 0.70 threshold (generative error call skipped)';
+      return {
+        errors: [],
+        qaAssessment: assessment,
+      };
+    }
+
+    assessment.invokedDetailedGenerator = true;
+    const errors = await identifyPotentialErrors(findings, model, {
+      triggeredRules: assessment.triggeredRules,
+      abortSignal,
+    });
+
+    if (errors.length === 0) {
+      const impressionRule = assessment.triggeredRules.find(
+        (r) => r.id === 'impression_contains_numbers' || r.id === 'impression_contradicts_or_omits_finding'
+      );
+      const primaryRule = impressionRule || assessment.triggeredRules[0];
+      const targetIndex = impressionRule && impressionIndex >= 0 ? impressionIndex : 0;
+      const fallbackDesc =
+        primaryRule.id === 'impression_contains_numbers'
+          ? `QA Alert (${Math.round(primaryRule.probability * 100)}%): Impression appears to contain numerical values or measurements (violating the "no numbers in impression" rule).`
+          : `QA Alert (${Math.round(primaryRule.probability * 100)}%): Potential ${primaryRule.label.toLowerCase()} issue flagged for review.`;
+
+      return {
+        errors: [
+          {
+            findingIndex: targetIndex,
+            errorDescription: fallbackDesc,
+            severity: primaryRule.id === 'impression_contains_numbers' ? 'INFO' : 'WARNING',
+          },
+        ],
+        qaAssessment: assessment,
+      };
+    }
+
+    return {
+      errors,
+      qaAssessment: assessment,
+    };
+  } catch (err: any) {
+    if (err?.name === 'AbortError' || abortSignal?.aborted) {
+      throw err;
+    }
+    console.warn('[Clinical QA] gemini-decision-1 check failed, falling back to identifyPotentialErrors:', err);
+    const fallbackErrors = await identifyPotentialErrors(findings, model, { abortSignal });
+    return {
+      errors: fallbackErrors,
+      qaAssessment: null,
+    };
+  }
 };
 
 // --- Complex Impression Generation Constants & Pipeline ---
