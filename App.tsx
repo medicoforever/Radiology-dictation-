@@ -47,6 +47,13 @@ interface ChatMessage {
   text: string;
 }
 
+interface QueuedConcurrentItem {
+  audioBlobs: Blob[];
+  customPrompt: string;
+  customImages: Array<{ data: string; mimeType: string }>;
+  customDocx: DocxTemplateData | null;
+}
+
 const formatFileSize = (bytes: number): string => {
   if (bytes < 1024) return bytes + ' B';
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
@@ -140,9 +147,13 @@ const App: React.FC = () => {
       if (config) {
         setCustomPrompt(config.promptText);
         setCustomDocx(config.docxData || null);
+        setConcurrentCustomPrompt(config.promptText);
+        setConcurrentCustomDocx(config.docxData || null);
       } else {
         setCustomPrompt('');
         setCustomDocx(null);
+        setConcurrentCustomPrompt('');
+        setConcurrentCustomDocx(null);
       }
     });
     return unsubscribe;
@@ -207,7 +218,7 @@ const App: React.FC = () => {
   const [driveSaveResult, setDriveSaveResult] = useState<SaveResult | null>(null);
   const processingRequestIdRef = useRef<number>(0);
   const inFlightAbortControllerRef = useRef<AbortController | null>(null);
-  const handleRecordingCompleteRef = useRef<(audioInput: Blob | Blob[], overridePrompt?: string, overrideDocx?: any) => Promise<void>>(() => Promise.resolve());
+  const handleRecordingCompleteRef = useRef<(audioInput: Blob | Blob[], overridePrompt?: string, overrideDocx?: any, overrideImages?: Array<{ data: string; mimeType: string }>) => Promise<void>>(() => Promise.resolve());
   const customPromptRef = useRef<string>(customPrompt);
   customPromptRef.current = customPrompt;
   const customDocxRef = useRef<DocxTemplateData | null>(customDocx);
@@ -242,9 +253,9 @@ const App: React.FC = () => {
     size: number;
   } | null>(null);
 
-  // Simultaneous / Concurrent Dictation while loading
+  // Simultaneous / Concurrent Dictation while loading (each queued dictation gets its own fresh Custom Instructions & Template config)
   const [concurrentRecordingStatus, setConcurrentRecordingStatus] = useState<AppStatus>(AppStatus.Idle);
-  const queuedConcurrentAudiosRef = useRef<Blob[]>([]);
+  const queuedConcurrentAudiosRef = useRef<QueuedConcurrentItem[]>([]);
   const [queuedAudiosCount, setQueuedAudiosCount] = useState<number>(0);
   const isConcurrentRecordingActiveRef = useRef<boolean>(false);
   const [isSimultaneousQueued, setIsSimultaneousQueued] = useState<boolean>(false);
@@ -257,6 +268,32 @@ const App: React.FC = () => {
   const isFirstDictationProcessingRef = useRef<boolean>(false);
   const [batchModeInstanceKey, setBatchModeInstanceKey] = useState<number>(Date.now());
   const handleContinueDictationRef = useRef<((newAudioBlob: Blob, premergedBlob?: Blob) => Promise<void>) | null>(null);
+
+  const [concurrentCustomPrompt, setConcurrentCustomPrompt] = useState<string>(() => getUpcomingTemplate()?.promptText || '');
+  const concurrentCustomPromptRef = useRef<string>(concurrentCustomPrompt);
+  concurrentCustomPromptRef.current = concurrentCustomPrompt;
+
+  const [concurrentCustomImages, setConcurrentCustomImages] = useState<Array<{ data: string; mimeType: string }>>([]);
+  const concurrentCustomImagesRef = useRef<Array<{ data: string; mimeType: string }>>(concurrentCustomImages);
+  concurrentCustomImagesRef.current = concurrentCustomImages;
+
+  const [concurrentCustomDocx, setConcurrentCustomDocx] = useState<DocxTemplateData | null>(() => getUpcomingTemplate()?.docxData || null);
+  const concurrentCustomDocxRef = useRef<DocxTemplateData | null>(concurrentCustomDocx);
+  concurrentCustomDocxRef.current = concurrentCustomDocx;
+
+  const resetConcurrentCustomConfig = useCallback(() => {
+    const up = getUpcomingTemplate();
+    setConcurrentCustomPrompt(up ? up.promptText : '');
+    setConcurrentCustomDocx(up ? (up.docxData || null) : null);
+    setConcurrentCustomImages([]);
+  }, []);
+
+  const concurrentActiveTemplateDisplayName = useMemo(() => {
+    if (concurrentCustomDocx && concurrentCustomDocx.name) return concurrentCustomDocx.name;
+    const matched = findBuiltinTemplates(concurrentCustomPrompt);
+    if (matched && matched.length > 0) return matched.map(t => t.name).join(' + ');
+    return null;
+  }, [concurrentCustomPrompt, concurrentCustomDocx]);
 
   useEffect(() => {
     const allThemeClasses = [
@@ -610,7 +647,7 @@ const App: React.FC = () => {
   const separateConcurrentDictationsToBatch = useCallback(async (
     firstFindings: string[],
     firstAudio: Blob,
-    subsequentAudios: Blob[],
+    subsequentItems: QueuedConcurrentItem[],
     firstErrorMsg?: string | null
   ) => {
     setStatus(AppStatus.Processing);
@@ -654,28 +691,31 @@ const App: React.FC = () => {
         error: firstErrorMsg || undefined,
         selectedModel,
         customPrompt,
+        customImages,
         customDocx: customDocx || null,
       };
 
-      const newBatches = [batch1];
+      const newBatches: Array<any> = [batch1];
 
-      // 2. Prepare all subsequent audios immediately with status: 'processing'
-      for (let i = 0; i < subsequentAudios.length; i++) {
-        const audio = subsequentAudios[i];
+      // 2. Prepare all subsequent dictations immediately with their own per-dictation template/instructions
+      for (let i = 0; i < subsequentItems.length; i++) {
+        const item = subsequentItems[i];
+        const primarySubsequentBlob = item.audioBlobs[0];
         const batchId = `batch-sep-${i + 2}-${now + i + 1}`;
-        await saveAudioBlob(`batch_audio_${curTabId}_${batchId}_0`, audio);
-        await saveAudioBlob(`batch_audio_${batchId}_0`, audio);
+        await saveAudioBlob(`batch_audio_${curTabId}_${batchId}_0`, primarySubsequentBlob);
+        await saveAudioBlob(`batch_audio_${batchId}_0`, primarySubsequentBlob);
 
         newBatches.push({
           id: batchId,
           name: `Report ${i + 2}`,
-          audioCount: 1,
-          audioBlobs: [audio],
+          audioCount: item.audioBlobs.length,
+          audioBlobs: item.audioBlobs,
           findings: ['Processing audio with AI...'],
           status: 'processing' as const,
           selectedModel,
-          customPrompt,
-          customDocx: customDocx || null,
+          customPrompt: item.customPrompt,
+          customImages: item.customImages,
+          customDocx: item.customDocx || null,
         });
       }
 
@@ -701,21 +741,21 @@ const App: React.FC = () => {
       // Instantly notify Batch Mode to refresh!
       window.dispatchEvent(new CustomEvent('raddoc_batch_mode_updated'));
 
-      // 5. Process subsequent audios and update storage incrementally as each finishes
-      for (let i = 0; i < subsequentAudios.length; i++) {
-        const audio = subsequentAudios[i];
+      // 5. Process subsequent dictations with their individual template & instructions
+      for (let i = 0; i < subsequentItems.length; i++) {
+        const item = subsequentItems[i];
         const batchId = `batch-sep-${i + 2}-${now + i + 1}`;
 
         let findings: string[] = [];
         let itemStatus: 'complete' | 'error' = 'complete';
         try {
           findings = await processAudio(
-            audio,
+            item.audioBlobs.length === 1 ? item.audioBlobs[0] : item.audioBlobs,
             selectedModel,
-            customPrompt,
-            customImages,
+            item.customPrompt,
+            item.customImages,
             undefined,
-            customDocx
+            item.customDocx
           );
         } catch (err) {
           console.error(`Error transcribing concurrent dictation #${i + 2}:`, err);
@@ -733,7 +773,7 @@ const App: React.FC = () => {
           targetBatch.findings = findings;
           targetBatch.name = reportName;
           targetBatch.status = itemStatus;
-          targetBatch.audioBlobs = [audio];
+          targetBatch.audioBlobs = item.audioBlobs;
           if (itemStatus === 'error') {
             targetBatch.error = findings[1] || 'Error processing dictation';
           }
@@ -791,7 +831,8 @@ const App: React.FC = () => {
   const handleRecordingComplete = useCallback(async (
     audioInput: Blob | Blob[],
     overridePrompt?: string,
-    overrideDocx?: DocxTemplateData | null
+    overrideDocx?: DocxTemplateData | null,
+    overrideImages?: Array<{ data: string; mimeType: string }>
   ) => {
     // 0. Immediately abort any active in-flight network request
     if (inFlightAbortControllerRef.current) {
@@ -830,6 +871,7 @@ const App: React.FC = () => {
     isConcurrentRecordingActiveRef.current = false;
     isSeparatingConcurrentRef.current = false;
     setIsSeparatingConcurrent(false);
+    resetConcurrentCustomConfig();
 
     const primaryBlob = audioBlobs[0];
     firstDictationAudioRef.current = primaryBlob;
@@ -863,13 +905,14 @@ const App: React.FC = () => {
 
     const promptToUse = overridePrompt !== undefined ? overridePrompt : customPromptRef.current;
     const docxToUse = overrideDocx !== undefined ? overrideDocx : customDocxRef.current;
+    const imagesToUse = overrideImages !== undefined ? overrideImages : customImages;
 
     try {
       const processedText = await processAudio(
         audioBlobs,
         selectedModel,
         promptToUse,
-        customImages,
+        imagesToUse,
         undefined,
         docxToUse,
         currentAbortController.signal
@@ -899,7 +942,7 @@ const App: React.FC = () => {
       }
 
       try {
-        const chatSession = await createChat(audioBlobs, processedText, promptToUse, customImages, selectedModel);
+        const chatSession = await createChat(audioBlobs, processedText, promptToUse, imagesToUse, selectedModel);
         if (processingRequestIdRef.current === reqId) {
           setChat(chatSession);
         }
@@ -974,18 +1017,23 @@ const App: React.FC = () => {
     setConcurrentRecordingStatus(AppStatus.Idle);
     const audioBlobs = Array.isArray(newAudioInput) ? newAudioInput : [newAudioInput];
     if (audioBlobs.length === 0 || audioBlobs.every(b => !b || b.size === 0)) return;
-    const newBlob = audioBlobs[0];
 
-    // Push new blob to the unlimited concurrent queue!
-    queuedConcurrentAudiosRef.current.push(newBlob);
+    const queuedItem: QueuedConcurrentItem = {
+      audioBlobs,
+      customPrompt: concurrentCustomPromptRef.current,
+      customImages: concurrentCustomImagesRef.current,
+      customDocx: concurrentCustomDocxRef.current,
+    };
+
+    // Push item to unlimited concurrent queue and reset the concurrent template/instructions selector for the next new dictation
+    queuedConcurrentAudiosRef.current.push(queuedItem);
     setQueuedAudiosCount(queuedConcurrentAudiosRef.current.length);
     setIsSimultaneousQueued(true);
     setHasMultipleSingleDictations(true);
+    resetConcurrentCustomConfig();
 
     // If first dictation is still running its processAudio:
     if (isFirstDictationProcessingRef.current) {
-      // First dictation is still running. The simultaneous recorder is reset to AppStatus.Idle,
-      // so user can immediately record a 3rd, 4th, 5th dictation if desired!
       return;
     }
 
@@ -1007,7 +1055,7 @@ const App: React.FC = () => {
         firstErr
       );
     }
-  }, [audioBlob, separateConcurrentDictationsToBatch]);
+  }, [audioBlob, separateConcurrentDictationsToBatch, resetConcurrentCustomConfig]);
 
   const handleSubsequentDictationAfterError = useCallback(async (newAudioInput: Blob | Blob[]) => {
     // 1. Preserve the failed audio into Batch Mode first so no data is ever lost!
@@ -1023,7 +1071,7 @@ const App: React.FC = () => {
         await saveAudioBlob(`batch_audio_${batchId}_0`, failedAudio);
 
         const curBatchKey = getBatchModeStorageKey(curTabId);
-        const existingBatches: any[] = (await getReportSession(curBatchKey)) || safeLocalStorage.getItem(curBatchKey) || [];
+        const existingBatches: any[] = (await getReportSession(curBatchKey)) || safeLocalStorage.getItem(curBatchKey, []);
         
         const failedBatchItem = {
           id: batchId,
@@ -1053,12 +1101,20 @@ const App: React.FC = () => {
       }
     }
 
-    // 2. Clear error state and start processing the new subsequent dictation!
+    // 2. Capture fresh per-dictation template & instructions selected for this new dictation
+    const nextPrompt = concurrentCustomPromptRef.current;
+    const nextImages = concurrentCustomImagesRef.current;
+    const nextDocx = concurrentCustomDocxRef.current;
+    setCustomPrompt(nextPrompt);
+    setCustomImages(nextImages);
+    setCustomDocx(nextDocx);
+
+    // 3. Clear error state and start processing the new subsequent dictation!
     setError(null);
     firstDictationErrorRef.current = null;
     setFirstDictationError(null);
     setErrorRecorderStatus(AppStatus.Idle);
-    await handleRecordingComplete(newAudioInput);
+    await handleRecordingComplete(newAudioInput, nextPrompt, nextDocx, nextImages);
   }, [audioBlob, error, selectedModel, customPrompt, customDocx, handleRecordingComplete]);
 
   const handleSubsequentFileSelectAfterError = useCallback(async (files: File[]) => {
@@ -1459,6 +1515,7 @@ const App: React.FC = () => {
       setCustomDocx(null);
     }
     setCustomImages([]);
+    resetConcurrentCustomConfig();
     setSingleExtraFiles([]);
     setIdentifiedErrors([]);
     setErrorCheckStatus('idle');
@@ -1808,6 +1865,45 @@ const App: React.FC = () => {
                   </div>
                 )}
 
+                <div className="mb-4">
+                  <div className="text-xs font-bold text-emerald-800 dark:text-emerald-200 mb-2 flex items-center gap-1.5">
+                    <Sparkles className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+                    <span>Custom Instructions &amp; Templates (New Dictation #{queuedAudiosCount + 2})</span>
+                  </div>
+                  <CustomPromptInput
+                    key={`concurrent-prompt-${queuedAudiosCount}`}
+                    prompt={concurrentCustomPrompt}
+                    onPromptChange={setConcurrentCustomPrompt}
+                    images={concurrentCustomImages}
+                    onImagesChange={setConcurrentCustomImages}
+                    customDocx={concurrentCustomDocx}
+                    onCustomDocxChange={setConcurrentCustomDocx}
+                    selectedModel={selectedModel}
+                    className="mb-2"
+                  />
+                  {concurrentActiveTemplateDisplayName && (
+                    <div className="mb-2 p-2.5 bg-white/80 dark:bg-slate-900/70 border border-emerald-300 dark:border-emerald-700 rounded-xl flex items-center justify-between text-xs shadow-2xs animate-fade-in">
+                      <div className="flex items-center gap-2 text-emerald-950 dark:text-emerald-100 font-medium min-w-0">
+                        <Sparkles className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                        <span className="truncate">
+                          Template for Dictation #{queuedAudiosCount + 2}: <strong className="font-bold underline text-emerald-700 dark:text-emerald-300">{concurrentActiveTemplateDisplayName}</strong>
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setConcurrentCustomPrompt('');
+                          setConcurrentCustomDocx(null);
+                          setConcurrentCustomImages([]);
+                        }}
+                        className="text-xs text-rose-600 dark:text-rose-400 hover:text-rose-800 font-bold ml-2 underline cursor-pointer shrink-0"
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  )}
+                </div>
+
                 <AudioRecorder
                   status={concurrentRecordingStatus}
                   setStatus={(newSt) => {
@@ -1970,6 +2066,44 @@ const App: React.FC = () => {
                 <span className="bg-emerald-600 text-white font-bold text-xs px-3 py-1.5 rounded-xl shadow-xs shrink-0">
                   Ready to Record
                 </span>
+              </div>
+
+              <div className="mb-4">
+                <div className="text-xs font-bold text-emerald-800 dark:text-emerald-200 mb-2 flex items-center gap-1.5">
+                  <Sparkles className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+                  <span>Custom Instructions &amp; Templates (New Next Dictation)</span>
+                </div>
+                <CustomPromptInput
+                  prompt={concurrentCustomPrompt}
+                  onPromptChange={setConcurrentCustomPrompt}
+                  images={concurrentCustomImages}
+                  onImagesChange={setConcurrentCustomImages}
+                  customDocx={concurrentCustomDocx}
+                  onCustomDocxChange={setConcurrentCustomDocx}
+                  selectedModel={selectedModel}
+                  className="mb-2"
+                />
+                {concurrentActiveTemplateDisplayName && (
+                  <div className="mb-2 p-2.5 bg-emerald-50/70 dark:bg-emerald-950/40 border border-emerald-300 dark:border-emerald-700 rounded-xl flex items-center justify-between text-xs shadow-2xs animate-fade-in">
+                    <div className="flex items-center gap-2 text-emerald-950 dark:text-emerald-100 font-medium min-w-0">
+                      <Sparkles className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                      <span className="truncate">
+                        Attached Template for Next Dictation: <strong className="font-bold underline text-emerald-700 dark:text-emerald-300">{concurrentActiveTemplateDisplayName}</strong>
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setConcurrentCustomPrompt('');
+                        setConcurrentCustomDocx(null);
+                        setConcurrentCustomImages([]);
+                      }}
+                      className="text-xs text-rose-600 dark:text-rose-400 hover:text-rose-800 font-bold ml-2 underline cursor-pointer shrink-0"
+                    >
+                      Remove
+                    </button>
+                  </div>
+                )}
               </div>
 
               <AudioRecorder
@@ -2783,7 +2917,11 @@ const App: React.FC = () => {
                   onClick={() => {
                     const files = [...multipleFilesModal];
                     setMultipleFilesModal(null);
-                    handleRecordingComplete(files);
+                    if (status === AppStatus.Processing) {
+                      handleConcurrentRecordingComplete(files);
+                    } else {
+                      handleRecordingComplete(files);
+                    }
                   }}
                   className="w-full text-left p-3.5 rounded-xl border border-slate-200 hover:border-slate-400 dark:border-slate-700 dark:hover:border-slate-500 bg-white hover:bg-slate-50 dark:bg-slate-800 dark:hover:bg-slate-750 transition-all cursor-pointer group"
                 >

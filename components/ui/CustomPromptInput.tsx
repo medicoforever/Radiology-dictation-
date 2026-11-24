@@ -206,8 +206,8 @@ const CustomPromptInput: React.FC<{
       const q = savedSearchQuery.toLowerCase().trim();
       list = list.filter(t => {
         const dId = getTemplateDisplayId(t).toLowerCase();
-        const idSearch = `id ${dId} #${dId} ${dId} ${t.id}`.toLowerCase();
-        return t.name.toLowerCase().includes(q) || idSearch.includes(q) || (t.text && t.text.toLowerCase().includes(q));
+        const idSearch = `id:${dId} id ${dId} #${dId} ${dId} ${t.id}`.toLowerCase();
+        return t.name.toLowerCase().includes(q) || idSearch.includes(q);
       });
     }
     return list;

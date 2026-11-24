@@ -363,9 +363,43 @@ export async function deleteUserTemplate(id: string): Promise<void> {
   }
 }
 
+function spokenWordsToNumber(input: string): number | null {
+  const s = input.trim().toLowerCase().replace(/[-\s]+/g, ' ');
+  if (/^\d+$/.test(s)) return parseInt(s, 10);
+  const ones: Record<string, number> = {
+    zero: 0, one: 1, won: 1, two: 2, to: 2, too: 2, three: 3, four: 4, for: 4, five: 5,
+    six: 6, seven: 7, eight: 8, ate: 8, nine: 9, ten: 10,
+    eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15,
+    sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19,
+  };
+  const tens: Record<string, number> = {
+    twenty: 20, thirty: 30, forty: 40, fourty: 40, fifty: 50, sixty: 60, seventy: 70, eighty: 80, ninety: 90,
+  };
+  const tokens = s.split(' ').filter(t => t && t !== 'and');
+  if (tokens.length === 0) return null;
+  let total = 0;
+  let current = 0;
+  for (const tok of tokens) {
+    if (ones[tok] !== undefined) {
+      current += ones[tok];
+    } else if (tens[tok] !== undefined) {
+      current += tens[tok];
+    } else if (tok === 'hundred') {
+      current = (current === 0 ? 1 : current) * 100;
+    } else if (/^\d+$/.test(tok)) {
+      current += parseInt(tok, 10);
+    } else {
+      return null;
+    }
+  }
+  total += current;
+  return total > 0 ? total : null;
+}
+
 /**
  * Resolve any template by dictated ID or number
  * Matches built-in templates (1-300 or tpl_001) or custom templates (C1, C2, etc.)
+ * Strictly rejects vague names without an explicit numeric or C-ID.
  */
 export async function findTemplateByIdOrNumber(
   idOrNum: string
@@ -383,35 +417,53 @@ export async function findTemplateByIdOrNumber(
 } | null> {
   if (!idOrNum || !idOrNum.trim()) return null;
   const raw = idOrNum.trim().toLowerCase();
-  const clean = raw.replace(/^\{?template\s*id\s*[:\s#]?/i, '').replace(/\}?$/, '').trim();
-  const cleanLower = clean.toLowerCase();
-  const cleanNumStr = cleanLower.replace(/^(tpl_|cust_|template_|c)/i, '').replace(/^0+/, '');
-  const cleanNum = parseInt(cleanNumStr, 10);
+  const clean = raw
+    .replace(/^\{?\s*(?:template\s+id|template|id)\s*(?:number|no\.?)?\s*[:\s#-]*/i, '')
+    .replace(/\}?$/, '')
+    .replace(/[.,!?;:]+$/, '')
+    .trim();
+  if (!clean) return null;
 
-  // 1. Check built-in templates (ALL_RADNITO_TEMPLATES)
-  const exactBuiltin = ALL_RADNITO_TEMPLATES.find(t => 
-    t.id.toLowerCase() === cleanLower ||
-    t.id.toLowerCase() === `tpl_${cleanLower.padStart(3, '0')}`
-  );
-  if (exactBuiltin) {
-    return {
-      ...exactBuiltin,
-      templateId: exactBuiltin.id.replace('tpl_', '').replace(/^0+/, '') || '1'
-    };
-  }
+  const cleanNoSpaces = clean.replace(/[\s\-]+/g, '');
+  const isCustomToken = /^(?:c|see|sea|custom|cust)(?:[\s\-_]|\d|$)/i.test(clean);
+  const strippedPrefix = clean
+    .replace(/^(?:builtin_)?(?:tpl_|template_|cust_|custom\s+|see\s+|sea\s+|c(?=\s*\d|\s+[a-z]))/i, '')
+    .replace(/^[c](?=\d)/i, '')
+    .replace(/^[\s\-_#]+/, '')
+    .trim();
 
-  // Check numeric match for built-in templates (e.g. "1" -> "tpl_001", "42" -> "tpl_042")
-  if (!isNaN(cleanNum) && cleanNum > 0 && cleanNum <= ALL_RADNITO_TEMPLATES.length && !cleanLower.startsWith('c')) {
-    const padded = String(cleanNum).padStart(3, '0');
-    const matchedBuiltin = ALL_RADNITO_TEMPLATES.find(t => 
-      t.id === `tpl_${padded}` || 
-      parseInt(t.id.replace('tpl_', ''), 10) === cleanNum
+  const parsedNum = /^\d+$/.test(strippedPrefix.replace(/^0+/, ''))
+    ? parseInt(strippedPrefix.replace(/^0+/, ''), 10)
+    : spokenWordsToNumber(strippedPrefix);
+
+  const normalizedCustomId = isCustomToken && parsedNum ? `c${parsedNum}` : '';
+  const cleanLower = cleanNoSpaces.toLowerCase();
+
+  // 1. Check built-in templates (ALL_RADNITO_TEMPLATES) if not explicitly prefixed as custom
+  if (!isCustomToken) {
+    const exactBuiltin = ALL_RADNITO_TEMPLATES.find(t =>
+      t.id.toLowerCase() === cleanLower ||
+      (parsedNum && t.id.toLowerCase() === `tpl_${String(parsedNum).padStart(3, '0')}`)
     );
-    if (matchedBuiltin) {
+    if (exactBuiltin) {
       return {
-        ...matchedBuiltin,
-        templateId: String(cleanNum)
+        ...exactBuiltin,
+        templateId: exactBuiltin.id.replace('tpl_', '').replace(/^0+/, '') || '1'
       };
+    }
+
+    if (parsedNum && !isNaN(parsedNum) && parsedNum > 0 && parsedNum <= ALL_RADNITO_TEMPLATES.length) {
+      const padded = String(parsedNum).padStart(3, '0');
+      const matchedBuiltin = ALL_RADNITO_TEMPLATES.find(t =>
+        t.id === `tpl_${padded}` ||
+        parseInt(t.id.replace('tpl_', ''), 10) === parsedNum
+      );
+      if (matchedBuiltin) {
+        return {
+          ...matchedBuiltin,
+          templateId: String(parsedNum)
+        };
+      }
     }
   }
 
@@ -423,8 +475,8 @@ export async function findTemplateByIdOrNumber(
       const tId = (t.templateId || '').toLowerCase();
       const rawId = (t.id || '').toLowerCase();
       if (tId === cleanLower || rawId === cleanLower) return true;
-      if (cleanLower.startsWith('c') && tId === cleanLower) return true;
-      if (cleanNumStr && (tId === `c${cleanNumStr}` || tId === cleanNumStr || (t.templateNumber && t.templateNumber === cleanNum))) return true;
+      if (normalizedCustomId && (tId === normalizedCustomId || rawId === `cust_${parsedNum}`)) return true;
+      if (isCustomToken && parsedNum && t.templateNumber === parsedNum) return true;
       return false;
     });
 

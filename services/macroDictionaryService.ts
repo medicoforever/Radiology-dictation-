@@ -292,11 +292,14 @@ export function expandMacrosInFindings(findings: string[]): string[] {
       const macroNorm = normalizeForMacroMatch(macro.name);
       if (!macroNorm) continue;
 
-      const strippedMacroPrefix = normalizedContent.replace(/^(?:insert\s+)?macro\s+/i, '').trim();
+      const strippedMacroPrefix = normalizedContent.replace(/^(?:(?:add|insert|use|apply|put|with)\s+)?macro\s+/i, '').trim();
       if (
         normalizedContent === macroNorm ||
         normalizedContent === `macro ${macroNorm}` ||
         normalizedContent === `insert macro ${macroNorm}` ||
+        normalizedContent === `add macro ${macroNorm}` ||
+        normalizedContent === `apply macro ${macroNorm}` ||
+        normalizedContent === `use macro ${macroNorm}` ||
         strippedMacroPrefix === macroNorm ||
         (macroNorm.length > 3 && strippedMacroPrefix.startsWith(macroNorm)) ||
         (strippedMacroPrefix.length > 3 && macroNorm.startsWith(strippedMacroPrefix))
@@ -334,15 +337,16 @@ export function expandMacrosInFindings(findings: string[]): string[] {
 
       const nameParts = macro.name.split(/[\s\-_]+/).map(p => p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).filter(Boolean);
       const namePattern = nameParts.join('[\\s\\-_]+');
+      const replacementText = (macro.text || (macro.findings ? macro.findings.join(' ') : macro.name)).trim();
 
-      // Embedded with "macro" keyword: {Macro age-related.} or Macro: age-related or macro age-related
+      // Embedded with "macro" keyword: {Macro age-related.} or add macro age-related or macro: age-related
       const embeddedRegex = new RegExp(
-        `(?:\\{|\\(|\\[)?\\s*(?:insert\\s+)?macro[\\s:\\-]+` + namePattern + `[.,!?;:]?\\s*(?:\\}|\\)|\\])?`,
+        `(?:\\{|\\(|\\[)?\\s*(?:(?:add|insert|use|apply|put|with)\\s+)?macro[\\s:\\-]+` + namePattern + `[.,!?;:]?\\s*(?:\\}|\\)|\\])?`,
         'gi'
       );
 
       if (embeddedRegex.test(processedFinding)) {
-        const replacementText = (macro.text || (macro.findings ? macro.findings.join(' ') : macro.name)).trim();
+        embeddedRegex.lastIndex = 0;
         processedFinding = processedFinding.replace(embeddedRegex, replacementText);
         didReplaceEmbedded = true;
       }
@@ -353,7 +357,7 @@ export function expandMacrosInFindings(findings: string[]): string[] {
         'gi'
       );
       if (bracketedRegex.test(processedFinding)) {
-        const replacementText = (macro.text || (macro.findings ? macro.findings.join(' ') : macro.name)).trim();
+        bracketedRegex.lastIndex = 0;
         processedFinding = processedFinding.replace(bracketedRegex, replacementText);
         didReplaceEmbedded = true;
       }
@@ -371,6 +375,15 @@ export function expandMacrosInFindings(findings: string[]): string[] {
   }
 
   return result;
+}
+
+/**
+ * Expands macros in a single plain-text string (used by continuation & single-finding voice edits).
+ */
+export function expandMacrosInSingleText(text: string): string {
+  if (!text || !text.trim()) return text;
+  const expanded = expandMacrosInFindings([text]);
+  return expanded.map(l => l.replace(/^BOLD::/i, '')).join('\n');
 }
 
 /**

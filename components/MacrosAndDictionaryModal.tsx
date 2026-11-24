@@ -344,79 +344,105 @@ export const MacrosAndDictionaryModal: React.FC<MacrosAndDictionaryModalProps> =
         <div className="p-4 sm:p-5 flex-1 overflow-y-auto min-h-[280px]">
           {/* EDIT / CREATE MACRO: Just Macro Name and Sentence/Paragraph */}
           {isEditingMacro ? (
-            <form onSubmit={handleSaveMacro} className="space-y-4 max-w-xl mx-auto py-1">
-              <div className="flex items-center justify-between pb-2 border-b border-slate-200 dark:border-slate-700">
-                <h3 className="text-sm font-bold text-slate-800 dark:text-slate-100">
-                  {editingMacroId ? 'Edit Macro' : 'New Macro'}
-                </h3>
+            <form
+              onSubmit={handleSaveMacro}
+              className="max-w-xl mx-auto rounded-2xl border border-indigo-200/80 dark:border-indigo-800/60 bg-white dark:bg-slate-900/90 shadow-lg overflow-hidden"
+            >
+              <div className="px-5 py-3.5 bg-gradient-to-r from-indigo-50 via-blue-50/70 to-purple-50 dark:from-indigo-950/60 dark:via-slate-900 dark:to-purple-950/40 border-b border-indigo-100 dark:border-indigo-900/60 flex items-center justify-between">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-8 h-8 rounded-xl bg-indigo-600 text-white flex items-center justify-center shadow-xs shrink-0">
+                    <Plus className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100 leading-tight">
+                      {editingMacroId ? 'Edit Saved Macro' : 'Create New Macro'}
+                    </h3>
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                      Pair a short voice keyword with standardized clinical text
+                    </p>
+                  </div>
+                </div>
                 <button
                   type="button"
                   onClick={() => setIsEditingMacro(false)}
-                  className="text-xs text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 underline cursor-pointer"
+                  className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-white/80 dark:hover:bg-slate-800 transition-colors cursor-pointer"
+                  aria-label="Cancel macro editing"
                 >
-                  Cancel
+                  <X className="w-4 h-4" />
                 </button>
               </div>
 
-              <div className="space-y-1.5">
-                <label className="text-xs font-bold text-slate-700 dark:text-slate-200">
-                  Macro Name *
-                </label>
-                <input
-                  type="text"
-                  required
-                  autoFocus
-                  value={macroName}
-                  onChange={(e) => setMacroName(e.target.value)}
-                  placeholder="e.g. Normal Appendix, Clear Chest, Normal Brain"
-                  className="w-full text-xs sm:text-sm p-2.5 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500 font-medium"
-                />
-                <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                  When dictating, say <span className="font-mono font-bold text-indigo-600 dark:text-indigo-400">"macro {macroName.trim() || '[macro name]'}"</span> to automatically add this text.
-                </p>
+              <div className="p-5 space-y-5">
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <label className="text-xs font-bold uppercase tracking-wider text-slate-600 dark:text-slate-300">
+                      Macro Name <span className="text-rose-500">*</span>
+                    </label>
+                    <span className="inline-flex items-center gap-1 text-[11px] font-mono font-semibold text-indigo-700 dark:text-indigo-300 bg-indigo-50 dark:bg-indigo-950/70 px-2.5 py-0.5 rounded-full border border-indigo-200/80 dark:border-indigo-800/80">
+                      🎙️ Say: "macro {macroName.trim() || '[macro name]'}"
+                    </span>
+                  </div>
+                  <input
+                    type="text"
+                    required
+                    autoFocus
+                    value={macroName}
+                    onChange={(e) => setMacroName(e.target.value)}
+                    placeholder="e.g. Normal Appendix, Clear Chest, Normal Brain"
+                    className="w-full text-sm px-3.5 py-2.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50/70 dark:bg-slate-800/90 text-slate-900 dark:text-white placeholder:text-slate-400 focus:bg-white dark:focus:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 font-medium transition-all shadow-2xs"
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <label className="text-xs font-bold uppercase tracking-wider text-slate-600 dark:text-slate-300">
+                      Expanded Report Text <span className="text-rose-500">*</span>
+                    </label>
+                    <span className="text-[11px] text-slate-400 dark:text-slate-500 font-medium">
+                      {macroText.length} chars
+                    </span>
+                  </div>
+                  <textarea
+                    required
+                    rows={7}
+                    value={macroText}
+                    onChange={(e) => setMacroText(e.target.value)}
+                    placeholder="Type the complete sentence or paragraph that will be inserted when this macro is spoken..."
+                    className="w-full text-xs sm:text-sm p-3.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50/70 dark:bg-slate-800/90 text-slate-900 dark:text-white placeholder:text-slate-400 focus:bg-white dark:focus:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 leading-relaxed font-sans transition-all shadow-2xs resize-y"
+                  />
+                </div>
               </div>
 
-              <div className="space-y-1.5">
-                <label className="text-xs font-bold text-slate-700 dark:text-slate-200">
-                  Sentence / Paragraph *
-                </label>
-                <textarea
-                  required
-                  rows={7}
-                  value={macroText}
-                  onChange={(e) => setMacroText(e.target.value)}
-                  placeholder="Type the sentence or paragraph that will be inserted..."
-                  className="w-full text-xs sm:text-sm p-2.5 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500 leading-relaxed font-sans"
-                />
-              </div>
-
-              <div className="flex items-center justify-between pt-3 border-t border-slate-200 dark:border-slate-700">
+              <div className="px-5 py-3.5 bg-slate-50/90 dark:bg-slate-900/70 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between">
                 {editingMacroId ? (
                   <button
                     type="button"
                     onClick={() => executeDeleteMacro(editingMacroId)}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold text-red-600 hover:text-red-700 hover:bg-red-50 dark:hover:bg-red-950/40 transition-colors cursor-pointer"
+                    className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold text-red-600 hover:text-red-700 hover:bg-red-50 dark:hover:bg-red-950/40 border border-transparent hover:border-red-200 dark:hover:border-red-900/60 transition-colors cursor-pointer"
                   >
                     <Trash2 className="w-3.5 h-3.5" />
                     <span>Delete Macro</span>
                   </button>
                 ) : (
-                  <div />
+                  <span className="text-[11px] text-slate-400 dark:text-slate-500">
+                    Saved locally &amp; synced to Drive
+                  </span>
                 )}
 
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2.5">
                   <button
                     type="button"
                     onClick={() => setIsEditingMacro(false)}
-                    className="px-3.5 py-2 rounded-lg text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
+                    className="px-4 py-2 rounded-xl text-xs font-semibold text-slate-600 dark:text-slate-300 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors cursor-pointer"
                   >
                     Cancel
                   </button>
                   <button
                     type="submit"
-                    className="px-5 py-2 rounded-lg text-xs font-semibold bg-indigo-600 hover:bg-indigo-700 text-white shadow-xs transition-colors cursor-pointer"
+                    className="inline-flex items-center gap-1.5 px-5 py-2 rounded-xl text-xs font-bold bg-indigo-600 hover:bg-indigo-700 active:scale-[0.98] text-white shadow-sm hover:shadow-md transition-all cursor-pointer"
                   >
-                    {editingMacroId ? 'Save Changes' : 'Save Macro'}
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>{editingMacroId ? 'Save Changes' : 'Save Macro'}</span>
                   </button>
                 </div>
               </div>

@@ -2,7 +2,7 @@ import { GoogleGenAI, Type, GenerateContentResponse, Chat } from "@google/genai"
 import { DEFAULT_LIVE_MODEL, DEFAULT_GEMINI_PROMPT, REPROCESS_GEMINI_PROMPT, TEMPLATE_GEMINI_PROMPT, REPORT_TEMPLATES, ERROR_IDENTIFIER_PROMPT, INITIAL_AGENT_PROMPT, REFINEMENT_AGENT_PROMPT, SYNTHESIZER_AGENT_PROMPT, VISUAL_TEMPLATE_GEMINI_PROMPT, getLiveModelFallbackChain, DEFAULT_SELECTED_MODEL, ReportTemplate } from '../constants';
 import { IdentifiedError } from "../types";
 import { isTableRowFinding } from "./docxService";
-import { expandMacrosInFindings, getMacroPromptContext } from "./macroDictionaryService";
+import { expandMacrosInFindings, expandMacrosInSingleText, getMacroPromptContext } from "./macroDictionaryService";
 import { executeWithApiKeyFailover, getRandomAIClient, getClientForApiKey } from "./apiKeyService";
 import { findTemplateByIdOrNumber } from "./templateStorage";
 
@@ -696,18 +696,25 @@ export function extractSpokenTemplateDirective(findings: string[]): {
   let detectedId: string | null = null;
   const cleaned: string[] = [];
 
-  const directiveRegex = /\{?\s*template\s+id\s*[:\s#]?\s*([a-zA-Z0-9_\-]+)\s*\}?/i;
+  const bracedRegex = /\{\s*template\s+id\s*(?:number|no\.?)?\s*[:\s#-]*([a-zA-Z0-9_\-\s]+?)\s*\}\.?/i;
+  const unbracedIdPattern = `(?:(?:builtin_)?(?:tpl_|cust_|template_)\\d+|[c](?:ustom)?[\\s-]*\\d+|(?:see|sea|c|custom)\\s+(?:zero|one|won|two|to|too|three|four|for|five|six|seven|eight|ate|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)|(?:one|two|three)\\s+hundred(?:\\s+and)?(?:\\s+(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety))?(?:[\\s-](?:one|two|three|four|five|six|seven|eight|nine))?|(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)(?:[\\s-](?:one|two|three|four|five|six|seven|eight|nine))?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|\\d+)`;
+  const unbracedRegex = new RegExp(
+    `(?:^|\\b)(?:(?:add|use|apply|insert|merge(?:\\s+with)?)\\s+)?template\\s+id\\s*(?:number|no\\.?)?\\s*[:\\s#-]*(` + unbracedIdPattern + `)\\b\\.?`,
+    'i'
+  );
 
   for (const rawFinding of findings) {
     if (!rawFinding) continue;
+    const isBold = /^BOLD::/i.test(rawFinding);
     const content = rawFinding.replace(/^BOLD::/i, '').trim();
 
-    const match = content.match(directiveRegex);
+    const match = content.match(bracedRegex) || content.match(unbracedRegex);
     if (match && !detectedId) {
-      detectedId = match[1];
-      const stripped = content.replace(directiveRegex, '').replace(/^[:\s\-.]+/, '').trim();
+      detectedId = match[1].trim();
+      const matchedRegex = content.match(bracedRegex) ? bracedRegex : unbracedRegex;
+      const stripped = content.replace(matchedRegex, '').replace(/^[:\s\-.,]+/, '').trim();
       if (stripped.length > 0) {
-        cleaned.push(rawFinding.startsWith('BOLD::') ? `BOLD::${stripped}` : stripped);
+        cleaned.push(isBold ? `BOLD::${stripped}` : stripped);
       }
     } else {
       cleaned.push(rawFinding);
@@ -1219,10 +1226,12 @@ Carefully integrate these dictated findings into the "${templateName}" baseline 
 ================================================================================
 `;
 
+  const macroContext = getMacroPromptContext();
   const parts: any[] = [
     { text: templateContextPrompt },
     { text: templateBasePrompt },
     { text: dictatedFindingsDirective },
+    ...(macroContext ? [{ text: macroContext }] : []),
   ];
 
   if (customPrompt && customPrompt.trim()) {
@@ -1356,6 +1365,11 @@ Follow these strict instructions to produce a clean and accurate continuation:
 5. Do not repeat any of the existing text in your output.
 6. Your final output must be ONLY the newly corrected text, with no additional commentary, introductions, or explanations. Do not use any markdown formatting (like asterisks for bolding).`;
 
+  const macroContext = getMacroPromptContext();
+  if (macroContext) {
+    prompt += `\n\n${macroContext}`;
+  }
+
   if (customPrompt) {
     prompt += `\n\nAdditionally, follow these custom instructions:\n${customPrompt}`;
   }
@@ -1374,7 +1388,7 @@ Follow these strict instructions to produce a clean and accurate continuation:
         if (!resultText) {
           throw new Error("API returned an empty response for audio continuation.");
         }
-        return resultText;
+        return expandMacrosInSingleText(resultText);
       },
       { selectedModel: targetModel }
     );
@@ -1422,6 +1436,11 @@ Existing Finding:
 
 Now, listen to the audio and provide the single, updated finding text.`;
 
+  const macroContext = getMacroPromptContext();
+  if (macroContext) {
+    prompt += `\n\n${macroContext}`;
+  }
+
   if (customPrompt) {
     prompt += `\n\nAdditionally, follow these custom instructions:\n${customPrompt}`;
   }
@@ -1440,7 +1459,7 @@ Now, listen to the audio and provide the single, updated finding text.`;
         if (!resultText) {
           throw new Error("API returned an empty response for finding modification.");
         }
-        return resultText;
+        return expandMacrosInSingleText(resultText);
       },
       { selectedModel: targetModel }
     );
@@ -1572,6 +1591,13 @@ ${JSON.stringify({ findings: currentFindings })}
     prompt += `\n\nAdditionally, follow these custom instructions when processing the request:\n${customPrompt}`;
   }
 
+  const macroContext = getMacroPromptContext();
+  if (macroContext) {
+    prompt += `\n\n${macroContext}`;
+  }
+
+  prompt += `\n\nSPOKEN TEMPLATE ID DIRECTIVE (STRICT): If the audio/instruction explicitly speaks "template id [ID]" (e.g. "template id 1", "template id C1"), output "{template id [ID]}" at the start of the "findings" array. Do NOT trigger on vague requests like "add ct brain".`;
+
   const parts: any[] = [];
   
   if (customImages && customImages.length > 0) {
@@ -1596,6 +1622,24 @@ ${JSON.stringify({ findings: currentFindings })}
     const findings = extractFindingsFromResponse(rawResponseText);
 
     if (findings && findings.length > 0) {
+      if (!templateInfo.isTemplateMode) {
+        const { templateId, cleanedFindings } = extractSpokenTemplateDirective(findings);
+        if (templateId) {
+          const matchedTemplate = await findTemplateByIdOrNumber(templateId);
+          if (matchedTemplate) {
+            const merged = await mergeDictatedFindingsWithTemplate(
+              cleanedFindings,
+              matchedTemplate,
+              targetModel,
+              blobs,
+              customPrompt,
+              customDocx
+            );
+            if (merged && merged.length > 0) return merged;
+          }
+          return cleanedFindings;
+        }
+      }
       return findings;
     } else {
       throw new Error("Invalid data structure in API response. Expected a 'findings' array.");

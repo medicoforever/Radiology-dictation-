@@ -180,15 +180,15 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
       }
     }
 
-    // Search query filter
+    // Search query filter (search by template name or template ID ONLY - do not match inside template body content)
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase().trim();
       const parts = q.split(/\s+/).filter(Boolean);
       list = list.filter(t => {
         const displayId = (t.id || '').replace('tpl_', '').replace(/^0+/, '');
-        const idText = `id ${displayId} #${displayId} tpl_${displayId} ${t.id || ''}`.toLowerCase();
-        const text = `${t.name} ${t.description} ${t.modality || ''} ${idText} ${t.lines ? t.lines.join(' ') : ''}`.toLowerCase();
-        return parts.every(part => text.includes(part));
+        const idText = `id:${displayId} id ${displayId} #${displayId} tpl_${displayId} ${t.id || ''}`.toLowerCase();
+        const nameLower = t.name.toLowerCase();
+        return parts.every(part => nameLower.includes(part) || idText.includes(part));
       });
     }
 
@@ -352,7 +352,7 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
                 type="text"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Search templates by scan name, organ, finding, or keyword..."
+                placeholder="Search templates by template name or ID..."
                 className="w-full py-2 pl-9 pr-8 text-sm border border-slate-300 dark:border-slate-700 rounded-xl bg-slate-50/50 dark:bg-slate-950/50 text-slate-900 placeholder-slate-400 dark:text-white focus:ring-2 focus:ring-blue-500 focus:outline-none transition-all"
                 aria-label="Search for report templates"
                 autoFocus

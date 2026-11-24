@@ -3,7 +3,7 @@ import { useAudioRecorder } from '../hooks/useAudioRecorder';
 import { processAudio, createChat, blobToBase64, continueAudioDictation, base64ToBlob, modifyFindingWithAudio, modifyReportWithAudio, identifyPotentialErrors, runComplexImpressionGeneration, transcribeAudioForPrompt, detectAndExtractTemplate, mergeDictatedFindingsWithTemplate } from '../services/geminiService';
 import { saveAudioBlob, getAudioBlob, clearUnusedAudioBlobs, saveReportSession, getReportSession, deleteReportSession } from '../services/audioStorage';
 import { mergeMultipleAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
-import { ClipboardPaste, X, CheckSquare, Sparkles } from 'lucide-react';
+import { ClipboardPaste, X, CheckSquare } from 'lucide-react';
 import { safeLocalStorage, markTabActive, getTabId, getBatchModeStorageKey } from '../services/storageService';
 import PasteTextModal from './PasteTextModal';
 import RichTextReportEditor from './RichTextReportEditor';
@@ -394,6 +394,9 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             return [];
         }
     });
+    const [globalCustomDocx, setGlobalCustomDocx] = useState<DocxTemplateData | null>(() => {
+        return getUpcomingTemplate()?.docxData || null;
+    });
     const [upcomingTemplate, setUpcomingTemplateState] = useState<UpcomingTemplateConfig | null>(() => getUpcomingTemplate());
 
     useEffect(() => {
@@ -585,7 +588,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                 status: 'complete',
                 selectedModel: selectedModel,
                 customPrompt: currentUpcoming ? currentUpcoming.promptText : globalCustomPrompt,
-                customDocx: currentUpcoming ? (currentUpcoming.docxData || null) : null,
+                customDocx: currentUpcoming ? (currentUpcoming.docxData || null) : globalCustomDocx,
                 customImages: [...globalCustomImages],
             }));
             setBatches(prev => [...prev, ...newBatches]);
@@ -803,7 +806,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                 status: 'complete',
                 selectedModel: selectedModel,
                 customPrompt: currentUpcoming ? currentUpcoming.promptText : globalCustomPrompt,
-                customDocx: currentUpcoming ? (currentUpcoming.docxData || null) : null,
+                customDocx: currentUpcoming ? (currentUpcoming.docxData || null) : globalCustomDocx,
                 customImages: [...globalCustomImages],
             }));
             setBatches(prev => [...prev, ...newBatches]);
@@ -1050,7 +1053,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             isChatting: false,
             selectedModel: selectedModel,
             customPrompt: currentUpcoming ? currentUpcoming.promptText : globalCustomPrompt,
-            customDocx: currentUpcoming ? (currentUpcoming.docxData || null) : null,
+            customDocx: currentUpcoming ? (currentUpcoming.docxData || null) : globalCustomDocx,
             customImages: [...globalCustomImages],
         };
         setBatches(prev => [...prev, newBatch]);
@@ -1188,18 +1191,25 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             pauseMainRecording();
         }
     };
-    
-    const handleStop = async () => {
+
+    const finalizeStoppedRecording = async (downloadBatch?: Batch) => {
         if (isBusy || !isMainRecording || !activeBatchId) return;
-        
+
         const batchIdToStop = activeBatchId;
         setIsBusy(true);
-    
+
         try {
             const blob = await stopMainRecording();
-            
-            // Update the batch with the new blob atomically
-            setBatches(prevBatches => 
+            if (downloadBatch && blob && blob.size > 0) {
+                const existingBlobs = downloadBatch.audioBlobs || [];
+                const allBlobs = [...existingBlobs, blob];
+                const fullAudioToDownload = allBlobs.length > 1
+                    ? await mergeMultipleAudioBlobs(allBlobs)
+                    : blob;
+                triggerAudioDownload(fullAudioToDownload, `${downloadBatch.name.replace(/[^a-z0-9_-]/gi, '_')}_audio`);
+            }
+
+            setBatches(prevBatches =>
                 prevBatches.map(b => {
                     if (b.id === batchIdToStop) {
                         return {
@@ -1211,14 +1221,12 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                     return b;
                 })
             );
-            
             setActiveBatchId(null);
         } catch (error) {
-            console.error('Error in handleStop:', error);
-            // Even if there's an error, try to update the status
+            console.error(downloadBatch ? 'Error in handleDownloadAndStop:' : 'Error in handleStop:', error);
             setBatches(prevBatches =>
-                prevBatches.map(b => 
-                    b.id === batchIdToStop 
+                prevBatches.map(b =>
+                    b.id === batchIdToStop
                         ? { ...b, status: 'error' as BatchStatus, error: String(error) }
                         : b
                 )
@@ -1228,6 +1236,9 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             setIsBusy(false);
         }
     };
+
+    const handleStop = () => finalizeStoppedRecording();
+    const handleDownloadAndStop = (batch: Batch) => finalizeStoppedRecording(batch);
     
     const [isGeneralDragging, setIsGeneralDragging] = useState(false);
     const [dragOverCardId, setDragOverCardId] = useState<string | null>(null);
@@ -1283,7 +1294,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                     status: 'complete',
                     selectedModel: selectedModel,
                     customPrompt: currentUpcoming ? currentUpcoming.promptText : globalCustomPrompt,
-                    customDocx: currentUpcoming ? (currentUpcoming.docxData || null) : null,
+                    customDocx: currentUpcoming ? (currentUpcoming.docxData || null) : globalCustomDocx,
                     customImages: [...globalCustomImages],
                 }));
                 setBatches(prev => [...prev, ...newBatches]);
@@ -1340,7 +1351,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                     status: 'complete',
                     selectedModel: selectedModel,
                     customPrompt: currentUpcoming ? currentUpcoming.promptText : globalCustomPrompt,
-                    customDocx: currentUpcoming ? (currentUpcoming.docxData || null) : null,
+                    customDocx: currentUpcoming ? (currentUpcoming.docxData || null) : globalCustomDocx,
                     customImages: [...globalCustomImages],
                 }));
                 setBatches(prev => [...prev, ...newBatches]);
@@ -1436,7 +1447,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                     const mergedBlob = await mergeMultipleAudioBlobs(batch.audioBlobs);
                     const currentUpcoming = getUpcomingTemplate();
                     const effectivePrompt = batch.customPrompt || (currentUpcoming ? currentUpcoming.promptText : globalCustomPrompt);
-                    const effectiveDocx = batch.customDocx || (currentUpcoming ? (currentUpcoming.docxData || null) : null);
+                    const effectiveDocx = batch.customDocx || (currentUpcoming ? (currentUpcoming.docxData || null) : globalCustomDocx);
                     const findings = await processAudio(mergedBlob, batch.selectedModel, effectivePrompt, batch.customImages, undefined, effectiveDocx);
                     
                     if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
@@ -2798,6 +2809,8 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                     onPromptChange={setGlobalCustomPrompt}
                     images={globalCustomImages}
                     onImagesChange={setGlobalCustomImages}
+                    customDocx={globalCustomDocx}
+                    onCustomDocxChange={setGlobalCustomDocx}
                     selectedModel={selectedModel}
                 />
             </div>
@@ -2985,16 +2998,15 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                         {isMainPaused ? <ResumeIcon className="w-4 h-4" /> : <PauseIcon className="w-4 h-4" />}
                                                         {isMainPaused ? 'Resume' : 'Pause'}
                                                     </button>
-                                                    {isMainPaused && (
-                                                        <button 
-                                                            type="button" 
-                                                            onClick={() => downloadMainCurrentAudio(`${batch.name.replace(/[^a-z0-9_-]/gi, '_')}_paused`)} 
-                                                            className="flex items-center gap-1.5 bg-slate-700 hover:bg-slate-800 text-white p-2 rounded-lg transition-colors text-sm px-3 shadow-xs cursor-pointer font-semibold"
-                                                            title="Download audio recorded up to this pause"
-                                                        >
-                                                            <DownloadIcon className="w-4 h-4 text-emerald-400" /> Download Audio
-                                                        </button>
-                                                    )}
+                                                    <button 
+                                                        type="button" 
+                                                        onClick={() => handleDownloadAndStop(batch)} 
+                                                        disabled={isBusy}
+                                                        className="flex items-center gap-1.5 bg-slate-700 hover:bg-slate-800 text-white p-2 rounded-lg transition-colors text-sm px-3 shadow-xs cursor-pointer font-semibold disabled:cursor-wait"
+                                                        title="Download full dictated audio and finalize this batch recording"
+                                                    >
+                                                        <DownloadIcon className="w-4 h-4 text-emerald-400" /> Download Audio
+                                                    </button>
                                                     <button onClick={handleStop} className="flex items-center gap-2 bg-red-600 text-white p-2 rounded-lg hover:bg-red-700 transition-colors text-sm px-3 disabled:cursor-wait" disabled={isBusy}>
                                                         <StopIcon className="w-4 h-4"/> Stop
                                                     </button>
@@ -3095,6 +3107,8 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                 onPromptChange={(p) => updateBatchCustomPrompt(batch.id, p)}
                                                 images={batch.customImages || []}
                                                 onImagesChange={(imgs) => updateBatchCustomImages(batch.id, imgs)}
+                                                customDocx={batch.customDocx}
+                                                onCustomDocxChange={(docx) => updateBatchCustomDocx(batch.id, docx)}
                                                 selectedModel={batch.selectedModel || selectedModel}
                                             />
                                         </div>
@@ -3189,38 +3203,6 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                     >
                                                         <StopIcon className="w-4 h-4" /> Cancel Analysis
                                                     </button>
-                                                </div>
-
-                                                {/* In-Flight Template Attachment in Batch Mode */}
-                                                <div className="mt-6 max-w-xl mx-auto border border-indigo-200 dark:border-indigo-800/70 bg-indigo-50/40 dark:bg-indigo-950/20 rounded-xl p-4 text-left shadow-sm">
-                                                    <div className="flex items-center justify-between mb-2">
-                                                        <span className="text-xs font-bold text-indigo-900 dark:text-indigo-200 flex items-center gap-1.5">
-                                                            <Sparkles className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
-                                                            Attach / Change Template for this In-Flight Batch
-                                                        </span>
-                                                        <span className="text-[11px] bg-indigo-100 dark:bg-indigo-900/60 text-indigo-800 dark:text-indigo-200 px-2 py-0.5 rounded-full font-semibold">
-                                                            Merge On-the-Fly
-                                                        </span>
-                                                    </div>
-                                                    <CustomPromptInput
-                                                        prompt={batch.customPrompt}
-                                                        onPromptChange={(p) => updateBatchCustomPrompt(batch.id, p)}
-                                                        images={batch.customImages || []}
-                                                        onImagesChange={(imgs) => updateBatchCustomImages(batch.id, imgs)}
-                                                        customDocx={batch.customDocx}
-                                                        onCustomDocxChange={(docx) => updateBatchCustomDocx(batch.id, docx)}
-                                                        selectedModel={batch.selectedModel || selectedModel}
-                                                        className="mb-3"
-                                                    />
-                                                    <div className="flex justify-end">
-                                                        <button
-                                                            onClick={() => handleReprocessBatch(batch.id)}
-                                                            className="flex items-center gap-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold py-2 px-4 rounded-xl shadow-sm transition-all cursor-pointer"
-                                                        >
-                                                            <Sparkles className="w-4 h-4" />
-                                                            Apply Template &amp; Re-process Batch Now
-                                                        </button>
-                                                    </div>
                                                 </div>
                                             </div>
                                         ) : batch.findings ? (

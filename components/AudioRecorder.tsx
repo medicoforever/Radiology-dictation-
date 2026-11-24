@@ -160,6 +160,34 @@ const AudioRecorder: React.FC<AudioRecorderProps> = ({ status, setStatus, onReco
     }
   };
 
+  const handleDownloadAndStop = async () => {
+    const audioBlob = await stopRecording();
+    setStatus(AppStatus.Idle);
+    if (audioBlob && audioBlob.size > 0) {
+      triggerAudioDownload(audioBlob, `dictation_audio_${new Date().toISOString().slice(0, 10)}`);
+      onRecordingComplete(audioBlob);
+    } else if (audioBlob) {
+      onRecordingComplete(audioBlob);
+    }
+  };
+
+  const handleDownloadAndStopStaged = async () => {
+    const audioBlob = await stopRecording();
+    setStatus(AppStatus.Idle);
+    const allItems: Blob[] = [];
+    if (audioBlob && audioBlob.size > 0) {
+      triggerAudioDownload(audioBlob, `dictation_audio_${new Date().toISOString().slice(0, 10)}`);
+      allItems.push(audioBlob);
+    }
+    allItems.push(...stagedFiles);
+    if (allItems.length === 0) return;
+
+    setStagedFiles([]);
+    setStagedAudioBlob(null);
+    setIsStagedMode(false);
+    onRecordingComplete(allItems.length === 1 ? allItems[0] : allItems);
+  };
+
   const handleStartStagedRecording = async () => {
     setIsStarting(true);
     try {
@@ -572,17 +600,15 @@ const AudioRecorder: React.FC<AudioRecorderProps> = ({ status, setStatus, onReco
                     >
                       {isPaused ? 'Resume' : 'Pause'}
                     </button>
-                    {isPaused && (
-                      <button
-                        type="button"
-                        onClick={() => downloadCurrentAudio('staged_dictation_paused')}
-                        className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-slate-700 hover:bg-slate-800 text-white transition-colors flex items-center gap-1.5 cursor-pointer shadow-xs"
-                        title="Download audio recorded up to this point"
-                      >
-                        <DownloadIcon className="w-3.5 h-3.5 text-emerald-400" />
-                        Download Audio
-                      </button>
-                    )}
+                    <button
+                      type="button"
+                      onClick={handleDownloadAndStopStaged}
+                      className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-slate-700 hover:bg-slate-800 text-white transition-colors flex items-center gap-1.5 cursor-pointer shadow-xs"
+                      title="Download full dictated audio and process immediately"
+                    >
+                      <DownloadIcon className="w-3.5 h-3.5 text-emerald-400" />
+                      Download Audio
+                    </button>
                     <button
                       type="button"
                       onClick={handleStopStagedRecording}
@@ -708,7 +734,7 @@ const AudioRecorder: React.FC<AudioRecorderProps> = ({ status, setStatus, onReco
           </p>
         </div>
       ) : (
-        <div className="flex flex-col sm:flex-row items-center justify-center gap-3 sm:gap-4 w-full max-w-lg">
+        <div className="flex flex-col sm:flex-row items-center justify-center gap-3 sm:gap-4 w-full max-w-2xl flex-wrap">
           <button
             onClick={handlePauseToggle}
             className={`w-full sm:w-auto flex items-center justify-center gap-2 font-bold py-3.5 px-7 rounded-full focus:outline-none focus:ring-4 transition-all duration-300 ease-in-out transform hover:scale-105 shadow-lg min-h-[48px] cursor-pointer ${
@@ -721,18 +747,17 @@ const AudioRecorder: React.FC<AudioRecorderProps> = ({ status, setStatus, onReco
             {isPaused ? <ResumeIcon className="w-5 h-5"/> : <PauseIcon className="w-5 h-5"/>}
             {isPaused ? 'Resume' : 'Pause'}
           </button>
-          {isPaused && (
-            <button
-              type="button"
-              onClick={() => downloadCurrentAudio('dictation_audio_paused')}
-              className="w-full sm:w-auto flex items-center justify-center gap-2 bg-slate-700 hover:bg-slate-800 text-white font-bold py-3.5 px-6 rounded-full focus:outline-none focus:ring-4 focus:ring-slate-400 transition-all duration-300 ease-in-out transform hover:scale-105 shadow-lg min-h-[48px] cursor-pointer"
-              aria-label="Download audio recorded so far"
-              title="Download complete audio recorded up to this point"
-            >
-              <DownloadIcon className="w-5 h-5 text-emerald-400" />
-              Download Audio
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={handleDownloadAndStop}
+            disabled={!isRecording}
+            className="w-full sm:w-auto flex items-center justify-center gap-2 bg-slate-700 hover:bg-slate-800 text-white font-bold py-3.5 px-6 rounded-full focus:outline-none focus:ring-4 focus:ring-slate-400 transition-all duration-300 ease-in-out transform hover:scale-105 shadow-lg min-h-[48px] cursor-pointer"
+            aria-label="Download audio and process dictation"
+            title="Download full dictated audio and process immediately"
+          >
+            <DownloadIcon className="w-5 h-5 text-emerald-400" />
+            Download Audio
+          </button>
           <button
             onClick={handleStop}
             disabled={!isRecording}
