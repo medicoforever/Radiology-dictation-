@@ -754,7 +754,7 @@ export function findingsToStandardHtml(findings: string[]): { html: string; plai
 
   const htmlParagraphs: string[] = [];
   const plainParagraphs: string[] = [];
-  const pStyle = "font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 8pt; padding: 0; line-height: normal; mso-line-height-rule: exactly;";
+  const pStyle = "font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal; mso-line-height-rule: exactly;";
 
   findings.forEach((raw, idx) => {
     if (!raw || typeof raw !== 'string') return;
@@ -851,9 +851,11 @@ export function findingsToStandardHtml(findings: string[]): { html: string; plai
     htmlParagraphs.push(`<p style="${pStyle}">${innerHtml}</p>`);
   });
 
-  // Double newline (\n\n) between separate boxes in plain text creates the 1-row empty gap
+  // Double newline (\n\n) between separate boxes in plain text creates the 1-row empty gap,
+  // and an explicit empty paragraph creates the 1-row empty gap in NeoRad PACS and MS Word!
+  const EMPTY_ROW_HTML = `<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;"><br></p>`;
   return {
-    html: htmlParagraphs.join('\n'),
+    html: htmlParagraphs.join(`\n${EMPTY_ROW_HTML}\n`),
     plainText: plainParagraphs.join('\n\n')
   };
 }
@@ -869,12 +871,12 @@ p, li, ul, ol, span, strong, em, b, u, div, font {
 p {
   margin: 0 !important;
   margin-top: 0 !important;
-  margin-bottom: 8pt !important;
+  margin-bottom: 0 !important;
   padding: 0 !important;
   line-height: normal !important;
   mso-para-margin: 0 !important;
   mso-para-margin-top: 0 !important;
-  mso-para-margin-bottom: 8pt !important;
+  mso-para-margin-bottom: 0 !important;
   mso-line-height-rule: exactly;
 }
 ul, ol {
@@ -1145,11 +1147,12 @@ export function findingsToRichHtml(findings: string[]): string {
       .map(p => isBold ? `<strong>${escapeHtml(p)}</strong>` : escapeHtml(p))
       .join('<br>');
 
-    htmlParts.push(`<p style="margin-top: 0; margin-bottom: 10px; line-height: normal; color: ${isBold ? '#0f172a' : '#334155'}; font-family: 'Times New Roman', serif; font-size: 12pt;">${innerHtml}</p>`);
+    htmlParts.push(`<p style="margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal; color: ${isBold ? '#0f172a' : '#334155'}; font-family: 'Times New Roman', serif; font-size: 12pt;">${innerHtml}</p>`);
     isFirst = false;
   }
 
-  return htmlParts.join('\n');
+  const EMPTY_ROW_HTML = `<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;"><br></p>`;
+  return htmlParts.join(`\n${EMPTY_ROW_HTML}\n`);
 }
 
 export function escapeRtf(text: string): string {

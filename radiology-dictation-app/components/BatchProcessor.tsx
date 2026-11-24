@@ -38,7 +38,7 @@ import { AVAILABLE_MODELS, REPORT_TEMPLATES, ReportTemplate } from '../constants
 import WarningIcon from './icons/WarningIcon';
 import BrainIcon from './icons/BrainIcon';
 import { autoSaveBatchDictations, SaveResult, BatchFolderInfo, isDriveConnected, subscribeToAuth } from '../services/googleDriveService';
-import { generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText, formatImpressionOutput, findingsToStandardHtml, isPureCorrelationOrRecommendation, isReportTitle, isAnatomicalSubheading, sanitizeHtmlForClipboard } from '../services/docxService';
+import { generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText, formatImpressionOutput, findingsToStandardHtml, isPureCorrelationOrRecommendation, isReportTitle, isAnatomicalSubheading, sanitizeHtmlForClipboard, escapeHtml } from '../services/docxService';
 import { isClinicalProfileFinding, formatClinicalProfileText } from './ResultsDisplay';
 
 const BATCH_DRIVE_FOLDER_KEY = 'radiologyDictationBatchDriveFolder';
@@ -1614,24 +1614,35 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             acc.html.push(imp.html);
           } else if (isStructured) {
             acc.plain.push([title, ...points].join('\n'));
-            let htmlContent = isBold ? `<p><strong>${title}</strong></p>` : `<p>${title}</p>`;
-            htmlContent += points.map(p => isBold ? `<p><strong>${p}</strong></p>` : `<p>${p}</p>`).join('');
-            acc.html.push(htmlContent);
+            const innerHtml = [
+              isBold ? `<strong>${escapeHtml(title)}</strong>` : escapeHtml(title),
+              ...points.map(p => isBold ? `<strong>${escapeHtml(p)}</strong>` : escapeHtml(p))
+            ].join('<br>');
+            acc.html.push(`<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;">${innerHtml}</p>`);
           } else {
             if (isItalic) {
-                acc.plain.push(cleanFinding.slice(1, -1));
-                acc.html.push(`<p><em>${cleanFinding.slice(1, -1)}</em></p>`);
+                const italicText = cleanFinding.replace(/^\*+|\*+$/g, '').trim();
+                acc.plain.push(italicText);
+                acc.html.push(`<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;"><em>${escapeHtml(italicText)}</em></p>`);
             } else {
-                acc.plain.push(cleanFinding);
-                acc.html.push(isBold ? `<p><strong>${cleanFinding}</strong></p>` : `<p>${cleanFinding}</p>`);
+                const lines = cleanFinding.split('\n').filter(Boolean);
+                if (lines.length > 1) {
+                  acc.plain.push(cleanFinding);
+                  const innerHtml = lines.map(l => isBold ? `<strong>${escapeHtml(l)}</strong>` : escapeHtml(l)).join('<br>');
+                  acc.html.push(`<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;">${innerHtml}</p>`);
+                } else {
+                  acc.plain.push(cleanFinding);
+                  acc.html.push(isBold ? `<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;"><strong>${escapeHtml(cleanFinding)}</strong></p>` : `<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;">${escapeHtml(cleanFinding)}</p>`);
+                }
             }
           }
         }
         return acc;
       }, { plain: [] as string[], html: [] as string[] });
 
+      const EMPTY_ROW_HTML = `<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;"><br></p>`;
       const plainText = plain.join('\n\n');
-      const htmlText = html.join('');
+      const htmlText = html.join(`\n${EMPTY_ROW_HTML}\n`);
       
       const success = await copyToClipboard(plainText, htmlText);
       const validCount = (batch.findings || []).filter(f => f && f.trim() !== '').length;
@@ -1796,16 +1807,18 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         const batchesWithFindings = batches.filter(b => b.findings && b.findings.length > 0);
         if (batchesWithFindings.length === 0) return;
 
+        const EMPTY_ROW_HTML = `<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;"><br></p>`;
         let allTextPlain = '';
-        let allTextHtml = '';
+        let allTextHtmlParts: string[] = [];
 
         batchesWithFindings.forEach(b => {
             const name = b.name;
             const std = findingsToStandardHtml(b.findings!);
             allTextPlain += `[${name}]\n${std.plainText}\n\n`;
-            allTextHtml += `<p><strong><u>--- ${name} ---</u></strong></p>` + std.html;
+            allTextHtmlParts.push(`<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;"><strong><u>--- ${escapeHtml(name)} ---</u></strong></p>\n${EMPTY_ROW_HTML}\n` + std.html);
         });
 
+        const allTextHtml = allTextHtmlParts.join(`\n${EMPTY_ROW_HTML}\n`);
         const success = await copyToClipboard(allTextPlain.trim(), allTextHtml.trim());
         if (success) {
           setIsAllBatchesCopied(true);

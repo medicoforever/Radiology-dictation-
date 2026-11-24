@@ -28,7 +28,7 @@ import TemplateSelectionModal from './ui/TemplateSelectionModal';
 import { getTemplateDocxBase64 } from '../services/builtInTemplates';
 import ImageIcon from './icons/ImageIcon';
 import { mergeAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
-import {  generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText , isSummaryLeadIn, formatImpressionOutput, isReportTitle as isDocxReportTitle, isAnatomicalSubheading, isPureCorrelationOrRecommendation, sanitizeHtmlForClipboard } from '../services/docxService';
+import {  generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText , isSummaryLeadIn, formatImpressionOutput, isReportTitle as isDocxReportTitle, isAnatomicalSubheading, isPureCorrelationOrRecommendation, sanitizeHtmlForClipboard, escapeHtml } from '../services/docxService';
 import { stopRepeatingInterruptedAlert } from '../services/soundService';
 import RichTextReportEditor from './RichTextReportEditor';
 import type { DocxTemplateData } from './ui/CustomPromptInput';
@@ -738,25 +738,35 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
             acc.html.push(imp.html);
         } else if (isStructured) {
           acc.plain.push([title, ...points].join('\n'));
-          let htmlContent = isBold ? `<p><strong>${title}</strong></p>` : `<p>${title}</p>`;
-          htmlContent += points.map(p => isBold ? `<p><strong>${p}</strong></p>` : `<p>${p}</p>`).join('');
-          acc.html.push(htmlContent);
+          const innerHtml = [
+            isBold ? `<strong>${escapeHtml(title)}</strong>` : escapeHtml(title),
+            ...points.map(p => isBold ? `<strong>${escapeHtml(p)}</strong>` : escapeHtml(p))
+          ].join('<br>');
+          acc.html.push(`<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;">${innerHtml}</p>`);
         } else {
           if (isItalic) {
               const italicText = cleanFinding.replace(/^\*+|\*+$/g, '').trim();
               acc.plain.push(italicText);
-              acc.html.push(`<p><em>${italicText}</em></p>`);
+              acc.html.push(`<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;"><em>${escapeHtml(italicText)}</em></p>`);
           } else {
-              acc.plain.push(cleanFinding);
-              acc.html.push(isBold ? `<p><strong>${cleanFinding}</strong></p>` : `<p>${cleanFinding}</p>`);
+              const lines = cleanFinding.split('\n').filter(Boolean);
+              if (lines.length > 1) {
+                acc.plain.push(cleanFinding);
+                const innerHtml = lines.map(l => isBold ? `<strong>${escapeHtml(l)}</strong>` : escapeHtml(l)).join('<br>');
+                acc.html.push(`<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;">${innerHtml}</p>`);
+              } else {
+                acc.plain.push(cleanFinding);
+                acc.html.push(isBold ? `<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;"><strong>${escapeHtml(cleanFinding)}</strong></p>` : `<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;">${escapeHtml(cleanFinding)}</p>`);
+              }
           }
         }
       }
       return acc;
     }, { plain: [] as string[], html: [] as string[] });
 
+    const EMPTY_ROW_HTML = `<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;"><br></p>`;
     const plainText = plain.join('\n\n');
-    const htmlText = html.join('');
+    const htmlText = html.join(`\n${EMPTY_ROW_HTML}\n`);
 
     const success = await copyToClipboard(plainText, htmlText);
     const totalValid = getValidFindingIndices().size;
@@ -855,16 +865,25 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         htmlText = imp.html;
     } else if (isStructured) {
         plainText = [title, ...points].join('\n');
-        let htmlContent = isBold ? `<p><strong>${title}</strong></p>` : `<p>${title}</p>`;
-        htmlContent += points.map(p => isBold ? `<p><strong>${p}</strong></p>` : `<p>${p}</p>`).join('');
-        htmlText = htmlContent;
+        const innerHtml = [
+          isBold ? `<strong>${escapeHtml(title)}</strong>` : escapeHtml(title),
+          ...points.map(p => isBold ? `<strong>${escapeHtml(p)}</strong>` : escapeHtml(p))
+        ].join('<br>');
+        htmlText = `<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;">${innerHtml}</p>`;
     } else {
         if (isItalic) {
             plainText = cleanFinding.replace(/^\*+|\*+$/g, '').trim();
-            htmlText = `<p><em>${plainText}</em></p>`;
+            htmlText = `<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;"><em>${escapeHtml(plainText)}</em></p>`;
         } else {
-            plainText = cleanFinding;
-            htmlText = isBold ? `<p><strong>${cleanFinding}</strong></p>` : `<p>${cleanFinding}</p>`;
+            const lines = cleanFinding.split('\n').filter(Boolean);
+            if (lines.length > 1) {
+              plainText = cleanFinding;
+              const innerHtml = lines.map(l => isBold ? `<strong>${escapeHtml(l)}</strong>` : escapeHtml(l)).join('<br>');
+              htmlText = `<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;">${innerHtml}</p>`;
+            } else {
+              plainText = cleanFinding;
+              htmlText = isBold ? `<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;"><strong>${escapeHtml(cleanFinding)}</strong></p>` : `<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;">${escapeHtml(cleanFinding)}</p>`;
+            }
         }
     }
     
@@ -923,6 +942,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
       plainParts.push(displayFinding);
     });
 
+    const EMPTY_ROW_HTML = `<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;"><br></p>`;
     const allTextPlain = plainParts.join('\n\n');
 
     const allTextHtml = findings.map((f, i) => {
@@ -932,14 +952,14 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
       const displayFinding = isTitle ? sanitizeTitleText(cleanFinding) : cleanFinding;
       if (isClinicalProfileFinding(displayFinding)) {
         const profText = formatClinicalProfileText(displayFinding);
-        return `<p><em>${profText}</em></p>`;
+        return `<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;"><em>${escapeHtml(profText)}</em></p>`;
       }
       const { isStructured, isTable, title, points, tableLines } = parseStructuredFinding(displayFinding);
       const isImpression = isStructured && !isTable && title.trim().toUpperCase() === 'IMPRESSION:';
       
       if (isTitle) {
           const titleUpper = displayFinding.toUpperCase();
-          return `<p style="text-align:center;"><strong><u>${titleUpper}</u></strong></p>`;
+          return `<p style="text-align:center; font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;"><strong><u>${escapeHtml(titleUpper)}</u></strong></p>`;
       }
       if (isTable) {
           return parseMarkdownTable(tableLines);
@@ -949,15 +969,22 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
           return imp.html;
       }
       if (isStructured) {
-        let htmlContent = isBold ? `<p><strong>${title}</strong></p>` : `<p>${title}</p>`;
-        htmlContent += points.map(p => isBold ? `<p><strong>${p}</strong></p>` : `<p>${p}</p>`).join('');
-        return htmlContent;
+        const innerHtml = [
+          isBold ? `<strong>${escapeHtml(title)}</strong>` : escapeHtml(title),
+          ...points.map(p => isBold ? `<strong>${escapeHtml(p)}</strong>` : escapeHtml(p))
+        ].join('<br>');
+        return `<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;">${innerHtml}</p>`;
       }
       if (displayFinding.startsWith('*') && displayFinding.endsWith('*')) {
-        return `<p><em>${displayFinding.replace(/^\*+|\*+$/g, '').trim()}</em></p>`;
+        return `<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;"><em>${escapeHtml(displayFinding.replace(/^\*+|\*+$/g, '').trim())}</em></p>`;
       }
-      return isBold ? `<p><strong>${displayFinding}</strong></p>` : `<p>${displayFinding}</p>`;
-    }).join('');
+      const lines = displayFinding.split('\n').filter(Boolean);
+      if (lines.length > 1) {
+        const innerHtml = lines.map(l => isBold ? `<strong>${escapeHtml(l)}</strong>` : escapeHtml(l)).join('<br>');
+        return `<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;">${innerHtml}</p>`;
+      }
+      return isBold ? `<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;"><strong>${escapeHtml(displayFinding)}</strong></p>` : `<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;">${escapeHtml(displayFinding)}</p>`;
+    }).join(`\n${EMPTY_ROW_HTML}\n`);
 
     const success = await copyToClipboard(allTextPlain, allTextHtml);
     if (success) {

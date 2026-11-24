@@ -350,17 +350,17 @@ const getEmbeddedScript = () => `
             const isImpression = (isStructured && cleanTitleCandidate === 'IMPRESSION:') || startsWithImpression;
             const isItalic = !isImpression && (isClinicalProfile || (!isStructured && cleanFinding.startsWith('*') && cleanFinding.endsWith('*')));
 
-            const pStyle = "font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 8pt; padding: 0; line-height: normal; mso-line-height-rule: exactly;";
+            const pStyle = "font-family: Times New Roman, serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal; mso-line-height-rule: exactly;";
 
             let plainText, htmlText;
 
             if (isTitle) {
                 const titleUpper = cleanFinding.toUpperCase();
                 plainText = titleUpper;
-                htmlText = '<p style="text-align:center; font-family: Times New Roman, serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 6pt; padding: 0; line-height: normal; mso-line-height-rule: exactly;"><strong><u>' + titleUpper + '</u></strong></p>';
+                htmlText = '<p style="text-align:center; font-family: Times New Roman, serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal; mso-line-height-rule: exactly;"><strong><u>' + escapeHtml(titleUpper) + '</u></strong></p>';
             } else if (isClinicalProfile) {
                 plainText = cleanClinicalProfileText(cleanFinding);
-                htmlText = '<p style="' + pStyle + ' margin-bottom: 4pt;"><em>' + plainText + '</em></p>';
+                htmlText = '<p style="' + pStyle + '"><em>' + escapeHtml(plainText) + '</em></p>';
             } else if (isImpression) {
                 let title = 'IMPRESSION:';
                 let points = [];
@@ -383,16 +383,22 @@ const getEmbeddedScript = () => `
                 htmlText = imp.html;
             } else if (isStructured) {
                 plainText = parts.join('\\n');
-                let htmlContent = isBold ? ('<p style="' + pStyle + '"><strong>' + parts[0] + '</strong></p>') : ('<p style="' + pStyle + '">' + parts[0] + '</p>');
-                htmlContent += parts.slice(1).map(p => isBold ? ('<p style="' + pStyle + '"><strong>' + p + '</strong></p>') : ('<p style="' + pStyle + '">' + p + '</p>')).join('');
-                htmlText = htmlContent;
+                const innerParts = parts.map(p => isBold ? ('<strong>' + escapeHtml(p) + '</strong>') : escapeHtml(p)).join('<br>');
+                htmlText = '<p style="' + pStyle + '">' + innerParts + '</p>';
             } else {
                 if (isItalic) {
                     plainText = cleanFinding.startsWith('*') && cleanFinding.endsWith('*') ? cleanFinding.slice(1, -1) : cleanFinding;
-                    htmlText = '<p style="' + pStyle + '"><em>' + plainText + '</em></p>';
+                    htmlText = '<p style="' + pStyle + '"><em>' + escapeHtml(plainText) + '</em></p>';
                 } else {
-                    plainText = cleanFinding;
-                    htmlText = isBold ? ('<p style="' + pStyle + '"><strong>' + cleanFinding + '</strong></p>') : ('<p style="' + pStyle + '">' + cleanFinding + '</p>');
+                    const lines = cleanFinding.split('\\n').filter(Boolean);
+                    if (lines.length > 1) {
+                        plainText = cleanFinding;
+                        const innerLines = lines.map(l => isBold ? ('<strong>' + escapeHtml(l) + '</strong>') : escapeHtml(l)).join('<br>');
+                        htmlText = '<p style="' + pStyle + '">' + innerLines + '</p>';
+                    } else {
+                        plainText = cleanFinding;
+                        htmlText = isBold ? ('<p style="' + pStyle + '"><strong>' + escapeHtml(cleanFinding) + '</strong></p>') : ('<p style="' + pStyle + '">' + escapeHtml(cleanFinding) + '</p>');
+                    }
                 }
             }
             return { plainText, htmlText };
@@ -436,6 +442,7 @@ const getEmbeddedScript = () => `
                     checkboxEl.textContent = '';
                 }
             }
+            updateSelectAllButtons(batchId);
         };
 
         const copyBatchSelection = async (batchId) => {
@@ -451,7 +458,7 @@ const getEmbeddedScript = () => `
             let htmlTexts = [];
 
             sortedIndices.forEach(i => {
-                const findingEl = document.querySelector(\`.finding-item[data-batch-id="\${batchId}"][data-finding-index="\${i}"]\`);
+                const findingEl = document.querySelector('.finding-item[data-batch-id="' + batchId + '"][data-finding-index="' + i + '"]');
                 if (findingEl) {
                     const { plainText, htmlText } = getCopyContent(findingEl);
                     plainTexts.push(plainText);
@@ -459,20 +466,63 @@ const getEmbeddedScript = () => `
                 }
             });
             
-            // Single newline between regular findings, double newline before IMPRESSION
-            const plainText = plainTexts.reduce((acc, p, idx) => {
-                if (idx === 0) return p;
-                const isImp = /^IMPRESSION/i.test(p.replace(/[*_]/g, '').trim());
-                if (isImp) return acc + '\\n\\n' + p;
-                return acc + '\\n' + p;
-            }, '');
-            const htmlText = htmlTexts.join('');
+            const EMPTY_ROW_HTML = '<p style="font-family: Times New Roman, serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;"><br></p>';
+            const plainText = plainTexts.join('\\n\\n');
+            const htmlText = htmlTexts.join(EMPTY_ROW_HTML);
 
             const success = await copyToClipboard(plainText, htmlText);
+            const totalValid = document.querySelectorAll('.finding-item[data-batch-id="' + batchId + '"]').length;
+            const isSubset = selection.size > 0 && selection.size < totalValid;
+            const deselectedCount = totalValid - selection.size;
             const notificationText = success
-                ? \`Copied \${selection.size} finding\${selection.size > 1 ? 's' : ''}!\`
+                ? (isSubset
+                    ? 'Copied ' + selection.size + ' finding' + (selection.size > 1 ? 's' : '') + ' (' + deselectedCount + ' deselected)!'
+                    : 'Copied ' + selection.size + ' finding' + (selection.size > 1 ? 's' : '') + '!')
                 : 'Copy failed!';
             showNotification(notificationText);
+        };
+
+        const handleSelectAll = async (batchId) => {
+            const findings = document.querySelectorAll('.finding-item[data-batch-id="' + batchId + '"]');
+            if (findings.length === 0) return;
+            if (!multiSelectMode) {
+                toggleMultiSelectMode(true);
+            }
+            if (!selections[batchId]) {
+                selections[batchId] = new Set();
+            }
+            findings.forEach(el => {
+                const idx = parseInt(el.dataset.findingIndex, 10);
+                updateFindingSelection(batchId, idx, true);
+            });
+            updateSelectAllButtons(batchId);
+            await copyBatchSelection(batchId);
+            showNotification('Selected & copied all ' + findings.length + ' findings! Click any to deselect.');
+        };
+
+        const handleDeselectAll = (batchId) => {
+            if (selections[batchId]) {
+                selections[batchId].forEach(idx => {
+                    updateFindingSelection(batchId, idx, false);
+                });
+                selections[batchId].clear();
+            }
+            updateSelectAllButtons(batchId);
+            showNotification('All findings deselected.');
+        };
+
+        const updateSelectAllButtons = (batchId) => {
+            const findings = document.querySelectorAll('.finding-item[data-batch-id="' + batchId + '"]');
+            const selection = selections[batchId];
+            const isAllSelected = selection && findings.length > 0 && selection.size === findings.length;
+            
+            document.querySelectorAll('.select-all-btn[data-batch-id="' + batchId + '"]').forEach(btn => {
+                btn.textContent = isAllSelected ? 'Deselect All' : 'Select All';
+            });
+            const bannerBtn = document.getElementById('banner-select-all-btn');
+            if (bannerBtn) {
+                bannerBtn.textContent = isAllSelected ? 'Deselect All' : 'Select All';
+            }
         };
         
         const toggleMultiSelectMode = (enabled) => {
@@ -852,17 +902,13 @@ const getEmbeddedScript = () => `
                     htmlTexts.push(htmlText);
                 });
 
-                const plainText = plainTexts.reduce((acc, p, idx) => {
-                    if (idx === 0) return p;
-                    const isImp = /^IMPRESSION/i.test(p.replace(/[*_]/g, '').trim());
-                    if (isImp) return acc + '\\n\\n' + p;
-                    return acc + '\\n' + p;
-                }, '');
-                const htmlText = htmlTexts.join('');
+                const EMPTY_ROW_HTML = '<p style="font-family: Times New Roman, serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;"><br></p>';
+                const plainText = plainTexts.join('\\n\\n');
+                const htmlText = htmlTexts.join(EMPTY_ROW_HTML);
                 const success = await copyToClipboard(plainText, htmlText);
 
                 if (success) {
-                    showNotification(\`Copied all \${findingElements.length} findings!\`);
+                    showNotification('Copied all ' + findingElements.length + ' findings!');
                     e.currentTarget.textContent = 'Copied!';
                     setTimeout(() => { e.currentTarget.textContent = 'Copy All'; }, 2000);
                 } else {
@@ -870,6 +916,35 @@ const getEmbeddedScript = () => `
                 }
             });
         });
+
+        document.querySelectorAll('.select-all-btn').forEach(btn => {
+            btn.addEventListener('click', async (e) => {
+                const batchId = e.currentTarget.dataset.batchId;
+                const findings = document.querySelectorAll('.finding-item[data-batch-id="' + batchId + '"]');
+                const selection = selections[batchId];
+                const isAllSelected = selection && findings.length > 0 && selection.size === findings.length;
+                if (isAllSelected) {
+                    handleDeselectAll(batchId);
+                } else {
+                    await handleSelectAll(batchId);
+                }
+            });
+        });
+
+        const bannerSelectAllBtn = document.getElementById('banner-select-all-btn');
+        if (bannerSelectAllBtn) {
+            bannerSelectAllBtn.addEventListener('click', async () => {
+                const firstBatch = document.querySelector('.finding-item')?.dataset.batchId || 'single';
+                const findings = document.querySelectorAll('.finding-item[data-batch-id="' + firstBatch + '"]');
+                const selection = selections[firstBatch];
+                const isAllSelected = selection && findings.length > 0 && selection.size === findings.length;
+                if (isAllSelected) {
+                    handleDeselectAll(firstBatch);
+                } else {
+                    await handleSelectAll(firstBatch);
+                }
+            });
+        }
 
         document.querySelectorAll('.top-undo-btn').forEach(btn => {
             btn.addEventListener('click', (e) => {
@@ -883,7 +958,8 @@ const getEmbeddedScript = () => `
             copyAllTranscriptsBtn.addEventListener('click', async () => {
                 const batches = Array.from(document.querySelectorAll('[data-batch-container-id]'));
                 let plainText = '';
-                let htmlText = '';
+                let htmlParts = [];
+                const EMPTY_ROW_HTML = '<p style="font-family: Times New Roman, serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal;"><br></p>';
 
                 batches.forEach(batchEl => {
                     const batchId = batchEl.dataset.batchContainerId;
@@ -893,22 +969,23 @@ const getEmbeddedScript = () => `
                     
                     if (findingElements.length > 0) {
                         let batchPlainText = [];
-                        let batchHtmlText = '';
+                        let batchHtmlTexts = [];
 
                         findingElements.forEach(el => {
                             const { plainText: findingPlainText, htmlText: findingHtmlText } = getCopyContent(el);
                             batchPlainText.push(findingPlainText);
-                            batchHtmlText += findingHtmlText;
+                            batchHtmlTexts.push(findingHtmlText);
                         });
 
-                        plainText += \`[\${batchName}]\\n\${batchPlainText.join('\\n')}\\n\\n\`;
-                        htmlText += \`<h3>\${batchName}</h3>\` + batchHtmlText;
+                        plainText += '[' + batchName + ']\\n' + batchPlainText.join('\\n\\n') + '\\n\\n';
+                        htmlParts.push('<h3>' + escapeHtml(batchName) + '</h3>' + batchHtmlTexts.join(EMPTY_ROW_HTML));
                     }
                 });
 
                 if (plainText.length === 0) return;
 
-                const success = await copyToClipboard(plainText.trim(), htmlText.trim());
+                const fullHtml = htmlParts.join(EMPTY_ROW_HTML);
+                const success = await copyToClipboard(plainText.trim(), fullHtml.trim());
                 if (success) {
                     copyAllTranscriptsBtn.textContent = 'Copied!';
                     setTimeout(() => { copyAllTranscriptsBtn.textContent = 'Copy All Transcripts'; }, 2000);
@@ -1073,7 +1150,7 @@ const getHTMLTemplate = (title: string, content: string): string => `
       .undo-merge-btn:hover {
         background-color: #eab308;
       }
-      .merge-toggle-btn, .reorder-toggle-btn, .copy-all-btn, #copy-all-transcripts {
+      .merge-toggle-btn, .reorder-toggle-btn, .copy-all-btn, .select-all-btn, #copy-all-transcripts {
         display: inline-flex;
         align-items: center;
         font-size: 0.8125rem;
@@ -1085,6 +1162,14 @@ const getHTMLTemplate = (title: string, content: string): string => `
         color: #334155;
         cursor: pointer;
         transition: all 0.2s;
+      }
+      .select-all-btn {
+        background-color: #dbeafe !important;
+        color: #1e40af !important;
+      }
+      .select-all-btn:hover {
+        background-color: #bfdbfe !important;
+        color: #1e3a8a !important;
       }
       .merge-toggle-btn:hover, .reorder-toggle-btn:hover, .copy-all-btn:hover, #copy-all-transcripts:hover {
         background-color: #cbd5e1;
@@ -1460,8 +1545,9 @@ const getHTMLTemplate = (title: string, content: string): string => `
         </button>
     </div>
 
-    <div id="multi-select-banner" class="fixed bottom-5 left-1/2 -translate-x-1/2 z-40 bg-slate-800 text-white rounded-full shadow-lg flex items-center gap-4 px-5 py-2 transition-all duration-300 ease-in-out">
+    <div id="multi-select-banner" class="fixed bottom-5 left-1/2 -translate-x-1/2 z-40 bg-slate-800 text-white rounded-full shadow-lg flex items-center gap-3 px-5 py-2 transition-all duration-300 ease-in-out">
         <p class="text-sm font-semibold">Multi-select Mode</p>
+        <button id="banner-select-all-btn" class="text-xs font-bold py-1 px-3 rounded-full bg-blue-600 hover:bg-blue-500 text-white transition-colors cursor-pointer">Select All</button>
         <label for="multi-select-toggle" class="flex items-center cursor-pointer select-none">
             <span class="mr-2 text-sm font-medium text-slate-300">OFF</span>
             <div class="relative">
@@ -1623,6 +1709,7 @@ export const generateSingleDictationHTML = (findings: string[], timestamp?: numb
                 <button class="undo-merge-btn hidden text-sm font-semibold py-1 px-3 rounded-lg bg-yellow-400 text-yellow-900 hover:bg-yellow-500 transition-colors" data-batch-id="single">Undo Merge</button>
                 <button class="merge-toggle-btn text-sm font-semibold py-1 px-3 rounded-lg transition-colors bg-slate-200 text-slate-700 hover:bg-slate-300" data-batch-id="single">Merge</button>
                 <button class="reorder-toggle-btn text-sm font-semibold py-1 px-3 rounded-lg transition-colors bg-slate-200 text-slate-700 hover:bg-slate-300" data-batch-id="single">Reorder</button>
+                <button class="select-all-btn text-sm font-semibold py-1 px-3 rounded-lg transition-colors bg-blue-100 text-blue-800 hover:bg-blue-200 cursor-pointer" data-batch-id="single">Select All</button>
                 <button class="copy-all-btn text-sm font-semibold py-1 px-3 rounded-lg transition-colors bg-slate-200 text-slate-700 hover:bg-slate-300" data-batch-id="single">Copy All</button>
             </div>
             ` : ''}
@@ -1677,6 +1764,7 @@ export const generateBatchDictationHTML = (batches: ReportBatch[], timestamp?: n
                          <button class="undo-merge-btn hidden text-sm font-semibold py-1 px-3 rounded-lg bg-yellow-400 text-yellow-900 hover:bg-yellow-500 transition-colors" data-batch-id="${batch.id}">Undo Merge</button>
                          <button class="merge-toggle-btn text-sm font-semibold py-1 px-3 rounded-lg transition-colors bg-slate-200 text-slate-700 hover:bg-slate-300" data-batch-id="${batch.id}">Merge</button>
                          <button class="reorder-toggle-btn text-sm font-semibold py-1 px-3 rounded-lg transition-colors bg-slate-200 text-slate-700 hover:bg-slate-300" data-batch-id="${batch.id}">Reorder</button>
+                         <button class="select-all-btn text-sm font-semibold py-1 px-3 rounded-lg transition-colors bg-blue-100 text-blue-800 hover:bg-blue-200 cursor-pointer" data-batch-id="${batch.id}">Select All</button>
                          <button class="copy-all-btn text-sm font-semibold py-1 px-3 rounded-lg transition-colors bg-slate-200 text-slate-700 hover:bg-slate-300" data-batch-id="${batch.id}">Copy All</button>
                     </div>
                     ${renderFindingsList(batch.findings, batch.id)}
