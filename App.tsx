@@ -26,7 +26,7 @@ import CloseIcon from './components/icons/CloseIcon';
 import CustomPromptInput, { DocxTemplateData } from './components/ui/CustomPromptInput';
 import { AVAILABLE_MODELS, DEFAULT_SELECTED_MODEL } from './constants';
 import { mergeAudioBlobs, triggerAudioDownload } from './services/audioMerger';
-import { autoSaveSingleDictation, autoSaveLiveDictation, SaveResult, syncPendingLocalDictationsToDrive, isDriveConnected, subscribeToAuth } from './services/googleDriveService';
+import { autoSaveSingleDictation, autoSaveLiveDictation, autoSaveBatchDictations, SaveResult, syncPendingLocalDictationsToDrive, isDriveConnected, subscribeToAuth } from './services/googleDriveService';
 import { DriveStatusBadge } from './components/DriveStatusBadge';
 import { DriveAutoSaveToast } from './components/DriveAutoSaveToast';
 import { DriveReportsModal } from './components/DriveReportsModal';
@@ -158,9 +158,10 @@ const App: React.FC = () => {
   const [activeMacrosCount, setActiveMacrosCount] = useState<number>(0);
   const [customKeysCount, setCustomKeysCount] = useState<number>(() => getUserApiKeys().length);
   const [isSecretUnlocked, setIsSecretUnlocked] = useState<boolean>(() => isBuiltinKeysUnlocked());
+  const [hasMultipleSingleDictations, setHasMultipleSingleDictations] = useState<boolean>(false);
 
   const handleHeaderTitleClick = useCallback(() => {
-    const input = window.prompt("Enter secret key (e.g. 1198):");
+    const input = window.prompt("Enter secret key:");
     if (input !== null && input.trim()) {
       const res = unlockBuiltinKeys(input.trim());
       if (res.success) {
@@ -648,38 +649,24 @@ const App: React.FC = () => {
         });
       }
 
-      // 3. Retrieve existing batches in this tab (if any) and append immediately
+      // 3. Replace any existing batches in this tab with these new single dictations (clean reset per user request)
       const curBatchKey = getBatchModeStorageKey(curTabId);
-      let existingBatches: any[] = [];
-      try {
-        const stored = await getReportSession(curBatchKey);
-        if (stored && Array.isArray(stored)) {
-          existingBatches = stored;
-        } else {
-          const raw = localStorage.getItem(curBatchKey);
-          if (raw) existingBatches = JSON.parse(raw);
-        }
-      } catch (_) {}
-
-      if (existingBatches.length === 0) {
-        try {
-          const storedLegacy = await getReportSession(BATCH_MODE_STORAGE_KEY);
-          if (storedLegacy && Array.isArray(storedLegacy)) {
-            existingBatches = storedLegacy;
-          } else {
-            const rawLegacy = localStorage.getItem(BATCH_MODE_STORAGE_KEY);
-            if (rawLegacy) existingBatches = JSON.parse(rawLegacy);
-          }
-        } catch (_) {}
-      }
-
-      const updatedBatches = [...existingBatches, ...newBatches];
+      const updatedBatches = [...newBatches];
 
       // 4. Save updated batches to storage session & localStorage IMMEDIATELY (0ms delay)
       await saveReportSession(curBatchKey, updatedBatches);
       safeLocalStorage.setItem(curBatchKey, updatedBatches);
       await saveReportSession(BATCH_MODE_STORAGE_KEY, updatedBatches).catch(() => {});
       safeLocalStorage.setItem(BATCH_MODE_STORAGE_KEY, updatedBatches);
+
+      // Auto-save batch dictations to Google Drive if connected
+      if (isDriveConnected()) {
+        autoSaveBatchDictations(updatedBatches, undefined, now).then(res => {
+          if (res.success) {
+            setDriveSaveResult({ success: true, fileName: `${updatedBatches.length} reports saved to Drive` });
+          }
+        }).catch(err => console.warn('Drive batch auto-save notice:', err));
+      }
 
       // Instantly notify Batch Mode to refresh!
       window.dispatchEvent(new CustomEvent('raddoc_batch_mode_updated'));
@@ -723,6 +710,14 @@ const App: React.FC = () => {
         await saveReportSession(BATCH_MODE_STORAGE_KEY, updatedBatches).catch(() => {});
         safeLocalStorage.setItem(BATCH_MODE_STORAGE_KEY, updatedBatches);
         window.dispatchEvent(new CustomEvent('raddoc_batch_mode_updated'));
+
+        if (isDriveConnected()) {
+          autoSaveBatchDictations(updatedBatches, undefined, now).then(res => {
+            if (res.success) {
+              setDriveSaveResult({ success: true, fileName: `${updatedBatches.filter(b => b.status === 'complete').length} reports saved to Drive` });
+            }
+          }).catch(err => console.warn('Drive incremental batch auto-save notice:', err));
+        }
       }
 
       // 6. Clear single mode in-flight states
@@ -743,6 +738,7 @@ const App: React.FC = () => {
       isFirstDictationProcessingRef.current = false;
       isSeparatingConcurrentRef.current = false;
       setIsSeparatingConcurrent(false);
+      setHasMultipleSingleDictations(true);
 
       // 8. Transition directly to Batch Mode with all reports side-by-side
       setBatchModeInstanceKey(Date.now());
@@ -929,6 +925,7 @@ const App: React.FC = () => {
     queuedConcurrentAudiosRef.current.push(newBlob);
     setQueuedAudiosCount(queuedConcurrentAudiosRef.current.length);
     setIsSimultaneousQueued(true);
+    setHasMultipleSingleDictations(true);
 
     // If first dictation is still running its processAudio:
     if (isFirstDictationProcessingRef.current) {
@@ -1567,6 +1564,34 @@ const App: React.FC = () => {
               </div>
             )}
 
+            {/* Flashing instruction banner to switch to Batch Dictation */}
+            {(hasMultipleSingleDictations || queuedAudiosCount > 0 || isSeparatingConcurrent || isSimultaneousQueued) && (
+              <div 
+                onClick={() => {
+                  setHasMultipleSingleDictations(false);
+                  setMode('batch');
+                  window.dispatchEvent(new CustomEvent('raddoc_batch_mode_updated'));
+                }}
+                className="p-3.5 bg-gradient-to-r from-amber-500 via-rose-500 to-indigo-600 hover:from-amber-600 hover:to-indigo-700 text-white rounded-2xl shadow-xl flex items-center justify-between cursor-pointer transition-all animate-pulse hover:scale-[1.01] border-2 border-white/50"
+                title="Click here to switch to Batch Dictation to view all your dictated reports side-by-side"
+              >
+                <div className="flex items-center gap-2.5">
+                  <span className="w-3.5 h-3.5 rounded-full bg-yellow-300 animate-ping shrink-0" />
+                  <div>
+                    <p className="text-xs sm:text-sm font-black tracking-wide uppercase text-yellow-100 flex items-center gap-1.5">
+                      👉 SWITCH TO BATCH DICTATION TO VIEW DICTATED REPORTS!
+                    </p>
+                    <p className="text-[11px] sm:text-xs text-white/95 font-medium">
+                      All your single dictations are placed as separate reports in Batch Mode. Previous batches replaced. Auto-saved to Google Drive.
+                    </p>
+                  </div>
+                </div>
+                <span className="bg-white text-slate-900 font-extrabold text-xs px-3 py-1.5 rounded-xl whitespace-nowrap shadow-md shrink-0 ml-2">
+                  Open Batch Mode →
+                </span>
+              </div>
+            )}
+
             <div className="bg-blue-50/90 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 rounded-2xl p-5 shadow-sm text-center">
               <Spinner className="w-8 h-8 mx-auto text-blue-600 dark:text-blue-400" />
               <p className="text-slate-800 dark:text-slate-100 mt-3 text-lg font-bold">
@@ -1698,6 +1723,32 @@ const App: React.FC = () => {
       case AppStatus.Success:
         return (
           <ErrorBoundary sectionName="Results Display" onReset={resetSingleMode}>
+            {hasMultipleSingleDictations && (
+              <div 
+                onClick={() => {
+                  setHasMultipleSingleDictations(false);
+                  setMode('batch');
+                  window.dispatchEvent(new CustomEvent('raddoc_batch_mode_updated'));
+                }}
+                className="mb-4 p-3.5 bg-gradient-to-r from-amber-500 via-rose-500 to-indigo-600 hover:from-amber-600 hover:to-indigo-700 text-white rounded-2xl shadow-xl flex items-center justify-between cursor-pointer transition-all animate-pulse hover:scale-[1.01] border-2 border-white/50"
+                title="Click here to switch to Batch Dictation to view all your dictated reports side-by-side"
+              >
+                <div className="flex items-center gap-2.5">
+                  <span className="w-3.5 h-3.5 rounded-full bg-yellow-300 animate-ping shrink-0" />
+                  <div>
+                    <p className="text-xs sm:text-sm font-black tracking-wide uppercase text-yellow-100 flex items-center gap-1.5">
+                      👉 SWITCH TO BATCH DICTATION TO VIEW DICTATED REPORTS!
+                    </p>
+                    <p className="text-[11px] sm:text-xs text-white/95 font-medium">
+                      You dictated multiple reports! All reports have replaced previous batches in Batch Mode and are saved to Google Drive.
+                    </p>
+                  </div>
+                </div>
+                <span className="bg-white text-slate-900 font-extrabold text-xs px-3 py-1.5 rounded-xl whitespace-nowrap shadow-md shrink-0 ml-2">
+                  Open Batch Mode →
+                </span>
+              </div>
+            )}
             <ResultsDisplay 
             findings={findings} 
             onReset={resetSingleMode} 
@@ -2168,18 +2219,26 @@ const App: React.FC = () => {
               <button
                 type="button"
                 onClick={() => {
+                  setHasMultipleSingleDictations(false);
                   setMode('batch');
                   window.dispatchEvent(new CustomEvent('raddoc_batch_mode_updated'));
                 }}
-                className={`flex-1 sm:flex-initial flex items-center justify-center gap-1.5 sm:gap-2 px-3 sm:px-5 py-2 rounded-lg text-xs sm:text-sm font-semibold transition-all min-h-[44px] ${
+                className={`flex-1 sm:flex-initial flex items-center justify-center gap-1.5 sm:gap-2 px-3 sm:px-5 py-2 rounded-lg text-xs sm:text-sm font-semibold transition-all min-h-[44px] relative ${
                   mode === 'batch'
                     ? 'bg-white dark:bg-slate-700 text-blue-600 dark:text-blue-400 shadow-sm'
-                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+                    : (hasMultipleSingleDictations || queuedAudiosCount > 0 || isSeparatingConcurrent || isSimultaneousQueued)
+                      ? 'text-white bg-gradient-to-r from-amber-500 via-rose-500 to-indigo-600 animate-pulse shadow-md font-bold'
+                      : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
                 }`}
                 aria-label="Batch Processing Mode"
               >
                 <span className="text-sm shrink-0">📑</span>
                 <span className="whitespace-nowrap">Batch Mode</span>
+                {(hasMultipleSingleDictations || queuedAudiosCount > 0 || isSeparatingConcurrent || isSimultaneousQueued) && (
+                  <span className="absolute -top-2 -right-1 px-1.5 py-0.5 bg-yellow-400 text-slate-900 text-[10px] font-black rounded-full animate-bounce shadow">
+                    GO HERE!
+                  </span>
+                )}
               </button>
               <button
                 type="button"

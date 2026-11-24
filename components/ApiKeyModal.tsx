@@ -356,7 +356,7 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
             )}
           </div>
 
-          {/* Secret Key / Passcode 1198 Section */}
+          {/* Administrative Secret Key Section */}
           <div className="p-4 rounded-xl border border-purple-200 dark:border-purple-800/70 bg-purple-50/40 dark:bg-purple-950/20 space-y-3">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
@@ -388,7 +388,7 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
             ) : (
               <div className="space-y-2">
                 <p className="text-xs text-slate-600 dark:text-slate-300">
-                  If you have the administrative secret key (e.g. 1198), enter it below to activate the built-in pool of 9 rotating API keys:
+                  If you have an administrative secret key, enter it below to activate the built-in pool of 9 rotating API keys:
                 </p>
                 <div className="flex items-center gap-2">
                   <input
