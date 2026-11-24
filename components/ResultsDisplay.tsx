@@ -384,6 +384,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     stopRecording: stopGlobalModificationRecording,
     pauseRecording: pauseGlobalModificationRecording,
     resumeRecording: resumeGlobalModificationRecording,
+    downloadCurrentAudio: downloadModificationAudio,
     isPaused: isModificationPaused,
     recordingDuration: modificationDuration,
     unsavedSession: modifyUnsavedSession,
@@ -2922,6 +2923,17 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                   >
                     {isModificationPaused ? 'Resume' : 'Pause'}
                   </button>
+                  {isModificationPaused && (
+                    <button
+                      type="button"
+                      onClick={() => downloadModificationAudio('dictated_changes_paused')}
+                      className="flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded-lg bg-slate-700 hover:bg-slate-800 text-white transition-colors cursor-pointer shadow-xs"
+                      title="Download audio recorded so far"
+                    >
+                      <DownloadIcon className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Download</span>
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={handleStopModification}

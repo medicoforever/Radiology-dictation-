@@ -22,6 +22,8 @@ type AudioRecorderResult = {
   stopRecording: () => Promise<Blob>;
   pauseRecording: () => void;
   resumeRecording: () => void;
+  getCurrentAudioBlob: () => Blob | null;
+  downloadCurrentAudio: (filenamePrefix?: string) => boolean;
   error: string | null;
   interruptedNotice: string | null;
   clearInterruptedNotice: () => void;
@@ -412,6 +414,9 @@ export const useAudioRecorder = (): AudioRecorderResult => {
 
   const pauseRecording = useCallback(() => {
     if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+      try {
+        mediaRecorderRef.current.requestData();
+      } catch (e) {}
       mediaRecorderRef.current.pause();
       setIsPaused(true);
     }
@@ -424,6 +429,35 @@ export const useAudioRecorder = (): AudioRecorderResult => {
       lastChunkTimestampRef.current = Date.now();
     }
   }, []);
+
+  const getCurrentAudioBlob = useCallback((): Blob | null => {
+    if (audioChunksRef.current && audioChunksRef.current.length > 0) {
+      return new Blob(audioChunksRef.current, { type: mimeTypeRef.current || 'audio/webm' });
+    }
+    return null;
+  }, []);
+
+  const downloadCurrentAudio = useCallback((filenamePrefix = 'dictation_audio') => {
+    if (mediaRecorderRef.current && (mediaRecorderRef.current.state === 'recording' || mediaRecorderRef.current.state === 'paused')) {
+      try {
+        mediaRecorderRef.current.requestData();
+      } catch (e) {}
+    }
+    const blob = getCurrentAudioBlob();
+    if (!blob || blob.size === 0) {
+      return false;
+    }
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const ext = (mimeTypeRef.current && mimeTypeRef.current.includes('ogg')) ? 'ogg' : (mimeTypeRef.current && mimeTypeRef.current.includes('mp4')) ? 'mp4' : 'webm';
+    a.download = `${filenamePrefix}_${new Date().toISOString().replace(/[:.]/g, '-')}.${ext}`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    return true;
+  }, [getCurrentAudioBlob]);
 
   const stopRecording = useCallback((): Promise<Blob> => {
     isUserInitiatedStopRef.current = true;
@@ -542,6 +576,8 @@ export const useAudioRecorder = (): AudioRecorderResult => {
     stopRecording,
     pauseRecording,
     resumeRecording,
+    getCurrentAudioBlob,
+    downloadCurrentAudio,
     error,
     interruptedNotice,
     clearInterruptedNotice,

@@ -25,7 +25,7 @@ import StopIcon from './components/icons/StopIcon';
 import CloseIcon from './components/icons/CloseIcon';
 import CustomPromptInput, { DocxTemplateData } from './components/ui/CustomPromptInput';
 import { AVAILABLE_MODELS, DEFAULT_SELECTED_MODEL } from './constants';
-import { mergeAudioBlobs } from './services/audioMerger';
+import { mergeAudioBlobs, triggerAudioDownload } from './services/audioMerger';
 import { autoSaveSingleDictation, autoSaveLiveDictation, SaveResult, syncPendingLocalDictationsToDrive, isDriveConnected, subscribeToAuth } from './services/googleDriveService';
 import { DriveStatusBadge } from './components/DriveStatusBadge';
 import { DriveAutoSaveToast } from './components/DriveAutoSaveToast';
@@ -629,48 +629,26 @@ const App: React.FC = () => {
 
       const newBatches = [batch1];
 
-      // 2. Process all subsequent audios (Dictation 2, 3, 4...)
+      // 2. Prepare all subsequent audios immediately with status: 'processing'
       for (let i = 0; i < subsequentAudios.length; i++) {
         const audio = subsequentAudios[i];
         const batchId = `batch-sep-${i + 2}-${now + i + 1}`;
         await saveAudioBlob(`batch_audio_${curTabId}_${batchId}_0`, audio);
         await saveAudioBlob(`batch_audio_${batchId}_0`, audio);
 
-        let findings: string[] = [];
-        let itemStatus: 'complete' | 'error' = 'complete';
-        try {
-          findings = await processAudio(
-            audio,
-            selectedModel,
-            customPrompt,
-            customImages,
-            undefined,
-            customDocx
-          );
-        } catch (err) {
-          console.error(`Error transcribing concurrent dictation #${i + 2}:`, err);
-          itemStatus = 'error';
-          const msg = err instanceof Error ? err.message : 'Error processing dictation';
-          findings = [
-            `BOLD::Error processing dictation #${i + 2}.`,
-            `[Error: ${msg}]. Audio preserved below.`
-          ];
-        }
-
-        const reportName = getTitle(findings, `Report ${i + 2}`);
         newBatches.push({
           id: batchId,
-          name: reportName,
+          name: `Report ${i + 2}`,
           audioCount: 1,
-          findings,
-          status: itemStatus,
+          findings: ['Processing audio with AI...'],
+          status: 'processing' as const,
           selectedModel,
           customPrompt,
           customDocx: customDocx || null,
         });
       }
 
-      // 3. Retrieve existing batches in this tab (if any) and append
+      // 3. Retrieve existing batches in this tab (if any) and append immediately
       const curBatchKey = getBatchModeStorageKey(curTabId);
       let existingBatches: any[] = [];
       try {
@@ -697,13 +675,57 @@ const App: React.FC = () => {
 
       const updatedBatches = [...existingBatches, ...newBatches];
 
-      // 4. Save updated batches to storage session & localStorage (both tab-scoped and fallback keys)
+      // 4. Save updated batches to storage session & localStorage IMMEDIATELY (0ms delay)
       await saveReportSession(curBatchKey, updatedBatches);
       safeLocalStorage.setItem(curBatchKey, updatedBatches);
       await saveReportSession(BATCH_MODE_STORAGE_KEY, updatedBatches).catch(() => {});
       safeLocalStorage.setItem(BATCH_MODE_STORAGE_KEY, updatedBatches);
 
-      // 5. Clear single mode in-flight states
+      // Instantly notify Batch Mode to refresh!
+      window.dispatchEvent(new CustomEvent('raddoc_batch_mode_updated'));
+
+      // 5. Process subsequent audios and update storage incrementally as each finishes
+      for (let i = 0; i < subsequentAudios.length; i++) {
+        const audio = subsequentAudios[i];
+        const batchId = `batch-sep-${i + 2}-${now + i + 1}`;
+
+        let findings: string[] = [];
+        let itemStatus: 'complete' | 'error' = 'complete';
+        try {
+          findings = await processAudio(
+            audio,
+            selectedModel,
+            customPrompt,
+            customImages,
+            undefined,
+            customDocx
+          );
+        } catch (err) {
+          console.error(`Error transcribing concurrent dictation #${i + 2}:`, err);
+          itemStatus = 'error';
+          const msg = err instanceof Error ? err.message : 'Error processing dictation';
+          findings = [
+            `BOLD::Error processing dictation #${i + 2}.`,
+            `[Error: ${msg}]. Audio preserved below.`
+          ];
+        }
+
+        const reportName = getTitle(findings, `Report ${i + 2}`);
+        const targetBatch = updatedBatches.find(b => b.id === batchId);
+        if (targetBatch) {
+          targetBatch.findings = findings;
+          targetBatch.name = reportName;
+          targetBatch.status = itemStatus;
+        }
+
+        await saveReportSession(curBatchKey, updatedBatches);
+        safeLocalStorage.setItem(curBatchKey, updatedBatches);
+        await saveReportSession(BATCH_MODE_STORAGE_KEY, updatedBatches).catch(() => {});
+        safeLocalStorage.setItem(BATCH_MODE_STORAGE_KEY, updatedBatches);
+        window.dispatchEvent(new CustomEvent('raddoc_batch_mode_updated'));
+      }
+
+      // 6. Clear single mode in-flight states
       deleteAudioBlob(`in_flight_recording_${curTabId}`).catch(() => {});
       deleteAudioBlob('in_flight_recording').catch(() => {});
       try {
@@ -711,7 +733,7 @@ const App: React.FC = () => {
         localStorage.removeItem('in_flight_recording_meta');
       } catch (_) {}
 
-      // 6. Reset concurrent refs
+      // 7. Reset concurrent refs
       firstDictationFindingsRef.current = null;
       firstDictationAudioRef.current = null;
       firstDictationErrorRef.current = null;
@@ -722,7 +744,7 @@ const App: React.FC = () => {
       isSeparatingConcurrentRef.current = false;
       setIsSeparatingConcurrent(false);
 
-      // 7. Transition directly to Batch Mode with all reports side-by-side
+      // 8. Transition directly to Batch Mode with all reports side-by-side
       setBatchModeInstanceKey(Date.now());
       setStatus(AppStatus.Idle);
       setMode('batch');
@@ -1486,15 +1508,61 @@ const App: React.FC = () => {
         return (
           <div className="space-y-6 animate-fade-in">
             {firstDictationError && (
-              <div className="bg-rose-50 dark:bg-rose-950/40 border border-rose-300 dark:border-rose-700/60 p-4 rounded-2xl flex items-start gap-3 text-left shadow-sm">
-                <WarningIcon className="w-5 h-5 text-rose-600 dark:text-rose-400 shrink-0 mt-0.5" />
-                <div className="text-xs sm:text-sm">
-                  <p className="font-bold text-rose-800 dark:text-rose-200">
-                    Previous dictation error: {firstDictationError}
-                  </p>
-                  <p className="text-rose-700 dark:text-rose-300 mt-1">
-                    Your previous dictation's audio has been safely preserved! You can continue speaking your current dictation below without interruption. All dictations will be organized side-by-side in Batch Mode.
-                  </p>
+              <div className="bg-rose-50 dark:bg-rose-950/40 border border-rose-300 dark:border-rose-700/60 p-4 rounded-2xl flex flex-col sm:flex-row items-start justify-between gap-3 text-left shadow-sm">
+                <div className="flex items-start gap-3">
+                  <WarningIcon className="w-5 h-5 text-rose-600 dark:text-rose-400 shrink-0 mt-0.5" />
+                  <div className="text-xs sm:text-sm">
+                    <p className="font-bold text-rose-800 dark:text-rose-200">
+                      Previous dictation error: {firstDictationError}
+                    </p>
+                    <p className="text-rose-700 dark:text-rose-300 mt-1">
+                      Your previous dictation's audio has been safely preserved! You can download it below, retry analysis, or continue dictating below without interruption.
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0 self-end sm:self-center flex-wrap">
+                  {(firstDictationAudioRef.current || audioBlob) && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const blob = firstDictationAudioRef.current || (Array.isArray(audioBlob) ? audioBlob[0] : audioBlob);
+                        if (blob) {
+                          triggerAudioDownload(blob, 'preserved_previous_dictation');
+                        }
+                      }}
+                      className="px-3 py-1.5 bg-rose-700 hover:bg-rose-800 text-white rounded-lg text-xs font-bold transition-colors flex items-center gap-1.5 shadow-xs cursor-pointer"
+                      title="Download the audio that encountered an error"
+                    >
+                      <DownloadIcon className="w-3.5 h-3.5" /> Download Audio
+                    </button>
+                  )}
+                  {(firstDictationAudioRef.current || audioBlob) && (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const blob = firstDictationAudioRef.current || (Array.isArray(audioBlob) ? audioBlob[0] : audioBlob);
+                        if (blob) {
+                          setFirstDictationError(null);
+                          firstDictationErrorRef.current = null;
+                          await handleRecordingComplete(blob);
+                        }
+                      }}
+                      className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-bold transition-colors flex items-center gap-1.5 shadow-xs cursor-pointer"
+                      title="Retry processing with rotating API keys"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" /> Retry Analysis
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setFirstDictationError(null);
+                      firstDictationErrorRef.current = null;
+                    }}
+                    className="px-2.5 py-1.5 bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-300 dark:hover:bg-slate-700 rounded-lg text-xs font-semibold transition-colors cursor-pointer"
+                  >
+                    Dismiss
+                  </button>
                 </div>
               </div>
             )}
@@ -1571,8 +1639,8 @@ const App: React.FC = () => {
               </div>
             )}
 
-            {!isSeparatingConcurrent && (
-              <div className="border border-emerald-200 dark:border-emerald-800/60 bg-emerald-50/40 dark:bg-emerald-950/20 rounded-2xl p-4 sm:p-5 shadow-sm">
+            {/* Always keep Simultaneous Dictation active & visible - never forbidden! */}
+            <div className="border border-emerald-200 dark:border-emerald-800/60 bg-emerald-50/40 dark:bg-emerald-950/20 rounded-2xl p-4 sm:p-5 shadow-sm">
                 <div className="flex items-center justify-between mb-3 px-1">
                   <span className="text-sm font-bold text-emerald-800 dark:text-emerald-200 flex items-center gap-2">
                     <MicIcon className="w-4 h-4 text-emerald-600 animate-pulse" />
@@ -1625,7 +1693,6 @@ const App: React.FC = () => {
                   onMultipleFilesUploaded={(files) => setMultipleFilesModal(files)}
                 />
               </div>
-            )}
           </div>
         );
       case AppStatus.Success:
@@ -2100,7 +2167,10 @@ const App: React.FC = () => {
               </button>
               <button
                 type="button"
-                onClick={() => setMode('batch')}
+                onClick={() => {
+                  setMode('batch');
+                  window.dispatchEvent(new CustomEvent('raddoc_batch_mode_updated'));
+                }}
                 className={`flex-1 sm:flex-initial flex items-center justify-center gap-1.5 sm:gap-2 px-3 sm:px-5 py-2 rounded-lg text-xs sm:text-sm font-semibold transition-all min-h-[44px] ${
                   mode === 'batch'
                     ? 'bg-white dark:bg-slate-700 text-blue-600 dark:text-blue-400 shadow-sm'

@@ -193,6 +193,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         startRecording: startMainRecording,
         pauseRecording: pauseMainRecording,
         resumeRecording: resumeMainRecording,
+        downloadCurrentAudio: downloadMainCurrentAudio,
         error: mainRecorderError,
         unsavedSession,
         getUnsavedSessionBlob,
@@ -604,95 +605,93 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         driveSyncedBatchHashRef.current = driveSyncedBatchHash;
     }, [driveSyncedBatchHash]);
 
-     // Load state from localStorage & IndexedDB on initial render (tab-isolated)
-    useEffect(() => {
-        const loadState = async () => {
-            try {
-                const currentTabId = getTabId();
-                const curKey = getBatchModeStorageKey(currentTabId);
-                let savedBatches: SerializableBatch[] | null = await getReportSession(curKey);
-                if (!savedBatches || !Array.isArray(savedBatches) || savedBatches.length === 0) {
-                    const savedStateJSON = localStorage.getItem(curKey);
-                    if (savedStateJSON) {
-                        try {
-                            savedBatches = JSON.parse(savedStateJSON);
-                        } catch {
-                            savedBatches = null;
-                        }
+     // Load state from localStorage & IndexedDB with instant responsiveness and event subscription
+    const loadState = useCallback(async () => {
+        try {
+            const currentTabId = getTabId();
+            const curKey = getBatchModeStorageKey(currentTabId);
+            let savedBatches: SerializableBatch[] | null = await getReportSession(curKey);
+            if (!savedBatches || !Array.isArray(savedBatches) || savedBatches.length === 0) {
+                const savedStateJSON = localStorage.getItem(curKey);
+                if (savedStateJSON) {
+                    try {
+                        savedBatches = JSON.parse(savedStateJSON);
+                    } catch {
+                        savedBatches = null;
                     }
                 }
-                // Fallback to legacy global key once for existing sessions, and migrate to tab-scoped key
-                if (!savedBatches || !Array.isArray(savedBatches) || savedBatches.length === 0) {
-                    savedBatches = await getReportSession(BATCH_MODE_STORAGE_KEY);
-                    if (!savedBatches) {
-                        const legacyJSON = localStorage.getItem(BATCH_MODE_STORAGE_KEY);
-                        if (legacyJSON) {
-                            try { savedBatches = JSON.parse(legacyJSON); } catch {}
-                        }
-                    }
-                    if (savedBatches && Array.isArray(savedBatches) && savedBatches.length > 0) {
-                        await saveReportSession(curKey, savedBatches);
-                        await deleteReportSession(BATCH_MODE_STORAGE_KEY).catch(() => {});
-                        localStorage.removeItem(BATCH_MODE_STORAGE_KEY);
+            }
+            // Fallback to legacy global key once for existing sessions, and migrate to tab-scoped key
+            if (!savedBatches || !Array.isArray(savedBatches) || savedBatches.length === 0) {
+                savedBatches = await getReportSession(BATCH_MODE_STORAGE_KEY);
+                if (!savedBatches) {
+                    const legacyJSON = localStorage.getItem(BATCH_MODE_STORAGE_KEY);
+                    if (legacyJSON) {
+                        try { savedBatches = JSON.parse(legacyJSON); } catch {}
                     }
                 }
                 if (savedBatches && Array.isArray(savedBatches) && savedBatches.length > 0) {
-                    const restoredBatches: Batch[] = await Promise.all(savedBatches.map(async (savedBatch) => {
-                        const audioBlobs: Blob[] = [];
+                    await saveReportSession(curKey, savedBatches);
+                    await deleteReportSession(BATCH_MODE_STORAGE_KEY).catch(() => {});
+                    localStorage.removeItem(BATCH_MODE_STORAGE_KEY);
+                }
+            }
+            if (savedBatches && Array.isArray(savedBatches) && savedBatches.length > 0) {
+                const restoredBatches: Batch[] = await Promise.all(savedBatches.map(async (savedBatch) => {
+                    const audioBlobs: Blob[] = [];
 
-                        // 1. Load audio blobs from IndexedDB by tab-scoped key, falling back to legacy key
-                        const count = savedBatch.audioCount ?? (savedBatch.audioBlobs ? savedBatch.audioBlobs.length : 0);
-                        for (let idx = 0; idx < count; idx++) {
-                            const blob = (await getAudioBlob(`batch_audio_${currentTabId}_${savedBatch.id}_${idx}`)) ||
-                                         (await getAudioBlob(`batch_audio_${savedBatch.id}_${idx}`));
-                            if (blob) {
-                                audioBlobs.push(blob);
-                            } else if (savedBatch.audioBlobs && savedBatch.audioBlobs[idx]?.data) {
-                                // Fallback to legacy base64 if present
-                                try {
-                                    audioBlobs.push(base64ToBlob(savedBatch.audioBlobs[idx].data, savedBatch.audioBlobs[idx].type));
-                                } catch (e) {
-                                    console.warn(`Could not decode legacy base64 audio for batch ${savedBatch.name}:`, e);
-                                }
-                            }
-                        }
-                        
-                        let chat: Chat | null = null;
-                        // Recreate chat session for batches that have been processed
-                        if (savedBatch.status === 'complete' && savedBatch.findings && audioBlobs.length > 0) {
+                    // Load audio blobs from IndexedDB by tab-scoped key, falling back to legacy key
+                    const count = savedBatch.audioCount ?? (savedBatch.audioBlobs ? savedBatch.audioBlobs.length : 0);
+                    for (let idx = 0; idx < count; idx++) {
+                        const blob = (await getAudioBlob(`batch_audio_${currentTabId}_${savedBatch.id}_${idx}`)) ||
+                                     (await getAudioBlob(`batch_audio_${savedBatch.id}_${idx}`));
+                        if (blob) {
+                            audioBlobs.push(blob);
+                        } else if (savedBatch.audioBlobs && savedBatch.audioBlobs[idx]?.data) {
                             try {
-                                const mergedBlob = await mergeMultipleAudioBlobs(audioBlobs);
-                                chat = await createChat(mergedBlob, savedBatch.findings, savedBatch.customPrompt, savedBatch.customImages, savedBatch.selectedModel || selectedModel);
+                                audioBlobs.push(base64ToBlob(savedBatch.audioBlobs[idx].data, savedBatch.audioBlobs[idx].type));
                             } catch (e) {
-                                console.error(`Failed to recreate chat for batch ${savedBatch.name}:`, e);
+                                console.warn(`Could not decode legacy base64 audio for batch ${savedBatch.name}:`, e);
                             }
                         }
+                    }
 
-                        const { audioCount: _, audioBlobs: __, ...batchFields } = savedBatch;
+                    const { audioCount: _, audioBlobs: __, ...batchFields } = savedBatch;
 
-                        return {
-                            ...batchFields,
-                            audioBlobs,
-                            chat,
-                        };
-                    }));
-                    
-                    if (restoredBatches.length > 0) {
-                        setBatches(restoredBatches);
-                        // Open the first processed batch accordion for better UX
-                        const firstProcessed = restoredBatches.find(b => b.findings);
-                        if (firstProcessed) {
-                            setOpenAccordion(firstProcessed.id);
+                    return {
+                        ...batchFields,
+                        audioBlobs,
+                        chat: null,
+                    };
+                }));
+                
+                if (restoredBatches.length > 0) {
+                    setBatches(restoredBatches);
+                    // Open the first processed batch accordion for better UX
+                    const firstProcessed = restoredBatches.find(b => b.findings);
+                    if (firstProcessed) {
+                        setOpenAccordion(firstProcessed.id);
+                    }
+
+                    // Asynchronously warm up chats in background without blocking UI
+                    restoredBatches.forEach(async (b) => {
+                        if (b.status === 'complete' && b.findings && b.audioBlobs.length > 0) {
+                            try {
+                                const mergedBlob = await mergeMultipleAudioBlobs(b.audioBlobs);
+                                const chatSession = await createChat(mergedBlob, b.findings, b.customPrompt, b.customImages, b.selectedModel || selectedModel);
+                                setBatches(prev => prev.map(item => item.id === b.id && !item.chat ? { ...item, chat: chatSession } : item));
+                            } catch (_) {}
                         }
-                    }
+                    });
+                }
 
-                    const savedFolderRaw = localStorage.getItem(BATCH_DRIVE_FOLDER_KEY);
-                    if (savedFolderRaw) {
-                        try {
-                            setDriveBatchFolder(JSON.parse(savedFolderRaw));
-                        } catch {}
-                    }
-                    const savedSessionTimestamp = localStorage.getItem(BATCH_SESSION_TIMESTAMP_KEY);
+                const savedFolderRaw = localStorage.getItem(BATCH_DRIVE_FOLDER_KEY);
+                if (savedFolderRaw) {
+                    try {
+                        setDriveBatchFolder(JSON.parse(savedFolderRaw));
+                    } catch {}
+                }
+                const savedSessionTimestamp = localStorage.getItem(BATCH_SESSION_TIMESTAMP_KEY);
                     if (savedSessionTimestamp) {
                         batchSessionTimestampRef.current = parseInt(savedSessionTimestamp, 10);
                     }
@@ -707,9 +706,19 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             } finally {
                 setIsRestored(true);
             }
-        };
+    }, [selectedModel]);
+
+    useEffect(() => {
         loadState();
-    }, []);
+    }, [loadState]);
+
+    useEffect(() => {
+        const handleBatchUpdate = () => {
+            loadState();
+        };
+        window.addEventListener('raddoc_batch_mode_updated', handleBatchUpdate);
+        return () => window.removeEventListener('raddoc_batch_mode_updated', handleBatchUpdate);
+    }, [loadState]);
 
     const saveBatchesToDrive = useCallback(async (currentBatches: Batch[], force = false) => {
         const completed = currentBatches.filter(b => b.findings && b.findings.length > 0);
@@ -2955,10 +2964,20 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                             )}
                                             {batch.status === 'recording' && (
                                                 <>
-                                                    <button onClick={handlePauseToggle} className={`flex items-center gap-2 text-white p-2 rounded-lg transition-colors text-sm px-3 disabled:cursor-wait ${isMainPaused ? 'bg-green-500 hover:bg-green-600' : 'bg-yellow-500 hover:bg-yellow-600'}`} disabled={isBusy}>
+                                                    <button onClick={handlePauseToggle} className={`flex items-center gap-2 text-white p-2 rounded-lg transition-colors text-sm px-3 disabled:cursor-wait cursor-pointer ${isMainPaused ? 'bg-green-500 hover:bg-green-600' : 'bg-yellow-500 hover:bg-yellow-600'}`} disabled={isBusy}>
                                                         {isMainPaused ? <ResumeIcon className="w-4 h-4" /> : <PauseIcon className="w-4 h-4" />}
                                                         {isMainPaused ? 'Resume' : 'Pause'}
                                                     </button>
+                                                    {isMainPaused && (
+                                                        <button 
+                                                            type="button" 
+                                                            onClick={() => downloadMainCurrentAudio(`${batch.name.replace(/[^a-z0-9_-]/gi, '_')}_paused`)} 
+                                                            className="flex items-center gap-1.5 bg-slate-700 hover:bg-slate-800 text-white p-2 rounded-lg transition-colors text-sm px-3 shadow-xs cursor-pointer font-semibold"
+                                                            title="Download audio recorded up to this pause"
+                                                        >
+                                                            <DownloadIcon className="w-4 h-4 text-emerald-400" /> Download Audio
+                                                        </button>
+                                                    )}
                                                     <button onClick={handleStop} className="flex items-center gap-2 bg-red-600 text-white p-2 rounded-lg hover:bg-red-700 transition-colors text-sm px-3 disabled:cursor-wait" disabled={isBusy}>
                                                         <StopIcon className="w-4 h-4"/> Stop
                                                     </button>

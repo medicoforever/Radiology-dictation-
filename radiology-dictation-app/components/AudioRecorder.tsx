@@ -43,6 +43,8 @@ const AudioRecorder: React.FC<AudioRecorderProps> = ({ status, setStatus, onReco
     stopRecording,
     pauseRecording,
     resumeRecording,
+    downloadCurrentAudio,
+    getCurrentAudioBlob,
     error,
     interruptedNotice,
     clearInterruptedNotice,
@@ -402,7 +404,6 @@ const AudioRecorder: React.FC<AudioRecorderProps> = ({ status, setStatus, onReco
         {/* Interactive Yin-Yang Microphone Button */}
         <button
           type="button"
-          id="main-mic-record-btn"
           onClick={handleCenterClick}
           disabled={isStarting || isRequestingMic}
           className={`group relative w-28 h-28 sm:w-32 sm:h-32 rounded-full shadow-2xl flex items-center justify-center transition-all duration-300 focus:outline-none focus-visible:ring-4 focus-visible:ring-blue-400/50 cursor-pointer ${
@@ -563,18 +564,29 @@ const AudioRecorder: React.FC<AudioRecorderProps> = ({ status, setStatus, onReco
                       {formatDuration(recordingDuration)}
                     </span>
                   </div>
-                  <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
+                  <div className="flex items-center gap-2 w-full sm:w-auto justify-end flex-wrap">
                     <button
                       type="button"
                       onClick={handlePauseToggle}
-                      className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-amber-100 dark:bg-amber-900/50 text-amber-800 dark:text-amber-300 hover:bg-amber-200 transition-colors"
+                      className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-amber-100 dark:bg-amber-900/50 text-amber-800 dark:text-amber-300 hover:bg-amber-200 transition-colors cursor-pointer"
                     >
                       {isPaused ? 'Resume' : 'Pause'}
                     </button>
+                    {isPaused && (
+                      <button
+                        type="button"
+                        onClick={() => downloadCurrentAudio('staged_dictation_paused')}
+                        className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-slate-700 hover:bg-slate-800 text-white transition-colors flex items-center gap-1.5 cursor-pointer shadow-xs"
+                        title="Download audio recorded up to this point"
+                      >
+                        <DownloadIcon className="w-3.5 h-3.5 text-emerald-400" />
+                        Download Audio
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={handleStopStagedRecording}
-                      className="px-3.5 py-1.5 text-xs font-bold rounded-lg bg-red-600 hover:bg-red-700 text-white shadow-xs transition-colors"
+                      className="px-3.5 py-1.5 text-xs font-bold rounded-lg bg-red-600 hover:bg-red-700 text-white shadow-xs transition-colors cursor-pointer"
                     >
                       Done Recording
                     </button>
@@ -696,10 +708,10 @@ const AudioRecorder: React.FC<AudioRecorderProps> = ({ status, setStatus, onReco
           </p>
         </div>
       ) : (
-        <div className="flex flex-col sm:flex-row items-center justify-center gap-3 sm:gap-4 w-full max-w-md">
+        <div className="flex flex-col sm:flex-row items-center justify-center gap-3 sm:gap-4 w-full max-w-lg">
           <button
             onClick={handlePauseToggle}
-            className={`w-full sm:w-auto flex items-center justify-center gap-2 font-bold py-3.5 px-7 rounded-full focus:outline-none focus:ring-4 transition-all duration-300 ease-in-out transform hover:scale-105 shadow-lg min-h-[48px] ${
+            className={`w-full sm:w-auto flex items-center justify-center gap-2 font-bold py-3.5 px-7 rounded-full focus:outline-none focus:ring-4 transition-all duration-300 ease-in-out transform hover:scale-105 shadow-lg min-h-[48px] cursor-pointer ${
               isPaused 
                 ? 'bg-green-500 text-white hover:bg-green-600 focus:ring-green-300' 
                 : 'bg-yellow-500 text-white hover:bg-yellow-600 focus:ring-yellow-300'
@@ -709,10 +721,22 @@ const AudioRecorder: React.FC<AudioRecorderProps> = ({ status, setStatus, onReco
             {isPaused ? <ResumeIcon className="w-5 h-5"/> : <PauseIcon className="w-5 h-5"/>}
             {isPaused ? 'Resume' : 'Pause'}
           </button>
+          {isPaused && (
+            <button
+              type="button"
+              onClick={() => downloadCurrentAudio('dictation_audio_paused')}
+              className="w-full sm:w-auto flex items-center justify-center gap-2 bg-slate-700 hover:bg-slate-800 text-white font-bold py-3.5 px-6 rounded-full focus:outline-none focus:ring-4 focus:ring-slate-400 transition-all duration-300 ease-in-out transform hover:scale-105 shadow-lg min-h-[48px] cursor-pointer"
+              aria-label="Download audio recorded so far"
+              title="Download complete audio recorded up to this point"
+            >
+              <DownloadIcon className="w-5 h-5 text-emerald-400" />
+              Download Audio
+            </button>
+          )}
           <button
             onClick={handleStop}
             disabled={!isRecording}
-            className="w-full sm:w-auto flex items-center justify-center gap-2 bg-red-600 text-white font-bold py-3.5 px-8 rounded-full hover:bg-red-700 focus:outline-none focus:ring-4 focus:ring-red-300 transition-all duration-300 ease-in-out transform hover:scale-105 shadow-lg min-h-[48px]"
+            className="w-full sm:w-auto flex items-center justify-center gap-2 bg-red-600 text-white font-bold py-3.5 px-8 rounded-full hover:bg-red-700 focus:outline-none focus:ring-4 focus:ring-red-300 transition-all duration-300 ease-in-out transform hover:scale-105 shadow-lg min-h-[48px] cursor-pointer"
             aria-label="Stop Recording"
           >
             <StopIcon className="w-5 h-5"/>
