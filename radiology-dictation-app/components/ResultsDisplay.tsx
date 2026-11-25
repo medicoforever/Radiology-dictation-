@@ -41,6 +41,7 @@ import {
   deleteDictateChangesAudio, 
   hasStoredDictateChangesAudio 
 } from '../services/audioStorage';
+import { filterAudioInputsForModel, classifyBlobForPrefilter, AudioPrefilterStats } from '../services/audioPrefilterService';
 
 interface ChatMessage {
   author: 'You' | 'AI';
@@ -80,6 +81,8 @@ interface ResultsDisplayProps {
   errorCheckStatus?: 'idle' | 'checking' | 'complete';
   onOpenMacrosModal?: () => void;
   initialExtraFiles?: File[];
+  isExperimentalAudioFilterEnabled?: boolean;
+  prefilterStats?: AudioPrefilterStats | null;
 }
 
 const formatAudioDuration = (totalSeconds: number): string => {
@@ -220,6 +223,8 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   errorCheckStatus = 'idle',
   onOpenMacrosModal,
   initialExtraFiles,
+  isExperimentalAudioFilterEnabled = false,
+  prefilterStats = null,
 }) => {
   const [isAllCopied, setIsAllCopied] = useState<boolean>(false);
   const [selectedIndices, setSelectedIndices] = useState<Set<number>>(new Set<number>());
@@ -1194,6 +1199,54 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     await startRowDictationRecording();
   };
 
+  /** Pre-filters audio inputs for Gemini only when the experimental filter is enabled. */
+  const prefilterInputForGemini = async <T extends Blob | Blob[]>(input: T): Promise<T> => {
+    const { filteredInput } = await filterAudioInputsForModel(input, {
+      enabled: Boolean(isExperimentalAudioFilterEnabled),
+    });
+    return filteredInput as T;
+  };
+
+  /** Applies global report modifications after pre-filtering any audio inputs (leaving docs/images untouched). */
+  const applyFilteredReportModification = async (inputs: Blob | Blob[]) => {
+    const filteredInputs = await prefilterInputForGemini(inputs);
+    const newFindings = await modifyReportWithAudio(
+      findings,
+      filteredInputs,
+      selectedModel,
+      customPrompt,
+      customImages
+    );
+    onAllFindingsUpdate(newFindings);
+  };
+
+  /** Merges raw audio for Download Audio and passes raw new audio to App.tsx (which handles continuation pre-filtering). */
+  const mergeAndApplyContinuationAudio = async (newRecordedBlob: Blob) => {
+    setIsMergingAudio(true);
+    let merged: Blob;
+    if (audioBlob) {
+      const candidates = Array.isArray(audioBlob) ? audioBlob : [audioBlob];
+      let baseAudioBlob: Blob | undefined;
+      for (const candidate of candidates) {
+        const classified = await classifyBlobForPrefilter(candidate);
+        if (classified.isAudio) {
+          baseAudioBlob = candidate;
+          break;
+        }
+      }
+      merged = baseAudioBlob ? await mergeAudioBlobs(baseAudioBlob, newRecordedBlob) : newRecordedBlob;
+    } else {
+      merged = newRecordedBlob;
+    }
+    setMergedContinuationBlob(merged);
+    onAudioBlobUpdate?.(merged);
+    setIsMergingAudio(false);
+
+    // Process with Gemini continuation in background (App.tsx:handleContinueDictation handles pre-filtering once)
+    setUndoState(findings);
+    await onContinueDictation(newRecordedBlob, merged);
+  };
+
   const handleStopRowDictation = async () => {
     if (dictatingIndex === null) return;
 
@@ -1206,7 +1259,8 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
       setUndoState(findings);
       try {
         const existingText = findings[currentIndex];
-        const newText = await continueAudioDictation(existingText, audioBlob, customPrompt, selectedModel);
+        const filteredAudio = await prefilterInputForGemini(audioBlob);
+        const newText = await continueAudioDictation(existingText, filteredAudio, customPrompt, selectedModel);
         const separator = existingText.trim().length > 0 && !existingText.endsWith(' ') ? ' ' : '';
         const updatedText = existingText + separator + newText.trim();
         onUpdateFinding(currentIndex, updatedText);
@@ -1246,7 +1300,8 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         setUndoState(findings);
         try {
             const existingText = findings[currentIndex];
-            const modifiedText = await modifyFindingWithAudio(existingText, audioBlob, customPrompt, selectedModel);
+            const filteredAudio = await prefilterInputForGemini(audioBlob);
+            const modifiedText = await modifyFindingWithAudio(existingText, filteredAudio, customPrompt, selectedModel);
             onUpdateFinding(currentIndex, modifiedText);
         } catch (err) {
             const message = err instanceof Error ? err.message : 'An unknown error occurred.';
@@ -1269,22 +1324,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     try {
       const newRecordedBlob = await stopContinuingRecording();
       if (newRecordedBlob && newRecordedBlob.size > 0) {
-        setIsMergingAudio(true);
-        // Immediately merge audio right at the moment Stop is clicked!
-        let merged: Blob;
-        if (audioBlob) {
-          const baseBlob = Array.isArray(audioBlob) ? (audioBlob.find(b => b.type?.startsWith('audio/')) || audioBlob[0]) : audioBlob;
-          merged = await mergeAudioBlobs(baseBlob, newRecordedBlob);
-        } else {
-          merged = newRecordedBlob;
-        }
-        setMergedContinuationBlob(merged);
-        onAudioBlobUpdate?.(merged);
-        setIsMergingAudio(false);
-
-        // Process with Gemini continuation in background
-        setUndoState(findings);
-        await onContinueDictation(newRecordedBlob, merged);
+        await mergeAndApplyContinuationAudio(newRecordedBlob);
         setContinuationState({ status: 'idle', error: null });
       } else {
         setContinuationState({ status: 'idle', error: null });
@@ -1337,14 +1377,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         setModificationState('processing');
         try {
           setUndoState(findings);
-          const newFindings = await modifyReportWithAudio(
-            findings, 
-            allItems.length === 1 ? allItems[0] : allItems, 
-            selectedModel, 
-            customPrompt, 
-            customImages
-          );
-          onAllFindingsUpdate(newFindings);
+          await applyFilteredReportModification(allItems.length === 1 ? allItems[0] : allItems);
           setStagedModificationFiles([]);
           showNotification('Changes applied and voice dictation stored in browser!');
         } catch (err) {
@@ -1421,14 +1454,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     setModificationError(null);
     try {
       setUndoState(findings);
-      const newFindings = await modifyReportWithAudio(
-        findings, 
-        allItems.length === 1 ? allItems[0] : allItems, 
-        selectedModel, 
-        customPrompt, 
-        customImages
-      );
-      onAllFindingsUpdate(newFindings);
+      await applyFilteredReportModification(allItems.length === 1 ? allItems[0] : allItems);
       setStagedModificationFiles([]);
       showNotification('Changes applied using stored audio/files!');
     } catch (err) {
@@ -1479,14 +1505,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     setModificationError(null);
     try {
       setUndoState(findings);
-      const newFindings = await modifyReportWithAudio(
-        findings,
-        allItems.length === 1 ? allItems[0] : allItems,
-        selectedModel,
-        customPrompt,
-        customImages
-      );
-      onAllFindingsUpdate(newFindings);
+      await applyFilteredReportModification(allItems.length === 1 ? allItems[0] : allItems);
       setStagedModificationFiles([]);
       showNotification('Changes applied to report!');
     } catch (err) {
@@ -1516,20 +1535,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     try {
       const newRecordedBlob = await recoverContinueSession();
       if (newRecordedBlob && newRecordedBlob.size > 0) {
-        setIsMergingAudio(true);
-        let merged: Blob;
-        if (audioBlob) {
-          const baseBlob = Array.isArray(audioBlob) ? (audioBlob.find(b => b.type?.startsWith('audio/')) || audioBlob[0]) : audioBlob;
-          merged = await mergeAudioBlobs(baseBlob, newRecordedBlob);
-        } else {
-          merged = newRecordedBlob;
-        }
-        setMergedContinuationBlob(merged);
-        onAudioBlobUpdate?.(merged);
-        setIsMergingAudio(false);
-
-        setUndoState(findings);
-        await onContinueDictation(newRecordedBlob, merged);
+        await mergeAndApplyContinuationAudio(newRecordedBlob);
       }
     } catch (err) {
       setIsMergingAudio(false);
@@ -1574,8 +1580,8 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         setHasPersistedChangesAudio(true);
 
         setModificationState('processing');
-        const modifiedFindings = await modifyReportWithAudio(findings, recoveredBlob, selectedModel, customPrompt, customImages);
-        onAllFindingsUpdate(modifiedFindings);
+        setUndoState(findings);
+        await applyFilteredReportModification(recoveredBlob);
         setModificationState('idle');
         showNotification('Restored and stored voice changes audio!');
       }
