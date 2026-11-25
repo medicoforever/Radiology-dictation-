@@ -734,16 +734,16 @@ test('filterAudioInputsForModel combines multi-audio inputs and downloads origin
   }
 });
 
-test('model ordering strictly matches verified clinical accuracy, clean UI labels, and 99%-dictation thinking levels', () => {
+test('model ordering strictly places 3.6 Flash below Robotics ER-2, preserves clean UI labels, and configures 99%-dictation thinking levels', () => {
   assert.equal(DEFAULT_SELECTED_MODEL, 'gemini-4-hydrogen');
   assert.deepEqual(
     AVAILABLE_MODELS.map((m) => m.value),
     [
       'gemini-4-hydrogen',
       'gemini-3.8-flash',
-      'gemini-3.6-flash',
       'gemini-3-flash-preview',
       'gemini-robotics-er-2-preview',
+      'gemini-3.6-flash',
       'gemini-3.7-flash',
       'gemini-3.5-flash',
       'gemini-3.5-flash-lite',
@@ -755,9 +755,9 @@ test('model ordering strictly matches verified clinical accuracy, clean UI label
     [
       'Gemini 4 Hydrogen',
       'Gemini 3.8 Flash',
-      'Gemini 3.6 Flash',
       'Gemini 3 Flash',
       'Gemini Robotics ER-2 Preview',
+      'Gemini 3.6 Flash',
       'Gemini 3.7 Flash',
       'Gemini 3.5 Flash',
       'Gemini 3.5 Flash Lite',
@@ -769,6 +769,8 @@ test('model ordering strictly matches verified clinical accuracy, clean UI label
     [
       'gemini-4-hydrogen',
       'gemini-3.8-flash',
+      'gemini-3-flash-preview',
+      'gemini-robotics-er-2-preview',
       'gemini-3.6-flash',
       'gemini-3.7-flash',
       'gemini-3.5-flash',
@@ -1026,13 +1028,13 @@ test('generateContentWithJsonFallback fails over from exhausted free-tier 4-hydr
   }
 });
 
-test('getFreeTierModelFallbackChain orders accuracy strictly and excludes gemini-3.5-flash-lite from automatic failover', () => {
+test('getFreeTierModelFallbackChain places gemini-3.6-flash below robotics and excludes gemini-3.5-flash-lite from automatic failover', () => {
   assert.deepEqual(getFreeTierModelFallbackChain('gemini-4-hydrogen'), [
     'gemini-4-hydrogen',
     'gemini-3.8-flash',
-    'gemini-3.6-flash',
     'gemini-3-flash-preview',
     'gemini-robotics-er-2-preview',
+    'gemini-3.6-flash',
   ]);
   // gemini-3.5-flash runs first when explicitly selected and skips redundant gemini-3.6-flash bucket
   const from35 = getFreeTierModelFallbackChain('gemini-3.5-flash');
@@ -1043,7 +1045,7 @@ test('getFreeTierModelFallbackChain orders accuracy strictly and excludes gemini
   assert.equal(getLiveModelFallbackChain('gemini-4-hydrogen').length, FREE_TIER_QUOTA_FALLBACK_ORDER.length);
 });
 
-test('multi-account LRU scheduler tracks PT daily quota ledger, pre-skips exhausted models, informs UI, and never auto-drops to 3.5-flash-lite', async () => {
+test('multi-account LRU scheduler ignores daily RPD locks, keeps all keys callable, cascades model-to-model, and never auto-drops to 3.5-flash-lite', async () => {
   const store = new Map<string, string>();
   const keys = ['AIzaSyAccountOneFreeKey00001', 'AIzaSyAccountTwoFreeKey00002', 'AIzaSyAccountThreeFreeKey0003'];
   store.set(USER_KEYS_STORAGE_KEY, JSON.stringify(keys));
@@ -1080,8 +1082,8 @@ test('multi-account LRU scheduler tracks PT daily quota ledger, pre-skips exhaus
     }
     assert.equal(new Set(pickedOrder).size, 3);
 
-    // 2. Exhaust key[0] daily RPD on gemini-4-hydrogen -> LRU sweeps all 3 keys, cools key[0] for RPD,
-    //    skips key[0] cleanly afterward, while keeping key[0] immediately healthy for gemini-3.8-flash
+    // 2. When key[0] hits 429 on gemini-4-hydrogen, healthy keys move ahead of key[0],
+    //    but ALL 3 valid keys remain callable (zero localStorage daily RPD lockouts)
     for (let i = 0; i < keys.length; i++) {
       await executeWithApiKeyFailover(
         async (_c, apiKey) => {
@@ -1096,15 +1098,15 @@ test('multi-account LRU scheduler tracks PT daily quota ledger, pre-skips exhaus
       );
     }
     const hydrogenAfterCooldown = getCandidateKeysForOperation('gemini-4-hydrogen').candidateKeys;
-    assert.equal(hydrogenAfterCooldown.includes(keys[0]), false);
-    assert.equal(hydrogenAfterCooldown.length, 2);
+    assert.equal(hydrogenAfterCooldown.length, 3);
+    assert.equal(hydrogenAfterCooldown[hydrogenAfterCooldown.length - 1], keys[0]);
 
     const for38Flash = getCandidateKeysForOperation('gemini-3.8-flash').candidateKeys;
     assert.equal(for38Flash.length, 3);
     assert.ok(for38Flash.includes(keys[0]));
 
-    // 3. Cross-model cascade reaches gemini-robotics-er-2-preview, emits failover events, updates quota ledger,
-    //    pre-skips exhausted 4-hydrogen on subsequent calls, and NEVER auto-uses gemini-3.5-flash-lite
+    // 3. Cross-model cascade reaches gemini-3.6-flash (below robotics), emits failover events,
+    //    ignores daily ledger pre-skips on subsequent runs, and NEVER auto-uses gemini-3.5-flash-lite
     resetApiKeyHealthState();
     failoverEvents.length = 0;
     const cascadeVisited: string[] = [];
@@ -1112,7 +1114,7 @@ test('multi-account LRU scheduler tracks PT daily quota ledger, pre-skips exhaus
       const match = url.match(/models\/([^:]+):generateContent/);
       const m = match ? decodeURIComponent(match[1]) : '';
       cascadeVisited.push(m);
-      if (m !== 'gemini-robotics-er-2-preview') {
+      if (m !== 'gemini-3.6-flash') {
         return {
           ok: false,
           status: 429,
@@ -1124,31 +1126,32 @@ test('multi-account LRU scheduler tracks PT daily quota ledger, pre-skips exhaus
         ok: true,
         status: 200,
         json: async () => ({
-          candidates: [{ content: { parts: [{ text: '{"findings":["BOLD::Accurate robotics fallback ok."]}' }] } }],
+          candidates: [{ content: { parts: [{ text: '{"findings":["BOLD::Accurate 3.6 fallback ok."]}' }] } }],
         }),
       };
     };
 
     const cascadeOut = await generateContentWithJsonFallback('gemini-4-hydrogen', [{ text: 'test' }]);
-    assert.equal(cascadeOut, '{"findings":["BOLD::Accurate robotics fallback ok."]}');
+    assert.equal(cascadeOut, '{"findings":["BOLD::Accurate 3.6 fallback ok."]}');
     assert.ok(cascadeVisited.includes('gemini-4-hydrogen'));
     assert.ok(cascadeVisited.includes('gemini-3.8-flash'));
-    assert.ok(cascadeVisited.includes('gemini-3.6-flash'));
     assert.ok(cascadeVisited.includes('gemini-3-flash-preview'));
+    assert.ok(cascadeVisited.includes('gemini-robotics-er-2-preview'));
     assert.equal(cascadeVisited.includes('gemini-3.5-flash-lite'), false);
-    assert.equal(cascadeVisited[cascadeVisited.length - 1], 'gemini-robotics-er-2-preview');
+    assert.equal(cascadeVisited[cascadeVisited.length - 1], 'gemini-3.6-flash');
     assert.ok(failoverEvents.length > 0);
-    assert.equal(hasConfirmedDailyExhaustionAcrossAllKeys('gemini-4-hydrogen'), true);
+    assert.equal(hasConfirmedDailyExhaustionAcrossAllKeys('gemini-4-hydrogen'), false);
 
-    // Subsequent call must pre-skip already RPD-exhausted models in 0ms and jump straight to robotics-er-2-preview
+    // Subsequent call still starts cleanly from the selected model (4-hydrogen -> ... -> 3.6) without skipping
     cascadeVisited.length = 0;
     await generateContentWithJsonFallback('gemini-4-hydrogen', [{ text: 'test 2' }]);
-    assert.deepEqual(cascadeVisited, ['gemini-robotics-er-2-preview']);
+    assert.equal(cascadeVisited[0], 'gemini-4-hydrogen');
+    assert.equal(cascadeVisited[cascadeVisited.length - 1], 'gemini-3.6-flash');
 
     const ledgerStats = getFreeTierDailyQuotaStats();
     assert.equal(ledgerStats.totalKeys, 3);
     const hydrogenStat = ledgerStats.models.find((m) => m.model === 'gemini-4-hydrogen');
-    assert.equal(hydrogenStat?.exhaustedKeys, 3);
+    assert.equal(hydrogenStat?.exhaustedKeys, 0);
 
     // Even if all 5 accurate models hit 429, Flash-Lite must NOT be tried automatically
     resetApiKeyHealthState();
@@ -1302,7 +1305,7 @@ test('Selected Model Only toggle defaults OFF (using clean 5-model cascade) and 
       const match = url.match(/models\/([^:]+):generateContent/);
       const model = match ? decodeURIComponent(match[1]) : '';
       failoverVisited.push(model);
-      if (model === 'gemini-robotics-er-2-preview') {
+      if (model === 'gemini-3.6-flash') {
         return {
           ok: true,
           status: 200,
@@ -1324,9 +1327,9 @@ test('Selected Model Only toggle defaults OFF (using clean 5-model cascade) and 
     assert.deepEqual(failoverVisited, [
       'gemini-4-hydrogen',
       'gemini-3.8-flash',
-      'gemini-3.6-flash',
       'gemini-3-flash-preview',
       'gemini-robotics-er-2-preview',
+      'gemini-3.6-flash',
     ]);
     assert.equal(failoverVisited.includes('gemini-3.7-flash'), false);
     assert.equal(failoverVisited.includes('gemini-3.5-flash'), false);
@@ -1338,9 +1341,9 @@ test('Selected Model Only toggle defaults OFF (using clean 5-model cascade) and 
       [
         'gemini-4-hydrogen',
         'gemini-3.8-flash',
-        'gemini-3.6-flash',
         'gemini-3-flash-preview',
         'gemini-robotics-er-2-preview',
+        'gemini-3.6-flash',
         'gemini-3.5-flash-lite',
       ]
     );
@@ -1381,8 +1384,8 @@ test('HTTP 503 UNAVAILABLE (high demand) fails fast across keys and auto-fails o
     ]);
     setStrictSelectedModelOnlyEnabled(false);
 
-    // Reproduces real live condition: gemini-4-hydrogen -> 503 UNAVAILABLE ("high demand"),
-    // gemini-3.8-flash -> 429 quota, gemini-3.6-flash -> 200 OK.
+    // gemini-4-hydrogen -> 503 UNAVAILABLE ("high demand"),
+    // gemini-3.8-flash -> 429 quota, gemini-3-flash-preview -> 200 OK.
     const calls: Array<{ model: string; key: string }> = [];
     (globalThis as any).fetch = async (url: string, init: any) => {
       const match = url.match(/models\/([^:]+):generateContent/);
@@ -1416,25 +1419,25 @@ test('HTTP 503 UNAVAILABLE (high demand) fails fast across keys and auto-fails o
         ok: true,
         status: 200,
         json: async () => ({
-          candidates: [{ content: { parts: [{ text: JSON.stringify({ findings: ['Recovered cleanly on 3.6'] }) }] } }],
+          candidates: [{ content: { parts: [{ text: JSON.stringify({ findings: ['Recovered cleanly on 3-flash-preview'] }) }] } }],
         }),
       };
     };
 
     const raw = await generateContentWithJsonFallback('gemini-4-hydrogen', [{ text: 'dictation test' }]);
-    assert.deepEqual(JSON.parse(raw).findings, ['Recovered cleanly on 3.6']);
+    assert.deepEqual(JSON.parse(raw).findings, ['Recovered cleanly on 3-flash-preview']);
 
     // Critical: 503 UNAVAILABLE on gemini-4-hydrogen must try AT MOST 1 key (not burn all 3 keys!)
     const h4Calls = calls.filter((c) => c.model === 'gemini-4-hydrogen');
     assert.equal(h4Calls.length, 1);
 
-    // Confirm event sequence: 4-hydrogen (service_unavailable) -> 3.8-flash (rate_limit) -> 3.6-flash
+    // Confirm event sequence: 4-hydrogen (service_unavailable) -> 3.8-flash (rate_limit) -> 3-flash-preview
     assert.equal(failoverEvents.length, 2);
     assert.equal(failoverEvents[0].fromModel, 'gemini-4-hydrogen');
     assert.equal(failoverEvents[0].toModel, 'gemini-3.8-flash');
     assert.equal(failoverEvents[0].reason, 'service_unavailable');
     assert.equal(failoverEvents[1].fromModel, 'gemini-3.8-flash');
-    assert.equal(failoverEvents[1].toModel, 'gemini-3.6-flash');
+    assert.equal(failoverEvents[1].toModel, 'gemini-3-flash-preview');
     assert.equal(failoverEvents[1].reason, 'rate_limit');
 
     // When Selected Model Only IS ON, 503 still stays strict and surfaces helpful overload error
@@ -1472,7 +1475,7 @@ test('HTTP 503 UNAVAILABLE (high demand) fails fast across keys and auto-fails o
   }
 });
 
-test('Selected Model Only (No Fallback) tries ALL pooled keys on the same model even after prior RPD cooldowns', async () => {
+test('Both Auto Fallback and Selected Model Only keep ALL pooled keys callable without daily RPD lockouts', async () => {
   const store = new Map<string, string>();
   const mockLocalStorage = {
     getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
@@ -1498,7 +1501,7 @@ test('Selected Model Only (No Fallback) tries ALL pooled keys on the same model 
     ];
     setUserApiKeys(fourKeys);
 
-    // Exhaust all 4 keys once with 429 PerDay RPD errors so all 4 enter localStorage RPD cooldown
+    // Trigger 429 PerDay RPD errors across all 4 keys once
     await executeWithApiKeyFailover(
       async () => {
         const err: any = new Error('429 requests per day limit exceeded');
@@ -1508,11 +1511,11 @@ test('Selected Model Only (No Fallback) tries ALL pooled keys on the same model 
       { selectedModel: 'gemini-3.8-flash', delayMs: 0 }
     ).catch(() => {});
 
-    // With Auto Fallback (strict OFF): cooled model probes at most 1 key before switching models
+    // Even after prior 429s, NO daily rate-limit ledger locks keys out in either mode
+    assert.equal(store.has('raddoc_free_tier_quota_ledger_v1'), false);
     setStrictSelectedModelOnlyEnabled(false);
-    assert.equal(getCandidateKeysForOperation('gemini-3.8-flash').candidateKeys.length, 1);
+    assert.equal(getCandidateKeysForOperation('gemini-3.8-flash').candidateKeys.length, 4);
 
-    // With Selected Model Only (No Fallback ON): MUST include ALL 4 valid keys in candidateKeys and try all 4
     setStrictSelectedModelOnlyEnabled(true);
     assert.equal(getCandidateKeysForOperation('gemini-3.8-flash').candidateKeys.length, 4);
 

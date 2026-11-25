@@ -79,6 +79,8 @@ export interface AIModelOption {
 export const LIVE_DICTATION_MODELS: AIModelOption[] = [
   { value: 'gemini-4-hydrogen', label: 'gemini-4-hydrogen' },
   { value: 'gemini-3.8-flash', label: 'gemini-3.8-flash' },
+  { value: 'gemini-3-flash-preview', label: 'gemini-3-flash-preview' },
+  { value: 'gemini-robotics-er-2-preview', label: 'gemini-robotics-er-2-preview' },
   { value: 'gemini-3.6-flash', label: 'gemini-3.6-flash' },
   { value: 'gemini-3.7-flash', label: 'gemini-3.7-flash' },
   { value: 'gemini-3.5-flash', label: 'gemini-3.5-flash' },
@@ -98,17 +100,15 @@ function getFreeTierQuotaBucket(model: string): string {
 }
 
 /**
- * Empirically verified clinical-accuracy-first Free-Tier cascade (5 genuinely distinct
- * Free-Tier model pools; EXCLUDES gemini-3.5-flash-lite so clinical dictation NEVER silently
- * degrades to low-accuracy Flash-Lite on quota/overload limits, and avoids redundant retries
- * on deprecated 3.7/3.5 aliases that route into 3.8/3.6).
+ * Ordered automatic failover cascade for Free Tier (3.6 Flash positioned below Robotics ER-2,
+ * and excludes gemini-3.5-flash-lite so clinical dictation NEVER silently degrades).
  */
 export const FREE_TIER_QUOTA_FALLBACK_ORDER: string[] = [
   'gemini-4-hydrogen',
   'gemini-3.8-flash',
-  'gemini-3.6-flash',
   'gemini-3-flash-preview',
   'gemini-robotics-er-2-preview',
+  'gemini-3.6-flash',
 ];
 
 export const LIVE_DICTATION_CYCLE_ORDER = FREE_TIER_QUOTA_FALLBACK_ORDER;
@@ -139,15 +139,15 @@ export function getLiveModelFallbackChain(selectedModel: string): string[] {
 }
 
 /**
- * Ordered strictly by verified radiology dictation accuracy (#1 -> #5 non-deprecated accurate,
- * followed by routed 3.7/3.5 Flash endpoints, manual Flash-Lite, and paid tiers).
+ * Ordered with Gemini 3.6 Flash positioned below Gemini Robotics ER-2 Preview,
+ * followed by routed 3.7/3.5 endpoints, manual Flash-Lite, and paid tiers.
  */
 export const AVAILABLE_MODELS: AIModelOption[] = [
   { value: 'gemini-4-hydrogen', label: 'Gemini 4 Hydrogen' },
   { value: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash' },
-  { value: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash' },
   { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash' },
   { value: 'gemini-robotics-er-2-preview', label: 'Gemini Robotics ER-2 Preview' },
+  { value: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash' },
   { value: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash' },
   { value: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
   { value: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash Lite' },

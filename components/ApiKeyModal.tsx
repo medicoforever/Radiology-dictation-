@@ -26,8 +26,6 @@ import {
   clearUserApiKeys,
   getDefaultApiKeys,
   getCandidateKeysForOperation,
-  getFreeTierDailyQuotaStats,
-  resetFreeTierDailyQuotaStats,
   maskApiKey,
   testApiKeyValidity,
   isBuiltinKeysUnlocked,
@@ -35,7 +33,6 @@ import {
   lockBuiltinKeys,
   syncApiKeysWithGoogleDrive,
   API_KEYS_UPDATED_EVENT,
-  type FreeTierModelQuotaStat,
 } from '../services/apiKeyService';
 
 interface ApiKeyModalProps {
@@ -56,15 +53,11 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
   const [secretKeyInput, setSecretKeyInput] = useState('');
   const [isUnlocked, setIsUnlocked] = useState(isBuiltinKeysUnlocked());
   const [showGuide, setShowGuide] = useState(true);
-  const [quotaStats, setQuotaStats] = useState<{ datePt: string; totalKeys: number; models: FreeTierModelQuotaStat[] }>(() =>
-    getFreeTierDailyQuotaStats()
-  );
 
   // Sync state from storage
   const refreshKeys = () => {
     setUserKeys(getUserApiKeys());
     setIsUnlocked(isBuiltinKeysUnlocked());
-    setQuotaStats(getFreeTierDailyQuotaStats());
   };
 
   useEffect(() => {
@@ -573,57 +566,6 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
                         >
                           <Trash2 className="w-3.5 h-3.5" />
                         </button>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-
-          {/* Daily Free-Tier Model Quota Tracker */}
-          {quotaStats.totalKeys > 0 && (
-            <div className="p-4 rounded-xl bg-slate-50 dark:bg-slate-800/30 border border-slate-200 dark:border-slate-800 space-y-2.5">
-              <div className="flex items-center justify-between gap-2">
-                <div>
-                  <span className="text-xs font-bold text-slate-800 dark:text-slate-200 block">
-                    Estimated Daily Free-Tier Quotas ({quotaStats.datePt} PT)
-                  </span>
-                  <span className="text-[11px] text-slate-500 dark:text-slate-400">
-                    Across {quotaStats.totalKeys} active key pool{quotaStats.totalKeys > 1 ? 's' : ''} • Resets midnight Pacific Time • Flash Lite excluded from auto-failover
-                  </span>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => {
-                    resetFreeTierDailyQuotaStats();
-                    refreshKeys();
-                  }}
-                  className="px-2 py-1 text-[11px] font-semibold rounded-lg bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 transition-colors shrink-0 cursor-pointer"
-                  title="Clear local daily quota counters if AI Studio quotas already reset"
-                >
-                  Reset Stats
-                </button>
-              </div>
-              <div className="space-y-1.5">
-                {quotaStats.models.map((stat) => {
-                  const isExhausted = stat.totalKeys > 0 && stat.exhaustedKeys >= stat.totalKeys;
-                  const pct = stat.totalCapacity > 0 ? Math.min(100, Math.round((stat.usedToday / stat.totalCapacity) * 100)) : 0;
-                  return (
-                    <div key={stat.model} className="text-[11px] space-y-0.5">
-                      <div className="flex items-center justify-between">
-                        <span className="font-medium text-slate-700 dark:text-slate-300">{stat.label}</span>
-                        <span className={`font-mono font-semibold ${isExhausted ? 'text-rose-600 dark:text-rose-400' : 'text-slate-600 dark:text-slate-300'}`}>
-                          {stat.usedToday} / {stat.totalCapacity} {isExhausted ? '• Daily Exhausted' : ''}
-                        </span>
-                      </div>
-                      <div className="w-full h-1.5 bg-slate-200 dark:bg-slate-700 rounded-full overflow-hidden">
-                        <div
-                          className={`h-full transition-all ${
-                            isExhausted ? 'bg-rose-500' : pct >= 75 ? 'bg-amber-500' : 'bg-emerald-500'
-                          }`}
-                          style={{ width: `${isExhausted ? 100 : pct}%` }}
-                        />
                       </div>
                     </div>
                   );

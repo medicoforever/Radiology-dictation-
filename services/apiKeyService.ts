@@ -383,10 +383,10 @@ export interface FreeTierModelQuotaStat {
 
 const TRACKED_FREE_TIER_MODELS: Array<{ model: string; label: string; rpdLimitPerKey: number }> = [
   { model: 'gemini-4-hydrogen', label: 'Gemini 4 Hydrogen (#1 Default)', rpdLimitPerKey: 20 },
-  { model: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash (#2 Accuracy)', rpdLimitPerKey: 20 },
-  { model: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash (#3 Accuracy)', rpdLimitPerKey: 20 },
-  { model: 'gemini-3-flash-preview', label: 'Gemini 3 Flash (#4 Backup)', rpdLimitPerKey: 20 },
-  { model: 'gemini-robotics-er-2-preview', label: 'Gemini Robotics ER-2 (#5 Backup)', rpdLimitPerKey: 20 },
+  { model: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash (#2 Backup)', rpdLimitPerKey: 20 },
+  { model: 'gemini-3-flash-preview', label: 'Gemini 3 Flash (#3 Backup)', rpdLimitPerKey: 20 },
+  { model: 'gemini-robotics-er-2-preview', label: 'Gemini Robotics ER-2 (#4 Backup)', rpdLimitPerKey: 20 },
+  { model: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash (#5 Backup)', rpdLimitPerKey: 20 },
   { model: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash Lite (Manual / QA)', rpdLimitPerKey: 500 },
 ];
 
@@ -394,11 +394,9 @@ const keyModelCooldowns = new Map<string, KeyCooldownEntry>();
 const keyGlobalInvalidUntil = new Map<string, number>();
 const keyModelRecentRequests = new Map<string, number[]>();
 const keyLastDispatchedAt = new Map<string, number>();
-let inMemoryLedger: PersistedQuotaLedger | null = null;
 
 const RPM_WINDOW_MS = 60_000;
 const DEFAULT_RPM_COOLDOWN_MS = 65_000;
-const DEFAULT_RPD_COOLDOWN_MS = 20 * 60_000;
 const DEFAULT_INVALID_KEY_COOLDOWN_MS = 10 * 60_000;
 
 export function getCurrentPacificDateString(nowMs = Date.now()): string {
@@ -414,65 +412,9 @@ export function getCurrentPacificDateString(nowMs = Date.now()): string {
   }
 }
 
-function getKeyFingerprint(apiKey: string): string {
-  let hash = 2166136261;
-  for (let i = 0; i < apiKey.length; i++) {
-    hash ^= apiKey.charCodeAt(i);
-    hash = Math.imul(hash, 16777619);
-  }
-  return `${maskApiKey(apiKey)}#${(hash >>> 0).toString(36)}`;
-}
-
-function getOrLoadQuotaLedger(nowMs = Date.now()): PersistedQuotaLedger {
-  const todayPt = getCurrentPacificDateString(nowMs);
-  if (inMemoryLedger && inMemoryLedger.datePt === todayPt) {
-    return inMemoryLedger;
-  }
-
-  try {
-    if (typeof window !== 'undefined' && window.localStorage) {
-      const raw = localStorage.getItem(QUOTA_LEDGER_STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw) as PersistedQuotaLedger;
-        if (parsed && parsed.datePt === todayPt && parsed.entries && typeof parsed.entries === 'object') {
-          inMemoryLedger = parsed;
-          return inMemoryLedger;
-        }
-      }
-    }
-  } catch {
-    // Ignore storage read errors cleanly
-  }
-
-  inMemoryLedger = { datePt: todayPt, entries: {} };
-  return inMemoryLedger;
-}
-
-function saveQuotaLedger(ledger: PersistedQuotaLedger): void {
-  inMemoryLedger = ledger;
-  try {
-    if (typeof window !== 'undefined' && window.localStorage) {
-      localStorage.setItem(QUOTA_LEDGER_STORAGE_KEY, JSON.stringify(ledger));
-    }
-  } catch {
-    // Ignore storage quota errors cleanly
-  }
-}
-
-function notifyKeyOrQuotaUpdated(): void {
-  try {
-    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function' && typeof CustomEvent === 'function') {
-      window.dispatchEvent(new CustomEvent(API_KEYS_UPDATED_EVENT));
-    }
-  } catch {
-    // Non-browser guard
-  }
-}
-
 /**
  * Normalizes model identifier cleanly and maps routed deprecated aliases (`3.7-flash -> 3.8-flash`,
- * `3.5-flash -> 3.6-flash`) to their shared Google quota bucket so we never burn redundant retries
- * against an already-exhausted bucket.
+ * `3.5-flash -> 3.6-flash`) cleanly for pool scheduling.
  */
 export function resolveQuotaPoolModel(model?: string): string {
   if (!model) return 'default';
@@ -484,14 +426,13 @@ export function resolveQuotaPoolModel(model?: string): string {
 }
 
 /**
- * Clears in-memory key cooldown & persistent daily ledger state (used on key updates, manual reset, or tests).
+ * Clears in-memory key cooldown & any legacy persistent daily ledger state.
  */
 export function resetApiKeyHealthState(): void {
   keyModelCooldowns.clear();
   keyGlobalInvalidUntil.clear();
   keyModelRecentRequests.clear();
   keyLastDispatchedAt.clear();
-  inMemoryLedger = null;
   try {
     if (typeof window !== 'undefined' && window.localStorage) {
       localStorage.removeItem(QUOTA_LEDGER_STORAGE_KEY);
@@ -503,7 +444,13 @@ export function resetApiKeyHealthState(): void {
 
 export function resetFreeTierDailyQuotaStats(): void {
   resetApiKeyHealthState();
-  notifyKeyOrQuotaUpdated();
+  try {
+    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function' && typeof CustomEvent === 'function') {
+      window.dispatchEvent(new CustomEvent(API_KEYS_UPDATED_EVENT));
+    }
+  } catch {
+    // Non-browser guard
+  }
 }
 
 function getPoolKey(apiKey: string, poolModel: string): string {
@@ -514,12 +461,6 @@ function getActiveCooldown(apiKey: string, poolModel: string, now: number): { un
   const mem = keyModelCooldowns.get(getPoolKey(apiKey, poolModel));
   if (mem && mem.untilMs > now) {
     return { untilMs: mem.untilMs, kind: mem.kind };
-  }
-  const ledger = getOrLoadQuotaLedger(now);
-  const fp = getKeyFingerprint(apiKey);
-  const persisted = ledger.entries[fp]?.[poolModel];
-  if (persisted?.cooldownUntil && persisted.cooldownUntil > now) {
-    return { untilMs: persisted.cooldownUntil, kind: persisted.cooldownKind || 'rpd' };
   }
   return null;
 }
@@ -538,22 +479,6 @@ function markApiKeyDispatched(apiKey: string, poolModel: string, now = Date.now(
   fresh.push(now);
   keyModelRecentRequests.set(poolKey, fresh);
   keyLastDispatchedAt.set(apiKey, now);
-
-  const ledger = getOrLoadQuotaLedger(now);
-  const fp = getKeyFingerprint(apiKey);
-  if (!ledger.entries[fp]) ledger.entries[fp] = {};
-  const existing = ledger.entries[fp][poolModel] || { count: 0 };
-  ledger.entries[fp][poolModel] = { ...existing, count: existing.count + 1 };
-  saveQuotaLedger(ledger);
-}
-
-function parseRetryDelayMs(msg: string): number | null {
-  const secMatch = msg.match(/retry\s*(?:in|after|delay)?\s*[:=]?\s*(\d+(?:\.\d+)?)\s*s\b/i);
-  if (secMatch) {
-    const ms = Math.ceil(parseFloat(secMatch[1]) * 1000) + 1000;
-    return Math.min(30 * 60_000, Math.max(5_000, ms));
-  }
-  return null;
 }
 
 function recordApiKeyFailure(apiKey: string, poolModel: string, err: any, now = Date.now()): void {
@@ -583,63 +508,21 @@ function recordApiKeyFailure(apiKey: string, poolModel: string, err: any, now = 
 
   if (!isQuotaError) return;
 
+  // Track only brief in-memory deprioritization (65s) so all valid keys remain callable
+  // without stale daily RPD locks blocking keys or models.
   const poolKey = getPoolKey(apiKey, poolModel);
   const prev = keyModelCooldowns.get(poolKey);
-  const recentQuotaHits = prev && now - prev.lastErrorAt < 10 * 60_000 ? prev.hitCount + 1 : 1;
-
-  const explicitDaily =
-    msg.includes('perday') ||
-    msg.includes('per_day') ||
-    msg.includes('requestsperday') ||
-    msg.includes('requests per day') ||
-    msg.includes('rpd') ||
-    msg.includes('daily');
-  const explicitMinute =
-    msg.includes('perminute') ||
-    msg.includes('per_minute') ||
-    msg.includes('tokensperminute') ||
-    msg.includes('requestsperminute') ||
-    msg.includes('rpm') ||
-    msg.includes('tpm');
-
-  const isDailyExhausted = explicitDaily || (!explicitMinute && recentQuotaHits >= 2);
-  const hintMs = parseRetryDelayMs(msg);
-  const cooldownMs = isDailyExhausted
-    ? Math.max(DEFAULT_RPD_COOLDOWN_MS, hintMs ?? 0)
-    : Math.max(DEFAULT_RPM_COOLDOWN_MS, hintMs ?? 0);
-
-  const kind: 'rpm' | 'rpd' = isDailyExhausted ? 'rpd' : 'rpm';
-  const untilMs = now + cooldownMs;
-
+  const hitCount = prev && now - prev.lastErrorAt < 10 * 60_000 ? prev.hitCount + 1 : 1;
   keyModelCooldowns.set(poolKey, {
-    untilMs,
-    kind,
-    hitCount: recentQuotaHits,
+    untilMs: now + DEFAULT_RPM_COOLDOWN_MS,
+    kind: 'rpm',
+    hitCount,
     lastErrorAt: now,
   });
-
-  const ledger = getOrLoadQuotaLedger(now);
-  const fp = getKeyFingerprint(apiKey);
-  if (!ledger.entries[fp]) ledger.entries[fp] = {};
-  const existing = ledger.entries[fp][poolModel] || { count: 0 };
-  ledger.entries[fp][poolModel] = {
-    ...existing,
-    cooldownUntil: untilMs,
-    cooldownKind: kind,
-  };
-  saveQuotaLedger(ledger);
 }
 
-export function hasConfirmedDailyExhaustionAcrossAllKeys(model: string, now = Date.now()): boolean {
-  const { customKeys, builtinKeys } = getRawCandidateKeyPools();
-  const allKeys = [...customKeys, ...builtinKeys];
-  if (allKeys.length === 0) return false;
-
-  const poolModel = resolveQuotaPoolModel(model);
-  return allKeys.every((key) => {
-    const cd = getActiveCooldown(key, poolModel, now);
-    return cd?.kind === 'rpd' && cd.untilMs > now;
-  });
+export function hasConfirmedDailyExhaustionAcrossAllKeys(_model: string, _now = Date.now()): boolean {
+  return false;
 }
 
 export function getFreeTierDailyQuotaStats(): {
@@ -647,36 +530,20 @@ export function getFreeTierDailyQuotaStats(): {
   totalKeys: number;
   models: FreeTierModelQuotaStat[];
 } {
-  const now = Date.now();
   const { customKeys, builtinKeys } = getRawCandidateKeyPools();
-  const allKeys = [...customKeys, ...builtinKeys];
-  const ledger = getOrLoadQuotaLedger(now);
-
-  const models = TRACKED_FREE_TIER_MODELS.map((entry) => {
-    let usedToday = 0;
-    let exhaustedKeys = 0;
-    for (const key of allKeys) {
-      const fp = getKeyFingerprint(key);
-      const stat = ledger.entries[fp]?.[entry.model];
-      if (stat?.count) usedToday += stat.count;
-      const cd = getActiveCooldown(key, entry.model, now);
-      if (cd?.kind === 'rpd' && cd.untilMs > now) exhaustedKeys++;
-    }
-    return {
+  const totalKeys = customKeys.length + builtinKeys.length;
+  return {
+    datePt: getCurrentPacificDateString(),
+    totalKeys,
+    models: TRACKED_FREE_TIER_MODELS.map((entry) => ({
       model: entry.model,
       label: entry.label,
       rpdLimitPerKey: entry.rpdLimitPerKey,
-      usedToday,
-      totalCapacity: allKeys.length * entry.rpdLimitPerKey,
-      exhaustedKeys,
-      totalKeys: allKeys.length,
-    };
-  });
-
-  return {
-    datePt: ledger.datePt,
-    totalKeys: allKeys.length,
-    models,
+      usedToday: 0,
+      totalCapacity: totalKeys * entry.rpdLimitPerKey,
+      exhaustedKeys: 0,
+      totalKeys,
+    })),
   };
 }
 
@@ -690,7 +557,6 @@ function getRawCandidateKeyPools(): { customKeys: string[]; builtinKeys: string[
 function classifyPoolTier(rawKeys: string[], poolModel: string, now: number) {
   const healthy: Array<{ key: string; recentCount: number; lastUsed: number }> = [];
   const shortRpmCooled: Array<{ key: string; untilMs: number }> = [];
-  const rpdCooled: Array<{ key: string; untilMs: number }> = [];
   const invalidKeys: Array<{ key: string; untilMs: number }> = [];
 
   for (const key of shuffle(rawKeys)) {
@@ -703,11 +569,7 @@ function classifyPoolTier(rawKeys: string[], poolModel: string, now: number) {
     const poolKey = getPoolKey(key, poolModel);
     const cd = getActiveCooldown(key, poolModel, now);
     if (cd && cd.untilMs > now) {
-      if (cd.kind === 'rpm' && cd.untilMs - now <= 120_000) {
-        shortRpmCooled.push({ key, untilMs: cd.untilMs });
-      } else {
-        rpdCooled.push({ key, untilMs: cd.untilMs });
-      }
+      shortRpmCooled.push({ key, untilMs: cd.untilMs });
       continue;
     }
 
@@ -724,24 +586,21 @@ function classifyPoolTier(rawKeys: string[], poolModel: string, now: number) {
     return a.lastUsed - b.lastUsed;
   });
   shortRpmCooled.sort((a, b) => a.untilMs - b.untilMs);
-  rpdCooled.sort((a, b) => a.untilMs - b.untilMs);
   invalidKeys.sort((a, b) => a.untilMs - b.untilMs);
 
-  return { healthy, shortRpmCooled, rpdCooled, invalidKeys };
+  return { healthy, shortRpmCooled, invalidKeys };
 }
 
 /**
- * Returns candidate keys ordered cleanly for maximum free-tier throughput and strict priority:
- * 1. Healthy user custom keys FIRST (sorted by fewest requests in the last 60s, then LRU).
- * 2. If secret 1198 is unlocked, healthy built-in keys strictly AFTER custom keys (as automatic failover).
- * 3. Short RPM-cooled keys (custom first, then built-in backup).
- * 4. If "Selected Model Only" (or includeRpdCooled) is active, includes ALL RPD-cooled valid keys
- *    (custom first, then built-in) so the selected model always retries the full active key pool.
- *    Otherwise (Auto Fallback), probes at most 1 RPD-cooled key before failing over models in 0ms.
+ * Returns ALL valid candidate keys without filtering by estimated daily rate limits:
+ * 1. Healthy user custom keys FIRST (sorted by fewest requests in last 60s, then LRU).
+ * 2. If secret 1198 is unlocked, healthy built-in keys strictly AFTER custom keys.
+ * 3. Recently 429-cooled valid keys (custom first, then built-in) right behind healthy keys so every
+ *    valid key in the pool stays callable before cascading to the next model.
  */
 export function getCandidateKeysForOperation(
   selectedModel?: string,
-  options?: { includeRpdCooled?: boolean }
+  _options?: { includeRpdCooled?: boolean }
 ): { candidateKeys: string[]; isCustom: boolean; hasBuiltinBackup: boolean } {
   const { customKeys, builtinKeys } = getRawCandidateKeyPools();
   const isCustom = customKeys.length > 0;
@@ -753,7 +612,6 @@ export function getCandidateKeysForOperation(
 
   const now = Date.now();
   const poolModel = resolveQuotaPoolModel(selectedModel);
-  const includeRpdCooled = options?.includeRpdCooled ?? isStrictSelectedModelOnlyEnabled();
 
   const customTier = classifyPoolTier(customKeys, poolModel, now);
   const builtinTier = classifyPoolTier(builtinKeys, poolModel, now);
@@ -765,20 +623,9 @@ export function getCandidateKeysForOperation(
     ...builtinTier.shortRpmCooled.map((c) => c.key),
   ];
 
-  if (includeRpdCooled) {
-    ordered.push(
-      ...customTier.rpdCooled.map((c) => c.key),
-      ...builtinTier.rpdCooled.map((c) => c.key)
-    );
-  }
-
-  // Fallback probe when nothing remains above (e.g. Auto Fallback with all keys RPD-cooled, or all invalid 401/403)
+  // Probe at most 1 key only if EVERY key was marked invalid (401/403)
   if (ordered.length === 0) {
-    if (customTier.rpdCooled.length > 0) {
-      ordered.push(customTier.rpdCooled[0].key);
-    } else if (builtinTier.rpdCooled.length > 0) {
-      ordered.push(builtinTier.rpdCooled[0].key);
-    } else if (customTier.invalidKeys.length > 0) {
+    if (customTier.invalidKeys.length > 0) {
       ordered.push(customTier.invalidKeys[0].key);
     } else if (builtinTier.invalidKeys.length > 0) {
       ordered.push(builtinTier.invalidKeys[0].key);

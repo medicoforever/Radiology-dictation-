@@ -9,7 +9,6 @@ import {
   getCandidateKeysForOperation,
   getClientForApiKey,
   getRandomAIClient,
-  hasConfirmedDailyExhaustionAcrossAllKeys,
   isModelLevelServiceUnavailableError,
   isStrictSelectedModelOnlyEnabled,
 } from "./apiKeyService";
@@ -707,28 +706,11 @@ export async function executeWithFreeTierModelFallback<T>(
     ? [resolvedPrimary]
     : getFreeTierModelFallbackChain(resolvedPrimary);
   let lastErr: any = null;
-  let notifiedPreSkip = false;
 
   for (let i = 0; i < chain.length; i++) {
     const modelName = chain[i];
     if (options?.abortSignal?.aborted) {
       throw new DOMException('Aborted by user', 'AbortError');
-    }
-
-    // If this model is already confirmed daily-exhausted across all pooled keys today and a healthier
-    // accurate fallback model remains in the chain, skip immediately in 0ms without burning a 429 retry.
-    const hasHealthyLaterCandidate = chain.slice(i + 1).some((m) => !hasConfirmedDailyExhaustionAcrossAllKeys(m));
-    if (i < chain.length - 1 && hasHealthyLaterCandidate && hasConfirmedDailyExhaustionAcrossAllKeys(modelName)) {
-      if (!notifiedPreSkip) {
-        notifiedPreSkip = true;
-        const target = chain.slice(i + 1).find((m) => !hasConfirmedDailyExhaustionAcrossAllKeys(m)) || chain[i + 1];
-        emitModelFailoverNotice({
-          fromModel: resolvedPrimary,
-          toModel: target,
-          reason: 'rpd_ledger',
-        });
-      }
-      continue;
     }
 
     const hasMoreFallbackModels = i < chain.length - 1;
@@ -3824,16 +3806,6 @@ INSTRUCTIONS FOR THIS AUDIO SEGMENT:
 
   for (let attempt = 0; attempt < fallbackChain.length; attempt++) {
     const currentModel = fallbackChain[attempt];
-    if (
-      attempt < fallbackChain.length - 1 &&
-      fallbackChain.slice(attempt + 1).some((m) => !hasConfirmedDailyExhaustionAcrossAllKeys(m)) &&
-      hasConfirmedDailyExhaustionAcrossAllKeys(currentModel)
-    ) {
-      const nextHealthy = fallbackChain.slice(attempt + 1).find((m) => !hasConfirmedDailyExhaustionAcrossAllKeys(m)) || fallbackChain[attempt + 1];
-      emitModelFailoverNotice({ fromModel: currentModel, toModel: nextHealthy, reason: 'rpd_ledger' });
-      onFailover?.(currentModel, nextHealthy, 'Daily Free-Tier RPD full across active keys');
-      continue;
-    }
 
     try {
       const liveChunkPrompt = buildPromptForModel(currentModel);
@@ -3975,13 +3947,6 @@ Output MUST be a JSON object with a single "findings" array of strings.`;
 
   for (let attempt = 0; attempt < fallbackChain.length; attempt++) {
     const currentModel = fallbackChain[attempt];
-    if (
-      attempt < fallbackChain.length - 1 &&
-      fallbackChain.slice(attempt + 1).some((m) => !hasConfirmedDailyExhaustionAcrossAllKeys(m)) &&
-      hasConfirmedDailyExhaustionAcrossAllKeys(currentModel)
-    ) {
-      continue;
-    }
     try {
       const rawResponseText = await generateContentWithJsonFallback(
         currentModel,
