@@ -356,15 +356,56 @@ test('Decision-1 gating logic: threshold, short skip, batching, 100%-drop guard,
   assert.equal(allDropRes.keptWindows.length, 2);
   assert.equal(allDropRes.droppedWindows.length, 0);
 
-  // 5) API/quota error falls back gracefully to VAD-trimmed windows
-  const errRes = await filterWindowsWithDecision1(twoWins, pcm, sr, {
+  // 5) API/quota error trips circuit breaker fast and falls back gracefully to VAD-trimmed windows
+  let errCalls = 0;
+  const errRes = await filterWindowsWithDecision1(sevenWindows, pcm, sr, {
     batchSpacingMs: 0,
+    concurrency: 1,
     callDecisionsFn: async () => {
+      errCalls++;
       throw new Error('429 RESOURCE_EXHAUSTED');
     },
   });
   assert.equal(errRes.usedDecision1, false);
-  assert.equal(errRes.keptWindows.length, 2);
+  assert.equal(errRes.keptWindows.length, 7);
+  assert.equal(errCalls, 1); // 2nd batch skipped immediately after 429 circuit trip
+
+  // 6) Parallel execution runs concurrent batches and keeps deterministic sorted outcomes
+  const manyWindows = buildEvaluationWindows(
+    Array.from({ length: 18 }, (_, i) => ({
+      startSec: i * 10,
+      endSec: i * 10 + 4,
+      durationSec: 4,
+      peakRms: 0.1,
+      meanRms: 0.05,
+    }))
+  );
+  let activeInFlight = 0;
+  let peakInFlight = 0;
+  const parallelRes = await filterWindowsWithDecision1(manyWindows, pcm, sr, {
+    concurrency: 3,
+    callDecisionsFn: async (req) => {
+      activeInFlight++;
+      if (activeInFlight > peakInFlight) peakInFlight = activeInFlight;
+      await new Promise((r) => setTimeout(r, 20));
+      activeInFlight--;
+      const qCount = Object.keys(req.questions).length;
+      const answers: Record<string, { noul: number; confidence: number }> = {};
+      for (let i = 1; i <= qCount; i++) {
+        // Verify compact 8kHz WAV fallback was used without WebCodecs
+        assert.equal((req.input.find((p) => p.type === 'audio') as any)?.mime_type, 'audio/wav');
+        answers[`seg_${i}`] = i === 2 ? { noul: 0.05, confidence: 0.95 } : { noul: 0.95, confidence: 0.95 };
+      }
+      return { answers };
+    },
+  });
+  assert.equal(peakInFlight, 3);
+  assert.equal(parallelRes.usedDecision1, true);
+  assert.equal(parallelRes.droppedWindows.length, 3); // seg_2 dropped in each of 3 batches
+  assert.deepEqual(
+    parallelRes.outcomes.map((o) => o.windowIndex),
+    manyWindows.map((w) => w.index)
+  );
 });
 
 test('muxOpusPacketsToOgg produces valid Ogg/Opus pages and passes ffprobe/ffmpeg when available', () => {

@@ -20,8 +20,11 @@ export const PREFILTER_DECISION_MODEL = 'gemini-decision-1';
 
 const DECISIONS_ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta/decisions';
 const DECISION_MAX_SEGMENTS_PER_BATCH = 6;
-const DECISION_MAX_BATCH_SPEECH_SEC = 90;
-const DECISION_BATCH_SPACING_MS = 350;
+const DECISION_MAX_BATCH_SPEECH_SEC = 150;
+const DECISION_BATCH_SPACING_MS = 0;
+const DECISION_MAX_CONCURRENCY = 4;
+const DECISION_WAV_FALLBACK_SAMPLE_RATE = 8000;
+const DECISION_OPUS_BITRATE = 24000;
 const DECISION_MIN_SPEECH_FOR_CHECK_SEC = 5;
 const DECISION_DISCARD_NOUL_MAX = 0.25;
 const DECISION_DISCARD_CONFIDENCE_MIN = 0.70;
@@ -922,13 +925,23 @@ async function defaultCallAudioDecisionsApi(
     },
     {
       selectedModel: PREFILTER_DECISION_MODEL,
+      // Keep failover fast because Decision-1 fails open safely to VAD-trimmed audio
+      maxTries: 2,
+      delayMs: 250,
       abortSignal,
     }
   );
 }
 
+export interface DecisionBatchWindowInput {
+  window: EvaluationWindow;
+  wavBase64?: string;
+  audioBase64?: string;
+  mimeType?: string;
+}
+
 export function buildDecisionBatchPayload(
-  batchWindows: Array<{ window: EvaluationWindow; wavBase64: string }>
+  batchWindows: DecisionBatchWindowInput[]
 ): { model: string; input: Array<Record<string, any>>; questions: Record<string, any> } {
   const input: Array<Record<string, any>> = [
     {
@@ -940,11 +953,13 @@ export function buildDecisionBatchPayload(
 
   for (let i = 0; i < batchWindows.length; i++) {
     const k = i + 1;
+    const audioData = batchWindows[i].audioBase64 ?? batchWindows[i].wavBase64 ?? '';
+    const mimeType = batchWindows[i].mimeType || 'audio/wav';
     input.push({ type: 'text', text: `[Segment ${k}]\n` });
     input.push({
       type: 'audio',
-      data: batchWindows[i].wavBase64,
-      mime_type: 'audio/wav',
+      data: audioData,
+      mime_type: mimeType,
     });
 
     questions[`seg_${k}`] = {
@@ -995,12 +1010,70 @@ export function groupWindowsIntoDecisionBatches(
   return batches;
 }
 
+function isQuotaOrRateLimitError(err: unknown): boolean {
+  const anyErr = err as any;
+  if (anyErr?.status === 429) return true;
+  const msg = (err instanceof Error ? err.message : String(err || '')).toLowerCase();
+  return (
+    msg.includes('429') ||
+    msg.includes('resource_exhausted') ||
+    msg.includes('quota') ||
+    msg.includes('rate limit') ||
+    msg.includes('too many requests')
+  );
+}
+
+function isDecisionBadRequestError(err: unknown): boolean {
+  const anyErr = err as any;
+  return anyErr?.status === 400 || anyErr?.isNonRetryable === true;
+}
+
+async function encodeDecisionBatchItems(
+  batch: EvaluationWindow[],
+  monoSamples: Float32Array,
+  sampleRate: number,
+  preferOggOpus: boolean,
+  abortSignal?: AbortSignal
+): Promise<{ items: DecisionBatchWindowInput[]; usedOgg: boolean }> {
+  let usedOgg = false;
+  const items = await Promise.all(
+    batch.map(async (win): Promise<DecisionBatchWindowInput> => {
+      throwIfAborted(abortSignal);
+      const segPcm = concatPcmIntervals(monoSamples, sampleRate, win.intervals);
+
+      if (preferOggOpus) {
+        const oggBytes = await encodePcmBytesWithWebCodecsOggOpus(segPcm, sampleRate, {
+          abortSignal,
+          bitrate: DECISION_OPUS_BITRATE,
+        });
+        if (oggBytes && oggBytes.byteLength > 0) {
+          usedOgg = true;
+          return {
+            window: win,
+            audioBase64: uint8ArrayToBase64(oggBytes),
+            mimeType: 'audio/ogg',
+          };
+        }
+      }
+
+      const pcmCompact = resampleMonoPcm(segPcm, sampleRate, DECISION_WAV_FALLBACK_SAMPLE_RATE);
+      const wavBytes = encodePcmToWavBytes(pcmCompact, DECISION_WAV_FALLBACK_SAMPLE_RATE);
+      return {
+        window: win,
+        wavBase64: uint8ArrayToBase64(wavBytes),
+        mimeType: 'audio/wav',
+      };
+    })
+  );
+  return { items, usedOgg };
+}
+
 /**
- * Evaluates VAD evaluation windows via Gemini Decision 1 to drop strictly non-radiology
- * chatter/noise while upholding recall-first safety guarantees:
+ * Evaluates VAD evaluation windows via Gemini Decision 1 using bounded parallel batches
+ * and compact Opus/8kHz WAV payloads to drop non-radiology chatter while upholding safety:
  * - Skips Decision-1 when total speech <= 5s or <= 1 window
  * - Never drops 100% of segments
- * - Falls back cleanly to VAD-trimmed audio on any non-abort API/quota error
+ * - Trips quota circuit breaker cleanly on 429 and keeps remaining VAD segments without stalling
  */
 export async function filterWindowsWithDecision1(
   windows: EvaluationWindow[],
@@ -1010,6 +1083,8 @@ export async function filterWindowsWithDecision1(
     abortSignal?: AbortSignal;
     callDecisionsFn?: DecisionsApiCaller;
     batchSpacingMs?: number;
+    concurrency?: number;
+    onProgress?: (stage: string) => void;
   } = {}
 ): Promise<{
   keptWindows: EvaluationWindow[];
@@ -1047,22 +1122,22 @@ export async function filterWindowsWithDecision1(
   const callDecisions = options.callDecisionsFn ?? defaultCallAudioDecisionsApi;
   const batchSpacingMs = options.batchSpacingMs ?? DECISION_BATCH_SPACING_MS;
   const batches = groupWindowsIntoDecisionBatches(windows);
+  const concurrency = Math.max(1, options.concurrency ?? DECISION_MAX_CONCURRENCY);
 
   const startedAt = Date.now();
   const keepMap = new Map<number, boolean>();
   const outcomes: DecisionSegmentOutcome[] = [];
   let anyBatchSucceeded = false;
-  let estimatedTokensUsed = 0;
   let fallbackReason: string | undefined;
 
+  // Reserve batches up to Free-Tier 50k TPM budget upfront so workers execute concurrently
+  const batchesToEvaluate: EvaluationWindow[][] = [];
+  let estimatedTokensReserved = 0;
   for (let bIdx = 0; bIdx < batches.length; bIdx++) {
-    throwIfAborted(options.abortSignal);
     const batch = batches[bIdx];
     const batchSpeechSec = batch.reduce((s, w) => s + w.speechDurationSec, 0);
     const estimatedBatchTokens = Math.ceil(batchSpeechSec * 32) + batch.length * 160;
-
-    // Respect Free-Tier 50k TPM budget cleanly if a huge session approaches capacity
-    if (bIdx > 0 && estimatedTokensUsed + estimatedBatchTokens > DECISION_APPROX_TPM_BUDGET) {
+    if (bIdx > 0 && estimatedTokensReserved + estimatedBatchTokens > DECISION_APPROX_TPM_BUDGET) {
       for (let remIdx = bIdx; remIdx < batches.length; remIdx++) {
         for (const remWin of batches[remIdx]) {
           keepMap.set(remWin.index, true);
@@ -1071,62 +1146,116 @@ export async function filterWindowsWithDecision1(
       fallbackReason = 'Decision-1 TPM budget threshold reached; kept remaining segments for safety';
       break;
     }
-
-    if (bIdx > 0 && batchSpacingMs > 0) {
-      await sleepWithAbort(batchSpacingMs, options.abortSignal);
-    }
-
-    const encodedBatch = batch.map((win) => {
-      const segPcm = concatPcmIntervals(monoSamples, sampleRate, win.intervals);
-      const pcm16k = resampleMonoPcm(segPcm, sampleRate, 16000);
-      const wavBytes = encodePcmToWavBytes(pcm16k, 16000);
-      return {
-        window: win,
-        wavBase64: uint8ArrayToBase64(wavBytes),
-      };
-    });
-
-    const payload = buildDecisionBatchPayload(encodedBatch);
-
-    try {
-      const data = await callDecisions(payload, options.abortSignal);
-      anyBatchSucceeded = true;
-      estimatedTokensUsed +=
-        typeof data?.usage?.total_input_tokens === 'number'
-          ? data.usage.total_input_tokens
-          : estimatedBatchTokens;
-
-      const answers = data?.answers || {};
-      for (let i = 0; i < batch.length; i++) {
-        const win = batch[i];
-        const ans = answers[`seg_${i + 1}`];
-        const noul = typeof ans?.noul === 'number' ? ans.noul : 1;
-        const confidence =
-          typeof ans?.confidence === 'number'
-            ? ans.confidence
-            : typeof ans?.noul === 'number'
-            ? Math.max(ans.noul, 1 - ans.noul)
-            : 0;
-        const discard = shouldDiscardDecisionSegment(noul, confidence);
-        keepMap.set(win.index, !discard);
-        outcomes.push({
-          windowIndex: win.index,
-          noul,
-          confidence,
-          keep: !discard,
-        });
-      }
-    } catch (err) {
-      if (isAbortError(err) || options.abortSignal?.aborted) {
-        throw err;
-      }
-      console.warn('[AudioPrefilter] Decision-1 batch failed; keeping batch segments safely:', err);
-      for (const win of batch) {
-        keepMap.set(win.index, true);
-      }
-      fallbackReason = 'Decision-1 API/quota error; fell back to VAD-trimmed audio';
-    }
+    batchesToEvaluate.push(batch);
+    estimatedTokensReserved += estimatedBatchTokens;
   }
+
+  let nextBatchIdx = 0;
+  let completedBatches = 0;
+  let quotaCircuitTripped = false;
+  let preferOggForDecisions = true;
+
+  const markBatchKept = (batch: EvaluationWindow[]) => {
+    for (const win of batch) {
+      keepMap.set(win.index, true);
+    }
+  };
+
+  const runWorker = async () => {
+    while (true) {
+      throwIfAborted(options.abortSignal);
+      const bIdx = nextBatchIdx++;
+      if (bIdx >= batchesToEvaluate.length) {
+        return;
+      }
+
+      const batch = batchesToEvaluate[bIdx];
+      if (quotaCircuitTripped) {
+        markBatchKept(batch);
+        continue;
+      }
+
+      if (bIdx > 0 && batchSpacingMs > 0 && concurrency === 1) {
+        await sleepWithAbort(batchSpacingMs, options.abortSignal);
+      }
+
+      let encoded = await encodeDecisionBatchItems(
+        batch,
+        monoSamples,
+        sampleRate,
+        preferOggForDecisions,
+        options.abortSignal
+      );
+
+      try {
+        let data: any;
+        try {
+          data = await callDecisions(buildDecisionBatchPayload(encoded.items), options.abortSignal);
+        } catch (firstErr) {
+          if (isAbortError(firstErr) || options.abortSignal?.aborted) {
+            throw firstErr;
+          }
+          // If an environment/endpoint rejects Ogg for Decisions, transparently retry once with compact 8kHz WAV
+          if (encoded.usedOgg && isDecisionBadRequestError(firstErr)) {
+            preferOggForDecisions = false;
+            encoded = await encodeDecisionBatchItems(
+              batch,
+              monoSamples,
+              sampleRate,
+              false,
+              options.abortSignal
+            );
+            data = await callDecisions(buildDecisionBatchPayload(encoded.items), options.abortSignal);
+          } else {
+            throw firstErr;
+          }
+        }
+
+        anyBatchSucceeded = true;
+        const answers = data?.answers || {};
+        for (let i = 0; i < batch.length; i++) {
+          const win = batch[i];
+          const ans = answers[`seg_${i + 1}`];
+          const noul = typeof ans?.noul === 'number' ? ans.noul : 1;
+          const confidence =
+            typeof ans?.confidence === 'number'
+              ? ans.confidence
+              : typeof ans?.noul === 'number'
+              ? Math.max(ans.noul, 1 - ans.noul)
+              : 0;
+          const discard = shouldDiscardDecisionSegment(noul, confidence);
+          keepMap.set(win.index, !discard);
+          outcomes.push({
+            windowIndex: win.index,
+            noul,
+            confidence,
+            keep: !discard,
+          });
+        }
+      } catch (err) {
+        if (isAbortError(err) || options.abortSignal?.aborted) {
+          throw err;
+        }
+        console.warn('[AudioPrefilter] Decision-1 batch failed; keeping batch segments safely:', err);
+        markBatchKept(batch);
+        if (isQuotaOrRateLimitError(err)) {
+          quotaCircuitTripped = true;
+        }
+        fallbackReason = 'Decision-1 API/quota error; fell back to VAD-trimmed audio';
+      } finally {
+        completedBatches++;
+        if (batchesToEvaluate.length > 1) {
+          options.onProgress?.(
+            `Filtering non-radiology chatter (${completedBatches}/${batchesToEvaluate.length} batches)...`
+          );
+        }
+      }
+    }
+  };
+
+  const workerCount = Math.min(concurrency, batchesToEvaluate.length);
+  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+  outcomes.sort((a, b) => a.windowIndex - b.windowIndex);
 
   const decisionLatencyMs = Date.now() - startedAt;
 
@@ -1385,12 +1514,38 @@ export function muxOpusPacketsToOgg(
   return out;
 }
 
-async function encodePcmWithWebCodecsOggOpus(
+const opusSupportCache = new Map<number, boolean>();
+
+async function isOpusWebCodecsSupported(bitrate: number): Promise<boolean> {
+  const cached = opusSupportCache.get(bitrate);
+  if (cached !== undefined) return cached;
+  if (typeof AudioEncoder === 'undefined' || typeof AudioData === 'undefined') {
+    return false;
+  }
+  const config: AudioEncoderConfig = {
+    codec: 'opus',
+    sampleRate: OPUS_TARGET_SAMPLE_RATE,
+    numberOfChannels: 1,
+    bitrate,
+  };
+  try {
+    const support = await AudioEncoder.isConfigSupported(config);
+    const ok = Boolean(support.supported);
+    opusSupportCache.set(bitrate, ok);
+    return ok;
+  } catch {
+    opusSupportCache.set(bitrate, false);
+    return false;
+  }
+}
+
+async function encodePcmBytesWithWebCodecsOggOpus(
   monoSamples: Float32Array,
   sampleRate: number,
-  abortSignal?: AbortSignal
-): Promise<Blob | null> {
-  if (typeof AudioEncoder === 'undefined' || typeof AudioData === 'undefined') {
+  options: { abortSignal?: AbortSignal; bitrate?: number } = {}
+): Promise<Uint8Array | null> {
+  const bitrate = options.bitrate ?? OPUS_TARGET_BITRATE;
+  if (!(await isOpusWebCodecsSupported(bitrate))) {
     return null;
   }
 
@@ -1398,19 +1553,10 @@ async function encodePcmWithWebCodecsOggOpus(
     codec: 'opus',
     sampleRate: OPUS_TARGET_SAMPLE_RATE,
     numberOfChannels: 1,
-    bitrate: OPUS_TARGET_BITRATE,
+    bitrate,
   };
 
-  try {
-    const support = await AudioEncoder.isConfigSupported(config);
-    if (!support.supported) {
-      return null;
-    }
-  } catch {
-    return null;
-  }
-
-  throwIfAborted(abortSignal);
+  throwIfAborted(options.abortSignal);
   const pcm48k = resampleMonoPcm(monoSamples, sampleRate, OPUS_TARGET_SAMPLE_RATE);
   if (pcm48k.length === 0) return null;
 
@@ -1463,14 +1609,14 @@ async function encodePcmWithWebCodecsOggOpus(
 
   try {
     encoder.configure(config);
-    // Feed in 1-second (48,000 sample) frames to keep queue pressure bounded
-    const blockSize = OPUS_TARGET_SAMPLE_RATE;
+    // Feed 4-second frames to minimize AudioData wrappers & queue stalls on long audio
+    const blockSize = OPUS_TARGET_SAMPLE_RATE * 4;
     for (let offset = 0; offset < pcm48k.length; offset += blockSize) {
-      throwIfAborted(abortSignal);
+      throwIfAborted(options.abortSignal);
       if (encodeError) throw encodeError;
 
-      while (encoder.encodeQueueSize > 16) {
-        await sleepWithAbort(5, abortSignal);
+      while (encoder.encodeQueueSize > 32) {
+        await sleepWithAbort(5, options.abortSignal);
         if (encodeError) throw encodeError;
       }
 
@@ -1496,8 +1642,7 @@ async function encodePcmWithWebCodecsOggOpus(
     if (encodeError) throw encodeError;
     if (packets.length === 0) return null;
 
-    const oggBytes = muxOpusPacketsToOgg(packets, preSkip);
-    return new Blob([oggBytes.buffer as ArrayBuffer], { type: 'audio/ogg' });
+    return muxOpusPacketsToOgg(packets, preSkip);
   } catch (err) {
     if (isAbortError(err)) throw err;
     console.warn('[AudioPrefilter] WebCodecs Opus encoding failed, falling back to WAV:', err);
@@ -1511,6 +1656,16 @@ async function encodePcmWithWebCodecsOggOpus(
       // Ignore close error
     }
   }
+}
+
+async function encodePcmWithWebCodecsOggOpus(
+  monoSamples: Float32Array,
+  sampleRate: number,
+  abortSignal?: AbortSignal
+): Promise<Blob | null> {
+  const oggBytes = await encodePcmBytesWithWebCodecsOggOpus(monoSamples, sampleRate, { abortSignal });
+  if (!oggBytes) return null;
+  return new Blob([oggBytes.buffer as ArrayBuffer], { type: 'audio/ogg' });
 }
 
 async function encodeCompactAudioBlob(
@@ -1656,6 +1811,7 @@ async function prefilterSingleAudioBlob(
   options.onProgress?.('Filtering non-radiology chatter with Decision-1...');
   const decisionRes = await filterWindowsWithDecision1(windows, samples, sampleRate, {
     abortSignal: options.abortSignal,
+    onProgress: options.onProgress,
   });
 
   const keptIntervals = decisionRes.keptWindows.flatMap((w) => w.intervals);
