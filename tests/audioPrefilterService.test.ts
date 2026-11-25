@@ -30,8 +30,10 @@ import {
   DEFAULT_SELECTED_MODEL,
   FREE_TIER_HIGH_ACCURACY_SIBLING,
   FREE_TIER_QUOTA_FALLBACK_ORDER,
+  LIVE_DICTATION_MODELS,
   MODEL_OPTIMAL_THINKING_LEVEL,
   MODEL_REASONING_THINKING_LEVEL,
+  STRICT_SELECTED_MODEL_ONLY_KEY,
   getFreeTierModelFallbackChain,
   getLiveModelFallbackChain,
   getOptimalThinkingLevel,
@@ -47,6 +49,7 @@ import {
 import {
   MODEL_FAILOVER_EVENT,
   SECRET_BUILTIN_KEYS_UNLOCKED_KEY,
+  STRICT_MODEL_ONLY_UPDATED_EVENT,
   USER_KEYS_STORAGE_KEY,
   executeWithApiKeyFailover,
   getCandidateKeysForOperation,
@@ -55,8 +58,10 @@ import {
   getUserApiKeys,
   hasConfirmedDailyExhaustionAcrossAllKeys,
   isBuiltinKeysUnlocked,
+  isStrictSelectedModelOnlyEnabled,
   lockBuiltinKeys,
   resetApiKeyHealthState,
+  setStrictSelectedModelOnlyEnabled,
   setUserApiKeys,
   unlockBuiltinKeys,
 } from '../services/apiKeyService';
@@ -727,16 +732,44 @@ test('filterAudioInputsForModel combines multi-audio inputs and downloads origin
   }
 });
 
-test('model ordering strictly matches verified clinical accuracy and configures 99%-dictation thinking levels', () => {
+test('model ordering strictly matches verified clinical accuracy, clean UI labels, and 99%-dictation thinking levels', () => {
   assert.equal(DEFAULT_SELECTED_MODEL, 'gemini-4-hydrogen');
   assert.deepEqual(
-    AVAILABLE_MODELS.slice(0, 6).map((m) => m.value),
+    AVAILABLE_MODELS.map((m) => m.value),
     [
       'gemini-4-hydrogen',
       'gemini-3.8-flash',
       'gemini-3.6-flash',
       'gemini-3-flash-preview',
       'gemini-robotics-er-2-preview',
+      'gemini-3.7-flash',
+      'gemini-3.5-flash',
+      'gemini-3.5-flash-lite',
+      'gemini-3.1-pro-preview',
+    ]
+  );
+  assert.deepEqual(
+    AVAILABLE_MODELS.map((m) => m.label),
+    [
+      'Gemini 4 Hydrogen',
+      'Gemini 3.8 Flash',
+      'Gemini 3.6 Flash',
+      'Gemini 3 Flash',
+      'Gemini Robotics ER-2 Preview',
+      'Gemini 3.7 Flash',
+      'Gemini 3.5 Flash',
+      'Gemini 3.5 Flash Lite',
+      'Gemini 3.1 Pro',
+    ]
+  );
+  assert.deepEqual(
+    LIVE_DICTATION_MODELS.map((m) => m.value),
+    [
+      'gemini-4-hydrogen',
+      'gemini-3.8-flash',
+      'gemini-3.6-flash',
+      'gemini-3.7-flash',
+      'gemini-3.5-flash',
       'gemini-3.5-flash-lite',
     ]
   );
@@ -746,7 +779,11 @@ test('model ordering strictly matches verified clinical accuracy and configures 
   assert.equal(getOptimalThinkingLevel('gemini-4-hydrogen', 'reasoning'), 'medium');
   assert.equal(getOptimalThinkingLevel('gemini-3.8-flash'), 'medium');
   assert.equal(getOptimalThinkingLevel('gemini-3.8-flash', 'reasoning'), 'medium');
+  assert.equal(getOptimalThinkingLevel('gemini-3.7-flash'), 'medium');
+  assert.equal(getOptimalThinkingLevel('gemini-3.7-flash', 'reasoning'), 'medium');
   assert.equal(getOptimalThinkingLevel('gemini-3.6-flash'), 'medium');
+  assert.equal(getOptimalThinkingLevel('gemini-3.5-flash'), 'medium');
+  assert.equal(getOptimalThinkingLevel('gemini-3.5-flash', 'reasoning'), 'medium');
   assert.equal(getOptimalThinkingLevel('gemini-3-flash-preview'), 'low');
   assert.equal(getOptimalThinkingLevel('gemini-3-flash-preview', 'live_chunk'), 'minimal');
   assert.equal(getOptimalThinkingLevel('gemini-3-flash-preview', 'reasoning'), 'low');
@@ -994,11 +1031,14 @@ test('getFreeTierModelFallbackChain orders accuracy strictly and excludes gemini
     'gemini-3.6-flash',
     'gemini-3-flash-preview',
     'gemini-robotics-er-2-preview',
+    'gemini-3.7-flash',
+    'gemini-3.5-flash',
   ]);
-  // gemini-3.5-flash shares quota pool with gemini-3.6-flash -> skips duplicate 3.6 bucket
+  // gemini-3.5-flash runs first when explicitly selected and retains gemini-3.6-flash independently
   const from35 = getFreeTierModelFallbackChain('gemini-3.5-flash');
   assert.equal(from35[0], 'gemini-3.5-flash');
-  assert.equal(from35.includes('gemini-3.6-flash'), false);
+  assert.equal(from35.includes('gemini-3.6-flash'), true);
+  assert.equal(from35.includes('gemini-3.7-flash'), true);
   assert.equal(getFreeTierModelFallbackChain('gemini-4-hydrogen').includes('gemini-3.5-flash-lite'), false);
   assert.equal(getLiveModelFallbackChain('gemini-4-hydrogen').length, FREE_TIER_QUOTA_FALLBACK_ORDER.length);
 });
@@ -1199,5 +1239,107 @@ test('custom keys always execute strictly before the 9 unlocked (1198) built-in 
     resetApiKeyHealthState();
     (globalThis as any).window = prevWindow;
     (globalThis as any).localStorage = prevLocalStorage;
+  }
+});
+
+test('Selected Model Only toggle defaults OFF (allowing 3.7/3.5 tail failover) and enforces strict single-model execution when ON', async () => {
+  const store = new Map<string, string>();
+  const mockLocalStorage = {
+    getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+    setItem: (k: string, v: string) => store.set(k, String(v)),
+    removeItem: (k: string) => store.delete(k),
+  };
+  const dispatchedEvents: string[] = [];
+  const prevWindow = (globalThis as any).window;
+  const prevLocalStorage = (globalThis as any).localStorage;
+  const prevFetch = (globalThis as any).fetch;
+  (globalThis as any).window = {
+    localStorage: mockLocalStorage,
+    dispatchEvent: (ev: any) => {
+      if (ev?.type) dispatchedEvents.push(ev.type);
+      return true;
+    },
+  };
+  (globalThis as any).localStorage = mockLocalStorage;
+  resetApiKeyHealthState();
+
+  try {
+    setUserApiKeys(['AIzaSyStrictToggleTestKey0001']);
+    assert.equal(isStrictSelectedModelOnlyEnabled(), false);
+
+    // Turning ON restricts failover strictly to the selected model
+    setStrictSelectedModelOnlyEnabled(true);
+    assert.equal(isStrictSelectedModelOnlyEnabled(), true);
+    assert.equal(store.get(STRICT_SELECTED_MODEL_ONLY_KEY), 'true');
+    assert.ok(dispatchedEvents.includes(STRICT_MODEL_ONLY_UPDATED_EVENT));
+
+    const strictVisited: string[] = [];
+    (globalThis as any).fetch = async (url: string) => {
+      const match = url.match(/models\/([^:]+):generateContent/);
+      strictVisited.push(match ? decodeURIComponent(match[1]) : '');
+      return {
+        ok: false,
+        status: 429,
+        statusText: 'Too Many Requests',
+        json: async () => ({ error: { message: '429 PerDay RPD exhausted' } }),
+      };
+    };
+
+    await assert.rejects(
+      () => generateContentWithJsonFallback('gemini-4-hydrogen', [{ text: 'strict check' }]),
+      /Selected Model Only.*is ON/i
+    );
+    assert.deepEqual(strictVisited, ['gemini-4-hydrogen']);
+
+    // Turning OFF restores the full 7-model fallback chain (trying 3.7 & 3.5 Flash at the tail, skipping Flash-Lite)
+    setStrictSelectedModelOnlyEnabled(false);
+    assert.equal(isStrictSelectedModelOnlyEnabled(), false);
+    assert.equal(store.get(STRICT_SELECTED_MODEL_ONLY_KEY), 'false');
+    resetApiKeyHealthState();
+
+    const failoverVisited: string[] = [];
+    (globalThis as any).fetch = async (url: string) => {
+      const match = url.match(/models\/([^:]+):generateContent/);
+      const model = match ? decodeURIComponent(match[1]) : '';
+      failoverVisited.push(model);
+      if (model === 'gemini-3.5-flash') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            candidates: [{ content: { parts: [{ text: JSON.stringify({ corrected: 'Tail fallback ok' }) }] } }],
+          }),
+        };
+      }
+      return {
+        ok: false,
+        status: 429,
+        statusText: 'Too Many Requests',
+        json: async () => ({ error: { message: '429 PerDay RPD exhausted' } }),
+      };
+    };
+
+    const raw = await generateContentWithJsonFallback('gemini-4-hydrogen', [{ text: 'tail fallback check' }]);
+    assert.equal(JSON.parse(raw).corrected, 'Tail fallback ok');
+    assert.deepEqual(failoverVisited, [
+      'gemini-4-hydrogen',
+      'gemini-3.8-flash',
+      'gemini-3.6-flash',
+      'gemini-3-flash-preview',
+      'gemini-robotics-er-2-preview',
+      'gemini-3.7-flash',
+      'gemini-3.5-flash',
+    ]);
+    assert.equal(failoverVisited.includes('gemini-3.5-flash-lite'), false);
+
+    const stats = getFreeTierDailyQuotaStats();
+    const trackedNames = stats.models.map((m) => m.model);
+    assert.ok(trackedNames.includes('gemini-3.7-flash'));
+    assert.ok(trackedNames.includes('gemini-3.5-flash'));
+  } finally {
+    resetApiKeyHealthState();
+    (globalThis as any).window = prevWindow;
+    (globalThis as any).localStorage = prevLocalStorage;
+    (globalThis as any).fetch = prevFetch;
   }
 });

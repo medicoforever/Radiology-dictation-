@@ -7,6 +7,7 @@ import DownloadIcon from './icons/DownloadIcon';
 import ResultsDisplay from './ResultsDisplay';
 import CustomPromptInput, { DocxTemplateData } from './ui/CustomPromptInput';
 import { DEFAULT_LIVE_MODEL, LIVE_DICTATION_MODELS, getLiveModelFallbackChain } from '../constants';
+import { isStrictSelectedModelOnlyEnabled, STRICT_MODEL_ONLY_UPDATED_EVENT } from '../services/apiKeyService';
 import { getIncompleteLiveAudioSessions, recoverLiveSessionAudioAsBlob, clearSessionAudioCache } from '../services/audioCacheService';
 import { triggerAudioDownload } from '../services/audioMerger';
 
@@ -23,6 +24,16 @@ const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack }) => 
     const [selectedModel, setSelectedModel] = useState<string>(DEFAULT_LIVE_MODEL || 'gemini-4-hydrogen');
     const [interruptedSession, setInterruptedSession] = useState<{ sessionId: string; createdAt: number; totalChunks: number } | null>(null);
     const [isRecovering, setIsRecovering] = useState(false);
+    const [strictModelOnly, setStrictModelOnly] = useState<boolean>(() => isStrictSelectedModelOnlyEnabled());
+
+    useEffect(() => {
+        const handleStrictChange = (ev: Event) => {
+            const enabled = (ev as CustomEvent<{ enabled?: boolean }>)?.detail?.enabled;
+            if (typeof enabled === 'boolean') setStrictModelOnly(enabled);
+        };
+        window.addEventListener(STRICT_MODEL_ONLY_UPDATED_EVENT, handleStrictChange);
+        return () => window.removeEventListener(STRICT_MODEL_ONLY_UPDATED_EVENT, handleStrictChange);
+    }, []);
 
     useEffect(() => {
         getIncompleteLiveAudioSessions().then(sessions => {
@@ -219,11 +230,19 @@ const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack }) => 
                             </select>
                         </div>
                         <p className="text-[11px] text-emerald-700/80 dark:text-emerald-400/80 mt-1.5 leading-snug">
-                            Auto-failover chain: <span className="font-mono font-semibold">{getLiveModelFallbackChain(selectedModel).join(' → ')}</span>
+                            {strictModelOnly ? (
+                                <>Selected Model Only (<span className="font-semibold text-amber-700 dark:text-amber-300">Strict ON</span>): <span className="font-mono font-semibold">{selectedModel}</span></>
+                            ) : (
+                                <>Auto-failover chain: <span className="font-mono font-semibold">{getLiveModelFallbackChain(selectedModel).join(' → ')}</span></>
+                            )}
                         </p>
                     </div>
-                    <span className="inline-flex items-center self-start sm:self-center px-2.5 py-1 rounded-full text-xs font-medium bg-emerald-100 text-emerald-800 dark:bg-emerald-800/50 dark:text-emerald-200 whitespace-nowrap">
-                        🛡️ 2-Model Failover Safe
+                    <span className={`inline-flex items-center self-start sm:self-center px-2.5 py-1 rounded-full text-xs font-medium whitespace-nowrap ${
+                        strictModelOnly
+                            ? 'bg-amber-100 text-amber-800 dark:bg-amber-800/50 dark:text-amber-200'
+                            : 'bg-emerald-100 text-emerald-800 dark:bg-emerald-800/50 dark:text-emerald-200'
+                    }`}>
+                        {strictModelOnly ? '🔒 Selected Model Only' : '🛡️ Auto Model Failover'}
                     </span>
                 </div>
 

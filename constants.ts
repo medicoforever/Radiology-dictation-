@@ -77,20 +77,21 @@ export interface AIModelOption {
 }
 
 export const LIVE_DICTATION_MODELS: AIModelOption[] = [
-  { value: 'gemini-4-hydrogen', label: 'gemini-4-hydrogen (Default • 20 RPD/key)' },
-  { value: 'gemini-3.8-flash', label: 'gemini-3.8-flash (20 RPD/key)' },
-  { value: 'gemini-3.6-flash', label: 'gemini-3.6-flash (20 RPD/key)' },
-  { value: 'gemini-3.5-flash-lite', label: 'gemini-3.5-flash-lite (Manual Only • 500 RPD/key)' },
+  { value: 'gemini-4-hydrogen', label: 'gemini-4-hydrogen' },
+  { value: 'gemini-3.8-flash', label: 'gemini-3.8-flash' },
+  { value: 'gemini-3.6-flash', label: 'gemini-3.6-flash' },
+  { value: 'gemini-3.7-flash', label: 'gemini-3.7-flash' },
+  { value: 'gemini-3.5-flash', label: 'gemini-3.5-flash' },
+  { value: 'gemini-3.5-flash-lite', label: 'gemini-3.5-flash-lite' },
 ];
+
+export const STRICT_SELECTED_MODEL_ONLY_KEY = 'raddoc_strict_selected_model_only';
 
 /**
  * Empirically verified clinical-accuracy-first Free-Tier cascade (EXCLUDES gemini-3.5-flash-lite so
- * clinical dictation NEVER silently degrades to low-accuracy Flash-Lite on rate limits):
- * 1. gemini-4-hydrogen (14/14, 0 errors, 18.0s)
- * 2. gemini-3.8-flash (14/14, 0 errors, 23.0s)
- * 3. gemini-3.6-flash (14/14 core + temporal bone/hemotympanum/clivus/clinoid intact, 22.3s)
- * 4. gemini-3-flash-preview (13/14, preserves undisplaced fracture statuses & structured JSON)
- * 5. gemini-robotics-er-2-preview (preserves hemotympanum/temporal/clivus, 20 RPD extra backup pool)
+ * clinical dictation NEVER silently degrades to low-accuracy Flash-Lite on rate limits).
+ * Includes routed endpoints gemini-3.7-flash (→ 3.8) and gemini-3.5-flash (→ 3.6) at the tail
+ * so all non-routed pools run first while also capturing any available alias endpoint headroom.
  */
 export const FREE_TIER_QUOTA_FALLBACK_ORDER: string[] = [
   'gemini-4-hydrogen',
@@ -98,30 +99,24 @@ export const FREE_TIER_QUOTA_FALLBACK_ORDER: string[] = [
   'gemini-3.6-flash',
   'gemini-3-flash-preview',
   'gemini-robotics-er-2-preview',
+  'gemini-3.7-flash',
+  'gemini-3.5-flash',
 ];
 
 export const LIVE_DICTATION_CYCLE_ORDER = FREE_TIER_QUOTA_FALLBACK_ORDER;
-
-function getQuotaBucketForDedup(model: string): string {
-  const clean = model.replace(/^models\//, '').trim();
-  if (clean === 'gemini-3.7-flash') return 'gemini-3.8-flash';
-  if (clean === 'gemini-3.5-flash') return 'gemini-3.6-flash';
-  return clean;
-}
 
 /**
  * Returns the candidate Free Tier model chain starting at `selectedModel` and cascading strictly
  * through high-accuracy Free Tier models (excluding gemini-3.5-flash-lite from automatic failover).
  */
 export function getFreeTierModelFallbackChain(selectedModel: string): string[] {
-  const primary = selectedModel?.trim() || DEFAULT_SELECTED_MODEL;
-  const seenBuckets = new Set<string>([getQuotaBucketForDedup(primary)]);
+  const primary = selectedModel?.replace(/^models\//, '').trim() || DEFAULT_SELECTED_MODEL;
+  const seen = new Set<string>([primary]);
   const chain: string[] = [primary];
 
   for (const candidate of FREE_TIER_QUOTA_FALLBACK_ORDER) {
-    const bucket = getQuotaBucketForDedup(candidate);
-    if (!seenBuckets.has(bucket)) {
-      seenBuckets.add(bucket);
+    if (!seen.has(candidate)) {
+      seen.add(candidate);
       chain.push(candidate);
     }
   }
@@ -133,16 +128,19 @@ export function getLiveModelFallbackChain(selectedModel: string): string[] {
 }
 
 /**
- * Ordered strictly by verified radiology dictation accuracy (#1 -> #5 accurate, then manual/paid tiers).
+ * Ordered strictly by verified radiology dictation accuracy (#1 -> #5 non-deprecated accurate,
+ * followed by routed 3.7/3.5 Flash endpoints, manual Flash-Lite, and paid tiers).
  */
 export const AVAILABLE_MODELS: AIModelOption[] = [
-  { value: 'gemini-4-hydrogen', label: 'Gemini 4 Hydrogen (Default • Best 14/14 • 20 RPD/key)' },
-  { value: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash (#2 Accuracy 14/14 • 20 RPD/key)' },
-  { value: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash (#3 Accuracy • 20 RPD/key)' },
-  { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash (#4 Backup • 20 RPD/key)' },
-  { value: 'gemini-robotics-er-2-preview', label: 'Gemini Robotics ER-2 Preview (#5 Backup • 20 RPD/key)' },
-  { value: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash Lite (Manual Lower-Accuracy • 500 RPD/key)' },
-  { value: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro (Paid Tier Only • 0 Free RPD)' },
+  { value: 'gemini-4-hydrogen', label: 'Gemini 4 Hydrogen' },
+  { value: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash' },
+  { value: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash' },
+  { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash' },
+  { value: 'gemini-robotics-er-2-preview', label: 'Gemini Robotics ER-2 Preview' },
+  { value: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash' },
+  { value: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
+  { value: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash Lite' },
+  { value: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro' },
 ];
 
 export const RADIOLOGY_CUSTOM_VOCABULARY = [

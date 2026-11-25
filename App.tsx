@@ -34,7 +34,18 @@ import { DriveReportsModal } from './components/DriveReportsModal';
 import { RotateCcw, X, ExternalLink, Power, Sparkles, Trash2, Download, ShieldCheck, BookOpen, Key } from 'lucide-react';
 import { OwnershipModal } from './components/ui/OwnershipModal';
 import { ApiKeyModal } from './components/ApiKeyModal';
-import { getUserApiKeys, API_KEYS_UPDATED_EVENT, MODEL_FAILOVER_EVENT, ModelFailoverEventDetail, isBuiltinKeysUnlocked, unlockBuiltinKeys, syncApiKeysWithGoogleDrive } from './services/apiKeyService';
+import {
+  getUserApiKeys,
+  API_KEYS_UPDATED_EVENT,
+  MODEL_FAILOVER_EVENT,
+  STRICT_MODEL_ONLY_UPDATED_EVENT,
+  ModelFailoverEventDetail,
+  isBuiltinKeysUnlocked,
+  unlockBuiltinKeys,
+  syncApiKeysWithGoogleDrive,
+  isStrictSelectedModelOnlyEnabled,
+  setStrictSelectedModelOnlyEnabled,
+} from './services/apiKeyService';
 import ThemeSelector from './components/ThemeSelector';
 import { getUpcomingTemplate, clearUpcomingTemplate, subscribeToUpcomingTemplate, UpcomingTemplateConfig, extractTemplateTagIds, mergeTemplateImages } from './services/upcomingTemplateService';
 import MacrosAndDictionaryModal from './components/MacrosAndDictionaryModal';
@@ -249,6 +260,7 @@ const App: React.FC = () => {
   const [isDecision1ChatterFilterEnabled, setIsDecision1ChatterFilterEnabled] = useState(() => {
     return safeLocalStorage.getItem<boolean>(DECISION1_CHATTER_FILTER_KEY, false);
   });
+  const [isStrictSelectedModelOnly, setIsStrictSelectedModelOnly] = useState<boolean>(() => isStrictSelectedModelOnlyEnabled());
   const isDecision1ChatterFilterEnabledRef = useRef(isDecision1ChatterFilterEnabled);
   isDecision1ChatterFilterEnabledRef.current = isDecision1ChatterFilterEnabled;
   const [prefilterStats, setPrefilterStats] = useState<AudioPrefilterStats | null>(null);
@@ -475,6 +487,19 @@ const App: React.FC = () => {
     safeLocalStorage.setItem(DECISION1_CHATTER_FILTER_KEY, isDecision1ChatterFilterEnabled);
   }, [isDecision1ChatterFilterEnabled]);
 
+  useEffect(() => {
+    setStrictSelectedModelOnlyEnabled(isStrictSelectedModelOnly);
+  }, [isStrictSelectedModelOnly]);
+
+  useEffect(() => {
+    const handleStrictSync = (ev: Event) => {
+      const enabled = (ev as CustomEvent<{ enabled?: boolean }>)?.detail?.enabled;
+      if (typeof enabled === 'boolean') setIsStrictSelectedModelOnly(enabled);
+    };
+    window.addEventListener(STRICT_MODEL_ONLY_UPDATED_EVENT, handleStrictSync);
+    return () => window.removeEventListener(STRICT_MODEL_ONLY_UPDATED_EVENT, handleStrictSync);
+  }, []);
+
   const toggleTheme = () => {
     setTheme(prevTheme => (prevTheme === 'light' ? 'dark' : 'light'));
   };
@@ -531,7 +556,7 @@ const App: React.FC = () => {
           setChatHistory(savedState.chatHistory || []);
           setStatus(AppStatus.Success);
           
-          const validModel = (savedState.selectedModel && savedState.selectedModel !== 'gemini-3.5-flash' && AVAILABLE_MODELS.some(m => m.value === savedState.selectedModel))
+          const validModel = (savedState.selectedModel && AVAILABLE_MODELS.some(m => m.value === savedState.selectedModel))
             ? savedState.selectedModel
             : DEFAULT_SELECTED_MODEL;
           setSelectedModel(validModel);
@@ -3569,6 +3594,41 @@ const App: React.FC = () => {
                               <option key={model.value} value={model.value}>{model.label}</option>
                           ))}
                       </select>
+                  </div>
+              )}
+              {(status === AppStatus.Idle || isContinuousSessionReady) && (mode === 'single' || mode === 'batch' || mode === 'autonomous' || mode === 'live') && (
+                  <div className="flex items-center gap-2.5 w-full sm:w-auto justify-between sm:justify-start">
+                      <label
+                          htmlFor="strict-model-only-toggle"
+                          className="text-xs sm:text-sm font-semibold text-slate-700 dark:text-slate-300 cursor-pointer flex items-center gap-1.5"
+                          title="OFF (Default): Automatically switches across accurate Free-Tier models (excluding Flash Lite) on rate limits. ON: Runs ONLY your selected model across active API keys without switching models."
+                      >
+                          <span>Selected Model Only</span>
+                          <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-md border ${
+                            isStrictSelectedModelOnly
+                              ? 'bg-amber-100 text-amber-800 border-amber-300 dark:bg-amber-900/60 dark:text-amber-200 dark:border-amber-700'
+                              : 'bg-slate-200 text-slate-700 border-slate-300 dark:bg-slate-700 dark:text-slate-300 dark:border-slate-600'
+                          }`}>
+                            {isStrictSelectedModelOnly ? 'No Fallback' : 'Auto Fallback'}
+                          </span>
+                      </label>
+                      <button
+                          type="button"
+                          id="strict-model-only-toggle"
+                          onClick={() => setIsStrictSelectedModelOnly(prev => !prev)}
+                          className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-amber-500 focus:ring-offset-2 dark:focus:ring-offset-slate-900 ${
+                            isStrictSelectedModelOnly ? 'bg-amber-600' : 'bg-gray-300 dark:bg-slate-600'
+                          }`}
+                          role="switch"
+                          aria-checked={isStrictSelectedModelOnly}
+                          title="OFF (Default): Automatically switches across accurate Free-Tier models on quota limits. ON: Strictly uses ONLY the selected model."
+                      >
+                          <span
+                            className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                              isStrictSelectedModelOnly ? 'translate-x-5' : 'translate-x-0'
+                            }`}
+                          />
+                      </button>
                   </div>
               )}
               <div className="flex items-center gap-2.5 w-full sm:w-auto justify-between sm:justify-start">

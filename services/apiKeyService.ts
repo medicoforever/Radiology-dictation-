@@ -1,4 +1,5 @@
 import { GoogleGenAI } from "@google/genai";
+import { STRICT_SELECTED_MODEL_ONLY_KEY } from "../constants";
 import { isDriveConnected, loadJsonFileFromRootFolder, saveJsonFileToRootFolder } from "./googleDriveService";
 
 // Obfuscated salt and keys to prevent raw API key string exposure in repo commits & secret scanners
@@ -26,6 +27,29 @@ export const DRIVE_KEYS_FILE_NAME = 'raddoc_user_api_keys.json';
 export const DRIVE_KEY_SETTINGS_FILE_NAME = 'raddoc_api_key_settings.json';
 export const QUOTA_LEDGER_STORAGE_KEY = 'raddoc_free_tier_quota_ledger_v1';
 export const MODEL_FAILOVER_EVENT = 'raddoc_model_failover';
+export const STRICT_MODEL_ONLY_UPDATED_EVENT = 'raddoc_strict_model_only_updated';
+
+export function isStrictSelectedModelOnlyEnabled(): boolean {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return false;
+    return localStorage.getItem(STRICT_SELECTED_MODEL_ONLY_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
+
+export function setStrictSelectedModelOnlyEnabled(enabled: boolean): void {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      localStorage.setItem(STRICT_SELECTED_MODEL_ONLY_KEY, enabled ? 'true' : 'false');
+    }
+    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function' && typeof CustomEvent === 'function') {
+      window.dispatchEvent(new CustomEvent(STRICT_MODEL_ONLY_UPDATED_EVENT, { detail: { enabled } }));
+    }
+  } catch {
+    // Non-browser environment guard
+  }
+}
 
 export interface ModelFailoverEventDetail {
   fromModel: string;
@@ -363,6 +387,8 @@ const TRACKED_FREE_TIER_MODELS: Array<{ model: string; label: string; rpdLimitPe
   { model: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash (#3 Accuracy)', rpdLimitPerKey: 20 },
   { model: 'gemini-3-flash-preview', label: 'Gemini 3 Flash (#4 Backup)', rpdLimitPerKey: 20 },
   { model: 'gemini-robotics-er-2-preview', label: 'Gemini Robotics ER-2 (#5 Backup)', rpdLimitPerKey: 20 },
+  { model: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash (Routes → 3.8)', rpdLimitPerKey: 20 },
+  { model: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash (Routes → 3.6)', rpdLimitPerKey: 20 },
   { model: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash Lite (Manual / QA)', rpdLimitPerKey: 500 },
 ];
 
@@ -446,13 +472,12 @@ function notifyKeyOrQuotaUpdated(): void {
 }
 
 /**
- * Normalizes model aliases that share the same backend quota counter in Google AI Studio.
+ * Normalizes model identifier cleanly while keeping each selectable model endpoint
+ * (including gemini-3.7-flash and gemini-3.5-flash) independently tracked.
  */
 export function resolveQuotaPoolModel(model?: string): string {
   if (!model) return 'default';
   const clean = model.replace(/^models\//, '').trim();
-  if (clean === 'gemini-3.7-flash') return 'gemini-3.8-flash';
-  if (clean === 'gemini-3.5-flash') return 'gemini-3.6-flash';
   if (clean === 'gemini-embedding-2-preview') return 'gemini-embedding-2';
   return clean || 'default';
 }

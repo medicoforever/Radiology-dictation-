@@ -9,6 +9,7 @@ import {
   getClientForApiKey,
   getRandomAIClient,
   hasConfirmedDailyExhaustionAcrossAllKeys,
+  isStrictSelectedModelOnlyEnabled,
 } from "./apiKeyService";
 import { findTemplateByIdOrNumber } from "./templateStorage";
 import { buildCombinedTemplateBundle, canonicalizeTemplateIdToken, extractTemplateTagIds, mergeTemplateImages, DocxTemplateData as BundleDocxTemplateData } from "./upcomingTemplateService";
@@ -697,7 +698,9 @@ export async function executeWithFreeTierModelFallback<T>(
   options?: { abortSignal?: AbortSignal; skipCrossModelFallback?: boolean }
 ): Promise<T> {
   const resolvedPrimary = resolveApiTargetModel(selectedModel);
-  const chain = options?.skipCrossModelFallback
+  const userStrictOnly = !options?.skipCrossModelFallback && isStrictSelectedModelOnlyEnabled();
+  const strictOnly = Boolean(options?.skipCrossModelFallback || userStrictOnly);
+  const chain = strictOnly
     ? [resolvedPrimary]
     : getFreeTierModelFallbackChain(resolvedPrimary);
   let lastErr: any = null;
@@ -744,7 +747,14 @@ export async function executeWithFreeTierModelFallback<T>(
         });
         continue;
       }
-      if (!options?.skipCrossModelFallback && isQuotaOrRateLimitExceededError(err)) {
+      if (userStrictOnly && isQuotaOrRateLimitExceededError(err)) {
+        const strictErr: any = new Error(
+          `Model ${resolvedPrimary} reached its rate limit/quota across your active API key(s) while "Selected Model Only" is ON. Turn OFF "Selected Model Only" to automatically use accurate backup models, or add another free Google-account key.`
+        );
+        strictErr.status = 429;
+        throw strictErr;
+      }
+      if (!strictOnly && isQuotaOrRateLimitExceededError(err)) {
         const exhaustedErr: any = new Error(
           `All accurate Free-Tier models (${chain.join(' → ')}) reached today's rate limit across your active API key(s). Gemini 3.5 Flash Lite was intentionally skipped to preserve clinical dictation accuracy. Add another free Google-account key in API Keys, wait 60s for RPM reset, or manually select Flash Lite if non-critical.`
         );
@@ -3689,8 +3699,11 @@ INSTRUCTIONS FOR THIS AUDIO SEGMENT:
 - Return the COMPLETE, FINAL, UPDATED array of findings for the whole report in JSON format.
 `;
 
-  // Multi-model fallback chain: selected model + subsequent next model
-  const fallbackChain = getLiveModelFallbackChain(model || DEFAULT_LIVE_MODEL || 'gemini-4-hydrogen');
+  // Multi-model fallback chain (restricted to single model when Selected Model Only toggle is ON)
+  const primaryLiveModel = model || DEFAULT_LIVE_MODEL || 'gemini-4-hydrogen';
+  const fallbackChain = isStrictSelectedModelOnlyEnabled()
+    ? [primaryLiveModel]
+    : getLiveModelFallbackChain(primaryLiveModel);
   let lastError: any = null;
   const failedModels: string[] = [];
 
@@ -3840,7 +3853,10 @@ Perform a comprehensive, holistic review pass over the draft to generate the fin
 
 Output MUST be a JSON object with a single "findings" array of strings.`;
 
-  const fallbackChain = getLiveModelFallbackChain(model || DEFAULT_LIVE_MODEL || 'gemini-4-hydrogen');
+  const primarySynthModel = model || DEFAULT_LIVE_MODEL || 'gemini-4-hydrogen';
+  const fallbackChain = isStrictSelectedModelOnlyEnabled()
+    ? [primarySynthModel]
+    : getLiveModelFallbackChain(primarySynthModel);
 
   for (let attempt = 0; attempt < fallbackChain.length; attempt++) {
     const currentModel = fallbackChain[attempt];
