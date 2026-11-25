@@ -1471,3 +1471,71 @@ test('HTTP 503 UNAVAILABLE (high demand) fails fast across keys and auto-fails o
     (globalThis as any).fetch = prevFetch;
   }
 });
+
+test('Selected Model Only (No Fallback) tries ALL pooled keys on the same model even after prior RPD cooldowns', async () => {
+  const store = new Map<string, string>();
+  const mockLocalStorage = {
+    getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+    setItem: (k: string, v: string) => store.set(k, String(v)),
+    removeItem: (k: string) => store.delete(k),
+  };
+  const prevWindow = (globalThis as any).window;
+  const prevLocalStorage = (globalThis as any).localStorage;
+  const prevFetch = (globalThis as any).fetch;
+  (globalThis as any).window = {
+    localStorage: mockLocalStorage,
+    dispatchEvent: () => true,
+  };
+  (globalThis as any).localStorage = mockLocalStorage;
+  resetApiKeyHealthState();
+
+  try {
+    const fourKeys = [
+      'AIzaSyStrictFullPoolKey0001',
+      'AIzaSyStrictFullPoolKey0002',
+      'AIzaSyStrictFullPoolKey0003',
+      'AIzaSyStrictFullPoolKey0004',
+    ];
+    setUserApiKeys(fourKeys);
+
+    // Exhaust all 4 keys once with 429 PerDay RPD errors so all 4 enter localStorage RPD cooldown
+    await executeWithApiKeyFailover(
+      async () => {
+        const err: any = new Error('429 requests per day limit exceeded');
+        err.status = 429;
+        throw err;
+      },
+      { selectedModel: 'gemini-3.8-flash', delayMs: 0 }
+    ).catch(() => {});
+
+    // With Auto Fallback (strict OFF): cooled model probes at most 1 key before switching models
+    setStrictSelectedModelOnlyEnabled(false);
+    assert.equal(getCandidateKeysForOperation('gemini-3.8-flash').candidateKeys.length, 1);
+
+    // With Selected Model Only (No Fallback ON): MUST include ALL 4 valid keys in candidateKeys and try all 4
+    setStrictSelectedModelOnlyEnabled(true);
+    assert.equal(getCandidateKeysForOperation('gemini-3.8-flash').candidateKeys.length, 4);
+
+    const attemptedKeys: string[] = [];
+    (globalThis as any).fetch = async (_url: string, init: any) => {
+      attemptedKeys.push(String(init?.headers?.['x-goog-api-key'] || ''));
+      return {
+        ok: false,
+        status: 429,
+        statusText: 'Too Many Requests',
+        json: async () => ({ error: { message: '429 requests per day limit exceeded' } }),
+      };
+    };
+
+    await assert.rejects(
+      () => generateContentWithJsonFallback('gemini-3.8-flash', [{ text: 'strict retry all keys' }]),
+      /across all 4 active API key\(s\) while "Selected Model Only" is ON/i
+    );
+    assert.equal(new Set(attemptedKeys).size, 4);
+  } finally {
+    resetApiKeyHealthState();
+    (globalThis as any).window = prevWindow;
+    (globalThis as any).localStorage = prevLocalStorage;
+    (globalThis as any).fetch = prevFetch;
+  }
+});

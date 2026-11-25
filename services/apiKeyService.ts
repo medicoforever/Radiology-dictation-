@@ -690,12 +690,13 @@ function getRawCandidateKeyPools(): { customKeys: string[]; builtinKeys: string[
 function classifyPoolTier(rawKeys: string[], poolModel: string, now: number) {
   const healthy: Array<{ key: string; recentCount: number; lastUsed: number }> = [];
   const shortRpmCooled: Array<{ key: string; untilMs: number }> = [];
-  const longRpdOrInvalid: Array<{ key: string; untilMs: number }> = [];
+  const rpdCooled: Array<{ key: string; untilMs: number }> = [];
+  const invalidKeys: Array<{ key: string; untilMs: number }> = [];
 
   for (const key of shuffle(rawKeys)) {
     const invalidUntil = keyGlobalInvalidUntil.get(key) ?? 0;
     if (invalidUntil > now) {
-      longRpdOrInvalid.push({ key, untilMs: invalidUntil });
+      invalidKeys.push({ key, untilMs: invalidUntil });
       continue;
     }
 
@@ -705,7 +706,7 @@ function classifyPoolTier(rawKeys: string[], poolModel: string, now: number) {
       if (cd.kind === 'rpm' && cd.untilMs - now <= 120_000) {
         shortRpmCooled.push({ key, untilMs: cd.untilMs });
       } else {
-        longRpdOrInvalid.push({ key, untilMs: cd.untilMs });
+        rpdCooled.push({ key, untilMs: cd.untilMs });
       }
       continue;
     }
@@ -723,9 +724,10 @@ function classifyPoolTier(rawKeys: string[], poolModel: string, now: number) {
     return a.lastUsed - b.lastUsed;
   });
   shortRpmCooled.sort((a, b) => a.untilMs - b.untilMs);
-  longRpdOrInvalid.sort((a, b) => a.untilMs - b.untilMs);
+  rpdCooled.sort((a, b) => a.untilMs - b.untilMs);
+  invalidKeys.sort((a, b) => a.untilMs - b.untilMs);
 
-  return { healthy, shortRpmCooled, longRpdOrInvalid };
+  return { healthy, shortRpmCooled, rpdCooled, invalidKeys };
 }
 
 /**
@@ -733,10 +735,13 @@ function classifyPoolTier(rawKeys: string[], poolModel: string, now: number) {
  * 1. Healthy user custom keys FIRST (sorted by fewest requests in the last 60s, then LRU).
  * 2. If secret 1198 is unlocked, healthy built-in keys strictly AFTER custom keys (as automatic failover).
  * 3. Short RPM-cooled keys (custom first, then built-in backup).
- * 4. If ALL keys are in long RPD cooldown, includes only 1 earliest-expiring probe key.
+ * 4. If "Selected Model Only" (or includeRpdCooled) is active, includes ALL RPD-cooled valid keys
+ *    (custom first, then built-in) so the selected model always retries the full active key pool.
+ *    Otherwise (Auto Fallback), probes at most 1 RPD-cooled key before failing over models in 0ms.
  */
 export function getCandidateKeysForOperation(
-  selectedModel?: string
+  selectedModel?: string,
+  options?: { includeRpdCooled?: boolean }
 ): { candidateKeys: string[]; isCustom: boolean; hasBuiltinBackup: boolean } {
   const { customKeys, builtinKeys } = getRawCandidateKeyPools();
   const isCustom = customKeys.length > 0;
@@ -748,6 +753,7 @@ export function getCandidateKeysForOperation(
 
   const now = Date.now();
   const poolModel = resolveQuotaPoolModel(selectedModel);
+  const includeRpdCooled = options?.includeRpdCooled ?? isStrictSelectedModelOnlyEnabled();
 
   const customTier = classifyPoolTier(customKeys, poolModel, now);
   const builtinTier = classifyPoolTier(builtinKeys, poolModel, now);
@@ -759,13 +765,23 @@ export function getCandidateKeysForOperation(
     ...builtinTier.shortRpmCooled.map((c) => c.key),
   ];
 
-  // If every key in both tiers is currently in long RPD cooldown for this model,
-  // probe at most 1 key (preferring custom first) rather than wasting retries across dead keys.
+  if (includeRpdCooled) {
+    ordered.push(
+      ...customTier.rpdCooled.map((c) => c.key),
+      ...builtinTier.rpdCooled.map((c) => c.key)
+    );
+  }
+
+  // Fallback probe when nothing remains above (e.g. Auto Fallback with all keys RPD-cooled, or all invalid 401/403)
   if (ordered.length === 0) {
-    if (customTier.longRpdOrInvalid.length > 0) {
-      ordered.push(customTier.longRpdOrInvalid[0].key);
-    } else if (builtinTier.longRpdOrInvalid.length > 0) {
-      ordered.push(builtinTier.longRpdOrInvalid[0].key);
+    if (customTier.rpdCooled.length > 0) {
+      ordered.push(customTier.rpdCooled[0].key);
+    } else if (builtinTier.rpdCooled.length > 0) {
+      ordered.push(builtinTier.rpdCooled[0].key);
+    } else if (customTier.invalidKeys.length > 0) {
+      ordered.push(customTier.invalidKeys[0].key);
+    } else if (builtinTier.invalidKeys.length > 0) {
+      ordered.push(builtinTier.invalidKeys[0].key);
     }
   }
 
@@ -886,13 +902,17 @@ export async function executeWithApiKeyFailover<T>(
     delayMs?: number;
     abortSignal?: AbortSignal;
     failFastOnModelUnavailable?: boolean;
+    includeRpdCooled?: boolean;
   }
 ): Promise<T> {
   if (options?.abortSignal?.aborted) {
     throw new DOMException('Aborted by user', 'AbortError');
   }
 
-  const { candidateKeys, isCustom } = getCandidateKeysForOperation(options?.selectedModel);
+  const includeRpdCooled = options?.includeRpdCooled ?? (isStrictSelectedModelOnlyEnabled() && !options?.failFastOnModelUnavailable);
+  const { candidateKeys, isCustom } = getCandidateKeysForOperation(options?.selectedModel, {
+    includeRpdCooled,
+  });
   if (!candidateKeys || candidateKeys.length === 0) {
     throw new Error("No Gemini API key found. Please click 'API Keys' at the top to add your free Gemini API key, or enter the secret access key.");
   }
@@ -938,6 +958,9 @@ export async function executeWithApiKeyFailover<T>(
         console.warn(
           `[API Key Failover] Model ${options?.selectedModel || 'selected'} is experiencing high demand / unavailable (${errMsg}); failing over to next accurate model immediately.`
         );
+        if (lastError && typeof lastError === 'object') {
+          lastError.triedKeysCount = attempt + 1;
+        }
         throw err;
       }
 
@@ -965,6 +988,9 @@ export async function executeWithApiKeyFailover<T>(
   }
 
   console.error(`[API Key Failover] All ${maxAttempts} candidate API keys failed:`, lastError);
+  if (lastError && typeof lastError === 'object') {
+    lastError.triedKeysCount = maxAttempts;
+  }
   throw lastError;
 }
 

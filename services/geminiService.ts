@@ -757,10 +757,11 @@ export async function executeWithFreeTierModelFallback<T>(
         continue;
       }
       if (userStrictOnly && isFailoverTrigger) {
+        const triedCount = typeof err?.triedKeysCount === 'number' && err.triedKeysCount > 0 ? err.triedKeysCount : 1;
         const strictErr: any = new Error(
           isQuotaErr
-            ? `Model ${resolvedPrimary} reached its rate limit/quota across your active API key(s) while "Selected Model Only" is ON. Turn OFF "Selected Model Only" to automatically use accurate backup models, or add another free Google-account key.`
-            : `Model ${resolvedPrimary} is currently experiencing high demand / unavailable across your active API key(s) while "Selected Model Only" is ON. Turn OFF "Selected Model Only" to automatically switch to backup models, or try again shortly.`
+            ? `Model ${resolvedPrimary} reached its rate limit/quota across all ${triedCount} active API key(s) while "Selected Model Only" is ON. Turn OFF "Selected Model Only" to automatically use accurate backup models, or add another free Google-account key.`
+            : `Model ${resolvedPrimary} is currently experiencing high demand / unavailable across all ${triedCount} active API key(s) while "Selected Model Only" is ON. Turn OFF "Selected Model Only" to automatically switch to backup models, or try again shortly.`
         );
         strictErr.status = getErrorStatusCode(err) ?? (isQuotaErr ? 429 : 503);
         throw strictErr;
