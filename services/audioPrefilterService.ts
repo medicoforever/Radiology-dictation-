@@ -1,11 +1,10 @@
 /**
- * Experimental Audio Pre-Filter Service
+ * Audio Pre-Filter Service (Client-Side VAD-Only Ogg/Opus 32 kbps)
  *
- * Three-stage client-side + Decision-1 pre-filtering pipeline that runs ONLY when
- * explicitly enabled via the experimental setting:
+ * Two-stage client-side pre-filtering pipeline that runs ONLY when enabled via the
+ * Smart Audio Pre-Trim setting (0 external API calls):
  *   1. Browser Web Audio Adaptive VAD silence trimming (0 API cost)
- *   2. Gemini Decision 1 (`gemini-decision-1`) non-radiology chatter filtering
- *   3. Size-safe re-encoding (WebCodecs Opus -> pure-TS Ogg/Opus, or 16kHz/12kHz WAV fallback)
+ *   2. Size-safe re-encoding (WebCodecs Opus 32 kbps -> pure-TS Ogg/Opus, or 16kHz/12kHz WAV fallback)
  *
  * Strictly preserves all non-audio attachments (PDF, DOC/DOCX, RTF, TXT, images, videos)
  * untouched at their original array positions, and never throws pre-filter failures that
@@ -1804,24 +1803,12 @@ async function prefilterSingleAudioBlob(
     };
   }
 
-  const windows = buildEvaluationWindows(vad.intervals);
+  const keptIntervals = vad.intervals;
   const afterVadDurationSec = vad.speechDurationSec;
   const silenceRemovedSec = vad.silenceRemovedSec;
-
-  options.onProgress?.('Filtering non-radiology chatter with Decision-1...');
-  const decisionRes = await filterWindowsWithDecision1(windows, samples, sampleRate, {
-    abortSignal: options.abortSignal,
-    onProgress: options.onProgress,
-  });
-
-  const keptIntervals = decisionRes.keptWindows.flatMap((w) => w.intervals);
-  const nonRadiologyRemovedSec = decisionRes.droppedWindows.reduce(
-    (sum, w) => sum + w.speechDurationSec,
-    0
-  );
-  const expectedKeptSpeechSec = Math.max(0, afterVadDurationSec - nonRadiologyRemovedSec);
+  const nonRadiologyRemovedSec = 0;
   const trimmedRatio =
-    originalDurationSec > 0 ? (originalDurationSec - expectedKeptSpeechSec) / originalDurationSec : 0;
+    originalDurationSec > 0 ? (originalDurationSec - afterVadDurationSec) / originalDurationSec : 0;
 
   // Avoid unnecessary re-encoding or file inflation when savings are negligible on <=10MB files
   if (trimmedRatio < NEGLIGIBLE_SAVINGS_RATIO && blob.size <= SMALL_ORIGINAL_BYTES_LIMIT) {
@@ -1833,17 +1820,17 @@ async function prefilterSingleAudioBlob(
       afterVadDurationSec,
       silenceRemovedSec: 0,
       nonRadiologyRemovedSec: 0,
-      keptSegmentsCount: decisionRes.keptWindows.length,
+      keptSegmentsCount: keptIntervals.length,
       droppedNonRadiologyCount: 0,
       outputMimeType: cleanMime,
-      decisionLatencyMs: decisionRes.decisionLatencyMs,
-      usedDecision1: decisionRes.usedDecision1,
+      decisionLatencyMs: 0,
+      usedDecision1: false,
       skippedReason: 'Negligible trimming (<10%) and original <= 10MB; kept original audio',
     };
   }
 
   throwIfAborted(options.abortSignal);
-  options.onProgress?.('Encoding compact filtered audio...');
+  options.onProgress?.('Encoding VAD-trimmed audio to Ogg/Opus (32 kbps)...');
   const concatenated = concatPcmIntervals(samples, sampleRate, keptIntervals);
   if (concatenated.length === 0) {
     return {
@@ -1854,11 +1841,11 @@ async function prefilterSingleAudioBlob(
       afterVadDurationSec,
       silenceRemovedSec: 0,
       nonRadiologyRemovedSec: 0,
-      keptSegmentsCount: windows.length,
+      keptSegmentsCount: keptIntervals.length,
       droppedNonRadiologyCount: 0,
       outputMimeType: cleanMime,
-      decisionLatencyMs: decisionRes.decisionLatencyMs,
-      usedDecision1: decisionRes.usedDecision1,
+      decisionLatencyMs: 0,
+      usedDecision1: false,
       skippedReason: 'Concatenated output empty; kept original audio',
     };
   }
@@ -1881,11 +1868,11 @@ async function prefilterSingleAudioBlob(
       afterVadDurationSec,
       silenceRemovedSec: 0,
       nonRadiologyRemovedSec: 0,
-      keptSegmentsCount: decisionRes.keptWindows.length,
+      keptSegmentsCount: keptIntervals.length,
       droppedNonRadiologyCount: 0,
       outputMimeType: cleanMime,
-      decisionLatencyMs: decisionRes.decisionLatencyMs,
-      usedDecision1: decisionRes.usedDecision1,
+      decisionLatencyMs: 0,
+      usedDecision1: false,
       skippedReason: 'Encoded output would inflate payload without safe savings; kept original audio',
     };
   }
@@ -1898,12 +1885,11 @@ async function prefilterSingleAudioBlob(
     afterVadDurationSec,
     silenceRemovedSec,
     nonRadiologyRemovedSec,
-    keptSegmentsCount: decisionRes.keptWindows.length,
-    droppedNonRadiologyCount: decisionRes.droppedWindows.length,
+    keptSegmentsCount: keptIntervals.length,
+    droppedNonRadiologyCount: 0,
     outputMimeType: encoded.mimeType,
-    decisionLatencyMs: decisionRes.decisionLatencyMs,
-    usedDecision1: decisionRes.usedDecision1,
-    skippedReason: decisionRes.fallbackReason,
+    decisionLatencyMs: 0,
+    usedDecision1: false,
   };
 }
 
@@ -1999,10 +1985,10 @@ export async function downloadOriginalAudioInput(
   return true;
 }
 
-/** Downloads the compacted Decision-1 audio Blob with its proper extension. */
+/** Downloads the compacted VAD-trimmed audio Blob with its proper extension. */
 export function downloadCompactedAudioBlob(
   compactedBlob: Blob | null | undefined,
-  baseName = 'radiology-dictation-compacted-decision1'
+  baseName = 'radiology-dictation-compacted-vad'
 ): boolean {
   if (!compactedBlob || compactedBlob.size === 0) return false;
   triggerAudioDownload(compactedBlob, baseName);

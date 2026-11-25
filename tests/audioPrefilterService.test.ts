@@ -23,6 +23,7 @@ import {
   type SpeechInterval,
 } from '../services/audioPrefilterService';
 import { safeLocalStorage } from '../services/storageService';
+import { AVAILABLE_MODELS, DEFAULT_SELECTED_MODEL } from '../constants';
 
 function makeSineBurst(sampleRate: number, durationSec: number, amplitude: number, freqHz = 320): Float32Array {
   const len = Math.round(sampleRate * durationSec);
@@ -687,5 +688,133 @@ test('filterAudioInputsForModel combines multi-audio inputs and downloads origin
     (globalThis as any).document = prevDoc;
     (URL as any).createObjectURL = prevCreateUrl;
     (URL as any).revokeObjectURL = prevRevokeUrl;
+  }
+});
+
+test('AVAILABLE_MODELS places Robotics ER-2 3rd and Gemini 3 Flash 4th while keeping other models untouched', () => {
+  assert.equal(DEFAULT_SELECTED_MODEL, 'gemini-4-hydrogen');
+  assert.deepEqual(
+    AVAILABLE_MODELS.map((m) => m.value),
+    [
+      'gemini-4-hydrogen',
+      'gemini-3.8-flash',
+      'gemini-robotics-er-2-preview',
+      'gemini-3-flash-preview',
+      'gemini-3.5-flash',
+      'gemini-3.6-flash',
+      'gemini-3.5-flash-lite',
+      'gemini-3.1-pro-preview',
+    ]
+  );
+  assert.equal(AVAILABLE_MODELS[2].label, 'Gemini Robotics ER-2 Preview');
+  assert.equal(AVAILABLE_MODELS[3].label, 'Gemini 3 Flash');
+});
+
+test('filterAudioInputsForModel uses VAD-Only Ogg/Opus 32 kbps with zero Decision-1 API calls on multi-window speech', async () => {
+  const sr = 16000;
+  // Build >25s multi-segment speech with long pauses so old pipeline would have triggered Decision-1 API batches
+  const pcmMulti = concatFloat32([
+    new Float32Array(sr * 3),
+    makeSineBurst(sr, 4.0, 0.15),
+    new Float32Array(sr * 3),
+    makeSineBurst(sr, 4.0, 0.15),
+    new Float32Array(sr * 3),
+    makeSineBurst(sr, 4.0, 0.15),
+    new Float32Array(sr * 3),
+  ]);
+  const wavBlob = new Blob([encodePcmToWavBytes(pcmMulti, sr)], { type: 'audio/wav' });
+
+  const prevWindow = (globalThis as any).window;
+  const prevFetch = globalThis.fetch;
+  const prevAudioEncoder = (globalThis as any).AudioEncoder;
+  const prevAudioData = (globalThis as any).AudioData;
+
+  let fetchCalls = 0;
+  let configuredBitrate = 0;
+  let configuredRate = 0;
+
+  globalThis.fetch = (async () => {
+    fetchCalls++;
+    throw new Error('Decision-1 fetch must not be called in VAD-Only pre-trim mode');
+  }) as any;
+
+  (globalThis as any).window = {
+    AudioContext: class MockVadAudioContext {
+      state = 'running';
+      async decodeAudioData() {
+        return {
+          sampleRate: sr,
+          numberOfChannels: 1,
+          length: pcmMulti.length,
+          getChannelData: () => pcmMulti,
+        };
+      }
+      async close() {
+        this.state = 'closed';
+      }
+    },
+  };
+
+  class MockAudioData {
+    close() {}
+  }
+
+  class MockAudioEncoder {
+    state = 'unconfigured';
+    encodeQueueSize = 0;
+    private onOutput: (chunk: any, metadata?: any) => void;
+    constructor(init: { output: (chunk: any, metadata?: any) => void }) {
+      this.onOutput = init.output;
+    }
+    static async isConfigSupported(cfg: { codec: string; bitrate?: number }) {
+      return { supported: cfg.codec === 'opus' };
+    }
+    configure(cfg: { bitrate?: number; sampleRate?: number }) {
+      this.state = 'configured';
+      configuredBitrate = cfg.bitrate ?? 0;
+      configuredRate = cfg.sampleRate ?? 0;
+    }
+    encode() {
+      const dummyOpus = new Uint8Array([0x78, 0x01, 0x02, 0x03]);
+      this.onOutput({
+        byteLength: dummyOpus.byteLength,
+        duration: 20000,
+        copyTo: (dst: Uint8Array) => dst.set(dummyOpus),
+      });
+    }
+    async flush() {}
+    close() {
+      this.state = 'closed';
+    }
+  }
+
+  (globalThis as any).AudioData = MockAudioData;
+  (globalThis as any).AudioEncoder = MockAudioEncoder;
+
+  try {
+    const res = await filterAudioInputsForModel(wavBlob, { enabled: true });
+    assert.equal(fetchCalls, 0);
+    assert.equal(configuredBitrate, 32000);
+    assert.equal(configuredRate, 48000);
+    assert.equal(res.stats?.applied, true);
+    assert.equal(res.stats?.usedDecision1, false);
+    assert.equal(res.stats?.decisionLatencyMs, 0);
+    assert.equal(res.stats?.nonRadiologyRemovedSec, 0);
+    assert.equal(res.stats?.droppedNonRadiologyCount, 0);
+    assert.equal(res.stats?.outputMimeType, 'audio/ogg');
+    assert.ok((res.stats?.silenceRemovedSec ?? 0) >= 10);
+    assert.ok(res.compactedAudioBlob instanceof Blob);
+    assert.equal(res.compactedAudioBlob?.type, 'audio/ogg');
+
+    const header = new Uint8Array(await res.compactedAudioBlob!.slice(0, 36).arrayBuffer());
+    assert.equal(Buffer.from(header.subarray(0, 4)).toString('ascii'), 'OggS');
+    assert.equal(Buffer.from(header.subarray(28, 36)).toString('ascii'), 'OpusHead');
+  } finally {
+    (globalThis as any).window = prevWindow;
+    globalThis.fetch = prevFetch;
+    if (prevAudioEncoder === undefined) delete (globalThis as any).AudioEncoder;
+    else (globalThis as any).AudioEncoder = prevAudioEncoder;
+    if (prevAudioData === undefined) delete (globalThis as any).AudioData;
+    else (globalThis as any).AudioData = prevAudioData;
   }
 });

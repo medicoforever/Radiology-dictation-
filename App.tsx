@@ -2302,7 +2302,7 @@ const App: React.FC = () => {
   };
 
   const handleDownloadCompacted = () => {
-    downloadCompactedAudioBlob(compactedAudioBlob, 'radiology-dictation-compacted-decision1');
+    downloadCompactedAudioBlob(compactedAudioBlob, 'radiology-dictation-compacted-vad');
   };
 
   const renderSingleModeContent = () => {
@@ -2599,7 +2599,7 @@ const App: React.FC = () => {
                             : firstDictationError
                               ? 'Simultaneous Dictation Active'
                               : prefilterStatusMsg
-                                ? 'Pre-trimming audio (Experimental)...'
+                                ? 'Pre-trimming audio (VAD Ogg/Opus 32 kbps)...'
                                 : 'Analyzing and correcting dictation...'}
                     </p>
                     {prefilterStatusMsg && !isSessionReady && (
@@ -2649,7 +2649,7 @@ const App: React.FC = () => {
                           onClick={handleDownloadCompacted}
                           className="inline-flex items-center gap-2 bg-amber-600 text-white font-semibold py-2 px-5 rounded-lg hover:bg-amber-700 focus:outline-none focus:ring-2 focus:ring-amber-400 focus:ring-opacity-50 transition-colors shadow-sm text-sm cursor-pointer"
                           aria-label="Download Compacted Audio"
-                          title="Download Decision-1 compacted pre-trimmed audio"
+                          title="Download VAD-trimmed Ogg/Opus (32 kbps) compacted audio"
                         >
                           <DownloadIcon className="w-4 h-4" /> Download Compacted ({formatFileSize(compactedAudioBlob.size)})
                         </button>
@@ -2814,7 +2814,7 @@ const App: React.FC = () => {
               >
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="font-bold px-1.5 py-0.5 rounded-md bg-amber-200/80 dark:bg-amber-900/70 text-amber-900 dark:text-amber-200 text-[10px] uppercase tracking-wide">
-                    Smart Pre-Trim (Experimental)
+                    VAD Pre-Trim (32 kbps Ogg/Opus)
                   </span>
                   <span className="font-semibold">
                     {formatPrefilterDuration(prefilterStats.originalDurationSec)} → {formatPrefilterDuration(prefilterStats.keptDurationSec)}
@@ -2858,7 +2858,7 @@ const App: React.FC = () => {
                       type="button"
                       onClick={handleDownloadCompacted}
                       className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-600 hover:bg-amber-700 text-white font-semibold transition-colors cursor-pointer"
-                      title="Download compacted audio made from Decision 1"
+                      title="Download VAD-trimmed Ogg/Opus (32 kbps) compacted audio"
                     >
                       <DownloadIcon className="w-3 h-3" />
                       <span>Compacted ({formatFileSize(compactedAudioBlob.size)})</span>
@@ -2870,7 +2870,7 @@ const App: React.FC = () => {
             {prefilterStats && !prefilterStats.applied && prefilterStats.skippedReason && isExperimentalAudioFilterEnabled && (
               <div className="mb-4 px-3.5 py-2 bg-slate-100/90 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700 rounded-xl flex flex-wrap items-center justify-between gap-2 text-xs text-slate-700 dark:text-slate-300">
                 <span>
-                  <strong className="font-semibold">Smart Pre-Trim:</strong> {prefilterStats.skippedReason}
+                  <strong className="font-semibold">VAD Pre-Trim:</strong> {prefilterStats.skippedReason}
                 </span>
                 {audioBlob && (
                   <button
@@ -2980,7 +2980,7 @@ const App: React.FC = () => {
                   <button
                     onClick={handleDownloadCompacted}
                     className="flex items-center gap-2 bg-amber-600 text-white font-bold py-2.5 px-5 rounded-lg hover:bg-amber-700 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:ring-opacity-50 transition-colors shadow text-sm cursor-pointer"
-                    title="Download Decision-1 compacted pre-trimmed audio"
+                    title="Download VAD-trimmed Ogg/Opus (32 kbps) compacted audio"
                   >
                     <DownloadIcon className="w-4 h-4" /> Download Compacted Audio ({formatFileSize(compactedAudioBlob.size)})
                   </button>
@@ -3555,11 +3555,11 @@ const App: React.FC = () => {
                   <label
                       htmlFor="experimental-audio-filter-toggle"
                       className="text-xs sm:text-sm font-semibold text-slate-700 dark:text-slate-300 cursor-pointer flex items-center gap-1.5"
-                      title="Experimental: Strips empty no-speech pauses (Web Audio VAD) and non-radiology speech (Gemini Decision 1) before sending final audio to your selected AI model."
+                      title="Strips empty no-speech pauses via client-side Web Audio VAD and encodes to 32 kbps Ogg/Opus before sending final audio to your selected AI model (0 Decision-1 API calls)."
                   >
                       <span>Smart Audio Pre-Trim</span>
                       <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-md bg-amber-100 text-amber-800 dark:bg-amber-900/60 dark:text-amber-200 border border-amber-200/80 dark:border-amber-700/60">
-                        (Experimental)
+                        (VAD Ogg/Opus 32kbps)
                       </span>
                   </label>
                   <button
@@ -3571,7 +3571,7 @@ const App: React.FC = () => {
                       role="switch"
                       aria-checked={isExperimentalAudioFilterEnabled}
                       id="experimental-audio-filter-toggle"
-                      title="Experimental: Strips empty no-speech pauses (Web Audio VAD) and non-radiology speech (Gemini Decision 1) before sending final audio to your selected AI model."
+                      title="Strips empty no-speech pauses via client-side Web Audio VAD and encodes to 32 kbps Ogg/Opus before sending final audio to your selected AI model (0 Decision-1 API calls)."
                   >
                       <span
                       className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${

@@ -1002,7 +1002,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   };
 
   const handleDownloadCompacted = () => {
-    downloadCompactedAudioBlob(compactedAudioBlob, 'radiology-dictation-compacted-decision1');
+    downloadCompactedAudioBlob(compactedAudioBlob, 'radiology-dictation-compacted-vad');
   };
 
   const handleDownloadMerged = (blobToDownload?: Blob | null) => {
@@ -3381,7 +3381,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
               <button
                 onClick={handleDownloadCompacted}
                 className="bg-amber-600 text-white font-bold py-2.5 px-5 rounded-xl hover:bg-amber-700 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:ring-opacity-50 transition-all shadow-sm w-full lg:w-auto flex items-center justify-center gap-2 min-h-[44px]"
-                title={`Download compacted audio trimmed by Decision-1 (${prefilterStats?.keptDurationSec ? `${formatPrefilterDuration(prefilterStats.keptDurationSec)}, ` : ''}${compactedAudioBlob.size >= 1024 * 1024 ? `${(compactedAudioBlob.size / (1024 * 1024)).toFixed(1)} MB` : `${Math.max(1, Math.round(compactedAudioBlob.size / 1024))} KB`})`}
+                title={`Download VAD-trimmed Ogg/Opus (32 kbps) compacted audio (${prefilterStats?.keptDurationSec ? `${formatPrefilterDuration(prefilterStats.keptDurationSec)}, ` : ''}${compactedAudioBlob.size >= 1024 * 1024 ? `${(compactedAudioBlob.size / (1024 * 1024)).toFixed(1)} MB` : `${Math.max(1, Math.round(compactedAudioBlob.size / 1024))} KB`})`}
               >
                 <DownloadIcon className="w-4 h-4" />
                 Download Compacted Audio
@@ -3449,7 +3449,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                         <button
                             onClick={handleDownloadCompacted}
                             className="flex items-center justify-center gap-2 bg-amber-600 hover:bg-amber-700 active:bg-amber-800 text-white font-bold py-2 px-4 rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-400 transition-all shadow-sm text-sm whitespace-nowrap min-h-[40px] w-full sm:w-auto cursor-pointer"
-                            title="Download Decision-1 compacted pre-trimmed audio"
+                            title="Download VAD-trimmed Ogg/Opus (32 kbps) compacted audio"
                         >
                             <DownloadIcon className="w-4 h-4"/>
                             Download Compacted Audio
