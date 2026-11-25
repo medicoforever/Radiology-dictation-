@@ -87,11 +87,21 @@ export const LIVE_DICTATION_MODELS: AIModelOption[] = [
 
 export const STRICT_SELECTED_MODEL_ONLY_KEY = 'raddoc_strict_selected_model_only';
 
+const ROUTED_MODEL_QUOTA_BUCKET: Record<string, string> = {
+  'gemini-3.7-flash': 'gemini-3.8-flash',
+  'gemini-3.5-flash': 'gemini-3.6-flash',
+};
+
+function getFreeTierQuotaBucket(model: string): string {
+  const clean = model.replace(/^models\//, '').trim();
+  return ROUTED_MODEL_QUOTA_BUCKET[clean] || clean;
+}
+
 /**
- * Empirically verified clinical-accuracy-first Free-Tier cascade (EXCLUDES gemini-3.5-flash-lite so
- * clinical dictation NEVER silently degrades to low-accuracy Flash-Lite on rate limits).
- * Includes routed endpoints gemini-3.7-flash (→ 3.8) and gemini-3.5-flash (→ 3.6) at the tail
- * so all non-routed pools run first while also capturing any available alias endpoint headroom.
+ * Empirically verified clinical-accuracy-first Free-Tier cascade (5 genuinely distinct
+ * Free-Tier model pools; EXCLUDES gemini-3.5-flash-lite so clinical dictation NEVER silently
+ * degrades to low-accuracy Flash-Lite on quota/overload limits, and avoids redundant retries
+ * on deprecated 3.7/3.5 aliases that route into 3.8/3.6).
  */
 export const FREE_TIER_QUOTA_FALLBACK_ORDER: string[] = [
   'gemini-4-hydrogen',
@@ -99,24 +109,25 @@ export const FREE_TIER_QUOTA_FALLBACK_ORDER: string[] = [
   'gemini-3.6-flash',
   'gemini-3-flash-preview',
   'gemini-robotics-er-2-preview',
-  'gemini-3.7-flash',
-  'gemini-3.5-flash',
 ];
 
 export const LIVE_DICTATION_CYCLE_ORDER = FREE_TIER_QUOTA_FALLBACK_ORDER;
 
 /**
  * Returns the candidate Free Tier model chain starting at `selectedModel` and cascading strictly
- * through high-accuracy Free Tier models (excluding gemini-3.5-flash-lite from automatic failover).
+ * through distinct high-accuracy Free Tier pools (excluding gemini-3.5-flash-lite).
  */
 export function getFreeTierModelFallbackChain(selectedModel: string): string[] {
   const primary = selectedModel?.replace(/^models\//, '').trim() || DEFAULT_SELECTED_MODEL;
-  const seen = new Set<string>([primary]);
+  const seenModels = new Set<string>([primary]);
+  const seenBuckets = new Set<string>([getFreeTierQuotaBucket(primary)]);
   const chain: string[] = [primary];
 
   for (const candidate of FREE_TIER_QUOTA_FALLBACK_ORDER) {
-    if (!seen.has(candidate)) {
-      seen.add(candidate);
+    const bucket = getFreeTierQuotaBucket(candidate);
+    if (!seenModels.has(candidate) && !seenBuckets.has(bucket)) {
+      seenModels.add(candidate);
+      seenBuckets.add(bucket);
       chain.push(candidate);
     }
   }

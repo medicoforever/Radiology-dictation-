@@ -5,7 +5,7 @@ import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react'
 import AudioRecorder from './components/AudioRecorder';
 import ResultsDisplay from './components/ResultsDisplay';
 import { AppStatus, IdentifiedError } from './types';
-import { processAudio, createChat, blobToBase64, base64ToBlob, createChatFromText, findBuiltinTemplates, runClinicalQaErrorCheck, ClinicalQaAssessment, SpokenTemplateResolution } from './services/geminiService';
+import { processAudio, createChat, blobToBase64, base64ToBlob, createChatFromText, sendChatMessageWithFailover, findBuiltinTemplates, runClinicalQaErrorCheck, ClinicalQaAssessment, SpokenTemplateResolution } from './services/geminiService';
 import ClinicalQaPanel from './components/ui/ClinicalQaPanel';
 import Spinner from './components/ui/Spinner';
 import { Chat } from '@google/genai';
@@ -2088,9 +2088,9 @@ const App: React.FC = () => {
     setChatHistory(prev => [...prev, { author: 'You', text: userMessageText }]);
 
     try {
-      let response;
+      let chatInput: string | any[];
       if (typeof message === 'string') {
-        response = await chat.sendMessage({ message });
+        chatInput = message;
       } else { // It's a Blob
         const base64Audio = await blobToBase64(message);
         const audioPart = {
@@ -2099,12 +2099,13 @@ const App: React.FC = () => {
             data: base64Audio,
           },
         };
-        // Adding a text part to guide the model.
         const textPart = { text: "Please analyze this audio in the context of our conversation." };
-        // The `message` property can be an array of parts for multipart messages.
-        response = await chat.sendMessage({ message: [audioPart, textPart] });
+        chatInput = [audioPart, textPart];
       }
-      const responseText = response.text;
+      const { text: responseText, activeChat } = await sendChatMessageWithFailover(chat, chatInput);
+      if (activeChat !== chat) {
+        setChat(activeChat);
+      }
       setChatHistory(prev => [...prev, { author: 'AI', text: responseText }]);
     } catch (err) {
       console.error("Chat error:", err);
@@ -4193,7 +4194,7 @@ const App: React.FC = () => {
           }}
         />
 
-        {/* Model Rate-Limit Auto-Switch Toast */}
+        {/* Model Failover Auto-Switch Toast */}
         {modelFailoverNotice && (
           <div
             role="status"
@@ -4206,7 +4207,11 @@ const App: React.FC = () => {
                 Smart Free-Tier Model Switch
               </p>
               <p className="text-[11px] text-amber-200/90 mt-0.5 leading-snug">
-                <span className="font-mono font-semibold">{modelFailoverNotice.fromModel}</span> reached quota across active keys — switched to{' '}
+                <span className="font-mono font-semibold">{modelFailoverNotice.fromModel}</span>{' '}
+                {modelFailoverNotice.reason === 'service_unavailable'
+                  ? 'is experiencing high demand / unavailable'
+                  : 'reached quota across active keys'}{' '}
+                — switched to{' '}
                 <span className="font-mono font-semibold text-emerald-300">{modelFailoverNotice.toModel}</span>.
               </p>
             </div>

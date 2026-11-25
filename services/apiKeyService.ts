@@ -54,7 +54,7 @@ export function setStrictSelectedModelOnlyEnabled(enabled: boolean): void {
 export interface ModelFailoverEventDetail {
   fromModel: string;
   toModel: string;
-  reason: 'rate_limit' | 'rpd_ledger';
+  reason: 'rate_limit' | 'rpd_ledger' | 'service_unavailable';
   timestamp: number;
 }
 
@@ -387,8 +387,6 @@ const TRACKED_FREE_TIER_MODELS: Array<{ model: string; label: string; rpdLimitPe
   { model: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash (#3 Accuracy)', rpdLimitPerKey: 20 },
   { model: 'gemini-3-flash-preview', label: 'Gemini 3 Flash (#4 Backup)', rpdLimitPerKey: 20 },
   { model: 'gemini-robotics-er-2-preview', label: 'Gemini Robotics ER-2 (#5 Backup)', rpdLimitPerKey: 20 },
-  { model: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash (Routes → 3.8)', rpdLimitPerKey: 20 },
-  { model: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash (Routes → 3.6)', rpdLimitPerKey: 20 },
   { model: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash Lite (Manual / QA)', rpdLimitPerKey: 500 },
 ];
 
@@ -472,12 +470,15 @@ function notifyKeyOrQuotaUpdated(): void {
 }
 
 /**
- * Normalizes model identifier cleanly while keeping each selectable model endpoint
- * (including gemini-3.7-flash and gemini-3.5-flash) independently tracked.
+ * Normalizes model identifier cleanly and maps routed deprecated aliases (`3.7-flash -> 3.8-flash`,
+ * `3.5-flash -> 3.6-flash`) to their shared Google quota bucket so we never burn redundant retries
+ * against an already-exhausted bucket.
  */
 export function resolveQuotaPoolModel(model?: string): string {
   if (!model) return 'default';
   const clean = model.replace(/^models\//, '').trim();
+  if (clean === 'gemini-3.7-flash') return 'gemini-3.8-flash';
+  if (clean === 'gemini-3.5-flash') return 'gemini-3.6-flash';
   if (clean === 'gemini-embedding-2-preview') return 'gemini-embedding-2';
   return clean || 'default';
 }
@@ -834,13 +835,48 @@ export async function testApiKeyValidity(key: string): Promise<{ valid: boolean;
 }
 
 /**
+ * Detects model-wide transient overload or service unavailability errors (e.g. HTTP 503 UNAVAILABLE
+ * "experiencing high demand", 500/502/504, or 404 model not found) where retrying additional API keys
+ * on the exact same overloaded model fails identically, so cross-model failover should trigger right away.
+ */
+export function isModelLevelServiceUnavailableError(err: any): boolean {
+  if (!err) return false;
+  const rawStatus = err?.status ?? err?.code ?? err?.error?.code;
+  const status = typeof rawStatus === 'number' ? rawStatus : Number(rawStatus);
+  const statusText = String(err?.statusText ?? err?.error?.status ?? '').toLowerCase();
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+
+  if (status === 503 || status === 502 || status === 504 || status === 404) {
+    return true;
+  }
+  if (status === 500 && !msg.includes('invalid argument') && !msg.includes('api key')) {
+    return true;
+  }
+  if (statusText === 'unavailable') {
+    return true;
+  }
+  return (
+    msg.includes('high demand') ||
+    msg.includes('currently experiencing high demand') ||
+    msg.includes('overloaded') ||
+    msg.includes('service unavailable') ||
+    msg.includes('"status":"unavailable"') ||
+    msg.includes('"status": "unavailable"') ||
+    msg.includes('"code":503') ||
+    msg.includes('"code": 503') ||
+    msg.includes('http 503') ||
+    msg.includes('model not found') ||
+    msg.includes('is not found for api version')
+  );
+}
+
+/**
  * Universal executor with random API key load-balancing, inter-key timing delay, and automatic failover.
  * Requirements:
  * - Always randomly selects an API key each time from the available pool.
  * - If a key fails or reaches quota, pauses with a timing delay before retrying with another random key.
- * - If user provides their own key(s), ONLY user keys are used with random rotation/failover.
- * - The selected model MUST NOT change across key retries.
- * - Runs smoothly without errors interrupting the user as long as any candidate key works.
+ * - If failFastOnModelUnavailable is enabled and the backend returns a model-wide 503/500/404 overload/unavailable
+ *   error, breaks immediately so cross-model fallback can switch to a healthy model without burning every key.
  */
 export async function executeWithApiKeyFailover<T>(
   operation: (client: GoogleGenAI, apiKey: string) => Promise<T>,
@@ -849,6 +885,7 @@ export async function executeWithApiKeyFailover<T>(
     maxTries?: number;
     delayMs?: number;
     abortSignal?: AbortSignal;
+    failFastOnModelUnavailable?: boolean;
   }
 ): Promise<T> {
   if (options?.abortSignal?.aborted) {
@@ -896,6 +933,14 @@ export async function executeWithApiKeyFailover<T>(
       recordApiKeyFailure(currentKey, poolModel, err);
       lastError = err;
       const errMsg = err?.message || String(err);
+
+      if (options?.failFastOnModelUnavailable && isModelLevelServiceUnavailableError(err)) {
+        console.warn(
+          `[API Key Failover] Model ${options?.selectedModel || 'selected'} is experiencing high demand / unavailable (${errMsg}); failing over to next accurate model immediately.`
+        );
+        throw err;
+      }
+
       console.warn(
         `[API Key Failover] Key ${masked} failed on attempt ${attempt + 1}/${maxAttempts} (${errMsg}). Evaluating next healthy key...`
       );

@@ -6,9 +6,11 @@ import { expandMacrosInFindings, expandMacrosInSingleText, getMacroPromptContext
 import {
   emitModelFailoverNotice,
   executeWithApiKeyFailover,
+  getCandidateKeysForOperation,
   getClientForApiKey,
   getRandomAIClient,
   hasConfirmedDailyExhaustionAcrossAllKeys,
+  isModelLevelServiceUnavailableError,
   isStrictSelectedModelOnlyEnabled,
 } from "./apiKeyService";
 import { findTemplateByIdOrNumber } from "./templateStorage";
@@ -689,12 +691,13 @@ function isQuotaOrRateLimitExceededError(err: any): boolean {
 
 /**
  * Executes a Gemini operation on the primary resolved model and automatically cascades across
- * the ordered accurate Free-Tier fallback chain (excluding Flash-Lite) ONLY on quota/429 limits,
- * pre-skipping models already known to be RPD-exhausted today and informing the UI on failover.
+ * the ordered accurate Free-Tier fallback chain (excluding Flash-Lite) on BOTH quota/429 limits
+ * AND model-wide 503/500/404 overload/unavailability errors, pre-skipping models already known to
+ * be RPD-exhausted today and informing the UI on failover.
  */
 export async function executeWithFreeTierModelFallback<T>(
   selectedModel: string,
-  runForModel: (targetModelName: string) => Promise<T>,
+  runForModel: (targetModelName: string, hasMoreFallbackModels?: boolean) => Promise<T>,
   options?: { abortSignal?: AbortSignal; skipCrossModelFallback?: boolean }
 ): Promise<T> {
   const resolvedPrimary = resolveApiTargetModel(selectedModel);
@@ -728,37 +731,47 @@ export async function executeWithFreeTierModelFallback<T>(
       continue;
     }
 
+    const hasMoreFallbackModels = i < chain.length - 1;
     try {
-      return await runForModel(modelName);
+      return await runForModel(modelName, hasMoreFallbackModels);
     } catch (err: any) {
       if (err?.name === 'AbortError' || options?.abortSignal?.aborted) {
         throw err;
       }
       lastErr = err;
-      if (i < chain.length - 1 && isQuotaOrRateLimitExceededError(err)) {
+      const isQuotaErr = isQuotaOrRateLimitExceededError(err);
+      const isUnavailableErr = isModelLevelServiceUnavailableError(err);
+      const isFailoverTrigger = isQuotaErr || isUnavailableErr;
+
+      if (hasMoreFallbackModels && isFailoverTrigger) {
         const nextModel = chain[i + 1];
+        const reason: 'rate_limit' | 'service_unavailable' = isQuotaErr ? 'rate_limit' : 'service_unavailable';
         console.warn(
-          `[Gemini API] Free-tier quota exhausted across keys for ${modelName}; failing over to next accurate model ${nextModel}...`
+          `[Gemini API] ${modelName} ${isQuotaErr ? 'exhausted Free-Tier quota across keys' : 'is experiencing high demand / unavailable'}; failing over to next accurate model ${nextModel}...`
         );
         emitModelFailoverNotice({
           fromModel: modelName,
           toModel: nextModel,
-          reason: 'rate_limit',
+          reason,
         });
         continue;
       }
-      if (userStrictOnly && isQuotaOrRateLimitExceededError(err)) {
+      if (userStrictOnly && isFailoverTrigger) {
         const strictErr: any = new Error(
-          `Model ${resolvedPrimary} reached its rate limit/quota across your active API key(s) while "Selected Model Only" is ON. Turn OFF "Selected Model Only" to automatically use accurate backup models, or add another free Google-account key.`
+          isQuotaErr
+            ? `Model ${resolvedPrimary} reached its rate limit/quota across your active API key(s) while "Selected Model Only" is ON. Turn OFF "Selected Model Only" to automatically use accurate backup models, or add another free Google-account key.`
+            : `Model ${resolvedPrimary} is currently experiencing high demand / unavailable across your active API key(s) while "Selected Model Only" is ON. Turn OFF "Selected Model Only" to automatically switch to backup models, or try again shortly.`
         );
-        strictErr.status = 429;
+        strictErr.status = getErrorStatusCode(err) ?? (isQuotaErr ? 429 : 503);
         throw strictErr;
       }
-      if (!strictOnly && isQuotaOrRateLimitExceededError(err)) {
+      if (!strictOnly && isFailoverTrigger) {
         const exhaustedErr: any = new Error(
-          `All accurate Free-Tier models (${chain.join(' → ')}) reached today's rate limit across your active API key(s). Gemini 3.5 Flash Lite was intentionally skipped to preserve clinical dictation accuracy. Add another free Google-account key in API Keys, wait 60s for RPM reset, or manually select Flash Lite if non-critical.`
+          isQuotaErr
+            ? `All accurate Free-Tier models (${chain.join(' → ')}) reached today's rate limit across your active API key(s). Gemini 3.5 Flash Lite was intentionally skipped to preserve clinical dictation accuracy. Add another free Google-account key in API Keys, wait 60s for RPM reset, or manually select Flash Lite if non-critical.`
+            : `All accurate Free-Tier models (${chain.join(' → ')}) are currently unavailable or overloaded across your active API key(s). Gemini 3.5 Flash Lite was intentionally skipped to preserve clinical dictation accuracy. Please retry in a moment or add another free Google-account key.`
         );
-        exhaustedErr.status = 429;
+        exhaustedErr.status = getErrorStatusCode(err) ?? (isQuotaErr ? 429 : 503);
         throw exhaustedErr;
       }
       throw err;
@@ -779,11 +792,17 @@ export async function generateContentWithJsonFallback(
   temperature: number = 0.1,
   abortSignal?: AbortSignal,
   taskType: GeminiThinkingTask = 'transcription',
-  options?: { skipCrossModelFallback?: boolean }
+  options?: { skipCrossModelFallback?: boolean; failFastOnModelUnavailable?: boolean }
 ): Promise<string> {
   const resolvedModel = resolveApiTargetModel(model);
 
-  const runOnModelAcrossKeys = async (targetModelName: string): Promise<string> => {
+  const runOnModelAcrossKeys = async (
+    targetModelName: string,
+    hasMoreFallbackModels?: boolean
+  ): Promise<string> => {
+    const failFastOnModelUnavailable = Boolean(
+      hasMoreFallbackModels ?? options?.failFastOnModelUnavailable
+    );
     return await executeWithApiKeyFailover(
       async (client, apiKey) => {
         const parts = typeof partsOrResolver === 'function'
@@ -843,17 +862,19 @@ export async function generateContentWithJsonFallback(
                 (retryErr as any).isNonRetryable = true;
                 throw retryErr;
               }
+              if (isTransientOrKeyError(retryErr) || isModelLevelServiceUnavailableError(retryErr)) {
+                throw retryErr;
+              }
             }
           }
 
-          // Re-throw so executeWithApiKeyFailover immediately retries with another random API key
-          // strictly preserving targetModelName!
+          // Re-throw so executeWithApiKeyFailover retries with another key or fails over to next model
           throw err;
         }
 
         return '';
       },
-      { selectedModel: targetModelName, abortSignal }
+      { selectedModel: targetModelName, abortSignal, failFastOnModelUnavailable }
     );
   };
 
@@ -2158,7 +2179,7 @@ Carefully integrate these dictated findings into the "${templateName}" baseline 
       const textOnlyParts = parts.filter(p => !p.inlineData && !p.fileData);
       const retryText = await executeWithFreeTierModelFallback(
         targetModel,
-        (activeModel) =>
+        (activeModel, hasMoreFallbackModels) =>
           executeWithApiKeyFailover(
             async (client, apiKey) => {
               return await callGenerateContentWithOptimalThinking({
@@ -2174,7 +2195,7 @@ Carefully integrate these dictated findings into the "${templateName}" baseline 
                 taskType: 'reasoning',
               });
             },
-            { selectedModel: activeModel, abortSignal }
+            { selectedModel: activeModel, abortSignal, failFastOnModelUnavailable: Boolean(hasMoreFallbackModels) }
           ),
         { abortSignal }
       );
@@ -2266,7 +2287,7 @@ Follow these strict instructions to produce a clean and accurate continuation:
     const targetModel = resolveApiTargetModel(model || DEFAULT_SELECTED_MODEL);
     return await executeWithFreeTierModelFallback(
       targetModel,
-      (activeModel) =>
+      (activeModel, hasMoreFallbackModels) =>
         executeWithApiKeyFailover(
           async (client, apiKey) => {
             const resultText = await callGenerateContentWithOptimalThinking({
@@ -2282,7 +2303,7 @@ Follow these strict instructions to produce a clean and accurate continuation:
             }
             return expandMacrosInSingleText(resultText);
           },
-          { selectedModel: activeModel }
+          { selectedModel: activeModel, failFastOnModelUnavailable: Boolean(hasMoreFallbackModels) }
         )
     );
   } catch (error) {
@@ -2344,7 +2365,7 @@ Now, listen to the audio and provide the single, updated finding text.`;
     const targetModel = resolveApiTargetModel(model || DEFAULT_SELECTED_MODEL);
     return await executeWithFreeTierModelFallback(
       targetModel,
-      (activeModel) =>
+      (activeModel, hasMoreFallbackModels) =>
         executeWithApiKeyFailover(
           async (client, apiKey) => {
             const resultText = await callGenerateContentWithOptimalThinking({
@@ -2360,7 +2381,7 @@ Now, listen to the audio and provide the single, updated finding text.`;
             }
             return expandMacrosInSingleText(resultText);
           },
-          { selectedModel: activeModel }
+          { selectedModel: activeModel, failFastOnModelUnavailable: Boolean(hasMoreFallbackModels) }
         )
     );
   } catch (error) {
@@ -2566,7 +2587,7 @@ export const transcribeAudioForPrompt = async (
   try {
     return await executeWithFreeTierModelFallback(
       primaryModel,
-      (activeModel) =>
+      (activeModel, hasMoreFallbackModels) =>
         executeWithApiKeyFailover(
           async (client, apiKey) => {
             const resultText = await callGenerateContentWithOptimalThinking({
@@ -2580,7 +2601,7 @@ export const transcribeAudioForPrompt = async (
 
             return resultText || "";
           },
-          { selectedModel: activeModel }
+          { selectedModel: activeModel, failFastOnModelUnavailable: Boolean(hasMoreFallbackModels) }
         )
     );
   } catch (lastError: any) {
@@ -2592,6 +2613,105 @@ export const transcribeAudioForPrompt = async (
   }
 };
 
+
+interface ChatFailoverContext {
+  model: string;
+  systemInstruction: string;
+  history: Array<{ role: 'user' | 'model'; parts: any[] }>;
+}
+
+const chatFailoverContextMap = new WeakMap<Chat, ChatFailoverContext>();
+
+function createManagedChatSession(ctx: ChatFailoverContext): Chat {
+  const { candidateKeys } = getCandidateKeysForOperation(ctx.model);
+  const firstKey = candidateKeys[0];
+  const client = firstKey ? getClientForApiKey(firstKey) : getAI();
+  const chat = client.chats.create({
+    model: ctx.model || DEFAULT_SELECTED_MODEL,
+    config: {
+      systemInstruction: ctx.systemInstruction,
+    },
+    history: ctx.history,
+  });
+  chatFailoverContextMap.set(chat, {
+    model: ctx.model || DEFAULT_SELECTED_MODEL,
+    systemInstruction: ctx.systemInstruction,
+    history: ctx.history.map((turn) => ({ role: turn.role, parts: [...turn.parts] })),
+  });
+  return chat;
+}
+
+/**
+ * Sends a follow-up Q&A message through an existing Chat session, automatically failing over
+ * across active API keys and accurate Free-Tier models on 429 quota or 503/unavailable errors.
+ */
+export async function sendChatMessageWithFailover(
+  chat: Chat,
+  message: string | any[],
+  abortSignal?: AbortSignal
+): Promise<{ text: string; activeChat: Chat }> {
+  const ctx = chatFailoverContextMap.get(chat);
+  const messageParts = typeof message === 'string' ? [{ text: message }] : message;
+
+  try {
+    const response = await chat.sendMessage({ message });
+    const text = response?.text || '';
+    if (ctx) {
+      ctx.history.push({ role: 'user', parts: [...messageParts] });
+      ctx.history.push({ role: 'model', parts: [{ text }] });
+    }
+    return { text, activeChat: chat };
+  } catch (err: any) {
+    if (!ctx || err?.name === 'AbortError' || abortSignal?.aborted) {
+      throw err;
+    }
+    const shouldRecover =
+      isQuotaOrRateLimitExceededError(err) ||
+      isModelLevelServiceUnavailableError(err) ||
+      isTransientOrKeyError(err);
+    if (!shouldRecover) {
+      throw err;
+    }
+
+    const result = await executeWithFreeTierModelFallback(
+      ctx.model,
+      (candidateModel, hasMoreFallbackModels) =>
+        executeWithApiKeyFailover(
+          async (client) => {
+            const recoveredChat = client.chats.create({
+              model: candidateModel,
+              config: { systemInstruction: ctx.systemInstruction },
+              history: ctx.history.map((t) => ({ role: t.role, parts: [...t.parts] })),
+            });
+            const r = await recoveredChat.sendMessage({ message });
+            return {
+              text: r?.text || '',
+              activeChat: recoveredChat,
+              activeModel: candidateModel,
+            };
+          },
+          {
+            selectedModel: candidateModel,
+            abortSignal,
+            failFastOnModelUnavailable: Boolean(hasMoreFallbackModels),
+          }
+        ),
+      { abortSignal }
+    );
+
+    const updatedHistory = [
+      ...ctx.history.map((t) => ({ role: t.role, parts: [...t.parts] })),
+      { role: 'user' as const, parts: [...messageParts] },
+      { role: 'model' as const, parts: [{ text: result.text }] },
+    ];
+    chatFailoverContextMap.set(result.activeChat, {
+      model: result.activeModel,
+      systemInstruction: ctx.systemInstruction,
+      history: updatedHistory,
+    });
+    return { text: result.text, activeChat: result.activeChat };
+  }
+}
 
 export const createChat = async (
   audioBlob: Blob | Blob[], 
@@ -2666,17 +2786,14 @@ export const createChat = async (
       systemInstruction += `\n\nAdditionally, follow these custom instructions from the user:\n${customPrompt}`;
   }
 
-  const chat = getAI().chats.create({
-    model: model || DEFAULT_SELECTED_MODEL,
-    config: {
-      systemInstruction: systemInstruction,
-    },
+  return createManagedChatSession({
+    model: resolveApiTargetModel(model || DEFAULT_SELECTED_MODEL),
+    systemInstruction,
     history: [
       { role: 'user', parts: userMessageParts },
       { role: 'model', parts: [modelResponsePart] },
     ],
   });
-  return chat;
 };
 
 export const createChatFromText = async (
@@ -2708,17 +2825,14 @@ export const createChatFromText = async (
       systemInstruction += `\n\nAdditionally, follow these custom instructions from the user:\n${customPrompt}`;
   }
 
-  const chat = getAI().chats.create({
-    model: model || DEFAULT_SELECTED_MODEL,
-    config: {
-      systemInstruction: systemInstruction,
-    },
+  return createManagedChatSession({
+    model: resolveApiTargetModel(model || DEFAULT_SELECTED_MODEL),
+    systemInstruction,
     history: [
       { role: 'user', parts: userMessageParts },
       { role: 'model', parts: [modelResponsePart] },
     ],
   });
-  return chat;
 };
 
 const errorSchema = {
@@ -3739,7 +3853,7 @@ INSTRUCTIONS FOR THIS AUDIO SEGMENT:
         0.1,
         undefined,
         'live_chunk',
-        { skipCrossModelFallback: true }
+        { skipCrossModelFallback: true, failFastOnModelUnavailable: attempt < fallbackChain.length - 1 }
       );
       const parsedFindings = extractFindingsFromResponse(rawResponseText);
 
@@ -3764,14 +3878,14 @@ INSTRUCTIONS FOR THIS AUDIO SEGMENT:
       lastError = error;
       failedModels.push(currentModel);
 
-      const isRateLimit =
-        error?.status === 429 ||
-        error?.message?.includes('429') ||
-        error?.message?.toLowerCase().includes('quota') ||
-        error?.message?.toLowerCase().includes('resource_exhausted') ||
-        error?.message?.toLowerCase().includes('rate');
+      const isRateLimit = isQuotaOrRateLimitExceededError(error);
+      const isUnavailable = isModelLevelServiceUnavailableError(error);
 
-      const reason = isRateLimit ? 'Rate limit exceeded' : (error?.message || 'Model service error');
+      const reason = isRateLimit
+        ? 'Rate limit exceeded'
+        : isUnavailable
+          ? 'Model high demand / unavailable'
+          : (error?.message || 'Model service error');
       console.warn(`[Live Dictation] Chunk #${chunkIndex + 1} attempt ${attempt + 1}/${fallbackChain.length} with ${currentModel} failed (${reason})`);
 
       if (attempt < fallbackChain.length - 1) {
@@ -3780,7 +3894,7 @@ INSTRUCTIONS FOR THIS AUDIO SEGMENT:
         emitModelFailoverNotice({
           fromModel: currentModel,
           toModel: nextModel,
-          reason: isRateLimit ? 'rate_limit' : 'rpd_ledger',
+          reason: isUnavailable && !isRateLimit ? 'service_unavailable' : isRateLimit ? 'rate_limit' : 'rpd_ledger',
         });
         if (onFailover) {
           onFailover(currentModel, nextModel, reason);
@@ -3875,7 +3989,7 @@ Output MUST be a JSON object with a single "findings" array of strings.`;
         0.1,
         undefined,
         'reasoning',
-        { skipCrossModelFallback: true }
+        { skipCrossModelFallback: true, failFastOnModelUnavailable: attempt < fallbackChain.length - 1 }
       );
       const parsedFindings = extractFindingsFromResponse(rawResponseText);
       if (parsedFindings && parsedFindings.length > 0) {
@@ -3886,8 +4000,13 @@ Output MUST be a JSON object with a single "findings" array of strings.`;
       console.warn(`[Synthesize Report] Attempt ${attempt + 1}/${fallbackChain.length} with ${currentModel} notice:`, err);
       if (attempt < fallbackChain.length - 1) {
         const nextModel = fallbackChain[attempt + 1];
+        const isUnavailable = isModelLevelServiceUnavailableError(err);
         console.info(`[Synthesize Report] Auto-failing over to subsequent model: ${nextModel}`);
-        emitModelFailoverNotice({ fromModel: currentModel, toModel: nextModel, reason: 'rate_limit' });
+        emitModelFailoverNotice({
+          fromModel: currentModel,
+          toModel: nextModel,
+          reason: isUnavailable ? 'service_unavailable' : 'rate_limit',
+        });
       }
     }
   }

@@ -58,9 +58,11 @@ import {
   getUserApiKeys,
   hasConfirmedDailyExhaustionAcrossAllKeys,
   isBuiltinKeysUnlocked,
+  isModelLevelServiceUnavailableError,
   isStrictSelectedModelOnlyEnabled,
   lockBuiltinKeys,
   resetApiKeyHealthState,
+  resolveQuotaPoolModel,
   setStrictSelectedModelOnlyEnabled,
   setUserApiKeys,
   unlockBuiltinKeys,
@@ -1031,14 +1033,12 @@ test('getFreeTierModelFallbackChain orders accuracy strictly and excludes gemini
     'gemini-3.6-flash',
     'gemini-3-flash-preview',
     'gemini-robotics-er-2-preview',
-    'gemini-3.7-flash',
-    'gemini-3.5-flash',
   ]);
-  // gemini-3.5-flash runs first when explicitly selected and retains gemini-3.6-flash independently
+  // gemini-3.5-flash runs first when explicitly selected and skips redundant gemini-3.6-flash bucket
   const from35 = getFreeTierModelFallbackChain('gemini-3.5-flash');
   assert.equal(from35[0], 'gemini-3.5-flash');
-  assert.equal(from35.includes('gemini-3.6-flash'), true);
-  assert.equal(from35.includes('gemini-3.7-flash'), true);
+  assert.equal(from35.includes('gemini-3.6-flash'), false);
+  assert.equal(from35.includes('gemini-3.8-flash'), true);
   assert.equal(getFreeTierModelFallbackChain('gemini-4-hydrogen').includes('gemini-3.5-flash-lite'), false);
   assert.equal(getLiveModelFallbackChain('gemini-4-hydrogen').length, FREE_TIER_QUOTA_FALLBACK_ORDER.length);
 });
@@ -1242,7 +1242,7 @@ test('custom keys always execute strictly before the 9 unlocked (1198) built-in 
   }
 });
 
-test('Selected Model Only toggle defaults OFF (allowing 3.7/3.5 tail failover) and enforces strict single-model execution when ON', async () => {
+test('Selected Model Only toggle defaults OFF (using clean 5-model cascade) and enforces strict single-model execution when ON', async () => {
   const store = new Map<string, string>();
   const mockLocalStorage = {
     getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
@@ -1291,7 +1291,7 @@ test('Selected Model Only toggle defaults OFF (allowing 3.7/3.5 tail failover) a
     );
     assert.deepEqual(strictVisited, ['gemini-4-hydrogen']);
 
-    // Turning OFF restores the full 7-model fallback chain (trying 3.7 & 3.5 Flash at the tail, skipping Flash-Lite)
+    // Turning OFF restores the clean 5 distinct accurate Free-Tier pools (skipping deprecated 3.7/3.5 aliases and Flash-Lite)
     setStrictSelectedModelOnlyEnabled(false);
     assert.equal(isStrictSelectedModelOnlyEnabled(), false);
     assert.equal(store.get(STRICT_SELECTED_MODEL_ONLY_KEY), 'false');
@@ -1302,12 +1302,12 @@ test('Selected Model Only toggle defaults OFF (allowing 3.7/3.5 tail failover) a
       const match = url.match(/models\/([^:]+):generateContent/);
       const model = match ? decodeURIComponent(match[1]) : '';
       failoverVisited.push(model);
-      if (model === 'gemini-3.5-flash') {
+      if (model === 'gemini-robotics-er-2-preview') {
         return {
           ok: true,
           status: 200,
           json: async () => ({
-            candidates: [{ content: { parts: [{ text: JSON.stringify({ corrected: 'Tail fallback ok' }) }] } }],
+            candidates: [{ content: { parts: [{ text: JSON.stringify({ corrected: 'Backup #5 ok' }) }] } }],
           }),
         };
       }
@@ -1319,23 +1319,151 @@ test('Selected Model Only toggle defaults OFF (allowing 3.7/3.5 tail failover) a
       };
     };
 
-    const raw = await generateContentWithJsonFallback('gemini-4-hydrogen', [{ text: 'tail fallback check' }]);
-    assert.equal(JSON.parse(raw).corrected, 'Tail fallback ok');
+    const raw = await generateContentWithJsonFallback('gemini-4-hydrogen', [{ text: 'cascade check' }]);
+    assert.equal(JSON.parse(raw).corrected, 'Backup #5 ok');
     assert.deepEqual(failoverVisited, [
       'gemini-4-hydrogen',
       'gemini-3.8-flash',
       'gemini-3.6-flash',
       'gemini-3-flash-preview',
       'gemini-robotics-er-2-preview',
-      'gemini-3.7-flash',
-      'gemini-3.5-flash',
     ]);
+    assert.equal(failoverVisited.includes('gemini-3.7-flash'), false);
+    assert.equal(failoverVisited.includes('gemini-3.5-flash'), false);
     assert.equal(failoverVisited.includes('gemini-3.5-flash-lite'), false);
 
     const stats = getFreeTierDailyQuotaStats();
-    const trackedNames = stats.models.map((m) => m.model);
-    assert.ok(trackedNames.includes('gemini-3.7-flash'));
-    assert.ok(trackedNames.includes('gemini-3.5-flash'));
+    assert.deepEqual(
+      stats.models.map((m) => m.model),
+      [
+        'gemini-4-hydrogen',
+        'gemini-3.8-flash',
+        'gemini-3.6-flash',
+        'gemini-3-flash-preview',
+        'gemini-robotics-er-2-preview',
+        'gemini-3.5-flash-lite',
+      ]
+    );
+  } finally {
+    resetApiKeyHealthState();
+    (globalThis as any).window = prevWindow;
+    (globalThis as any).localStorage = prevLocalStorage;
+    (globalThis as any).fetch = prevFetch;
+  }
+});
+
+test('HTTP 503 UNAVAILABLE (high demand) fails fast across keys and auto-fails over to healthy backup models', async () => {
+  const store = new Map<string, string>();
+  const mockLocalStorage = {
+    getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+    setItem: (k: string, v: string) => store.set(k, String(v)),
+    removeItem: (k: string) => store.delete(k),
+  };
+  const failoverEvents: any[] = [];
+  const prevWindow = (globalThis as any).window;
+  const prevLocalStorage = (globalThis as any).localStorage;
+  const prevFetch = (globalThis as any).fetch;
+  (globalThis as any).window = {
+    localStorage: mockLocalStorage,
+    dispatchEvent: (ev: any) => {
+      if (ev?.type === MODEL_FAILOVER_EVENT) failoverEvents.push(ev.detail);
+      return true;
+    },
+  };
+  (globalThis as any).localStorage = mockLocalStorage;
+  resetApiKeyHealthState();
+
+  try {
+    setUserApiKeys([
+      'AIzaSyKeyOnePoolTest00001',
+      'AIzaSyKeyTwoPoolTest00002',
+      'AIzaSyKeyThreePoolTest003',
+    ]);
+    setStrictSelectedModelOnlyEnabled(false);
+
+    // Reproduces real live condition: gemini-4-hydrogen -> 503 UNAVAILABLE ("high demand"),
+    // gemini-3.8-flash -> 429 quota, gemini-3.6-flash -> 200 OK.
+    const calls: Array<{ model: string; key: string }> = [];
+    (globalThis as any).fetch = async (url: string, init: any) => {
+      const match = url.match(/models\/([^:]+):generateContent/);
+      const model = match ? decodeURIComponent(match[1]) : '';
+      const key = String(init?.headers?.['x-goog-api-key'] || '');
+      calls.push({ model, key });
+
+      if (model === 'gemini-4-hydrogen') {
+        return {
+          ok: false,
+          status: 503,
+          statusText: 'Service Unavailable',
+          json: async () => ({
+            error: {
+              code: 503,
+              message: 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.',
+              status: 'UNAVAILABLE',
+            },
+          }),
+        };
+      }
+      if (model === 'gemini-3.8-flash') {
+        return {
+          ok: false,
+          status: 429,
+          statusText: 'Too Many Requests',
+          json: async () => ({ error: { message: '429 PerDay RPD exhausted' } }),
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          candidates: [{ content: { parts: [{ text: JSON.stringify({ findings: ['Recovered cleanly on 3.6'] }) }] } }],
+        }),
+      };
+    };
+
+    const raw = await generateContentWithJsonFallback('gemini-4-hydrogen', [{ text: 'dictation test' }]);
+    assert.deepEqual(JSON.parse(raw).findings, ['Recovered cleanly on 3.6']);
+
+    // Critical: 503 UNAVAILABLE on gemini-4-hydrogen must try AT MOST 1 key (not burn all 3 keys!)
+    const h4Calls = calls.filter((c) => c.model === 'gemini-4-hydrogen');
+    assert.equal(h4Calls.length, 1);
+
+    // Confirm event sequence: 4-hydrogen (service_unavailable) -> 3.8-flash (rate_limit) -> 3.6-flash
+    assert.equal(failoverEvents.length, 2);
+    assert.equal(failoverEvents[0].fromModel, 'gemini-4-hydrogen');
+    assert.equal(failoverEvents[0].toModel, 'gemini-3.8-flash');
+    assert.equal(failoverEvents[0].reason, 'service_unavailable');
+    assert.equal(failoverEvents[1].fromModel, 'gemini-3.8-flash');
+    assert.equal(failoverEvents[1].toModel, 'gemini-3.6-flash');
+    assert.equal(failoverEvents[1].reason, 'rate_limit');
+
+    // When Selected Model Only IS ON, 503 still stays strict and surfaces helpful overload error
+    setStrictSelectedModelOnlyEnabled(true);
+    const strict503Calls: string[] = [];
+    (globalThis as any).fetch = async (url: string) => {
+      const match = url.match(/models\/([^:]+):generateContent/);
+      strict503Calls.push(match ? decodeURIComponent(match[1]) : '');
+      return {
+        ok: false,
+        status: 503,
+        statusText: 'Service Unavailable',
+        json: async () => ({
+          error: { code: 503, message: 'This model is currently experiencing high demand.', status: 'UNAVAILABLE' },
+        }),
+      };
+    };
+    await assert.rejects(
+      () => generateContentWithJsonFallback('gemini-4-hydrogen', [{ text: 'strict 503 check' }]),
+      /experiencing high demand.*Selected Model Only.*is ON/i
+    );
+    assert.ok(strict503Calls.every((m) => m === 'gemini-4-hydrogen'));
+    assert.equal(strict503Calls.length, 3);
+
+    // Direct helper assertions for quota aliasing & model-unavailable detection
+    assert.equal(resolveQuotaPoolModel('gemini-3.7-flash'), 'gemini-3.8-flash');
+    assert.equal(resolveQuotaPoolModel('gemini-3.5-flash'), 'gemini-3.6-flash');
+    assert.equal(isModelLevelServiceUnavailableError({ status: 503, message: 'This model is currently experiencing high demand.' }), true);
+    assert.equal(isModelLevelServiceUnavailableError({ status: 400, message: 'Invalid argument: unsupported audio' }), false);
   } finally {
     resetApiKeyHealthState();
     (globalThis as any).window = prevWindow;
