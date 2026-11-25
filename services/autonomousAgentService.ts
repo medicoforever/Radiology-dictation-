@@ -28,6 +28,7 @@ import {
   getMacroPromptContext 
 } from "./macroDictionaryService";
 import { getUserTemplates } from "./templateStorage";
+import { filterAudioInputsForModel } from "./audioPrefilterService";
 
 export interface AutonomousAttachedFile {
   id: string;
@@ -313,17 +314,36 @@ Respond with ONLY valid JSON adhering to this schema:
   ]
 }`;
 
+/** Encodes an audio blob as a Gemini inlineData part, running experimental pre-filtering when enabled. */
+async function prepareInlineAudioPart(
+  audioBlob: Blob,
+  preFilterAudio: boolean
+): Promise<{ inlineData: { mimeType: string; data: string } }> {
+  const { filteredInput } = await filterAudioInputsForModel(audioBlob, {
+    enabled: preFilterAudio,
+  });
+  const effectiveBlob = Array.isArray(filteredInput) ? filteredInput[0] : filteredInput;
+  const base64Audio = await blobToBase64(effectiveBlob);
+  const mimeType = effectiveBlob.type || audioBlob.type || 'audio/webm';
+  return {
+    inlineData: {
+      mimeType,
+      data: base64Audio,
+    },
+  };
+}
+
 /**
  * Processes an autonomous audio dictation with the user-selected model
  */
 export async function parseAutonomousAudioDictation(
   audioBlob: Blob,
   selectedModel: string,
-  attachedFiles?: AutonomousAttachedFile[]
+  attachedFiles?: AutonomousAttachedFile[],
+  options?: { preFilterAudio?: boolean }
 ): Promise<AutonomousExecutionPlan> {
   const targetModel = resolveApiTargetModel(selectedModel);
-  const base64Audio = await blobToBase64(audioBlob);
-  const mimeType = audioBlob.type || 'audio/webm';
+  const audioPart = await prepareInlineAudioPart(audioBlob, options?.preFilterAudio === true);
   const macroContext = getMacroPromptContext();
 
   let attachedFilesManifest = '';
@@ -347,12 +367,7 @@ If the doctor mentions assigning any of these files or notes to a patient, set t
       const promptInstruction = `${AUTONOMOUS_AGENT_SYSTEM_PROMPT}\n${macroContext}\n${attachedFilesManifest}\nExecute autonomous orchestration for this audio dictation. Return the structured JSON execution plan now.`;
 
       const parts: any[] = [
-        {
-          inlineData: {
-            mimeType: mimeType,
-            data: base64Audio,
-          },
-        },
+        audioPart,
         {
           text: promptInstruction
         }
@@ -458,10 +473,16 @@ export async function parseAutonomousFeedbackDictation(
   feedbackAudioBlob?: Blob | null,
   feedbackText?: string,
   selectedModel: string = 'gemini-2.5-pro',
-  attachedFiles?: AutonomousAttachedFile[]
+  attachedFiles?: AutonomousAttachedFile[],
+  options?: { preFilterAudio?: boolean }
 ): Promise<AutonomousExecutionPlan> {
   const targetModel = resolveApiTargetModel(selectedModel);
   const macroContext = getMacroPromptContext();
+
+  const feedbackAudioPart =
+    feedbackAudioBlob && feedbackAudioBlob.size > 0
+      ? await prepareInlineAudioPart(feedbackAudioBlob, options?.preFilterAudio === true)
+      : null;
 
   let attachedFilesManifest = '';
   if (attachedFiles && attachedFiles.length > 0) {
@@ -508,15 +529,8 @@ Execute feedback modifications now. Return the updated structured JSON execution
 
       const parts: any[] = [];
 
-      if (feedbackAudioBlob && feedbackAudioBlob.size > 0) {
-        const base64Audio = await blobToBase64(feedbackAudioBlob);
-        const mimeType = feedbackAudioBlob.type || 'audio/webm';
-        parts.push({
-          inlineData: {
-            mimeType: mimeType,
-            data: base64Audio,
-          },
-        });
+      if (feedbackAudioPart) {
+        parts.push(feedbackAudioPart);
       }
 
       parts.push({

@@ -4,6 +4,7 @@ import { processAudio, createChat, blobToBase64, continueAudioDictation, base64T
 import ClinicalQaPanel, { getUrgencyBadgeMeta } from './ui/ClinicalQaPanel';
 import { saveAudioBlob, getAudioBlob, clearUnusedAudioBlobs, saveReportSession, getReportSession, deleteReportSession } from '../services/audioStorage';
 import { mergeMultipleAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
+import { filterAudioInputsForModel, AudioPrefilterStats } from '../services/audioPrefilterService';
 import { ClipboardPaste, X, CheckSquare } from 'lucide-react';
 import { safeLocalStorage, markTabActive, getTabId, getBatchModeStorageKey } from '../services/storageService';
 import PasteTextModal from './PasteTextModal';
@@ -73,12 +74,14 @@ interface Batch {
     qaAssessment?: ClinicalQaAssessment | null;
     qaFindingsHash?: string;
     errorCheckStatus?: 'idle' | 'checking' | 'complete';
+    prefilterStats?: AudioPrefilterStats | null;
 }
 
 interface BatchProcessorProps {
     onBack: () => void;
     selectedModel: string;
     isErrorCheckEnabled: boolean;
+    isExperimentalAudioFilterEnabled?: boolean;
     initialFiles?: File[] | null;
     onClearInitialFiles?: () => void;
     onSaveToDrive?: (result: SaveResult) => void;
@@ -179,10 +182,59 @@ const getCleanMimeType = (blob: Blob): string => {
     return mimeType.split(';')[0];
 };
 
+/** Formats seconds into a compact human-readable duration for pre-filter badges. */
+const formatPrefilterDuration = (seconds: number): string => {
+    const safeSec = Math.max(0, seconds);
+    if (safeSec < 60) {
+        return `${safeSec.toFixed(1)}s`;
+    }
+    const mins = Math.floor(safeSec / 60);
+    const remSec = Math.round(safeSec % 60);
+    return `${mins}m ${remSec}s`;
+};
+
+/** Builds a concise summary of removed silence/chatter for the batch pre-filter pill. */
+const formatPrefilterRemovedSummary = (stats: AudioPrefilterStats): string => {
+    const removedParts: string[] = [];
+    if (stats.silenceRemovedSec > 0) {
+        removedParts.push(`-${formatPrefilterDuration(stats.silenceRemovedSec)} silence`);
+    }
+    if (stats.nonRadiologyRemovedSec > 0) {
+        removedParts.push(`-${formatPrefilterDuration(stats.nonRadiologyRemovedSec)} chatter`);
+    }
+    return removedParts.length > 0 ? ` (${removedParts.join(', ')})` : '';
+};
+
+/** Combines pre-filter telemetry when additional dictation is appended to a processed batch. */
+const mergePrefilterStats = (
+    prev: AudioPrefilterStats | null | undefined,
+    next: AudioPrefilterStats | null
+): AudioPrefilterStats | null => {
+    if (!next?.applied) return prev ?? null;
+    if (!prev?.applied) return next;
+    const mimes = Array.from(new Set([prev.outputMimeType, next.outputMimeType].filter(Boolean)));
+    return {
+        applied: true,
+        originalDurationSec: Number((prev.originalDurationSec + next.originalDurationSec).toFixed(3)),
+        keptDurationSec: Number((prev.keptDurationSec + next.keptDurationSec).toFixed(3)),
+        afterVadDurationSec: Number((prev.afterVadDurationSec + next.afterVadDurationSec).toFixed(3)),
+        silenceRemovedSec: Number((prev.silenceRemovedSec + next.silenceRemovedSec).toFixed(3)),
+        nonRadiologyRemovedSec: Number((prev.nonRadiologyRemovedSec + next.nonRadiologyRemovedSec).toFixed(3)),
+        keptSegmentsCount: prev.keptSegmentsCount + next.keptSegmentsCount,
+        droppedNonRadiologyCount: prev.droppedNonRadiologyCount + next.droppedNonRadiologyCount,
+        originalBytes: prev.originalBytes + next.originalBytes,
+        outputBytes: prev.outputBytes + next.outputBytes,
+        outputMimeType: mimes.join(', '),
+        decisionLatencyMs: prev.decisionLatencyMs + next.decisionLatencyMs,
+        usedDecision1: prev.usedDecision1 || next.usedDecision1,
+    };
+};
+
 const BatchProcessor: React.FC<BatchProcessorProps> = ({ 
     onBack, 
     selectedModel, 
     isErrorCheckEnabled, 
+    isExperimentalAudioFilterEnabled = false,
     initialFiles, 
     onClearInitialFiles,
     onSaveToDrive
@@ -1454,6 +1506,34 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         }
     };
 
+    /** Pre-filters a single audio clip for Gemini when experimental pre-filtering is enabled. */
+    const prefilterSingleAudioBlob = async (blob: Blob): Promise<{ blob: Blob; stats: AudioPrefilterStats | null }> => {
+        const { filteredInput, stats } = await filterAudioInputsForModel(blob, {
+            enabled: Boolean(isExperimentalAudioFilterEnabled),
+        });
+        return {
+            blob: Array.isArray(filteredInput) ? filteredInput[0] : filteredInput,
+            stats,
+        };
+    };
+
+    /**
+     * Prepares model-ready inputs from raw batch blobs.
+     * When experimental filtering is enabled, runs filterAudioInputsForModel first and never passes
+     * non-audio attachments (PDF, DOCX, TXT, images, videos) into mergeMultipleAudioBlobs.
+     */
+    const prepareModelInputsForBatch = async (
+        blobs: Blob[],
+        mergeWhenDisabled: boolean
+    ): Promise<{ modelInput: Blob | Blob[]; prefilterStats: AudioPrefilterStats | null }> => {
+        if (isExperimentalAudioFilterEnabled) {
+            const { filteredInput, stats } = await filterAudioInputsForModel(blobs, { enabled: true });
+            return { modelInput: filteredInput, prefilterStats: stats };
+        }
+        const modelInput = mergeWhenDisabled ? await mergeMultipleAudioBlobs(blobs) : blobs;
+        return { modelInput, prefilterStats: null };
+    };
+
     const handleProcessAll = async () => {
         const batchesToProcess = batches.filter(b => (b.status === 'complete' || b.status === 'paused') && b.audioBlobs.length > 0 && !b.findings);
         if (batchesToProcess.length === 0) return;
@@ -1474,21 +1554,23 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                 if (batch.audioBlobs.length === 0) return;
                 const currentReqId = batchProcessingIdRef.current[batch.id];
                 try {
-                    const mergedBlob = await mergeMultipleAudioBlobs(batch.audioBlobs);
+                    const { modelInput, prefilterStats } = await prepareModelInputsForBatch(batch.audioBlobs, true);
+                    if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
+
                     const currentUpcoming = getUpcomingTemplate();
                     const effectivePrompt = batch.customPrompt || (currentUpcoming ? currentUpcoming.promptText : globalCustomPrompt);
                     const effectiveDocx = batch.customDocx || (currentUpcoming ? (currentUpcoming.docxData || null) : globalCustomDocx);
-                    const findings = await processAudio(mergedBlob, batch.selectedModel, effectivePrompt, batch.customImages, undefined, effectiveDocx);
+                    const findings = await processAudio(modelInput, batch.selectedModel, effectivePrompt, batch.customImages, undefined, effectiveDocx);
                     
                     if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
 
-                    const chatSession = await createChat(mergedBlob, findings, effectivePrompt, batch.customImages, batch.selectedModel);
+                    const chatSession = await createChat(modelInput, findings, effectivePrompt, batch.customImages, batch.selectedModel);
                     const aiGreeting = "I have reviewed the audio and transcript for this dictation. How can I help you further?";
                     const initialChatHistory = [{ author: 'AI' as const, text: `${findings.join('\n\n')}\n\n${aiGreeting}` }];
 
                     if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
 
-                    setBatches(prev => prev.map(b => b.id === batch.id ? { ...b, status: 'complete', findings, chat: chatSession, chatHistory: initialChatHistory, isChatting: false } : b));
+                    setBatches(prev => prev.map(b => b.id === batch.id ? { ...b, status: 'complete', findings, chat: chatSession, chatHistory: initialChatHistory, isChatting: false, prefilterStats } : b));
                 } catch (err) {
                     if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
                     const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';
@@ -1532,18 +1614,21 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         setBatches(prev => prev.map(b => b.id === batchId ? {...b, status: 'processing', error: undefined } : b));
 
         try {
-            const findings = await processAudio(allBlobs, batch.selectedModel, batch.customPrompt, batch.customImages, undefined, batch.customDocx);
+            const { modelInput, prefilterStats } = await prepareModelInputsForBatch(allBlobs, false);
+            if (batchProcessingIdRef.current[batchId] !== currentReqId) return;
+
+            const findings = await processAudio(modelInput, batch.selectedModel, batch.customPrompt, batch.customImages, undefined, batch.customDocx);
             
             if (batchProcessingIdRef.current[batchId] !== currentReqId) return;
 
-            const chatSession = await createChat(allBlobs, findings, batch.customPrompt, batch.customImages, batch.selectedModel);
+            const chatSession = await createChat(modelInput, findings, batch.customPrompt, batch.customImages, batch.selectedModel);
             const aiGreeting = "I have reviewed the audio and transcript for this dictation. How can I help you further?";
             const initialChatHistory = [{ author: 'AI' as const, text: `${findings.join('\n\n')}\n\n${aiGreeting}` }];
 
             if (batchProcessingIdRef.current[batchId] !== currentReqId) return;
 
             setBatches(prev => {
-                const updated = prev.map(b => b.id === batchId ? { ...b, audioBlobs: allBlobs, extraFiles: [], status: 'complete', findings, chat: chatSession, chatHistory: initialChatHistory, isChatting: false } : b);
+                const updated = prev.map(b => b.id === batchId ? { ...b, audioBlobs: allBlobs, extraFiles: [], status: 'complete', findings, chat: chatSession, chatHistory: initialChatHistory, isChatting: false, prefilterStats } : b);
                 saveBatchesToDrive(updated);
                 return updated;
             });
@@ -2051,7 +2136,8 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             setProcessingState({ batchId, index });
             try {
                 const existingText = batch.findings[index];
-                const newText = await continueAudioDictation(existingText, audioBlob, batch.customPrompt, batch.selectedModel);
+                const { blob: filteredAudio } = await prefilterSingleAudioBlob(audioBlob);
+                const newText = await continueAudioDictation(existingText, filteredAudio, batch.customPrompt, batch.selectedModel);
                 const separator = existingText.trim().length > 0 && !existingText.endsWith(' ') ? ' ' : '';
                 const updatedText = existingText + separator + newText.trim();
                 handleUpdateFindingForBatch(batchId, index, updatedText);
@@ -2092,7 +2178,8 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             setProcessingState({ batchId, index });
             try {
                 const existingText = batch.findings[index];
-                const newText = await modifyFindingWithAudio(existingText, audioBlob, batch.customPrompt, batch.selectedModel);
+                const { blob: filteredAudio } = await prefilterSingleAudioBlob(audioBlob);
+                const newText = await modifyFindingWithAudio(existingText, filteredAudio, batch.customPrompt, batch.selectedModel);
                 handleUpdateFindingForBatch(batchId, index, newText);
             } catch (err) {
                 const message = err instanceof Error ? err.message : 'An unknown error occurred.';
@@ -2137,13 +2224,24 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             setUndoStates(prev => ({ ...prev, [batchId]: [...batch.findings!] }));
 
             try {
-                const newFindings = await processAudio(newAudioBlob, batch.selectedModel, batch.customPrompt, batch.customImages);
+                const { blob: filteredNewAudio, stats: continueStats } = await prefilterSingleAudioBlob(newAudioBlob);
+                const newFindings = await processAudio(filteredNewAudio, batch.selectedModel, batch.customPrompt, batch.customImages);
                 const updatedFindings = [...batch.findings, ...newFindings];
                 
                 const updatedAudioBlobs = [...batch.audioBlobs, newAudioBlob];
-                const mergedBlob = await mergeMultipleAudioBlobs(updatedAudioBlobs);
+                let chatAudioInput: Blob | Blob[];
+                if (isExperimentalAudioFilterEnabled) {
+                    if (batch.audioBlobs.length > 0) {
+                        const { modelInput: priorFiltered } = await prepareModelInputsForBatch(batch.audioBlobs, false);
+                        chatAudioInput = [...(Array.isArray(priorFiltered) ? priorFiltered : [priorFiltered]), filteredNewAudio];
+                    } else {
+                        chatAudioInput = [filteredNewAudio];
+                    }
+                } else {
+                    chatAudioInput = await mergeMultipleAudioBlobs(updatedAudioBlobs);
+                }
 
-                const chatSession = await createChat(mergedBlob, updatedFindings, batch.customPrompt, batch.customImages);
+                const chatSession = await createChat(chatAudioInput, updatedFindings, batch.customPrompt, batch.customImages, batch.selectedModel);
                 const aiGreeting = "I have updated the transcript with your new dictation. How can I help you further?";
                 const updatedChatHistory = [{ author: 'AI' as const, text: `${updatedFindings.join('\n\n')}\n\n${aiGreeting}` }];
 
@@ -2154,6 +2252,9 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                         audioBlobs: updatedAudioBlobs,
                         chat: chatSession,
                         chatHistory: updatedChatHistory,
+                        prefilterStats: isExperimentalAudioFilterEnabled
+                            ? mergePrefilterStats(b.prefilterStats, continueStats)
+                            : b.prefilterStats,
                     } : b);
                     saveBatchesToDrive(updated);
                     return updated;
@@ -2201,10 +2302,11 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             setUndoStates(prev => ({ ...prev, [batchId]: [...batchToModify.findings!] }));
     
             try {
-                const newFindings = await modifyReportWithAudio(batchToModify.findings, audioBlob, batchToModify.selectedModel, batchToModify.customPrompt, batchToModify.customImages);
+                const { blob: filteredModAudio } = await prefilterSingleAudioBlob(audioBlob);
+                const newFindings = await modifyReportWithAudio(batchToModify.findings, filteredModAudio, batchToModify.selectedModel, batchToModify.customPrompt, batchToModify.customImages);
                 
-                const mergedBlob = await mergeMultipleAudioBlobs(batchToModify.audioBlobs);
-                const chatSession = await createChat(mergedBlob, newFindings, batchToModify.customPrompt, batchToModify.customImages, batchToModify.selectedModel);
+                const { modelInput: chatAudioInput } = await prepareModelInputsForBatch(batchToModify.audioBlobs, true);
+                const chatSession = await createChat(chatAudioInput, newFindings, batchToModify.customPrompt, batchToModify.customImages, batchToModify.selectedModel);
                 const aiGreeting = "I have updated the transcript with your new dictation. How can I help you further?";
                 const updatedChatHistory = [{ author: 'AI' as const, text: `${newFindings.join('\n\n')}\n\n${aiGreeting}` }];
     
@@ -3351,7 +3453,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                             </div>
                                         ) : batch.findings ? (
                                             <>
-                                                <div className="flex justify-between items-center mb-3">
+                                                <div className="flex flex-wrap justify-between items-center gap-2 mb-3">
                                                   <div className="flex items-center gap-2">
                                                     <h4 className="text-lg font-bold text-slate-800 dark:text-slate-200">Transcript</h4>
                                                     {batch.errorCheckStatus === 'checking' && (
@@ -3361,6 +3463,22 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                         </div>
                                                     )}
                                                   </div>
+                                                  {batch.prefilterStats?.applied && (
+                                                    <span
+                                                      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-teal-50 text-teal-800 border border-teal-200 dark:bg-teal-950/50 dark:text-teal-300 dark:border-teal-800/80"
+                                                      title={`Pre-filtered audio (${batch.prefilterStats.outputMimeType}, ${(batch.prefilterStats.originalBytes / 1024).toFixed(0)} KB → ${(batch.prefilterStats.outputBytes / 1024).toFixed(0)} KB)`}
+                                                    >
+                                                      <span>Pre-Trim</span>
+                                                      <span>
+                                                        {formatPrefilterDuration(batch.prefilterStats.originalDurationSec)} → {formatPrefilterDuration(batch.prefilterStats.keptDurationSec)}
+                                                      </span>
+                                                      {formatPrefilterRemovedSummary(batch.prefilterStats) && (
+                                                        <span className="text-teal-700 dark:text-teal-300">
+                                                          {formatPrefilterRemovedSummary(batch.prefilterStats)}
+                                                        </span>
+                                                      )}
+                                                    </span>
+                                                  )}
                                                 </div>
 
                                                 {isErrorCheckEnabled && (

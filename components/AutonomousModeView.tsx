@@ -53,6 +53,7 @@ interface AutonomousModeViewProps {
   onNavigateToSingle?: () => void;
   onNavigateToBatch: () => void;
   onSaveToDrive?: (result: SaveResult) => void;
+  isExperimentalAudioFilterEnabled?: boolean;
 }
 
 export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
@@ -63,6 +64,7 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
   onNavigateToSingle,
   onNavigateToBatch,
   onSaveToDrive,
+  isExperimentalAudioFilterEnabled = false,
 }) => {
   const {
     isRecording,
@@ -593,7 +595,8 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
       const plan: AutonomousExecutionPlan = await parseAutonomousAudioDictation(
         recordedBlob,
         selectedModel,
-        attachedFiles
+        attachedFiles,
+        { preFilterAudio: Boolean(isExperimentalAudioFilterEnabled) }
       );
       setLastPlan(plan);
 
@@ -710,7 +713,8 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
         audioToUse,
         textToUse,
         selectedModel,
-        attachedFiles
+        attachedFiles,
+        { preFilterAudio: Boolean(isExperimentalAudioFilterEnabled) }
       );
 
       setLastPlan(updatedPlan);
