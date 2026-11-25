@@ -1,73 +1,38 @@
-export const DEFAULT_LIVE_MODEL = 'gemini-4-hydrogen';
-export const GEMINI_TRANSCRIBE_LIVE_MODEL = 'gemini-4-hydrogen';
-export const LIVE_DICTATION_MODEL = 'gemini-4-hydrogen';
+export const DEFAULT_LIVE_MODEL = 'gemini-3.8-flash';
+export const GEMINI_TRANSCRIBE_LIVE_MODEL = 'gemini-3.8-flash';
+export const LIVE_DICTATION_MODEL = 'gemini-3.8-flash';
 export const GEMINI_FLASH_LITE_MODEL = 'gemini-3.5-flash-lite';
-export const DEFAULT_SELECTED_MODEL = 'gemini-4-hydrogen';
+export const DEFAULT_SELECTED_MODEL = 'gemini-3.8-flash';
 
 export type GeminiThinkingLevel = 'minimal' | 'low' | 'medium' | 'high';
-export type GeminiThinkingTask = 'transcription' | 'live_chunk' | 'reasoning';
 
 /**
- * Fast Free-Tier thinkingLevel baseline calibrated for 99% dictation/merging accuracy & speed:
- * - gemini-4-hydrogen: 'low' for raw dictation/live chunks (18.0s vs 41.7s Auto, 739 vs 4,796 thk, 14/14);
- *   'medium' for template merging / multi-patient reasoning.
- * - gemini-3.8-flash / 3.7-flash: 'medium' (= Auto, 23.0s, 14/14; 'low' was slower 26.3s + "SDH" substitution).
- * - gemini-3.6-flash / 3.5-flash: 'medium' (= Auto, 22.3s, 0 errors; 'minimal' hallucinates & adds hyphens).
- * - gemini-3-flash-preview: 'low' for full dictation & merging (avoids 'minimal' missing hemotympanum & "Pachyfibrosis"
- *   and avoids Auto 'high' 225.9s / 62.9k thk stall); 'minimal' for fast live chunks.
- * - gemini-robotics-er-2-preview: 'low' for full dictation & merging (avoids 'minimal' dropping clinoid/petrous),
- *   'minimal' for fast live chunks.
- * - gemini-3.5-flash-lite: 'minimal' for manual raw speed (18.1s vs 'low' 20.2s repeat loop); 'high' for text QA/reasoning.
+ * Verified optimal per-model thinkingLevel defaults from full-length trauma dictation benchmarks:
+ * - gemini-3.8-flash: 'medium' (14/14 clinical accuracy, 0 formatting errors; 'minimal' is unsupported, 'low' risks "SDH" substitution)
+ * - gemini-4-hydrogen / argon / carbon / neon & 3.1-pro-preview: 'low' (cuts latency & cost up to 2.3x while maintaining 14/14 recall)
+ * - gemini-3-flash-preview & gemini-robotics-er-2-preview: 'minimal' (avoids excessive thinking tokens)
+ * - gemini-3.6-flash / 3.5-flash: 'medium' ('minimal' drops skull-base/cisternal SAH findings)
+ * - flash-lite models: 'minimal' (lowest latency)
  */
 export const MODEL_OPTIMAL_THINKING_LEVEL: Record<string, GeminiThinkingLevel> = {
-  'gemini-4-hydrogen': 'low',
   'gemini-3.8-flash': 'medium',
   'gemini-3.7-flash': 'medium',
+  'gemini-4-hydrogen': 'low',
+  'gemini-4-argon': 'low',
+  'gemini-4-carbon': 'low',
+  'gemini-4-neon': 'low',
+  'gemini-3.1-pro-preview': 'low',
+  'gemini-3-flash-preview': 'minimal',
+  'gemini-robotics-er-2-preview': 'minimal',
   'gemini-3.6-flash': 'medium',
   'gemini-3.5-flash': 'medium',
-  'gemini-3-flash-preview': 'low',
-  'gemini-robotics-er-2-preview': 'low',
   'gemini-3.5-flash-lite': 'minimal',
   'gemini-3.1-flash-lite': 'minimal',
 };
 
-/**
- * Elevated Free-Tier thinkingLevel profile for template merging, visual/DOCX integration,
- * report edits, live final synthesis, autonomous multi-patient planning, and background QA.
- */
-export const MODEL_REASONING_THINKING_LEVEL: Record<string, GeminiThinkingLevel> = {
-  'gemini-4-hydrogen': 'medium',
-  'gemini-3.8-flash': 'medium',
-  'gemini-3.7-flash': 'medium',
-  'gemini-3.6-flash': 'medium',
-  'gemini-3.5-flash': 'medium',
-  'gemini-3-flash-preview': 'low',
-  'gemini-robotics-er-2-preview': 'low',
-  'gemini-3.5-flash-lite': 'high',
-  'gemini-3.1-flash-lite': 'high',
-};
-
-/**
- * Paired 14/14-accuracy Free Tier models for seamless quota failover when one free-tier pool hits 429:
- * both run fast (18-23s on VAD inline Ogg) without dropping clinical findings.
- */
-export const FREE_TIER_HIGH_ACCURACY_SIBLING: Record<string, string> = {
-  'gemini-4-hydrogen': 'gemini-3.8-flash',
-  'gemini-3.8-flash': 'gemini-4-hydrogen',
-};
-
-export function getOptimalThinkingLevel(
-  model?: string,
-  taskType: GeminiThinkingTask = 'transcription'
-): GeminiThinkingLevel | undefined {
+export function getOptimalThinkingLevel(model?: string): GeminiThinkingLevel | undefined {
   if (!model) return undefined;
   const clean = model.replace(/^models\//, '').trim();
-  if (taskType === 'live_chunk' && (clean === 'gemini-3-flash-preview' || clean === 'gemini-robotics-er-2-preview')) {
-    return 'minimal';
-  }
-  if (taskType === 'reasoning') {
-    return MODEL_REASONING_THINKING_LEVEL[clean];
-  }
   return MODEL_OPTIMAL_THINKING_LEVEL[clean];
 }
 
@@ -77,79 +42,48 @@ export interface AIModelOption {
 }
 
 export const LIVE_DICTATION_MODELS: AIModelOption[] = [
+  { value: 'gemini-3.8-flash', label: 'gemini-3.8-flash (Default)' },
   { value: 'gemini-4-hydrogen', label: 'gemini-4-hydrogen' },
-  { value: 'gemini-3.8-flash', label: 'gemini-3.8-flash' },
-  { value: 'gemini-3-flash-preview', label: 'gemini-3-flash-preview' },
-  { value: 'gemini-robotics-er-2-preview', label: 'gemini-robotics-er-2-preview' },
-  { value: 'gemini-3.6-flash', label: 'gemini-3.6-flash' },
-  { value: 'gemini-3.7-flash', label: 'gemini-3.7-flash' },
   { value: 'gemini-3.5-flash', label: 'gemini-3.5-flash' },
   { value: 'gemini-3.5-flash-lite', label: 'gemini-3.5-flash-lite' },
 ];
 
-export const STRICT_SELECTED_MODEL_ONLY_KEY = 'raddoc_strict_selected_model_only';
-
-const ROUTED_MODEL_QUOTA_BUCKET: Record<string, string> = {
-  'gemini-3.7-flash': 'gemini-3.8-flash',
-  'gemini-3.5-flash': 'gemini-3.6-flash',
-};
-
-function getFreeTierQuotaBucket(model: string): string {
-  const clean = model.replace(/^models\//, '').trim();
-  return ROUTED_MODEL_QUOTA_BUCKET[clean] || clean;
-}
-
-/**
- * Ordered automatic failover cascade for Free Tier (3.6 Flash positioned below Robotics ER-2,
- * and excludes gemini-3.5-flash-lite so clinical dictation NEVER silently degrades).
- */
-export const FREE_TIER_QUOTA_FALLBACK_ORDER: string[] = [
-  'gemini-4-hydrogen',
+export const LIVE_DICTATION_CYCLE_ORDER = [
   'gemini-3.8-flash',
-  'gemini-3-flash-preview',
-  'gemini-robotics-er-2-preview',
-  'gemini-3.6-flash',
+  'gemini-4-hydrogen',
+  'gemini-3.5-flash',
+  'gemini-3.5-flash-lite',
 ];
 
-export const LIVE_DICTATION_CYCLE_ORDER = FREE_TIER_QUOTA_FALLBACK_ORDER;
-
 /**
- * Returns the candidate Free Tier model chain starting at `selectedModel` and cascading strictly
- * through distinct high-accuracy Free Tier pools (excluding gemini-3.5-flash-lite).
+ * Returns the candidate model chain: the selected primary model plus subsequent fallback model,
+ * cycling across permitted live dictation models:
+ * 1. gemini-3.8-flash (Default)
+ * 2. gemini-4-hydrogen
+ * 3. gemini-3.5-flash
+ * 4. gemini-3.5-flash-lite
  */
-export function getFreeTierModelFallbackChain(selectedModel: string): string[] {
-  const primary = selectedModel?.replace(/^models\//, '').trim() || DEFAULT_SELECTED_MODEL;
-  const seenModels = new Set<string>([primary]);
-  const seenBuckets = new Set<string>([getFreeTierQuotaBucket(primary)]);
-  const chain: string[] = [primary];
-
-  for (const candidate of FREE_TIER_QUOTA_FALLBACK_ORDER) {
-    const bucket = getFreeTierQuotaBucket(candidate);
-    if (!seenModels.has(candidate) && !seenBuckets.has(bucket)) {
-      seenModels.add(candidate);
-      seenBuckets.add(bucket);
-      chain.push(candidate);
-    }
-  }
-  return chain;
-}
-
 export function getLiveModelFallbackChain(selectedModel: string): string[] {
-  return getFreeTierModelFallbackChain(selectedModel || DEFAULT_LIVE_MODEL);
+  const modelOrder = LIVE_DICTATION_CYCLE_ORDER;
+  const idx = modelOrder.indexOf(selectedModel);
+
+  if (idx !== -1) {
+    return [
+      modelOrder[idx],
+      ...modelOrder.filter((_, i) => i !== idx),
+    ];
+  }
+
+  return [...modelOrder];
 }
 
-/**
- * Ordered with Gemini 3.6 Flash positioned below Gemini Robotics ER-2 Preview,
- * followed by routed 3.7/3.5 endpoints, manual Flash-Lite, and paid tiers.
- */
 export const AVAILABLE_MODELS: AIModelOption[] = [
-  { value: 'gemini-4-hydrogen', label: 'Gemini 4 Hydrogen' },
-  { value: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash' },
+  { value: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash (Default)' },
+  { value: 'gemini-4-hydrogen', label: 'Gemini 4 Hydrogen (Fast Flagship)' },
+  { value: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
   { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash' },
   { value: 'gemini-robotics-er-2-preview', label: 'Gemini Robotics ER-2 Preview' },
   { value: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash' },
-  { value: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash' },
-  { value: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
   { value: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash Lite' },
   { value: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro' },
 ];

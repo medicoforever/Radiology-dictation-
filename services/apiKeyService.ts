@@ -1,5 +1,4 @@
 import { GoogleGenAI } from "@google/genai";
-import { STRICT_SELECTED_MODEL_ONLY_KEY } from "../constants";
 import { isDriveConnected, loadJsonFileFromRootFolder, saveJsonFileToRootFolder } from "./googleDriveService";
 
 // Obfuscated salt and keys to prevent raw API key string exposure in repo commits & secret scanners
@@ -24,53 +23,6 @@ export const USER_KEYS_STORAGE_KEY = 'raddoc_user_gemini_api_keys';
 export const API_KEYS_UPDATED_EVENT = 'raddoc_api_keys_updated';
 export const SECRET_BUILTIN_KEYS_UNLOCKED_KEY = 'raddoc_builtin_keys_unlocked';
 export const DRIVE_KEYS_FILE_NAME = 'raddoc_user_api_keys.json';
-export const DRIVE_KEY_SETTINGS_FILE_NAME = 'raddoc_api_key_settings.json';
-export const QUOTA_LEDGER_STORAGE_KEY = 'raddoc_free_tier_quota_ledger_v1';
-export const MODEL_FAILOVER_EVENT = 'raddoc_model_failover';
-export const STRICT_MODEL_ONLY_UPDATED_EVENT = 'raddoc_strict_model_only_updated';
-
-export function isStrictSelectedModelOnlyEnabled(): boolean {
-  try {
-    if (typeof window === 'undefined' || !window.localStorage) return false;
-    return localStorage.getItem(STRICT_SELECTED_MODEL_ONLY_KEY) === 'true';
-  } catch {
-    return false;
-  }
-}
-
-export function setStrictSelectedModelOnlyEnabled(enabled: boolean): void {
-  try {
-    if (typeof window !== 'undefined' && window.localStorage) {
-      localStorage.setItem(STRICT_SELECTED_MODEL_ONLY_KEY, enabled ? 'true' : 'false');
-    }
-    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function' && typeof CustomEvent === 'function') {
-      window.dispatchEvent(new CustomEvent(STRICT_MODEL_ONLY_UPDATED_EVENT, { detail: { enabled } }));
-    }
-  } catch {
-    // Non-browser environment guard
-  }
-}
-
-export interface ModelFailoverEventDetail {
-  fromModel: string;
-  toModel: string;
-  reason: 'rate_limit' | 'rpd_ledger' | 'service_unavailable';
-  timestamp: number;
-}
-
-export function emitModelFailoverNotice(detail: Omit<ModelFailoverEventDetail, 'timestamp'>): void {
-  try {
-    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function' && typeof CustomEvent === 'function') {
-      window.dispatchEvent(
-        new CustomEvent<ModelFailoverEventDetail>(MODEL_FAILOVER_EVENT, {
-          detail: { ...detail, timestamp: Date.now() },
-        })
-      );
-    }
-  } catch {
-    // Non-browser environment guard
-  }
-}
 
 // Salted signature for administrative secret passcode verification (completely hidden from plaintext):
 const SECRET_PASSCODE_HASH = 'cmFkZG9jX3NhbHRfMTE5OF9zZWM=';
@@ -98,13 +50,6 @@ export function isBuiltinKeysUnlocked(): boolean {
   }
 }
 
-function saveBuiltinUnlockStateToDrive(unlocked: boolean): void {
-  if (!isDriveConnected()) return;
-  saveJsonFileToRootFolder(DRIVE_KEY_SETTINGS_FILE_NAME, { builtinUnlocked: unlocked }).catch((err) => {
-    console.warn("Could not auto-save secret unlock setting to Drive:", err);
-  });
-}
-
 /**
  * Verifies the secret passcode and unlocks the 9 built-in keys if correct.
  */
@@ -112,12 +57,10 @@ export function unlockBuiltinKeys(code: string): { success: boolean; message: st
   if (verifySecretPasscode(code)) {
     try {
       localStorage.setItem(SECRET_BUILTIN_KEYS_UNLOCKED_KEY, 'true');
-      resetApiKeyHealthState();
       window.dispatchEvent(new CustomEvent(API_KEYS_UPDATED_EVENT));
-      saveBuiltinUnlockStateToDrive(true);
       return {
         success: true,
-        message: 'Secret key verified! 9 built-in rotating API keys have been activated and saved.'
+        message: 'Secret key verified! 9 built-in rotating API keys have been activated.'
       };
     } catch (e: any) {
       return { success: false, message: e?.message || 'Storage error' };
@@ -132,10 +75,8 @@ export function unlockBuiltinKeys(code: string): { success: boolean; message: st
 export function lockBuiltinKeys(): void {
   try {
     if (typeof window !== 'undefined' && window.localStorage) {
-      localStorage.setItem(SECRET_BUILTIN_KEYS_UNLOCKED_KEY, 'false');
-      resetApiKeyHealthState();
+      localStorage.removeItem(SECRET_BUILTIN_KEYS_UNLOCKED_KEY);
       window.dispatchEvent(new CustomEvent(API_KEYS_UPDATED_EVENT));
-      saveBuiltinUnlockStateToDrive(false);
     }
   } catch (e) {
     console.error("Failed to lock built-in keys:", e);
@@ -224,14 +165,6 @@ export function hasUserApiKeys(): boolean {
   return getUserApiKeys().length > 0;
 }
 
-function persistLocalUserKeys(clean: string[]): void {
-  if (typeof window !== 'undefined' && window.localStorage) {
-    localStorage.setItem(USER_KEYS_STORAGE_KEY, JSON.stringify(clean));
-    resetApiKeyHealthState();
-    window.dispatchEvent(new CustomEvent(API_KEYS_UPDATED_EVENT));
-  }
-}
-
 /**
  * Saves user API keys to localStorage and automatically syncs to Google Drive if connected.
  */
@@ -242,7 +175,8 @@ export function setUserApiKeys(keys: string[]): void {
         .map(k => k.trim())
         .filter(k => k.length >= 10)
         .filter((k, idx, arr) => arr.indexOf(k) === idx);
-      persistLocalUserKeys(clean);
+      localStorage.setItem(USER_KEYS_STORAGE_KEY, JSON.stringify(clean));
+      window.dispatchEvent(new CustomEvent(API_KEYS_UPDATED_EVENT));
 
       // Auto-save to Google Drive in background if connected
       if (isDriveConnected()) {
@@ -257,56 +191,28 @@ export function setUserApiKeys(keys: string[]): void {
 }
 
 /**
- * Syncs both user API keys and secret unlock preference cleanly between localStorage and Google Drive.
+ * Syncs user API keys with Google Drive.
  */
 export async function syncApiKeysWithGoogleDrive(): Promise<{ success: boolean; syncedCount?: number }> {
   if (!isDriveConnected()) return { success: false };
   try {
-    const [driveKeys, driveSettings] = await Promise.all([
-      loadJsonFileFromRootFolder<string[]>(DRIVE_KEYS_FILE_NAME),
-      loadJsonFileFromRootFolder<{ builtinUnlocked?: boolean }>(DRIVE_KEY_SETTINGS_FILE_NAME),
-    ]);
+    const driveKeys = await loadJsonFileFromRootFolder<string[]>(DRIVE_KEYS_FILE_NAME);
     const localKeys = getUserApiKeys();
-    const cleanDriveKeys = Array.isArray(driveKeys)
-      ? driveKeys
-          .map((k: any) => (typeof k === 'string' ? k.trim() : ''))
-          .filter((k: string) => k.length >= 10)
-          .filter((k: string, idx: number, arr: string[]) => arr.indexOf(k) === idx)
-      : [];
-
-    const merged = [...localKeys];
-    for (const k of cleanDriveKeys) {
-      if (!merged.includes(k)) {
-        merged.push(k);
+    
+    let merged = [...localKeys];
+    if (driveKeys && Array.isArray(driveKeys)) {
+      for (const k of driveKeys) {
+        if (typeof k === 'string' && k.trim().length >= 10 && !merged.includes(k.trim())) {
+          merged.push(k.trim());
+        }
       }
     }
 
-    if (merged.length !== localKeys.length || merged.some((k, i) => localKeys[i] !== k)) {
-      persistLocalUserKeys(merged);
+    if (merged.length !== localKeys.length) {
+      setUserApiKeys(merged);
+    } else if (localKeys.length > 0 && (!driveKeys || driveKeys.length === 0)) {
+      await saveJsonFileToRootFolder(DRIVE_KEYS_FILE_NAME, localKeys);
     }
-
-    const driveMissingAny =
-      !Array.isArray(driveKeys) ||
-      cleanDriveKeys.length !== merged.length ||
-      merged.some(k => !cleanDriveKeys.includes(k));
-    if (driveMissingAny && (merged.length > 0 || !Array.isArray(driveKeys))) {
-      await saveJsonFileToRootFolder(DRIVE_KEYS_FILE_NAME, merged);
-    }
-
-    // Also sync secret 1198 unlock status between localStorage and Google Drive
-    if (typeof window !== 'undefined' && window.localStorage) {
-      const localSecretRaw = localStorage.getItem(SECRET_BUILTIN_KEYS_UNLOCKED_KEY);
-      if (localSecretRaw === 'true' && driveSettings?.builtinUnlocked !== true) {
-        await saveJsonFileToRootFolder(DRIVE_KEY_SETTINGS_FILE_NAME, { builtinUnlocked: true });
-      } else if (localSecretRaw === 'false' && driveSettings?.builtinUnlocked === true) {
-        await saveJsonFileToRootFolder(DRIVE_KEY_SETTINGS_FILE_NAME, { builtinUnlocked: false });
-      } else if (localSecretRaw === null && driveSettings?.builtinUnlocked === true) {
-        localStorage.setItem(SECRET_BUILTIN_KEYS_UNLOCKED_KEY, 'true');
-        resetApiKeyHealthState();
-        window.dispatchEvent(new CustomEvent(API_KEYS_UPDATED_EVENT));
-      }
-    }
-
     return { success: true, syncedCount: merged.length };
   } catch (e) {
     console.warn("Could not sync API keys with Google Drive:", e);
@@ -342,7 +248,6 @@ export function clearUserApiKeys(): void {
   try {
     if (typeof window !== 'undefined' && window.localStorage) {
       localStorage.removeItem(USER_KEYS_STORAGE_KEY);
-      resetApiKeyHealthState();
       window.dispatchEvent(new CustomEvent(API_KEYS_UPDATED_EVENT));
       if (isDriveConnected()) {
         saveJsonFileToRootFolder(DRIVE_KEYS_FILE_NAME, []).catch(() => {});
@@ -353,314 +258,32 @@ export function clearUserApiKeys(): void {
   }
 }
 
-type KeyCooldownEntry = {
-  untilMs: number;
-  kind: 'rpm' | 'rpd';
-  hitCount: number;
-  lastErrorAt: number;
-};
-
-type LedgerPoolStats = {
-  count: number;
-  cooldownUntil?: number;
-  cooldownKind?: 'rpm' | 'rpd';
-};
-
-type PersistedQuotaLedger = {
-  datePt: string;
-  entries: Record<string, Record<string, LedgerPoolStats>>;
-};
-
-export interface FreeTierModelQuotaStat {
-  model: string;
-  label: string;
-  rpdLimitPerKey: number;
-  usedToday: number;
-  totalCapacity: number;
-  exhaustedKeys: number;
-  totalKeys: number;
-}
-
-const TRACKED_FREE_TIER_MODELS: Array<{ model: string; label: string; rpdLimitPerKey: number }> = [
-  { model: 'gemini-4-hydrogen', label: 'Gemini 4 Hydrogen (#1 Default)', rpdLimitPerKey: 20 },
-  { model: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash (#2 Backup)', rpdLimitPerKey: 20 },
-  { model: 'gemini-3-flash-preview', label: 'Gemini 3 Flash (#3 Backup)', rpdLimitPerKey: 20 },
-  { model: 'gemini-robotics-er-2-preview', label: 'Gemini Robotics ER-2 (#4 Backup)', rpdLimitPerKey: 20 },
-  { model: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash (#5 Backup)', rpdLimitPerKey: 20 },
-  { model: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash Lite (Manual / QA)', rpdLimitPerKey: 500 },
-];
-
-const keyModelCooldowns = new Map<string, KeyCooldownEntry>();
-const keyGlobalInvalidUntil = new Map<string, number>();
-const keyModelRecentRequests = new Map<string, number[]>();
-const keyLastDispatchedAt = new Map<string, number>();
-const modelUnavailableCooldownUntil = new Map<string, number>();
-
-const RPM_WINDOW_MS = 60_000;
-const DEFAULT_RPM_COOLDOWN_MS = 65_000;
-const DEFAULT_INVALID_KEY_COOLDOWN_MS = 10 * 60_000;
-export const MODEL_UNAVAILABLE_COOLDOWN_MS = 5 * 60_000;
-
-export function markModelTemporarilyUnavailable(model: string, now = Date.now()): void {
-  const bucket = resolveQuotaPoolModel(model);
-  if (!bucket || bucket === 'default') return;
-  modelUnavailableCooldownUntil.set(bucket, now + MODEL_UNAVAILABLE_COOLDOWN_MS);
-}
-
-export function clearModelTemporarilyUnavailable(model: string): void {
-  const bucket = resolveQuotaPoolModel(model);
-  if (bucket) modelUnavailableCooldownUntil.delete(bucket);
-}
-
-export function isModelTemporarilyUnavailable(model: string, now = Date.now()): boolean {
-  const bucket = resolveQuotaPoolModel(model);
-  if (!bucket) return false;
-  const until = modelUnavailableCooldownUntil.get(bucket) ?? 0;
-  if (until <= now) {
-    if (until > 0) modelUnavailableCooldownUntil.delete(bucket);
-    return false;
-  }
-  return true;
-}
-
-export function getCurrentPacificDateString(nowMs = Date.now()): string {
-  try {
-    return new Intl.DateTimeFormat('en-CA', {
-      timeZone: 'America/Los_Angeles',
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-    }).format(new Date(nowMs));
-  } catch {
-    return new Date(nowMs - 8 * 3600_000).toISOString().slice(0, 10);
-  }
-}
-
 /**
- * Normalizes model identifier cleanly and maps routed deprecated aliases (`3.7-flash -> 3.8-flash`,
- * `3.5-flash -> 3.6-flash`) cleanly for pool scheduling.
+ * Returns the candidate keys in sequence for an operation:
+ * 1. If user added custom keys: ONLY those custom keys are used.
+ * 2. If unlocked with secret code: The 9 built-in keys are shuffled and used.
+ * 3. Default: Empty array (user must add their key or unlock with administrative secret key).
  */
-export function resolveQuotaPoolModel(model?: string): string {
-  if (!model) return 'default';
-  const clean = model.replace(/^models\//, '').trim();
-  if (clean === 'gemini-3.7-flash') return 'gemini-3.8-flash';
-  if (clean === 'gemini-3.5-flash') return 'gemini-3.6-flash';
-  if (clean === 'gemini-embedding-2-preview') return 'gemini-embedding-2';
-  return clean || 'default';
-}
-
-/**
- * Clears in-memory key cooldown & temporary overload state.
- */
-export function resetApiKeyHealthState(): void {
-  keyModelCooldowns.clear();
-  keyGlobalInvalidUntil.clear();
-  keyModelRecentRequests.clear();
-  keyLastDispatchedAt.clear();
-  modelUnavailableCooldownUntil.clear();
-  try {
-    if (typeof window !== 'undefined' && window.localStorage) {
-      localStorage.removeItem(QUOTA_LEDGER_STORAGE_KEY);
-    }
-  } catch {
-    // Ignore storage errors cleanly
-  }
-}
-
-export function resetFreeTierDailyQuotaStats(): void {
-  resetApiKeyHealthState();
-  try {
-    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function' && typeof CustomEvent === 'function') {
-      window.dispatchEvent(new CustomEvent(API_KEYS_UPDATED_EVENT));
-    }
-  } catch {
-    // Non-browser guard
-  }
-}
-
-function getPoolKey(apiKey: string, poolModel: string): string {
-  return `${apiKey}::${poolModel}`;
-}
-
-function getActiveCooldown(apiKey: string, poolModel: string, now: number): { untilMs: number; kind: 'rpm' | 'rpd' } | null {
-  const mem = keyModelCooldowns.get(getPoolKey(apiKey, poolModel));
-  if (mem && mem.untilMs > now) {
-    return { untilMs: mem.untilMs, kind: mem.kind };
-  }
-  return null;
-}
-
-function pruneRecentRequests(poolKey: string, now: number): number[] {
-  const arr = keyModelRecentRequests.get(poolKey);
-  if (!arr || arr.length === 0) return [];
-  const fresh = arr.filter((t) => now - t < RPM_WINDOW_MS);
-  keyModelRecentRequests.set(poolKey, fresh);
-  return fresh;
-}
-
-function markApiKeyDispatched(apiKey: string, poolModel: string, now = Date.now()): void {
-  const poolKey = getPoolKey(apiKey, poolModel);
-  const fresh = pruneRecentRequests(poolKey, now);
-  fresh.push(now);
-  keyModelRecentRequests.set(poolKey, fresh);
-  keyLastDispatchedAt.set(apiKey, now);
-}
-
-function recordApiKeyFailure(apiKey: string, poolModel: string, err: any, now = Date.now()): void {
-  const status = err?.status ?? err?.code ?? err?.error?.code;
-  const msg = (err instanceof Error ? err.message : String(err || '')).toLowerCase();
-
-  if (
-    status === 401 ||
-    status === 403 ||
-    msg.includes('api_key_invalid') ||
-    msg.includes('api key not valid') ||
-    msg.includes('permission_denied') ||
-    msg.includes('unauthenticated')
-  ) {
-    keyGlobalInvalidUntil.set(apiKey, now + DEFAULT_INVALID_KEY_COOLDOWN_MS);
-    return;
+export function getCandidateKeysForOperation(): { candidateKeys: string[]; isCustom: boolean } {
+  const userKeys = getUserApiKeys();
+  if (userKeys.length > 0) {
+    return {
+      candidateKeys: shuffle(userKeys),
+      isCustom: true
+    };
   }
 
-  const isQuotaError =
-    status === 429 ||
-    status === 'RESOURCE_EXHAUSTED' ||
-    msg.includes('429') ||
-    msg.includes('resource_exhausted') ||
-    msg.includes('quota') ||
-    msg.includes('rate limit') ||
-    msg.includes('too many requests');
-
-  if (!isQuotaError) return;
-
-  // Track only brief in-memory deprioritization (65s) so all valid keys remain callable
-  // without stale daily RPD locks blocking keys or models.
-  const poolKey = getPoolKey(apiKey, poolModel);
-  const prev = keyModelCooldowns.get(poolKey);
-  const hitCount = prev && now - prev.lastErrorAt < 10 * 60_000 ? prev.hitCount + 1 : 1;
-  keyModelCooldowns.set(poolKey, {
-    untilMs: now + DEFAULT_RPM_COOLDOWN_MS,
-    kind: 'rpm',
-    hitCount,
-    lastErrorAt: now,
-  });
-}
-
-export function hasConfirmedDailyExhaustionAcrossAllKeys(_model: string, _now = Date.now()): boolean {
-  return false;
-}
-
-export function getFreeTierDailyQuotaStats(): {
-  datePt: string;
-  totalKeys: number;
-  models: FreeTierModelQuotaStat[];
-} {
-  const { customKeys, builtinKeys } = getRawCandidateKeyPools();
-  const totalKeys = customKeys.length + builtinKeys.length;
-  return {
-    datePt: getCurrentPacificDateString(),
-    totalKeys,
-    models: TRACKED_FREE_TIER_MODELS.map((entry) => ({
-      model: entry.model,
-      label: entry.label,
-      rpdLimitPerKey: entry.rpdLimitPerKey,
-      usedToday: 0,
-      totalCapacity: totalKeys * entry.rpdLimitPerKey,
-      exhaustedKeys: 0,
-      totalKeys,
-    })),
-  };
-}
-
-function getRawCandidateKeyPools(): { customKeys: string[]; builtinKeys: string[] } {
-  const customKeys = getUserApiKeys();
-  const customSet = new Set(customKeys);
-  const builtinKeys = getDefaultApiKeys().filter((k) => !customSet.has(k));
-  return { customKeys, builtinKeys };
-}
-
-function classifyPoolTier(rawKeys: string[], poolModel: string, now: number) {
-  const healthy: Array<{ key: string; recentCount: number; lastUsed: number }> = [];
-  const shortRpmCooled: Array<{ key: string; untilMs: number }> = [];
-  const invalidKeys: Array<{ key: string; untilMs: number }> = [];
-
-  for (const key of shuffle(rawKeys)) {
-    const invalidUntil = keyGlobalInvalidUntil.get(key) ?? 0;
-    if (invalidUntil > now) {
-      invalidKeys.push({ key, untilMs: invalidUntil });
-      continue;
-    }
-
-    const poolKey = getPoolKey(key, poolModel);
-    const cd = getActiveCooldown(key, poolModel, now);
-    if (cd && cd.untilMs > now) {
-      shortRpmCooled.push({ key, untilMs: cd.untilMs });
-      continue;
-    }
-
-    const recent = pruneRecentRequests(poolKey, now);
-    healthy.push({
-      key,
-      recentCount: recent.length,
-      lastUsed: keyLastDispatchedAt.get(key) ?? 0,
-    });
-  }
-
-  healthy.sort((a, b) => {
-    if (a.recentCount !== b.recentCount) return a.recentCount - b.recentCount;
-    return a.lastUsed - b.lastUsed;
-  });
-  shortRpmCooled.sort((a, b) => a.untilMs - b.untilMs);
-  invalidKeys.sort((a, b) => a.untilMs - b.untilMs);
-
-  return { healthy, shortRpmCooled, invalidKeys };
-}
-
-/**
- * Returns ALL valid candidate keys without filtering by estimated daily rate limits:
- * 1. Healthy user custom keys FIRST (sorted by fewest requests in last 60s, then LRU).
- * 2. If secret 1198 is unlocked, healthy built-in keys strictly AFTER custom keys.
- * 3. Recently 429-cooled valid keys (custom first, then built-in) right behind healthy keys so every
- *    valid key in the pool stays callable before cascading to the next model.
- */
-export function getCandidateKeysForOperation(
-  selectedModel?: string,
-  _options?: { includeRpdCooled?: boolean }
-): { candidateKeys: string[]; isCustom: boolean; hasBuiltinBackup: boolean } {
-  const { customKeys, builtinKeys } = getRawCandidateKeyPools();
-  const isCustom = customKeys.length > 0;
-  const hasBuiltinBackup = isCustom && builtinKeys.length > 0;
-
-  if (customKeys.length === 0 && builtinKeys.length === 0) {
-    return { candidateKeys: [], isCustom: false, hasBuiltinBackup: false };
-  }
-
-  const now = Date.now();
-  const poolModel = resolveQuotaPoolModel(selectedModel);
-
-  const customTier = classifyPoolTier(customKeys, poolModel, now);
-  const builtinTier = classifyPoolTier(builtinKeys, poolModel, now);
-
-  const ordered = [
-    ...customTier.healthy.map((h) => h.key),
-    ...builtinTier.healthy.map((h) => h.key),
-    ...customTier.shortRpmCooled.map((c) => c.key),
-    ...builtinTier.shortRpmCooled.map((c) => c.key),
-  ];
-
-  // Probe at most 1 key only if EVERY key was marked invalid (401/403)
-  if (ordered.length === 0) {
-    if (customTier.invalidKeys.length > 0) {
-      ordered.push(customTier.invalidKeys[0].key);
-    } else if (builtinTier.invalidKeys.length > 0) {
-      ordered.push(builtinTier.invalidKeys[0].key);
-    }
+  const defaultKeys = getDefaultApiKeys(); // [] unless unlocked with secret code
+  if (defaultKeys.length > 0) {
+    return {
+      candidateKeys: shuffle(defaultKeys),
+      isCustom: false
+    };
   }
 
   return {
-    candidateKeys: ordered,
-    isCustom,
-    hasBuiltinBackup,
+    candidateKeys: [],
+    isCustom: false
   };
 }
 
@@ -723,48 +346,13 @@ export async function testApiKeyValidity(key: string): Promise<{ valid: boolean;
 }
 
 /**
- * Detects model-wide transient overload or service unavailability errors (e.g. HTTP 503 UNAVAILABLE
- * "experiencing high demand", 500/502/504, or 404 model not found) where retrying additional API keys
- * on the exact same overloaded model fails identically, so cross-model failover should trigger right away.
- */
-export function isModelLevelServiceUnavailableError(err: any): boolean {
-  if (!err) return false;
-  const rawStatus = err?.status ?? err?.code ?? err?.error?.code;
-  const status = typeof rawStatus === 'number' ? rawStatus : Number(rawStatus);
-  const statusText = String(err?.statusText ?? err?.error?.status ?? '').toLowerCase();
-  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
-
-  if (status === 503 || status === 502 || status === 504 || status === 404) {
-    return true;
-  }
-  if (status === 500 && !msg.includes('invalid argument') && !msg.includes('api key')) {
-    return true;
-  }
-  if (statusText === 'unavailable') {
-    return true;
-  }
-  return (
-    msg.includes('high demand') ||
-    msg.includes('currently experiencing high demand') ||
-    msg.includes('overloaded') ||
-    msg.includes('service unavailable') ||
-    msg.includes('"status":"unavailable"') ||
-    msg.includes('"status": "unavailable"') ||
-    msg.includes('"code":503') ||
-    msg.includes('"code": 503') ||
-    msg.includes('http 503') ||
-    msg.includes('model not found') ||
-    msg.includes('is not found for api version')
-  );
-}
-
-/**
  * Universal executor with random API key load-balancing, inter-key timing delay, and automatic failover.
  * Requirements:
  * - Always randomly selects an API key each time from the available pool.
  * - If a key fails or reaches quota, pauses with a timing delay before retrying with another random key.
- * - If failFastOnModelUnavailable is enabled and the backend returns a model-wide 503/500/404 overload/unavailable
- *   error, breaks immediately so cross-model fallback can switch to a healthy model without burning every key.
+ * - If user provides their own key(s), ONLY user keys are used with random rotation/failover.
+ * - The selected model MUST NOT change across key retries.
+ * - Runs smoothly without errors interrupting the user as long as any candidate key works.
  */
 export async function executeWithApiKeyFailover<T>(
   operation: (client: GoogleGenAI, apiKey: string) => Promise<T>,
@@ -773,23 +361,17 @@ export async function executeWithApiKeyFailover<T>(
     maxTries?: number;
     delayMs?: number;
     abortSignal?: AbortSignal;
-    failFastOnModelUnavailable?: boolean;
-    includeRpdCooled?: boolean;
   }
 ): Promise<T> {
   if (options?.abortSignal?.aborted) {
     throw new DOMException('Aborted by user', 'AbortError');
   }
 
-  const includeRpdCooled = options?.includeRpdCooled ?? (isStrictSelectedModelOnlyEnabled() && !options?.failFastOnModelUnavailable);
-  const { candidateKeys, isCustom } = getCandidateKeysForOperation(options?.selectedModel, {
-    includeRpdCooled,
-  });
+  const { candidateKeys, isCustom } = getCandidateKeysForOperation();
   if (!candidateKeys || candidateKeys.length === 0) {
     throw new Error("No Gemini API key found. Please click 'API Keys' at the top to add your free Gemini API key, or enter the secret access key.");
   }
 
-  const poolModel = resolveQuotaPoolModel(options?.selectedModel);
   const maxAttempts = options?.maxTries 
     ? Math.min(options.maxTries, candidateKeys.length)
     : candidateKeys.length;
@@ -804,14 +386,13 @@ export async function executeWithApiKeyFailover<T>(
     const currentKey = candidateKeys[attempt];
     const masked = maskApiKey(currentKey);
     const client = getClientForApiKey(currentKey);
-    markApiKeyDispatched(currentKey, poolModel);
 
     try {
       if (attempt === 0) {
         const keyRole = isCustom ? 'custom key' : 'random pool key';
         console.info(`[API Execution] Attempt 1/${maxAttempts} using ${keyRole} ${masked} (Model: ${options?.selectedModel || 'selected'})...`);
       } else {
-        console.warn(`[API Failover] Attempt ${attempt + 1}/${maxAttempts} retrying with backup key ${masked} (Model: ${options?.selectedModel || 'selected'})...`);
+        console.warn(`[API Failover] Attempt ${attempt + 1}/${maxAttempts} retrying with random backup key ${masked} (Model: ${options?.selectedModel || 'selected'})...`);
       }
       const result = await operation(client, currentKey);
       return result;
@@ -822,31 +403,19 @@ export async function executeWithApiKeyFailover<T>(
       if (err?.isNonRetryable === true) {
         throw err;
       }
-      recordApiKeyFailure(currentKey, poolModel, err);
       lastError = err;
       const errMsg = err?.message || String(err);
-
-      if (options?.failFastOnModelUnavailable && isModelLevelServiceUnavailableError(err)) {
-        console.warn(
-          `[API Key Failover] Model ${options?.selectedModel || 'selected'} is experiencing high demand / unavailable (${errMsg}); failing over to next accurate model immediately.`
-        );
-        if (lastError && typeof lastError === 'object') {
-          lastError.triedKeysCount = attempt + 1;
-        }
-        throw err;
-      }
-
       console.warn(
-        `[API Key Failover] Key ${masked} failed on attempt ${attempt + 1}/${maxAttempts} (${errMsg}). Evaluating next healthy key...`
+        `[API Key Failover] Key ${masked} failed on attempt ${attempt + 1}/${maxAttempts} (${errMsg}). Evaluating next random key...`
       );
 
-      // Separate Google accounts have independent quotas, so brief 150ms handoff avoids wasted 1s stalls
+      // If we still have candidate keys remaining, wait with timing delay between trying different keys
       if (attempt < maxAttempts - 1) {
         if (options?.abortSignal?.aborted) {
           throw new DOMException('Aborted by user', 'AbortError');
         }
-        const retryDelayMs = options?.delayMs ?? 150;
-        console.info(`[API Key Failover] Waiting ${retryDelayMs}ms before retrying with next key...`);
+        const retryDelayMs = options?.delayMs ?? 1000;
+        console.info(`[API Key Failover] Waiting ${retryDelayMs}ms before retrying with next random key...`);
         await new Promise((resolve, reject) => {
           const timeout = setTimeout(resolve, retryDelayMs);
           options?.abortSignal?.addEventListener('abort', () => {
@@ -860,14 +429,11 @@ export async function executeWithApiKeyFailover<T>(
   }
 
   console.error(`[API Key Failover] All ${maxAttempts} candidate API keys failed:`, lastError);
-  if (lastError && typeof lastError === 'object') {
-    lastError.triedKeysCount = maxAttempts;
-  }
   throw lastError;
 }
 
 /**
- * Returns a GoogleGenAI client instance honoring custom-key priority and LRU health ordering.
+ * Returns a random GoogleGenAI client instance using the current active key pool.
  */
 export function getRandomAIClient(): GoogleGenAI {
   const { candidateKeys } = getCandidateKeysForOperation();
@@ -875,5 +441,6 @@ export function getRandomAIClient(): GoogleGenAI {
   if (!pool || pool.length === 0) {
     throw new Error("No Gemini API key found. Please add a valid Gemini API key in Settings or enter the secret key.");
   }
-  return getClientForApiKey(pool[0]);
+  const key = pool[Math.floor(Math.random() * pool.length)];
+  return getClientForApiKey(key);
 }

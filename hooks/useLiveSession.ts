@@ -727,10 +727,10 @@ export const useLiveSession = () => {
 
       if (hasSpeechInWindow) {
         // Speech was detected in this segment.
-        // Align chunk cadence with Free-Tier 5 RPM/key ceiling (~12s sustained max) while staying responsive on natural pauses:
-        // 1. Natural clause/sentence boundary: doctor finished speaking and paused for >= 900ms, with >= 3.0s audio
-        // 2. OR sustained speech length reached >= 12.0s (to keep display updated without exceeding 5 RPM per key)
-        if ((timeSinceSpeech >= 900 && unprocessedSec >= 3.0) || unprocessedSec >= 12.0) {
+        // Trigger condition:
+        // 1. Natural clause/sentence boundary: doctor finished speaking and paused for >= 750ms, with >= 2.5s audio
+        // 2. OR sustained speech length reached >= 7.5s (to keep display updated progressively)
+        if ((timeSinceSpeech >= 750 && unprocessedSec >= 2.5) || unprocessedSec >= 7.5) {
           shouldProcess = true;
         }
       } else {

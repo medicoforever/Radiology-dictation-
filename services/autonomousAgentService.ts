@@ -18,7 +18,6 @@ import { ALL_RADNITO_TEMPLATES, BuiltInTemplateItem, getTemplateDocxBase64 } fro
 import {
   callGenerateContentWithOptimalThinking,
   cleanupUploadedGeminiFiles,
-  executeWithFreeTierModelFallback,
   mergeDictatedFindingsWithTemplate,
   prepareBlobPartDescriptors,
   resolveApiTargetModel,
@@ -376,53 +375,50 @@ If the doctor mentions assigning any of these files or notes to a patient, set t
   }
 
   try {
-    return await executeWithFreeTierModelFallback(targetModel, (activeModel) =>
-      executeWithApiKeyFailover(
-        async (client, apiKey) => {
-          const promptInstruction = `${AUTONOMOUS_AGENT_SYSTEM_PROMPT}\n${macroContext}\n${attachedFilesManifest}\nExecute autonomous orchestration for this audio dictation. Return the structured JSON execution plan now.`;
+    return await executeWithApiKeyFailover(
+      async (client, apiKey) => {
+        const promptInstruction = `${AUTONOMOUS_AGENT_SYSTEM_PROMPT}\n${macroContext}\n${attachedFilesManifest}\nExecute autonomous orchestration for this audio dictation. Return the structured JSON execution plan now.`;
 
-          const mediaParts = await resolveBlobDescriptorPartsForAttempt({
-            descriptors,
-            client,
-            apiKey,
-            uploadedByKey,
-          });
-          const parts: any[] = [
-            ...mediaParts,
-            { text: promptInstruction },
-          ];
+        const mediaParts = await resolveBlobDescriptorPartsForAttempt({
+          descriptors,
+          client,
+          apiKey,
+          uploadedByKey,
+        });
+        const parts: any[] = [
+          ...mediaParts,
+          { text: promptInstruction },
+        ];
 
-          const responseText = await callGenerateContentWithOptimalThinking({
-            client,
-            apiKey,
-            model: activeModel,
-            parts,
-            temperature: 0.1,
-            responseMimeType: 'application/json',
-            taskType: 'reasoning',
-          });
+        const responseText = await callGenerateContentWithOptimalThinking({
+          client,
+          apiKey,
+          model: targetModel,
+          parts,
+          temperature: 0.1,
+          responseMimeType: 'application/json',
+        });
 
-          if (!responseText.trim()) {
-            throw new Error("Autonomous agent returned an empty response.");
-          }
+        if (!responseText.trim()) {
+          throw new Error("Autonomous agent returned an empty response.");
+        }
 
-          // Parse JSON response
-          let cleanJson = responseText.trim();
-          if (cleanJson.startsWith('```json')) {
-            cleanJson = cleanJson.replace(/^```json\s*/, '').replace(/```\s*$/, '');
-          } else if (cleanJson.startsWith('```')) {
-            cleanJson = cleanJson.replace(/^```\s*/, '').replace(/```\s*$/, '');
-          }
+        // Parse JSON response
+        let cleanJson = responseText.trim();
+        if (cleanJson.startsWith('```json')) {
+          cleanJson = cleanJson.replace(/^```json\s*/, '').replace(/```\s*$/, '');
+        } else if (cleanJson.startsWith('```')) {
+          cleanJson = cleanJson.replace(/^```\s*/, '').replace(/```\s*$/, '');
+        }
 
-          const plan: AutonomousExecutionPlan = JSON.parse(cleanJson);
-          if (!plan.patients || !Array.isArray(plan.patients)) {
-            throw new Error("Invalid plan structure: 'patients' array is missing.");
-          }
+        const plan: AutonomousExecutionPlan = JSON.parse(cleanJson);
+        if (!plan.patients || !Array.isArray(plan.patients)) {
+          throw new Error("Invalid plan structure: 'patients' array is missing.");
+        }
 
-          return plan;
-        },
-        { selectedModel: activeModel }
-      )
+        return plan;
+      },
+      { selectedModel: targetModel }
     );
   } finally {
     cleanupUploadedGeminiFiles(uploadedByKey).catch(() => {});
@@ -549,67 +545,64 @@ ${p.findings.map(f => `  * ${f}`).join('\n')}
 `;
 
   try {
-    return await executeWithFreeTierModelFallback(targetModel, (activeModel) =>
-      executeWithApiKeyFailover(
-        async (client, apiKey) => {
-          const promptInstruction = `${AUTONOMOUS_FEEDBACK_SYSTEM_PROMPT}
+    return await executeWithApiKeyFailover(
+      async (client, apiKey) => {
+        const promptInstruction = `${AUTONOMOUS_FEEDBACK_SYSTEM_PROMPT}
 ${previousContextSummary}
 ${macroContext}
 ${attachedFilesManifest}
 ${feedbackText ? `DOCTOR'S WRITTEN FEEDBACK & MODIFICATION INSTRUCTIONS:\n"""\n${feedbackText.trim()}\n"""\n` : ''}
 Execute feedback modifications now. Return the updated structured JSON execution plan.`;
 
-          const mediaParts = feedbackDescriptors
-            ? await resolveBlobDescriptorPartsForAttempt({
-                descriptors: feedbackDescriptors,
-                client,
-                apiKey,
-                uploadedByKey,
-              })
-            : [];
-          const parts: any[] = [
-            ...mediaParts,
-            { text: promptInstruction },
-          ];
+        const mediaParts = feedbackDescriptors
+          ? await resolveBlobDescriptorPartsForAttempt({
+              descriptors: feedbackDescriptors,
+              client,
+              apiKey,
+              uploadedByKey,
+            })
+          : [];
+        const parts: any[] = [
+          ...mediaParts,
+          { text: promptInstruction },
+        ];
 
-          const responseText = await callGenerateContentWithOptimalThinking({
-            client,
-            apiKey,
-            model: activeModel,
-            parts,
-            temperature: 0.1,
-            responseMimeType: 'application/json',
-            taskType: 'reasoning',
-          });
+        const responseText = await callGenerateContentWithOptimalThinking({
+          client,
+          apiKey,
+          model: targetModel,
+          parts,
+          temperature: 0.1,
+          responseMimeType: 'application/json',
+        });
 
-          if (!responseText.trim()) {
-            throw new Error("Autonomous agent returned an empty response for feedback.");
-          }
+        if (!responseText.trim()) {
+          throw new Error("Autonomous agent returned an empty response for feedback.");
+        }
 
-          let cleanJson = responseText.trim();
-          if (cleanJson.startsWith('```json')) {
-            cleanJson = cleanJson.replace(/^```json\s*/, '').replace(/```\s*$/, '');
-          } else if (cleanJson.startsWith('```')) {
-            cleanJson = cleanJson.replace(/^```\s*/, '').replace(/```\s*$/, '');
-          }
+        let cleanJson = responseText.trim();
+        if (cleanJson.startsWith('```json')) {
+          cleanJson = cleanJson.replace(/^```json\s*/, '').replace(/```\s*$/, '');
+        } else if (cleanJson.startsWith('```')) {
+          cleanJson = cleanJson.replace(/^```\s*/, '').replace(/```\s*$/, '');
+        }
 
-          const plan: AutonomousExecutionPlan = JSON.parse(cleanJson);
-          if (!plan.patients || !Array.isArray(plan.patients)) {
-            throw new Error("Invalid plan structure: 'patients' array is missing in feedback response.");
-          }
+        const plan: AutonomousExecutionPlan = JSON.parse(cleanJson);
+        if (!plan.patients || !Array.isArray(plan.patients)) {
+          throw new Error("Invalid plan structure: 'patients' array is missing in feedback response.");
+        }
 
-          // Preserve patient IDs if AI omitted them
-          plan.patients = plan.patients.map((p, idx) => ({
-            ...p,
-            patientId: p.patientId || previousPlan.patients[idx]?.patientId || `pt_${idx + 1}`,
-            targetMode: p.targetMode || previousPlan.patients[idx]?.targetMode || 'single',
-            findings: (p.findings && p.findings.length > 0) ? p.findings : (previousPlan.patients[idx]?.findings || [])
-          }));
+        // Preserve patient IDs if AI omitted them
+        plan.patients = plan.patients.map((p, idx) => ({
+          ...p,
+          patientId: p.patientId || previousPlan.patients[idx]?.patientId || `pt_${idx + 1}`,
+          targetMode: p.targetMode || previousPlan.patients[idx]?.targetMode || 'single',
+          findings: (p.findings && p.findings.length > 0) ? p.findings : (previousPlan.patients[idx]?.findings || [])
+        }));
 
-          return plan;
-        },
-        { selectedModel: activeModel }
-      )
+        return plan;
+      },
+      { selectedModel: targetModel }
     );
   } finally {
     cleanupUploadedGeminiFiles(uploadedByKey).catch(() => {});

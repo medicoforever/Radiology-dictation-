@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useAudioRecorder } from '../hooks/useAudioRecorder';
-import { processAudio, createChat, sendChatMessageWithFailover, blobToBase64, continueAudioDictation, base64ToBlob, modifyFindingWithAudio, modifyReportWithAudio, runComplexImpressionGeneration, transcribeAudioForPrompt, detectAndExtractTemplate, mergeDictatedFindingsWithTemplate, runClinicalQaErrorCheck, ClinicalQaAssessment, SpokenTemplateResolution } from '../services/geminiService';
+import { processAudio, createChat, blobToBase64, continueAudioDictation, base64ToBlob, modifyFindingWithAudio, modifyReportWithAudio, runComplexImpressionGeneration, transcribeAudioForPrompt, detectAndExtractTemplate, mergeDictatedFindingsWithTemplate, runClinicalQaErrorCheck, ClinicalQaAssessment, SpokenTemplateResolution } from '../services/geminiService';
 import ClinicalQaPanel, { getUrgencyBadgeMeta } from './ui/ClinicalQaPanel';
 import { saveAudioBlob, getAudioBlob, clearUnusedAudioBlobs, saveReportSession, getReportSession, deleteReportSession } from '../services/audioStorage';
 import { mergeMultipleAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
@@ -16,7 +16,6 @@ import {
 } from '../services/audioPrefilterService';
 import { ClipboardPaste, X, CheckSquare } from 'lucide-react';
 import { safeLocalStorage, markTabActive, getTabId, getBatchModeStorageKey } from '../services/storageService';
-import { getCandidateKeysForOperation } from '../services/apiKeyService';
 import PasteTextModal from './PasteTextModal';
 import RichTextReportEditor from './RichTextReportEditor';
 import TemplateSelectionModal from './ui/TemplateSelectionModal';
@@ -1487,16 +1486,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         setBatches(prev => prev.map(b => batchesToProcess.find(p => p.id === b.id) ? {...b, status: 'processing', compactedAudioBlob: null, prefilterStats: null} : b));
 
         try {
-            // Pace concurrent batch workers cleanly to 1 request per active Free-Tier key (max 6)
-            // so a 1-key or 2-key pool stays comfortably below the 5 RPM per-model burst ceiling.
-            const keyPoolCount = Math.max(
-                1,
-                getCandidateKeysForOperation(batchesToProcess[0]?.selectedModel).candidateKeys.length
-            );
-            const maxConcurrency = Math.min(batchesToProcess.length, Math.max(1, Math.min(6, keyPoolCount)));
-            let nextIndex = 0;
-
-            const processBatchItem = async (batch: Batch) => {
+            await Promise.all(batchesToProcess.map(async (batch) => {
                 if (batch.audioBlobs.length === 0) return;
                 const currentReqId = batchProcessingIdRef.current[batch.id];
                 try {
@@ -1555,15 +1545,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                     const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';
                     setBatches(prev => prev.map(b => b.id === batch.id ? { ...b, status: 'error', error: errorMessage } : b));
                 }
-            };
-
-            const workers = Array.from({ length: maxConcurrency }, async () => {
-                while (nextIndex < batchesToProcess.length) {
-                    const batch = batchesToProcess[nextIndex++];
-                    await processBatchItem(batch);
-                }
-            });
-            await Promise.all(workers);
+            }));
         } finally {
             clearInterval(processingHeartbeatTimer);
             markTabActive('idle');
@@ -1674,23 +1656,19 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         setBatches(prev => prev.map(b => b.id === batchId ? { ...b, isChatting: true, chatHistory: updatedHistory } : b));
 
         try {
-            let chatInput: string | any[];
+            let response;
             if (typeof message === 'string') {
-                chatInput = message;
+                response = await batch.chat.sendMessage({ message });
             } else {
                 const base64Audio = await blobToBase64(message);
                 const audioPart = {
                     inlineData: { mimeType: getCleanMimeType(message), data: base64Audio },
                 };
                 const textPart = { text: "Please analyze this audio in the context of our conversation." };
-                chatInput = [audioPart, textPart];
+                response = await batch.chat.sendMessage({ message: [audioPart, textPart] });
             }
-            const { text: responseText, activeChat } = await sendChatMessageWithFailover(batch.chat, chatInput);
-            setBatches(prev => prev.map(b => b.id === batchId ? {
-                ...b,
-                chat: activeChat,
-                chatHistory: [...updatedHistory, { author: 'AI' as const, text: responseText }]
-            } : b));
+            const responseText = response.text;
+            setBatches(prev => prev.map(b => b.id === batchId ? {...b, chatHistory: [...updatedHistory, { author: 'AI' as const, text: responseText }]} : b));
         } catch (err) {
             console.error("Chat error:", err);
             const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';

@@ -1,20 +1,9 @@
 import { GoogleGenAI, Type, GenerateContentResponse, Chat } from "@google/genai";
-import { DEFAULT_LIVE_MODEL, DEFAULT_GEMINI_PROMPT, REPROCESS_GEMINI_PROMPT, TEMPLATE_GEMINI_PROMPT, REPORT_TEMPLATES, ERROR_IDENTIFIER_PROMPT, INITIAL_AGENT_PROMPT, REFINEMENT_AGENT_PROMPT, SYNTHESIZER_AGENT_PROMPT, VISUAL_TEMPLATE_GEMINI_PROMPT, getLiveModelFallbackChain, getFreeTierModelFallbackChain, DEFAULT_SELECTED_MODEL, GEMINI_FLASH_LITE_MODEL, FREE_TIER_HIGH_ACCURACY_SIBLING, getOptimalThinkingLevel, GeminiThinkingTask, ReportTemplate } from '../constants';
+import { DEFAULT_LIVE_MODEL, DEFAULT_GEMINI_PROMPT, REPROCESS_GEMINI_PROMPT, TEMPLATE_GEMINI_PROMPT, REPORT_TEMPLATES, ERROR_IDENTIFIER_PROMPT, INITIAL_AGENT_PROMPT, REFINEMENT_AGENT_PROMPT, SYNTHESIZER_AGENT_PROMPT, VISUAL_TEMPLATE_GEMINI_PROMPT, getLiveModelFallbackChain, DEFAULT_SELECTED_MODEL, getOptimalThinkingLevel, ReportTemplate } from '../constants';
 import { IdentifiedError } from "../types";
 import { isTableRowFinding } from "./docxService";
 import { expandMacrosInFindings, expandMacrosInSingleText, getMacroPromptContext } from "./macroDictionaryService";
-import {
-  clearModelTemporarilyUnavailable,
-  emitModelFailoverNotice,
-  executeWithApiKeyFailover,
-  getCandidateKeysForOperation,
-  getClientForApiKey,
-  getRandomAIClient,
-  isModelLevelServiceUnavailableError,
-  isModelTemporarilyUnavailable,
-  isStrictSelectedModelOnlyEnabled,
-  markModelTemporarilyUnavailable,
-} from "./apiKeyService";
+import { executeWithApiKeyFailover, getRandomAIClient, getClientForApiKey } from "./apiKeyService";
 import { findTemplateByIdOrNumber } from "./templateStorage";
 import { buildCombinedTemplateBundle, canonicalizeTemplateIdToken, extractTemplateTagIds, mergeTemplateImages, DocxTemplateData as BundleDocxTemplateData } from "./upcomingTemplateService";
 
@@ -437,7 +426,6 @@ export async function callGenerateContentWithOptimalThinking(params: {
   responseMimeType?: string;
   responseSchema?: any;
   abortSignal?: AbortSignal;
-  taskType?: GeminiThinkingTask;
 }): Promise<string> {
   const {
     client,
@@ -448,10 +436,9 @@ export async function callGenerateContentWithOptimalThinking(params: {
     responseMimeType,
     responseSchema: schema,
     abortSignal,
-    taskType = 'transcription',
   } = params;
 
-  const thinkingLevel = getOptimalThinkingLevel(model, taskType);
+  const thinkingLevel = getOptimalThinkingLevel(model);
 
   if (typeof fetch !== 'function' || !apiKey) {
     const config: Record<string, any> = { temperature };
@@ -679,222 +666,87 @@ export async function cleanupUploadedGeminiFiles(
   await Promise.all(deletions);
 }
 
-function isQuotaOrRateLimitExceededError(err: any): boolean {
-  if (!err) return false;
-  if (getErrorStatusCode(err) === 429) return true;
-  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
-  return (
-    msg.includes('resource_exhausted') ||
-    msg.includes('quota') ||
-    msg.includes('rate limit') ||
-    msg.includes('too many requests')
-  );
-}
-
-function findHealthyFailoverTarget(chain: string[], fromIndex: number): string | null {
-  if (fromIndex >= chain.length - 1) return null;
-  return chain.slice(fromIndex + 1).find((m) => !isModelTemporarilyUnavailable(m)) || null;
-}
-
-/**
- * Executes a Gemini operation on the primary resolved model and automatically cascades across
- * the ordered accurate Free-Tier fallback chain (excluding Flash-Lite) on BOTH quota/429 limits
- * AND model-wide 503/500/404 overload/unavailability errors, bypassing models experiencing an active
- * 5-minute 503 high-demand spike (when Auto Fallback is ON) so Google's RPD counter is not burned
- * repeatedly on failed 503 requests.
- */
-export async function executeWithFreeTierModelFallback<T>(
-  selectedModel: string,
-  runForModel: (targetModelName: string, hasMoreFallbackModels?: boolean) => Promise<T>,
-  options?: { abortSignal?: AbortSignal; skipCrossModelFallback?: boolean }
-): Promise<T> {
-  const resolvedPrimary = resolveApiTargetModel(selectedModel);
-  const userStrictOnly = !options?.skipCrossModelFallback && isStrictSelectedModelOnlyEnabled();
-  const strictOnly = Boolean(options?.skipCrossModelFallback || userStrictOnly);
-  const chain = strictOnly
-    ? [resolvedPrimary]
-    : getFreeTierModelFallbackChain(resolvedPrimary);
-  let lastErr: any = null;
-  let notifiedPreSkip = false;
-
-  for (let i = 0; i < chain.length; i++) {
-    const modelName = chain[i];
-    if (options?.abortSignal?.aborted) {
-      throw new DOMException('Aborted by user', 'AbortError');
-    }
-
-    const hasMoreFallbackModels = i < chain.length - 1;
-    if (!strictOnly && hasMoreFallbackModels && isModelTemporarilyUnavailable(modelName)) {
-      const healthyTarget = findHealthyFailoverTarget(chain, i);
-      if (healthyTarget) {
-        if (!notifiedPreSkip) {
-          notifiedPreSkip = true;
-          emitModelFailoverNotice({
-            fromModel: resolvedPrimary,
-            toModel: healthyTarget,
-            reason: 'service_unavailable',
-          });
-        }
-        continue;
-      }
-    }
-
-    try {
-      const result = await runForModel(modelName, hasMoreFallbackModels);
-      clearModelTemporarilyUnavailable(modelName);
-      return result;
-    } catch (err: any) {
-      if (err?.name === 'AbortError' || options?.abortSignal?.aborted) {
-        throw err;
-      }
-      lastErr = err;
-      const isQuotaErr = isQuotaOrRateLimitExceededError(err);
-      const isUnavailableErr = isModelLevelServiceUnavailableError(err);
-      if (isUnavailableErr) {
-        markModelTemporarilyUnavailable(modelName);
-      }
-      const isFailoverTrigger = isQuotaErr || isUnavailableErr;
-
-      if (hasMoreFallbackModels && isFailoverTrigger) {
-        const nextModel = chain[i + 1];
-        const reason: 'rate_limit' | 'service_unavailable' = isQuotaErr ? 'rate_limit' : 'service_unavailable';
-        console.warn(
-          `[Gemini API] ${modelName} ${isQuotaErr ? 'exhausted Free-Tier quota across keys' : 'is experiencing high demand / unavailable'}; failing over to next accurate model ${nextModel}...`
-        );
-        emitModelFailoverNotice({
-          fromModel: modelName,
-          toModel: nextModel,
-          reason,
-        });
-        continue;
-      }
-      if (userStrictOnly && isFailoverTrigger) {
-        const triedCount = typeof err?.triedKeysCount === 'number' && err.triedKeysCount > 0 ? err.triedKeysCount : 1;
-        const strictErr: any = new Error(
-          isQuotaErr
-            ? `Model ${resolvedPrimary} reached its rate limit/quota across all ${triedCount} active API key(s) while "Selected Model Only" is ON. Turn OFF "Selected Model Only" to automatically use accurate backup models, or add another free Google-account key.`
-            : `Model ${resolvedPrimary} is currently experiencing high demand / unavailable across all ${triedCount} active API key(s) while "Selected Model Only" is ON. Turn OFF "Selected Model Only" to automatically switch to backup models, or try again shortly.`
-        );
-        strictErr.status = getErrorStatusCode(err) ?? (isQuotaErr ? 429 : 503);
-        throw strictErr;
-      }
-      if (!strictOnly && isFailoverTrigger) {
-        const exhaustedErr: any = new Error(
-          isQuotaErr
-            ? `All accurate Free-Tier models (${chain.join(' → ')}) reached today's rate limit across your active API key(s). Gemini 3.5 Flash Lite was intentionally skipped to preserve clinical dictation accuracy. Add another free Google-account key in API Keys, wait 60s for RPM reset, or manually select Flash Lite if non-critical.`
-            : `All accurate Free-Tier models (${chain.join(' → ')}) are currently unavailable or overloaded across your active API key(s). Gemini 3.5 Flash Lite was intentionally skipped to preserve clinical dictation accuracy. Please retry in a moment or add another free Google-account key.`
-        );
-        exhaustedErr.status = getErrorStatusCode(err) ?? (isQuotaErr ? 429 : 503);
-        throw exhaustedErr;
-      }
-      throw err;
-    }
-  }
-
-  throw lastErr;
-}
-
 /**
  * Universal safe caller for Gemini models that applies optimal thinking settings and gracefully handles
- * JSON mode incompatibilities, Files API fallback (>14.5MB), and full free-tier cross-key + accurate-model failover.
+ * JSON mode incompatibilities and Files API fallback (>14.5MB) across all models.
  */
 export async function generateContentWithJsonFallback(
   model: string,
   partsOrResolver: any[] | ((client: GoogleGenAI, apiKey: string) => Promise<any[]>),
   schema: any = responseSchema,
   temperature: number = 0.1,
-  abortSignal?: AbortSignal,
-  taskType: GeminiThinkingTask = 'transcription',
-  options?: { skipCrossModelFallback?: boolean; failFastOnModelUnavailable?: boolean }
+  abortSignal?: AbortSignal
 ): Promise<string> {
   const resolvedModel = resolveApiTargetModel(model);
 
-  const runOnModelAcrossKeys = async (
-    targetModelName: string,
-    hasMoreFallbackModels?: boolean
-  ): Promise<string> => {
-    const failFastOnModelUnavailable = Boolean(
-      hasMoreFallbackModels ?? options?.failFastOnModelUnavailable
-    );
-    return await executeWithApiKeyFailover(
-      async (client, apiKey) => {
-        const parts = typeof partsOrResolver === 'function'
-          ? await partsOrResolver(client, apiKey)
-          : partsOrResolver;
+  return await executeWithApiKeyFailover(
+    async (client, apiKey) => {
+      const parts = typeof partsOrResolver === 'function'
+        ? await partsOrResolver(client, apiKey)
+        : partsOrResolver;
 
-        // Strategy 1: Primary attempt with structured JSON schema + optimal thinkingLevel on the selected model
-        try {
-          const text = await callGenerateContentWithOptimalThinking({
-            client,
-            apiKey,
-            model: targetModelName,
-            parts,
-            temperature,
-            responseMimeType: "application/json",
-            responseSchema: schema,
-            abortSignal,
-            taskType,
-          });
+      // Strategy 1: Primary attempt with structured JSON schema + optimal thinkingLevel on the selected model
+      try {
+        const text = await callGenerateContentWithOptimalThinking({
+          client,
+          apiKey,
+          model: resolvedModel,
+          parts,
+          temperature,
+          responseMimeType: "application/json",
+          responseSchema: schema,
+          abortSignal,
+        });
 
-          if (text) return text;
-        } catch (err: any) {
-          if (err?.name === 'AbortError' || abortSignal?.aborted) {
-            throw err;
-          }
-          if (isNonRetryableMediaError(err)) {
-            (err as any).isNonRetryable = true;
-            throw err;
-          }
-          // Strategy 2: If JSON mode unsupported or schema error, retry prompt-only on the SAME selected model
-          if (isJsonModeUnsupportedError(err) || (err?.message && err.message.toLowerCase().includes('schema'))) {
-            console.warn(`[Gemini API] Primary JSON mode call failed on model ${targetModelName} (${err?.message || err}). Attempting prompt-only fallback without schema config on SAME model...`);
-            try {
-              const partsWithJsonInstruction = [
-                ...parts,
-                { text: '\n\nCRITICAL OUTPUT REQUIREMENT: Output ONLY a valid JSON object in the exact format: {"findings": ["finding 1", "finding 2", ...]}. Do NOT output any markdown wrappers or conversational text.' }
-              ];
-
-              const retryText = await callGenerateContentWithOptimalThinking({
-                client,
-                apiKey,
-                model: targetModelName,
-                parts: partsWithJsonInstruction,
-                temperature,
-                abortSignal,
-                taskType,
-              });
-
-              if (retryText) return retryText;
-            } catch (retryErr: any) {
-              console.warn(`[Gemini API] Prompt-only retry on ${targetModelName} failed:`, retryErr);
-              const retryMsg = (retryErr instanceof Error ? retryErr.message : String(retryErr)).toLowerCase();
-              if (
-                isNonRetryableMediaError(retryErr) ||
-                (!isTransientOrKeyError(retryErr) && (getErrorStatusCode(retryErr) === 400 || retryMsg.includes('invalid argument')))
-              ) {
-                (retryErr as any).isNonRetryable = true;
-                throw retryErr;
-              }
-              if (isTransientOrKeyError(retryErr) || isModelLevelServiceUnavailableError(retryErr)) {
-                throw retryErr;
-              }
-            }
-          }
-
-          // Re-throw so executeWithApiKeyFailover retries with another key or fails over to next model
+        if (text) return text;
+      } catch (err: any) {
+        if (err?.name === 'AbortError' || abortSignal?.aborted) {
           throw err;
         }
+        if (isNonRetryableMediaError(err)) {
+          (err as any).isNonRetryable = true;
+          throw err;
+        }
+        // Strategy 2: If JSON mode unsupported or schema error, retry prompt-only on the SAME selected model
+        if (isJsonModeUnsupportedError(err) || (err?.message && err.message.toLowerCase().includes('schema'))) {
+          console.warn(`[Gemini API] Primary JSON mode call failed on model ${resolvedModel} (${err?.message || err}). Attempting prompt-only fallback without schema config on SAME model...`);
+          try {
+            const partsWithJsonInstruction = [
+              ...parts,
+              { text: '\n\nCRITICAL OUTPUT REQUIREMENT: Output ONLY a valid JSON object in the exact format: {"findings": ["finding 1", "finding 2", ...]}. Do NOT output any markdown wrappers or conversational text.' }
+            ];
 
-        return '';
-      },
-      { selectedModel: targetModelName, abortSignal, failFastOnModelUnavailable }
-    );
-  };
+            const retryText = await callGenerateContentWithOptimalThinking({
+              client,
+              apiKey,
+              model: resolvedModel,
+              parts: partsWithJsonInstruction,
+              temperature,
+              abortSignal,
+            });
 
-  return await executeWithFreeTierModelFallback(
-    resolvedModel,
-    runOnModelAcrossKeys,
-    { abortSignal, skipCrossModelFallback: options?.skipCrossModelFallback }
+            if (retryText) return retryText;
+          } catch (retryErr: any) {
+            console.warn(`[Gemini API] Prompt-only retry on ${resolvedModel} failed:`, retryErr);
+            const retryMsg = (retryErr instanceof Error ? retryErr.message : String(retryErr)).toLowerCase();
+            if (
+              isNonRetryableMediaError(retryErr) ||
+              (!isTransientOrKeyError(retryErr) && (getErrorStatusCode(retryErr) === 400 || retryMsg.includes('invalid argument')))
+            ) {
+              (retryErr as any).isNonRetryable = true;
+              throw retryErr;
+            }
+          }
+        }
+
+        // Re-throw so executeWithApiKeyFailover immediately retries with another random API key
+        // strictly preserving the selected model!
+        throw err;
+      }
+
+      return '';
+    },
+    { selectedModel: resolvedModel, abortSignal }
   );
 }
 
@@ -1738,24 +1590,9 @@ export const processAudio = async (
   };
 
   const targetModel = resolveApiTargetModel(model);
-  const audioTaskType: GeminiThinkingTask =
-    isReprocessing ||
-    templateInfo.isTemplateMode ||
-    Boolean(customPrompt?.trim()) ||
-    Boolean(customImages && customImages.length > 0) ||
-    Boolean(customDocx)
-      ? 'reasoning'
-      : 'transcription';
 
   try {
-    const rawResponseText = await generateContentWithJsonFallback(
-      targetModel,
-      resolveRequestParts,
-      responseSchema,
-      0.1,
-      abortSignal,
-      audioTaskType
-    );
+    const rawResponseText = await generateContentWithJsonFallback(targetModel, resolveRequestParts, responseSchema, 0.1, abortSignal);
     const findings = extractFindingsFromResponse(rawResponseText);
 
     if (findings && findings.length > 0) {
@@ -1794,7 +1631,7 @@ export const processAudio = async (
         (error instanceof Error && error.message.includes("Expected a 'findings' array")));
     if (templateInfo.isTemplateMode && isSchemaOrParseError) {
       try {
-        const retryText = await generateContentWithJsonFallback(targetModel, resolveRequestParts, responseSchema, 0.1, abortSignal, audioTaskType);
+        const retryText = await generateContentWithJsonFallback(targetModel, resolveRequestParts, responseSchema, 0.1, abortSignal);
         const parsedFindings = extractFindingsFromResponse(retryText);
         if (parsedFindings && parsedFindings.length > 0) {
           return parsedFindings;
@@ -2177,7 +2014,7 @@ Carefully integrate these dictated findings into the "${templateName}" baseline 
   const targetModel = resolveApiTargetModel(model);
 
   try {
-    const rawResponseText = await generateContentWithJsonFallback(targetModel, parts, responseSchema, 0.1, abortSignal, 'reasoning');
+    const rawResponseText = await generateContentWithJsonFallback(targetModel, parts, responseSchema, 0.1, abortSignal);
     const mergedFindings = extractFindingsFromResponse(rawResponseText);
 
     if (mergedFindings && mergedFindings.length > 0) {
@@ -2190,27 +2027,21 @@ Carefully integrate these dictated findings into the "${templateName}" baseline 
     // Direct JSON prompt fallback using text-only parts to guarantee payload fits
     try {
       const textOnlyParts = parts.filter(p => !p.inlineData && !p.fileData);
-      const retryText = await executeWithFreeTierModelFallback(
-        targetModel,
-        (activeModel, hasMoreFallbackModels) =>
-          executeWithApiKeyFailover(
-            async (client, apiKey) => {
-              return await callGenerateContentWithOptimalThinking({
-                client,
-                apiKey,
-                model: activeModel,
-                parts: [
-                  ...textOnlyParts,
-                  { text: "\n\nCRITICAL OUTPUT REQUIREMENT: Output ONLY a valid JSON object in the exact format: {\"findings\": [\"finding 1\", \"finding 2\", ...]}" }
-                ],
-                temperature: 0.1,
-                abortSignal,
-                taskType: 'reasoning',
-              });
-            },
-            { selectedModel: activeModel, abortSignal, failFastOnModelUnavailable: Boolean(hasMoreFallbackModels) }
-          ),
-        { abortSignal }
+      const retryText = await executeWithApiKeyFailover(
+        async (client, apiKey) => {
+          return await callGenerateContentWithOptimalThinking({
+            client,
+            apiKey,
+            model: targetModel,
+            parts: [
+              ...textOnlyParts,
+              { text: "\n\nCRITICAL OUTPUT REQUIREMENT: Output ONLY a valid JSON object in the exact format: {\"findings\": [\"finding 1\", \"finding 2\", ...]}" }
+            ],
+            temperature: 0.1,
+            abortSignal,
+          });
+        },
+        { selectedModel: targetModel, abortSignal }
       );
       const parsed = extractFindingsFromResponse(retryText);
       if (parsed && parsed.length > 0) {
@@ -2298,26 +2129,21 @@ Follow these strict instructions to produce a clean and accurate continuation:
 
   try {
     const targetModel = resolveApiTargetModel(model || DEFAULT_SELECTED_MODEL);
-    return await executeWithFreeTierModelFallback(
-      targetModel,
-      (activeModel, hasMoreFallbackModels) =>
-        executeWithApiKeyFailover(
-          async (client, apiKey) => {
-            const resultText = await callGenerateContentWithOptimalThinking({
-              client,
-              apiKey,
-              model: activeModel,
-              parts: [textPart, audioPart],
-              temperature: 0.1,
-              taskType: 'live_chunk',
-            });
-            if (!resultText) {
-              throw new Error("API returned an empty response for audio continuation.");
-            }
-            return expandMacrosInSingleText(resultText);
-          },
-          { selectedModel: activeModel, failFastOnModelUnavailable: Boolean(hasMoreFallbackModels) }
-        )
+    return await executeWithApiKeyFailover(
+      async (client, apiKey) => {
+        const resultText = await callGenerateContentWithOptimalThinking({
+          client,
+          apiKey,
+          model: targetModel,
+          parts: [textPart, audioPart],
+          temperature: 0.1,
+        });
+        if (!resultText) {
+          throw new Error("API returned an empty response for audio continuation.");
+        }
+        return expandMacrosInSingleText(resultText);
+      },
+      { selectedModel: targetModel }
     );
   } catch (error) {
     console.error("Error calling Gemini API for audio continuation:", error);
@@ -2376,26 +2202,21 @@ Now, listen to the audio and provide the single, updated finding text.`;
 
   try {
     const targetModel = resolveApiTargetModel(model || DEFAULT_SELECTED_MODEL);
-    return await executeWithFreeTierModelFallback(
-      targetModel,
-      (activeModel, hasMoreFallbackModels) =>
-        executeWithApiKeyFailover(
-          async (client, apiKey) => {
-            const resultText = await callGenerateContentWithOptimalThinking({
-              client,
-              apiKey,
-              model: activeModel,
-              parts: [textPart, audioPart],
-              temperature: 0.1,
-              taskType: 'live_chunk',
-            });
-            if (!resultText) {
-              throw new Error("API returned an empty response for finding modification.");
-            }
-            return expandMacrosInSingleText(resultText);
-          },
-          { selectedModel: activeModel, failFastOnModelUnavailable: Boolean(hasMoreFallbackModels) }
-        )
+    return await executeWithApiKeyFailover(
+      async (client, apiKey) => {
+        const resultText = await callGenerateContentWithOptimalThinking({
+          client,
+          apiKey,
+          model: targetModel,
+          parts: [textPart, audioPart],
+          temperature: 0.1,
+        });
+        if (!resultText) {
+          throw new Error("API returned an empty response for finding modification.");
+        }
+        return expandMacrosInSingleText(resultText);
+      },
+      { selectedModel: targetModel }
     );
   } catch (error) {
     console.error("Error calling Gemini API for finding modification:", error);
@@ -2553,7 +2374,7 @@ ${JSON.stringify({ findings: currentFindings })}
   const targetModel = resolveApiTargetModel(model);
 
   try {
-    const rawResponseText = await generateContentWithJsonFallback(targetModel, parts, responseSchema, 0.1, undefined, 'reasoning');
+    const rawResponseText = await generateContentWithJsonFallback(targetModel, parts, responseSchema, 0.1);
     const findings = extractFindingsFromResponse(rawResponseText);
 
     if (findings && findings.length > 0) {
@@ -2598,24 +2419,19 @@ export const transcribeAudioForPrompt = async (
   const primaryModel = resolveApiTargetModel(model || DEFAULT_SELECTED_MODEL);
 
   try {
-    return await executeWithFreeTierModelFallback(
-      primaryModel,
-      (activeModel, hasMoreFallbackModels) =>
-        executeWithApiKeyFailover(
-          async (client, apiKey) => {
-            const resultText = await callGenerateContentWithOptimalThinking({
-              client,
-              apiKey,
-              model: activeModel,
-              parts: [textPart, audioPart],
-              temperature: 0.1,
-              taskType: 'live_chunk',
-            });
+    return await executeWithApiKeyFailover(
+      async (client, apiKey) => {
+        const resultText = await callGenerateContentWithOptimalThinking({
+          client,
+          apiKey,
+          model: primaryModel,
+          parts: [textPart, audioPart],
+          temperature: 0.1,
+        });
 
-            return resultText || "";
-          },
-          { selectedModel: activeModel, failFastOnModelUnavailable: Boolean(hasMoreFallbackModels) }
-        )
+        return resultText || "";
+      },
+      { selectedModel: primaryModel }
     );
   } catch (lastError: any) {
     console.error("Transcription failed across API keys for model:", primaryModel, lastError);
@@ -2626,105 +2442,6 @@ export const transcribeAudioForPrompt = async (
   }
 };
 
-
-interface ChatFailoverContext {
-  model: string;
-  systemInstruction: string;
-  history: Array<{ role: 'user' | 'model'; parts: any[] }>;
-}
-
-const chatFailoverContextMap = new WeakMap<Chat, ChatFailoverContext>();
-
-function createManagedChatSession(ctx: ChatFailoverContext): Chat {
-  const { candidateKeys } = getCandidateKeysForOperation(ctx.model);
-  const firstKey = candidateKeys[0];
-  const client = firstKey ? getClientForApiKey(firstKey) : getAI();
-  const chat = client.chats.create({
-    model: ctx.model || DEFAULT_SELECTED_MODEL,
-    config: {
-      systemInstruction: ctx.systemInstruction,
-    },
-    history: ctx.history,
-  });
-  chatFailoverContextMap.set(chat, {
-    model: ctx.model || DEFAULT_SELECTED_MODEL,
-    systemInstruction: ctx.systemInstruction,
-    history: ctx.history.map((turn) => ({ role: turn.role, parts: [...turn.parts] })),
-  });
-  return chat;
-}
-
-/**
- * Sends a follow-up Q&A message through an existing Chat session, automatically failing over
- * across active API keys and accurate Free-Tier models on 429 quota or 503/unavailable errors.
- */
-export async function sendChatMessageWithFailover(
-  chat: Chat,
-  message: string | any[],
-  abortSignal?: AbortSignal
-): Promise<{ text: string; activeChat: Chat }> {
-  const ctx = chatFailoverContextMap.get(chat);
-  const messageParts = typeof message === 'string' ? [{ text: message }] : message;
-
-  try {
-    const response = await chat.sendMessage({ message });
-    const text = response?.text || '';
-    if (ctx) {
-      ctx.history.push({ role: 'user', parts: [...messageParts] });
-      ctx.history.push({ role: 'model', parts: [{ text }] });
-    }
-    return { text, activeChat: chat };
-  } catch (err: any) {
-    if (!ctx || err?.name === 'AbortError' || abortSignal?.aborted) {
-      throw err;
-    }
-    const shouldRecover =
-      isQuotaOrRateLimitExceededError(err) ||
-      isModelLevelServiceUnavailableError(err) ||
-      isTransientOrKeyError(err);
-    if (!shouldRecover) {
-      throw err;
-    }
-
-    const result = await executeWithFreeTierModelFallback(
-      ctx.model,
-      (candidateModel, hasMoreFallbackModels) =>
-        executeWithApiKeyFailover(
-          async (client) => {
-            const recoveredChat = client.chats.create({
-              model: candidateModel,
-              config: { systemInstruction: ctx.systemInstruction },
-              history: ctx.history.map((t) => ({ role: t.role, parts: [...t.parts] })),
-            });
-            const r = await recoveredChat.sendMessage({ message });
-            return {
-              text: r?.text || '',
-              activeChat: recoveredChat,
-              activeModel: candidateModel,
-            };
-          },
-          {
-            selectedModel: candidateModel,
-            abortSignal,
-            failFastOnModelUnavailable: Boolean(hasMoreFallbackModels),
-          }
-        ),
-      { abortSignal }
-    );
-
-    const updatedHistory = [
-      ...ctx.history.map((t) => ({ role: t.role, parts: [...t.parts] })),
-      { role: 'user' as const, parts: [...messageParts] },
-      { role: 'model' as const, parts: [{ text: result.text }] },
-    ];
-    chatFailoverContextMap.set(result.activeChat, {
-      model: result.activeModel,
-      systemInstruction: ctx.systemInstruction,
-      history: updatedHistory,
-    });
-    return { text: result.text, activeChat: result.activeChat };
-  }
-}
 
 export const createChat = async (
   audioBlob: Blob | Blob[], 
@@ -2799,14 +2516,17 @@ export const createChat = async (
       systemInstruction += `\n\nAdditionally, follow these custom instructions from the user:\n${customPrompt}`;
   }
 
-  return createManagedChatSession({
-    model: resolveApiTargetModel(model || DEFAULT_SELECTED_MODEL),
-    systemInstruction,
+  const chat = getAI().chats.create({
+    model: model || DEFAULT_SELECTED_MODEL,
+    config: {
+      systemInstruction: systemInstruction,
+    },
     history: [
       { role: 'user', parts: userMessageParts },
       { role: 'model', parts: [modelResponsePart] },
     ],
   });
+  return chat;
 };
 
 export const createChatFromText = async (
@@ -2838,14 +2558,17 @@ export const createChatFromText = async (
       systemInstruction += `\n\nAdditionally, follow these custom instructions from the user:\n${customPrompt}`;
   }
 
-  return createManagedChatSession({
-    model: resolveApiTargetModel(model || DEFAULT_SELECTED_MODEL),
-    systemInstruction,
+  const chat = getAI().chats.create({
+    model: model || DEFAULT_SELECTED_MODEL,
+    config: {
+      systemInstruction: systemInstruction,
+    },
     history: [
       { role: 'user', parts: userMessageParts },
       { role: 'model', parts: [modelResponsePart] },
     ],
   });
+  return chat;
 };
 
 const errorSchema = {
@@ -2881,7 +2604,6 @@ export const identifyPotentialErrors = async (
   options?: {
     triggeredRules?: ClinicalQaRuleResult[];
     abortSignal?: AbortSignal;
-    skipCrossModelFallback?: boolean;
   }
 ): Promise<IdentifiedError[]> => {
     const triggeredHint = options?.triggeredRules && options.triggeredRules.length > 0
@@ -2901,9 +2623,7 @@ export const identifyPotentialErrors = async (
           [textPart],
           errorSchema,
           0.1,
-          options?.abortSignal,
-          'reasoning',
-          { skipCrossModelFallback: options?.skipCrossModelFallback }
+          options?.abortSignal
         );
         return extractErrorsFromResponse(rawResponseText);
     } catch (error: any) {
@@ -3284,13 +3004,10 @@ export const runClinicalQaErrorCheck = async (
       };
     }
 
-    // Background QA explanation uses high-quota Flash-Lite (500 RPD/key) isolated from 20 RPD dictation models
-    const backgroundQaModel = GEMINI_FLASH_LITE_MODEL;
     assessment.invokedDetailedGenerator = true;
-    const errors = await identifyPotentialErrors(findings, backgroundQaModel, {
+    const errors = await identifyPotentialErrors(findings, model, {
       triggeredRules: assessment.triggeredRules,
       abortSignal,
-      skipCrossModelFallback: true,
     });
 
     if (errors.length === 0) {
@@ -3325,10 +3042,7 @@ export const runClinicalQaErrorCheck = async (
       throw err;
     }
     console.warn('[Clinical QA] gemini-decision-1 check failed, falling back to identifyPotentialErrors:', err);
-    const fallbackErrors = await identifyPotentialErrors(findings, GEMINI_FLASH_LITE_MODEL, {
-      abortSignal,
-      skipCrossModelFallback: true,
-    });
+    const fallbackErrors = await identifyPotentialErrors(findings, model, { abortSignal });
     return {
       errors: fallbackErrors,
       qaAssessment: null,
@@ -3826,25 +3540,13 @@ INSTRUCTIONS FOR THIS AUDIO SEGMENT:
 - Return the COMPLETE, FINAL, UPDATED array of findings for the whole report in JSON format.
 `;
 
-  // Multi-model fallback chain (restricted to single model when Selected Model Only toggle is ON)
-  const primaryLiveModel = model || DEFAULT_LIVE_MODEL || 'gemini-4-hydrogen';
-  const fallbackChain = isStrictSelectedModelOnlyEnabled()
-    ? [primaryLiveModel]
-    : getLiveModelFallbackChain(primaryLiveModel);
+  // Multi-model fallback chain: selected model + subsequent next model
+  const fallbackChain = getLiveModelFallbackChain(model || DEFAULT_LIVE_MODEL || 'gemini-4-hydrogen');
   let lastError: any = null;
   const failedModels: string[] = [];
 
   for (let attempt = 0; attempt < fallbackChain.length; attempt++) {
     const currentModel = fallbackChain[attempt];
-    if (!isStrictSelectedModelOnlyEnabled() && isModelTemporarilyUnavailable(currentModel)) {
-      const healthyTarget = findHealthyFailoverTarget(fallbackChain, attempt);
-      if (healthyTarget) {
-        emitModelFailoverNotice({ fromModel: currentModel, toModel: healthyTarget, reason: 'service_unavailable' });
-        onFailover?.(currentModel, healthyTarget, 'Model temporarily unavailable (5-min skip to save RPD)');
-        continue;
-      }
-    }
-
     try {
       const liveChunkPrompt = buildPromptForModel(currentModel);
       const parts: any[] = [
@@ -3857,16 +3559,7 @@ INSTRUCTIONS FOR THIS AUDIO SEGMENT:
         }
       ];
 
-      const rawResponseText = await generateContentWithJsonFallback(
-        currentModel,
-        parts,
-        responseSchema,
-        0.1,
-        undefined,
-        'live_chunk',
-        { skipCrossModelFallback: true, failFastOnModelUnavailable: attempt < fallbackChain.length - 1 }
-      );
-      clearModelTemporarilyUnavailable(currentModel);
+      const rawResponseText = await generateContentWithJsonFallback(currentModel, parts, responseSchema, 0.1);
       const parsedFindings = extractFindingsFromResponse(rawResponseText);
 
       if (parsedFindings && parsedFindings.length > 0) {
@@ -3890,27 +3583,19 @@ INSTRUCTIONS FOR THIS AUDIO SEGMENT:
       lastError = error;
       failedModels.push(currentModel);
 
-      const isRateLimit = isQuotaOrRateLimitExceededError(error);
-      const isUnavailable = isModelLevelServiceUnavailableError(error);
-      if (isUnavailable) {
-        markModelTemporarilyUnavailable(currentModel);
-      }
+      const isRateLimit =
+        error?.status === 429 ||
+        error?.message?.includes('429') ||
+        error?.message?.toLowerCase().includes('quota') ||
+        error?.message?.toLowerCase().includes('resource_exhausted') ||
+        error?.message?.toLowerCase().includes('rate');
 
-      const reason = isRateLimit
-        ? 'Rate limit exceeded'
-        : isUnavailable
-          ? 'Model high demand / unavailable'
-          : (error?.message || 'Model service error');
+      const reason = isRateLimit ? 'Rate limit exceeded' : (error?.message || 'Model service error');
       console.warn(`[Live Dictation] Chunk #${chunkIndex + 1} attempt ${attempt + 1}/${fallbackChain.length} with ${currentModel} failed (${reason})`);
 
       if (attempt < fallbackChain.length - 1) {
         const nextModel = fallbackChain[attempt + 1];
         console.info(`[Live Dictation] Auto-failing over to subsequent model: ${nextModel}`);
-        emitModelFailoverNotice({
-          fromModel: currentModel,
-          toModel: nextModel,
-          reason: isUnavailable && !isRateLimit ? 'service_unavailable' : isRateLimit ? 'rate_limit' : 'rpd_ledger',
-        });
         if (onFailover) {
           onFailover(currentModel, nextModel, reason);
         }
@@ -3982,31 +3667,12 @@ Perform a comprehensive, holistic review pass over the draft to generate the fin
 
 Output MUST be a JSON object with a single "findings" array of strings.`;
 
-  const primarySynthModel = model || DEFAULT_LIVE_MODEL || 'gemini-4-hydrogen';
-  const fallbackChain = isStrictSelectedModelOnlyEnabled()
-    ? [primarySynthModel]
-    : getLiveModelFallbackChain(primarySynthModel);
+  const fallbackChain = getLiveModelFallbackChain(model || DEFAULT_LIVE_MODEL || 'gemini-4-hydrogen');
 
   for (let attempt = 0; attempt < fallbackChain.length; attempt++) {
     const currentModel = fallbackChain[attempt];
-    if (!isStrictSelectedModelOnlyEnabled() && isModelTemporarilyUnavailable(currentModel)) {
-      const healthyTarget = findHealthyFailoverTarget(fallbackChain, attempt);
-      if (healthyTarget) {
-        emitModelFailoverNotice({ fromModel: currentModel, toModel: healthyTarget, reason: 'service_unavailable' });
-        continue;
-      }
-    }
     try {
-      const rawResponseText = await generateContentWithJsonFallback(
-        currentModel,
-        [{ text: prompt }],
-        responseSchema,
-        0.1,
-        undefined,
-        'reasoning',
-        { skipCrossModelFallback: true, failFastOnModelUnavailable: attempt < fallbackChain.length - 1 }
-      );
-      clearModelTemporarilyUnavailable(currentModel);
+      const rawResponseText = await generateContentWithJsonFallback(currentModel, [{ text: prompt }], responseSchema, 0.1);
       const parsedFindings = extractFindingsFromResponse(rawResponseText);
       if (parsedFindings && parsedFindings.length > 0) {
         return parsedFindings;
@@ -4014,18 +3680,8 @@ Output MUST be a JSON object with a single "findings" array of strings.`;
       return rawFindings;
     } catch (err) {
       console.warn(`[Synthesize Report] Attempt ${attempt + 1}/${fallbackChain.length} with ${currentModel} notice:`, err);
-      const isUnavailable = isModelLevelServiceUnavailableError(err);
-      if (isUnavailable) {
-        markModelTemporarilyUnavailable(currentModel);
-      }
       if (attempt < fallbackChain.length - 1) {
-        const nextModel = fallbackChain[attempt + 1];
-        console.info(`[Synthesize Report] Auto-failing over to subsequent model: ${nextModel}`);
-        emitModelFailoverNotice({
-          fromModel: currentModel,
-          toModel: nextModel,
-          reason: isUnavailable ? 'service_unavailable' : 'rate_limit',
-        });
+        console.info(`[Synthesize Report] Auto-failing over to subsequent model: ${fallbackChain[attempt + 1]}`);
       }
     }
   }

@@ -5,7 +5,7 @@ import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react'
 import AudioRecorder from './components/AudioRecorder';
 import ResultsDisplay from './components/ResultsDisplay';
 import { AppStatus, IdentifiedError } from './types';
-import { processAudio, createChat, blobToBase64, base64ToBlob, createChatFromText, sendChatMessageWithFailover, findBuiltinTemplates, runClinicalQaErrorCheck, ClinicalQaAssessment, SpokenTemplateResolution } from './services/geminiService';
+import { processAudio, createChat, blobToBase64, base64ToBlob, createChatFromText, findBuiltinTemplates, runClinicalQaErrorCheck, ClinicalQaAssessment, SpokenTemplateResolution } from './services/geminiService';
 import ClinicalQaPanel from './components/ui/ClinicalQaPanel';
 import Spinner from './components/ui/Spinner';
 import { Chat } from '@google/genai';
@@ -34,18 +34,7 @@ import { DriveReportsModal } from './components/DriveReportsModal';
 import { RotateCcw, X, ExternalLink, Power, Sparkles, Trash2, Download, ShieldCheck, BookOpen, Key } from 'lucide-react';
 import { OwnershipModal } from './components/ui/OwnershipModal';
 import { ApiKeyModal } from './components/ApiKeyModal';
-import {
-  getUserApiKeys,
-  API_KEYS_UPDATED_EVENT,
-  MODEL_FAILOVER_EVENT,
-  STRICT_MODEL_ONLY_UPDATED_EVENT,
-  ModelFailoverEventDetail,
-  isBuiltinKeysUnlocked,
-  unlockBuiltinKeys,
-  syncApiKeysWithGoogleDrive,
-  isStrictSelectedModelOnlyEnabled,
-  setStrictSelectedModelOnlyEnabled,
-} from './services/apiKeyService';
+import { getUserApiKeys, API_KEYS_UPDATED_EVENT, isBuiltinKeysUnlocked, unlockBuiltinKeys, syncApiKeysWithGoogleDrive } from './services/apiKeyService';
 import ThemeSelector from './components/ThemeSelector';
 import { getUpcomingTemplate, clearUpcomingTemplate, subscribeToUpcomingTemplate, UpcomingTemplateConfig, extractTemplateTagIds, mergeTemplateImages } from './services/upcomingTemplateService';
 import MacrosAndDictionaryModal from './components/MacrosAndDictionaryModal';
@@ -260,7 +249,6 @@ const App: React.FC = () => {
   const [isDecision1ChatterFilterEnabled, setIsDecision1ChatterFilterEnabled] = useState(() => {
     return safeLocalStorage.getItem<boolean>(DECISION1_CHATTER_FILTER_KEY, false);
   });
-  const [isStrictSelectedModelOnly, setIsStrictSelectedModelOnly] = useState<boolean>(() => isStrictSelectedModelOnlyEnabled());
   const isDecision1ChatterFilterEnabledRef = useRef(isDecision1ChatterFilterEnabled);
   isDecision1ChatterFilterEnabledRef.current = isDecision1ChatterFilterEnabled;
   const [prefilterStats, setPrefilterStats] = useState<AudioPrefilterStats | null>(null);
@@ -281,7 +269,6 @@ const App: React.FC = () => {
   const [isSecretUnlocked, setIsSecretUnlocked] = useState<boolean>(() => isBuiltinKeysUnlocked());
   const [hasMultipleSingleDictations, setHasMultipleSingleDictations] = useState<boolean>(false);
   const [errorRecorderStatus, setErrorRecorderStatus] = useState<AppStatus>(AppStatus.Idle);
-  const [modelFailoverNotice, setModelFailoverNotice] = useState<ModelFailoverEventDetail | null>(null);
 
   const handleHeaderTitleClick = useCallback(() => {
     const input = window.prompt("Enter secret key:");
@@ -303,22 +290,6 @@ const App: React.FC = () => {
     };
     window.addEventListener(API_KEYS_UPDATED_EVENT, handleKeyUpdate);
     return () => window.removeEventListener(API_KEYS_UPDATED_EVENT, handleKeyUpdate);
-  }, []);
-
-  useEffect(() => {
-    let dismissTimer: ReturnType<typeof setTimeout> | null = null;
-    const handleModelFailover = (ev: Event) => {
-      const customEv = ev as CustomEvent<ModelFailoverEventDetail>;
-      if (!customEv?.detail) return;
-      setModelFailoverNotice(customEv.detail);
-      if (dismissTimer) clearTimeout(dismissTimer);
-      dismissTimer = setTimeout(() => setModelFailoverNotice(null), 6500);
-    };
-    window.addEventListener(MODEL_FAILOVER_EVENT, handleModelFailover);
-    return () => {
-      window.removeEventListener(MODEL_FAILOVER_EVENT, handleModelFailover);
-      if (dismissTimer) clearTimeout(dismissTimer);
-    };
   }, []);
 
   useEffect(() => {
@@ -487,19 +458,6 @@ const App: React.FC = () => {
     safeLocalStorage.setItem(DECISION1_CHATTER_FILTER_KEY, isDecision1ChatterFilterEnabled);
   }, [isDecision1ChatterFilterEnabled]);
 
-  useEffect(() => {
-    setStrictSelectedModelOnlyEnabled(isStrictSelectedModelOnly);
-  }, [isStrictSelectedModelOnly]);
-
-  useEffect(() => {
-    const handleStrictSync = (ev: Event) => {
-      const enabled = (ev as CustomEvent<{ enabled?: boolean }>)?.detail?.enabled;
-      if (typeof enabled === 'boolean') setIsStrictSelectedModelOnly(enabled);
-    };
-    window.addEventListener(STRICT_MODEL_ONLY_UPDATED_EVENT, handleStrictSync);
-    return () => window.removeEventListener(STRICT_MODEL_ONLY_UPDATED_EVENT, handleStrictSync);
-  }, []);
-
   const toggleTheme = () => {
     setTheme(prevTheme => (prevTheme === 'light' ? 'dark' : 'light'));
   };
@@ -556,7 +514,7 @@ const App: React.FC = () => {
           setChatHistory(savedState.chatHistory || []);
           setStatus(AppStatus.Success);
           
-          const validModel = (savedState.selectedModel && AVAILABLE_MODELS.some(m => m.value === savedState.selectedModel))
+          const validModel = (savedState.selectedModel && savedState.selectedModel !== 'gemini-3.5-flash' && AVAILABLE_MODELS.some(m => m.value === savedState.selectedModel))
             ? savedState.selectedModel
             : DEFAULT_SELECTED_MODEL;
           setSelectedModel(validModel);
@@ -2088,9 +2046,9 @@ const App: React.FC = () => {
     setChatHistory(prev => [...prev, { author: 'You', text: userMessageText }]);
 
     try {
-      let chatInput: string | any[];
+      let response;
       if (typeof message === 'string') {
-        chatInput = message;
+        response = await chat.sendMessage({ message });
       } else { // It's a Blob
         const base64Audio = await blobToBase64(message);
         const audioPart = {
@@ -2099,13 +2057,12 @@ const App: React.FC = () => {
             data: base64Audio,
           },
         };
+        // Adding a text part to guide the model.
         const textPart = { text: "Please analyze this audio in the context of our conversation." };
-        chatInput = [audioPart, textPart];
+        // The `message` property can be an array of parts for multipart messages.
+        response = await chat.sendMessage({ message: [audioPart, textPart] });
       }
-      const { text: responseText, activeChat } = await sendChatMessageWithFailover(chat, chatInput);
-      if (activeChat !== chat) {
-        setChat(activeChat);
-      }
+      const responseText = response.text;
       setChatHistory(prev => [...prev, { author: 'AI', text: responseText }]);
     } catch (err) {
       console.error("Chat error:", err);
@@ -3351,9 +3308,7 @@ const App: React.FC = () => {
                   }`}
                   aria-label="Gemini API Keys"
                   title={
-                    customKeysCount > 0 && isSecretUnlocked
-                      ? `API Keys (${customKeysCount} custom first → 9 built-in backup)`
-                      : customKeysCount > 0
+                    customKeysCount > 0
                       ? `API Keys (${customKeysCount} active)`
                       : isSecretUnlocked
                       ? 'API Keys (Secret Mode: 9 built-in keys active)'
@@ -3450,9 +3405,7 @@ const App: React.FC = () => {
                 }`}
                 aria-label="Gemini API Keys & Failover"
                 title={
-                  customKeysCount > 0 && isSecretUnlocked
-                    ? `API Keys (${customKeysCount} custom first → 9 built-in backup)`
-                    : customKeysCount > 0
+                  customKeysCount > 0
                     ? `API Keys (${customKeysCount} custom keys active)`
                     : isSecretUnlocked
                     ? 'API Keys (Secret Mode: 9 rotating keys active)'
@@ -3467,9 +3420,7 @@ const App: React.FC = () => {
                     : 'text-amber-600 dark:text-amber-400'
                 }`} />
                 <span className="text-xs font-semibold hidden md:inline">
-                  {customKeysCount > 0 && isSecretUnlocked
-                    ? `Custom (${customKeysCount}) + 9`
-                    : customKeysCount > 0
+                  {customKeysCount > 0
                     ? `Custom Keys (${customKeysCount})`
                     : isSecretUnlocked
                     ? 'Secret Keys (9)'
@@ -3595,41 +3546,6 @@ const App: React.FC = () => {
                               <option key={model.value} value={model.value}>{model.label}</option>
                           ))}
                       </select>
-                  </div>
-              )}
-              {(status === AppStatus.Idle || isContinuousSessionReady) && (mode === 'single' || mode === 'batch' || mode === 'autonomous' || mode === 'live') && (
-                  <div className="flex items-center gap-2.5 w-full sm:w-auto justify-between sm:justify-start">
-                      <label
-                          htmlFor="strict-model-only-toggle"
-                          className="text-xs sm:text-sm font-semibold text-slate-700 dark:text-slate-300 cursor-pointer flex items-center gap-1.5"
-                          title="OFF (Default): Automatically switches across accurate Free-Tier models (excluding Flash Lite) on rate limits. ON: Runs ONLY your selected model across active API keys without switching models."
-                      >
-                          <span>Selected Model Only</span>
-                          <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-md border ${
-                            isStrictSelectedModelOnly
-                              ? 'bg-amber-100 text-amber-800 border-amber-300 dark:bg-amber-900/60 dark:text-amber-200 dark:border-amber-700'
-                              : 'bg-slate-200 text-slate-700 border-slate-300 dark:bg-slate-700 dark:text-slate-300 dark:border-slate-600'
-                          }`}>
-                            {isStrictSelectedModelOnly ? 'No Fallback' : 'Auto Fallback'}
-                          </span>
-                      </label>
-                      <button
-                          type="button"
-                          id="strict-model-only-toggle"
-                          onClick={() => setIsStrictSelectedModelOnly(prev => !prev)}
-                          className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-amber-500 focus:ring-offset-2 dark:focus:ring-offset-slate-900 ${
-                            isStrictSelectedModelOnly ? 'bg-amber-600' : 'bg-gray-300 dark:bg-slate-600'
-                          }`}
-                          role="switch"
-                          aria-checked={isStrictSelectedModelOnly}
-                          title="OFF (Default): Automatically switches across accurate Free-Tier models on quota limits. ON: Strictly uses ONLY the selected model."
-                      >
-                          <span
-                            className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
-                              isStrictSelectedModelOnly ? 'translate-x-5' : 'translate-x-0'
-                            }`}
-                          />
-                      </button>
                   </div>
               )}
               <div className="flex items-center gap-2.5 w-full sm:w-auto justify-between sm:justify-start">
@@ -4193,38 +4109,6 @@ const App: React.FC = () => {
             }
           }}
         />
-
-        {/* Model Failover Auto-Switch Toast */}
-        {modelFailoverNotice && (
-          <div
-            role="status"
-            aria-live="polite"
-            className="fixed bottom-5 left-5 z-50 max-w-sm bg-slate-900/95 dark:bg-slate-800/95 backdrop-blur-md text-white px-4 py-3 rounded-2xl shadow-2xl border border-amber-500/40 flex items-start gap-3 animate-in fade-in duration-200"
-          >
-            <span className="mt-0.5 text-amber-400 text-sm shrink-0">⚡</span>
-            <div className="flex-1 min-w-0">
-              <p className="text-xs font-bold text-slate-100">
-                Smart Free-Tier Model Switch
-              </p>
-              <p className="text-[11px] text-amber-200/90 mt-0.5 leading-snug">
-                <span className="font-mono font-semibold">{modelFailoverNotice.fromModel}</span>{' '}
-                {modelFailoverNotice.reason === 'service_unavailable'
-                  ? 'is experiencing high demand / unavailable'
-                  : 'reached quota across active keys'}{' '}
-                — switched to{' '}
-                <span className="font-mono font-semibold text-emerald-300">{modelFailoverNotice.toModel}</span>.
-              </p>
-            </div>
-            <button
-              type="button"
-              onClick={() => setModelFailoverNotice(null)}
-              className="p-1 text-slate-400 hover:text-white rounded-md transition-colors shrink-0 cursor-pointer"
-              aria-label="Dismiss model failover notification"
-            >
-              <X className="w-3.5 h-3.5" />
-            </button>
-          </div>
-        )}
 
         {/* Gemini API Keys & Failover Modal */}
         <ApiKeyModal

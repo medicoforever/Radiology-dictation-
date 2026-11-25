@@ -288,9 +288,7 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
                     : 'bg-amber-100 text-amber-800 dark:bg-amber-900/50 dark:text-amber-300'
                 }`}
               >
-                {isUsingCustomKeys && isUnlocked
-                  ? `Custom (${userKeys.length}) → +9 Built-In Backup`
-                  : isUsingCustomKeys
+                {isUsingCustomKeys
                   ? `Custom Keys Active (${userKeys.length})`
                   : isUnlocked
                   ? `Secret Mode Active (9 Built-In Keys)`
@@ -298,13 +296,9 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
               </span>
             </div>
             <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
-              {isUsingCustomKeys && isUnlocked ? (
+              {isUsingCustomKeys ? (
                 <>
-                  <strong>Priority Failover Active:</strong> Your <strong>{userKeys.length} custom API key(s)</strong> are always tried first with smart load balancing; if they reach quota or rate limits, the app seamlessly fails over to the <strong>9 built-in keys</strong>. Both custom keys and secret mode are saved permanently in local storage and Google Drive (when signed in).
-                </>
-              ) : isUsingCustomKeys ? (
-                <>
-                  The app is using <strong>your custom API key(s)</strong>, permanently saved in local storage and Google Drive (when signed in). Requests rotate cleanly across healthy keys and fail over automatically on quota limits.
+                  The app is using <strong>ONLY your custom API key(s)</strong>. Every dictation randomly picks from your keys, and if any key fails or hits a quota limit, it automatically retries with another random key without interrupting your work.
                 </>
               ) : isUnlocked ? (
                 <>
@@ -392,10 +386,10 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
 
                 <div className="mt-3 p-3 rounded-lg bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/60 text-amber-900 dark:text-amber-200">
                   <p className="font-bold flex items-center gap-1.5 text-xs">
-                    <span>💡</span> Free-Tier Multi-Account Pooling (For You &amp; Friends):
+                    <span>💡</span> Pro-Tip for Unlimited Daily Dictations:
                   </p>
                   <p className="mt-1 leading-relaxed text-[11px] sm:text-xs text-amber-800 dark:text-amber-300">
-                    Each free Google Cloud project gives <strong>20 RPD</strong> on Gemini 4 Hydrogen, 3.8 Flash, 3.6 Flash, 3 Flash, and Robotics ER-2 Preview (<strong>100</strong> frontier reports/day) plus <strong>500 RPD</strong> on Gemini 3.5 Flash Lite. Keys from <strong>different Google accounts / separate projects</strong> have completely independent quotas—the app spreads load across healthy keys and fails over automatically with zero rate-limit penalty. Avoid creating multiple keys under the same Google Cloud project, as those share one quota.
+                    If you dictate high volumes of reports each day, you can create keys under different Google / Gmail accounts and paste all of them below! This app will automatically rotate and failover across all of them to multiply your total dictation capacity.
                   </p>
                 </div>
               </div>
@@ -594,7 +588,7 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
               </button>
             </div>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              Verifies load balancing across active keys. Model selected: <span className="font-semibold text-blue-600 dark:text-blue-400">{selectedModel || 'gemini-4-hydrogen'}</span>.
+              Verifies load balancing across active keys. Model selected: <span className="font-semibold text-blue-600 dark:text-blue-400">{selectedModel || 'gemini-3.8-flash'}</span>.
             </p>
             {failoverTestResult && (
               <div className="mt-2 p-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-xs font-mono text-slate-700 dark:text-slate-300">
