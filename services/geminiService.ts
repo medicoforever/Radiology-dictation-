@@ -4,13 +4,16 @@ import { IdentifiedError } from "../types";
 import { isTableRowFinding } from "./docxService";
 import { expandMacrosInFindings, expandMacrosInSingleText, getMacroPromptContext } from "./macroDictionaryService";
 import {
+  clearModelTemporarilyUnavailable,
   emitModelFailoverNotice,
   executeWithApiKeyFailover,
   getCandidateKeysForOperation,
   getClientForApiKey,
   getRandomAIClient,
   isModelLevelServiceUnavailableError,
+  isModelTemporarilyUnavailable,
   isStrictSelectedModelOnlyEnabled,
+  markModelTemporarilyUnavailable,
 } from "./apiKeyService";
 import { findTemplateByIdOrNumber } from "./templateStorage";
 import { buildCombinedTemplateBundle, canonicalizeTemplateIdToken, extractTemplateTagIds, mergeTemplateImages, DocxTemplateData as BundleDocxTemplateData } from "./upcomingTemplateService";
@@ -688,11 +691,17 @@ function isQuotaOrRateLimitExceededError(err: any): boolean {
   );
 }
 
+function findHealthyFailoverTarget(chain: string[], fromIndex: number): string | null {
+  if (fromIndex >= chain.length - 1) return null;
+  return chain.slice(fromIndex + 1).find((m) => !isModelTemporarilyUnavailable(m)) || null;
+}
+
 /**
  * Executes a Gemini operation on the primary resolved model and automatically cascades across
  * the ordered accurate Free-Tier fallback chain (excluding Flash-Lite) on BOTH quota/429 limits
- * AND model-wide 503/500/404 overload/unavailability errors, pre-skipping models already known to
- * be RPD-exhausted today and informing the UI on failover.
+ * AND model-wide 503/500/404 overload/unavailability errors, bypassing models experiencing an active
+ * 5-minute 503 high-demand spike (when Auto Fallback is ON) so Google's RPD counter is not burned
+ * repeatedly on failed 503 requests.
  */
 export async function executeWithFreeTierModelFallback<T>(
   selectedModel: string,
@@ -706,6 +715,7 @@ export async function executeWithFreeTierModelFallback<T>(
     ? [resolvedPrimary]
     : getFreeTierModelFallbackChain(resolvedPrimary);
   let lastErr: any = null;
+  let notifiedPreSkip = false;
 
   for (let i = 0; i < chain.length; i++) {
     const modelName = chain[i];
@@ -714,8 +724,25 @@ export async function executeWithFreeTierModelFallback<T>(
     }
 
     const hasMoreFallbackModels = i < chain.length - 1;
+    if (!strictOnly && hasMoreFallbackModels && isModelTemporarilyUnavailable(modelName)) {
+      const healthyTarget = findHealthyFailoverTarget(chain, i);
+      if (healthyTarget) {
+        if (!notifiedPreSkip) {
+          notifiedPreSkip = true;
+          emitModelFailoverNotice({
+            fromModel: resolvedPrimary,
+            toModel: healthyTarget,
+            reason: 'service_unavailable',
+          });
+        }
+        continue;
+      }
+    }
+
     try {
-      return await runForModel(modelName, hasMoreFallbackModels);
+      const result = await runForModel(modelName, hasMoreFallbackModels);
+      clearModelTemporarilyUnavailable(modelName);
+      return result;
     } catch (err: any) {
       if (err?.name === 'AbortError' || options?.abortSignal?.aborted) {
         throw err;
@@ -723,6 +750,9 @@ export async function executeWithFreeTierModelFallback<T>(
       lastErr = err;
       const isQuotaErr = isQuotaOrRateLimitExceededError(err);
       const isUnavailableErr = isModelLevelServiceUnavailableError(err);
+      if (isUnavailableErr) {
+        markModelTemporarilyUnavailable(modelName);
+      }
       const isFailoverTrigger = isQuotaErr || isUnavailableErr;
 
       if (hasMoreFallbackModels && isFailoverTrigger) {
@@ -3806,6 +3836,14 @@ INSTRUCTIONS FOR THIS AUDIO SEGMENT:
 
   for (let attempt = 0; attempt < fallbackChain.length; attempt++) {
     const currentModel = fallbackChain[attempt];
+    if (!isStrictSelectedModelOnlyEnabled() && isModelTemporarilyUnavailable(currentModel)) {
+      const healthyTarget = findHealthyFailoverTarget(fallbackChain, attempt);
+      if (healthyTarget) {
+        emitModelFailoverNotice({ fromModel: currentModel, toModel: healthyTarget, reason: 'service_unavailable' });
+        onFailover?.(currentModel, healthyTarget, 'Model temporarily unavailable (5-min skip to save RPD)');
+        continue;
+      }
+    }
 
     try {
       const liveChunkPrompt = buildPromptForModel(currentModel);
@@ -3828,6 +3866,7 @@ INSTRUCTIONS FOR THIS AUDIO SEGMENT:
         'live_chunk',
         { skipCrossModelFallback: true, failFastOnModelUnavailable: attempt < fallbackChain.length - 1 }
       );
+      clearModelTemporarilyUnavailable(currentModel);
       const parsedFindings = extractFindingsFromResponse(rawResponseText);
 
       if (parsedFindings && parsedFindings.length > 0) {
@@ -3853,6 +3892,9 @@ INSTRUCTIONS FOR THIS AUDIO SEGMENT:
 
       const isRateLimit = isQuotaOrRateLimitExceededError(error);
       const isUnavailable = isModelLevelServiceUnavailableError(error);
+      if (isUnavailable) {
+        markModelTemporarilyUnavailable(currentModel);
+      }
 
       const reason = isRateLimit
         ? 'Rate limit exceeded'
@@ -3947,6 +3989,13 @@ Output MUST be a JSON object with a single "findings" array of strings.`;
 
   for (let attempt = 0; attempt < fallbackChain.length; attempt++) {
     const currentModel = fallbackChain[attempt];
+    if (!isStrictSelectedModelOnlyEnabled() && isModelTemporarilyUnavailable(currentModel)) {
+      const healthyTarget = findHealthyFailoverTarget(fallbackChain, attempt);
+      if (healthyTarget) {
+        emitModelFailoverNotice({ fromModel: currentModel, toModel: healthyTarget, reason: 'service_unavailable' });
+        continue;
+      }
+    }
     try {
       const rawResponseText = await generateContentWithJsonFallback(
         currentModel,
@@ -3957,6 +4006,7 @@ Output MUST be a JSON object with a single "findings" array of strings.`;
         'reasoning',
         { skipCrossModelFallback: true, failFastOnModelUnavailable: attempt < fallbackChain.length - 1 }
       );
+      clearModelTemporarilyUnavailable(currentModel);
       const parsedFindings = extractFindingsFromResponse(rawResponseText);
       if (parsedFindings && parsedFindings.length > 0) {
         return parsedFindings;
@@ -3964,9 +4014,12 @@ Output MUST be a JSON object with a single "findings" array of strings.`;
       return rawFindings;
     } catch (err) {
       console.warn(`[Synthesize Report] Attempt ${attempt + 1}/${fallbackChain.length} with ${currentModel} notice:`, err);
+      const isUnavailable = isModelLevelServiceUnavailableError(err);
+      if (isUnavailable) {
+        markModelTemporarilyUnavailable(currentModel);
+      }
       if (attempt < fallbackChain.length - 1) {
         const nextModel = fallbackChain[attempt + 1];
-        const isUnavailable = isModelLevelServiceUnavailableError(err);
         console.info(`[Synthesize Report] Auto-failing over to subsequent model: ${nextModel}`);
         emitModelFailoverNotice({
           fromModel: currentModel,

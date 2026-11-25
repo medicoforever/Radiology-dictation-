@@ -59,6 +59,7 @@ import {
   hasConfirmedDailyExhaustionAcrossAllKeys,
   isBuiltinKeysUnlocked,
   isModelLevelServiceUnavailableError,
+  isModelTemporarilyUnavailable,
   isStrictSelectedModelOnlyEnabled,
   lockBuiltinKeys,
   resetApiKeyHealthState,
@@ -1440,7 +1441,71 @@ test('HTTP 503 UNAVAILABLE (high demand) fails fast across keys and auto-fails o
     assert.equal(failoverEvents[1].toModel, 'gemini-3-flash-preview');
     assert.equal(failoverEvents[1].reason, 'rate_limit');
 
-    // When Selected Model Only IS ON, 503 still stays strict and surfaces helpful overload error
+    // Second dictation within 5 minutes MUST bypass overloaded 4-hydrogen with 0 requests (saving Google RPD!)
+    assert.equal(isModelTemporarilyUnavailable('gemini-4-hydrogen'), true);
+    assert.equal(isModelTemporarilyUnavailable('gemini-3-flash-preview'), false);
+    const secondRunCalls: string[] = [];
+    (globalThis as any).fetch = async (url: string) => {
+      const match = url.match(/models\/([^:]+):generateContent/);
+      const model = match ? decodeURIComponent(match[1]) : '';
+      secondRunCalls.push(model);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          candidates: [{ content: { parts: [{ text: JSON.stringify({ findings: ['Bypassed 503 with 0 wasted RPD'] }) }] } }],
+        }),
+      };
+    };
+    const secondOut = await generateContentWithJsonFallback('gemini-4-hydrogen', [{ text: 'second dictation' }]);
+    assert.deepEqual(JSON.parse(secondOut).findings, ['Bypassed 503 with 0 wasted RPD']);
+    assert.equal(secondRunCalls.includes('gemini-4-hydrogen'), false);
+    assert.equal(secondRunCalls[0], 'gemini-3.8-flash');
+
+    // Mark 3.8-flash temporarily unavailable too and verify both 4-hydrogen and 3.8-flash burn 0 RPD on run 3
+    (globalThis as any).fetch = async (url: string) => {
+      const match = url.match(/models\/([^:]+):generateContent/);
+      const model = match ? decodeURIComponent(match[1]) : '';
+      if (model === 'gemini-4-hydrogen' || model === 'gemini-3.8-flash') {
+        return {
+          ok: false,
+          status: 503,
+          statusText: 'Service Unavailable',
+          json: async () => ({
+            error: { code: 503, message: 'This model is currently experiencing high demand.', status: 'UNAVAILABLE' },
+          }),
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          candidates: [{ content: { parts: [{ text: JSON.stringify({ findings: ['3-flash direct'] }) }] } }],
+        }),
+      };
+    };
+    resetApiKeyHealthState();
+    await generateContentWithJsonFallback('gemini-4-hydrogen', [{ text: 'prime both 503' }]);
+    assert.equal(isModelTemporarilyUnavailable('gemini-4-hydrogen'), true);
+    assert.equal(isModelTemporarilyUnavailable('gemini-3.8-flash'), true);
+
+    const thirdRunCalls: string[] = [];
+    (globalThis as any).fetch = async (url: string) => {
+      const match = url.match(/models\/([^:]+):generateContent/);
+      thirdRunCalls.push(match ? decodeURIComponent(match[1]) : '');
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          candidates: [{ content: { parts: [{ text: JSON.stringify({ findings: ['Direct 3-flash 0 wasted RPD'] }) }] } }],
+        }),
+      };
+    };
+    const thirdOut = await generateContentWithJsonFallback('gemini-4-hydrogen', [{ text: 'third dictation' }]);
+    assert.deepEqual(JSON.parse(thirdOut).findings, ['Direct 3-flash 0 wasted RPD']);
+    assert.deepEqual(thirdRunCalls, ['gemini-3-flash-preview']);
+
+    // When Selected Model Only IS ON, 503 still stays strict (ignores 5-min skip) and surfaces helpful overload error
     setStrictSelectedModelOnlyEnabled(true);
     const strict503Calls: string[] = [];
     (globalThis as any).fetch = async (url: string) => {

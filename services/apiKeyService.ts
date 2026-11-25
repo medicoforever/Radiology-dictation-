@@ -394,10 +394,34 @@ const keyModelCooldowns = new Map<string, KeyCooldownEntry>();
 const keyGlobalInvalidUntil = new Map<string, number>();
 const keyModelRecentRequests = new Map<string, number[]>();
 const keyLastDispatchedAt = new Map<string, number>();
+const modelUnavailableCooldownUntil = new Map<string, number>();
 
 const RPM_WINDOW_MS = 60_000;
 const DEFAULT_RPM_COOLDOWN_MS = 65_000;
 const DEFAULT_INVALID_KEY_COOLDOWN_MS = 10 * 60_000;
+export const MODEL_UNAVAILABLE_COOLDOWN_MS = 5 * 60_000;
+
+export function markModelTemporarilyUnavailable(model: string, now = Date.now()): void {
+  const bucket = resolveQuotaPoolModel(model);
+  if (!bucket || bucket === 'default') return;
+  modelUnavailableCooldownUntil.set(bucket, now + MODEL_UNAVAILABLE_COOLDOWN_MS);
+}
+
+export function clearModelTemporarilyUnavailable(model: string): void {
+  const bucket = resolveQuotaPoolModel(model);
+  if (bucket) modelUnavailableCooldownUntil.delete(bucket);
+}
+
+export function isModelTemporarilyUnavailable(model: string, now = Date.now()): boolean {
+  const bucket = resolveQuotaPoolModel(model);
+  if (!bucket) return false;
+  const until = modelUnavailableCooldownUntil.get(bucket) ?? 0;
+  if (until <= now) {
+    if (until > 0) modelUnavailableCooldownUntil.delete(bucket);
+    return false;
+  }
+  return true;
+}
 
 export function getCurrentPacificDateString(nowMs = Date.now()): string {
   try {
@@ -426,13 +450,14 @@ export function resolveQuotaPoolModel(model?: string): string {
 }
 
 /**
- * Clears in-memory key cooldown & any legacy persistent daily ledger state.
+ * Clears in-memory key cooldown & temporary overload state.
  */
 export function resetApiKeyHealthState(): void {
   keyModelCooldowns.clear();
   keyGlobalInvalidUntil.clear();
   keyModelRecentRequests.clear();
   keyLastDispatchedAt.clear();
+  modelUnavailableCooldownUntil.clear();
   try {
     if (typeof window !== 'undefined' && window.localStorage) {
       localStorage.removeItem(QUOTA_LEDGER_STORAGE_KEY);
