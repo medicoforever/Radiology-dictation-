@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import {
   EXPERIMENTAL_AUDIO_FILTER_KEY,
+  VAD_SILENCE_TRIM_ENABLED_KEY,
+  DECISION1_CHATTER_FILTER_KEY,
   classifyBlobForPrefilter,
   detectAudioMimeFromHeader,
   detectSpeechIntervalsFromPcm,
@@ -23,6 +25,41 @@ import {
   type SpeechInterval,
 } from '../services/audioPrefilterService';
 import { safeLocalStorage } from '../services/storageService';
+import {
+  AVAILABLE_MODELS,
+  DEFAULT_SELECTED_MODEL,
+  FREE_TIER_HIGH_ACCURACY_SIBLING,
+  FREE_TIER_QUOTA_FALLBACK_ORDER,
+  MODEL_OPTIMAL_THINKING_LEVEL,
+  MODEL_REASONING_THINKING_LEVEL,
+  getFreeTierModelFallbackChain,
+  getLiveModelFallbackChain,
+  getOptimalThinkingLevel,
+} from '../constants';
+import {
+  SAFE_INLINE_MEDIA_BYTES,
+  callGenerateContentWithOptimalThinking,
+  generateContentWithJsonFallback,
+  resolveBlobDescriptorPartsForAttempt,
+  cleanupUploadedGeminiFiles,
+  type UploadedGeminiFileRef,
+} from '../services/geminiService';
+import {
+  MODEL_FAILOVER_EVENT,
+  SECRET_BUILTIN_KEYS_UNLOCKED_KEY,
+  USER_KEYS_STORAGE_KEY,
+  executeWithApiKeyFailover,
+  getCandidateKeysForOperation,
+  getDefaultApiKeys,
+  getFreeTierDailyQuotaStats,
+  getUserApiKeys,
+  hasConfirmedDailyExhaustionAcrossAllKeys,
+  isBuiltinKeysUnlocked,
+  lockBuiltinKeys,
+  resetApiKeyHealthState,
+  setUserApiKeys,
+  unlockBuiltinKeys,
+} from '../services/apiKeyService';
 
 function makeSineBurst(sampleRate: number, durationSec: number, amplitude: number, freqHz = 320): Float32Array {
   const len = Math.round(sampleRate * durationSec);
@@ -687,5 +724,480 @@ test('filterAudioInputsForModel combines multi-audio inputs and downloads origin
     (globalThis as any).document = prevDoc;
     (URL as any).createObjectURL = prevCreateUrl;
     (URL as any).revokeObjectURL = prevRevokeUrl;
+  }
+});
+
+test('model ordering strictly matches verified clinical accuracy and configures 99%-dictation thinking levels', () => {
+  assert.equal(DEFAULT_SELECTED_MODEL, 'gemini-4-hydrogen');
+  assert.deepEqual(
+    AVAILABLE_MODELS.slice(0, 6).map((m) => m.value),
+    [
+      'gemini-4-hydrogen',
+      'gemini-3.8-flash',
+      'gemini-3.6-flash',
+      'gemini-3-flash-preview',
+      'gemini-robotics-er-2-preview',
+      'gemini-3.5-flash-lite',
+    ]
+  );
+
+  assert.equal(getOptimalThinkingLevel('gemini-4-hydrogen'), 'low');
+  assert.equal(getOptimalThinkingLevel('gemini-4-hydrogen', 'live_chunk'), 'low');
+  assert.equal(getOptimalThinkingLevel('gemini-4-hydrogen', 'reasoning'), 'medium');
+  assert.equal(getOptimalThinkingLevel('gemini-3.8-flash'), 'medium');
+  assert.equal(getOptimalThinkingLevel('gemini-3.8-flash', 'reasoning'), 'medium');
+  assert.equal(getOptimalThinkingLevel('gemini-3.6-flash'), 'medium');
+  assert.equal(getOptimalThinkingLevel('gemini-3-flash-preview'), 'low');
+  assert.equal(getOptimalThinkingLevel('gemini-3-flash-preview', 'live_chunk'), 'minimal');
+  assert.equal(getOptimalThinkingLevel('gemini-3-flash-preview', 'reasoning'), 'low');
+  assert.equal(getOptimalThinkingLevel('gemini-robotics-er-2-preview'), 'low');
+  assert.equal(getOptimalThinkingLevel('gemini-robotics-er-2-preview', 'live_chunk'), 'minimal');
+  assert.equal(getOptimalThinkingLevel('gemini-robotics-er-2-preview', 'reasoning'), 'low');
+  assert.equal(getOptimalThinkingLevel('gemini-3.5-flash-lite'), 'minimal');
+  assert.equal(getOptimalThinkingLevel('gemini-3.5-flash-lite', 'reasoning'), 'high');
+  assert.equal(AVAILABLE_MODELS.some((m) => m.value === 'gemini-3.1-flash-lite'), false);
+
+  // Ensure no paid-only models (argon/carbon/neon/3.1-pro) are configured in free-tier tuning/failover tables
+  for (const paidOnly of ['gemini-4-argon', 'gemini-4-carbon', 'gemini-4-neon', 'gemini-3.1-pro-preview']) {
+    assert.equal(MODEL_OPTIMAL_THINKING_LEVEL[paidOnly], undefined);
+    assert.equal(MODEL_REASONING_THINKING_LEVEL[paidOnly], undefined);
+    assert.equal(FREE_TIER_HIGH_ACCURACY_SIBLING[paidOnly], undefined);
+  }
+  assert.equal(FREE_TIER_HIGH_ACCURACY_SIBLING['gemini-4-hydrogen'], 'gemini-3.8-flash');
+  assert.equal(FREE_TIER_HIGH_ACCURACY_SIBLING['gemini-3.8-flash'], 'gemini-4-hydrogen');
+});
+
+test('filterAudioInputsForModel defaults to VAD-only (no Decision-1) for 100% recall on >5s multi-window audio', async () => {
+  const sr = 16000;
+  // 2s silence + 3.5s speech + 3s silence + 3.5s speech + 2s silence (>5s total speech across 2 windows)
+  const pcmMultiWin = concatFloat32([
+    new Float32Array(sr * 2),
+    makeSineBurst(sr, 3.5, 0.15),
+    new Float32Array(sr * 3),
+    makeSineBurst(sr, 3.5, 0.15),
+    new Float32Array(sr * 2),
+  ]);
+  const wavBlob = new Blob([encodePcmToWavBytes(pcmMultiWin, sr)], { type: 'audio/wav' });
+
+  const prevWindow = (globalThis as any).window;
+  const prevFetch = (globalThis as any).fetch;
+  let fetchCalled = 0;
+  (globalThis as any).fetch = async () => {
+    fetchCalled++;
+    throw new Error('Decision-1 endpoint should NOT be called when useDecision1 is false');
+  };
+  (globalThis as any).window = {
+    AudioContext: class MockVadOnlyCtx {
+      state = 'running';
+      async decodeAudioData() {
+        return {
+          sampleRate: sr,
+          numberOfChannels: 1,
+          length: pcmMultiWin.length,
+          getChannelData: () => pcmMultiWin,
+        };
+      }
+      async close() {
+        this.state = 'closed';
+      }
+    },
+  };
+
+  try {
+    const res = await filterAudioInputsForModel(wavBlob, { enabled: true });
+    assert.equal(fetchCalled, 0);
+    assert.equal(res.stats?.applied, true);
+    assert.equal(res.stats?.usedDecision1, false);
+    assert.equal(res.stats?.droppedNonRadiologyCount, 0);
+    assert.equal(res.stats?.keptSegmentsCount, 2);
+    assert.ok((res.stats?.silenceRemovedSec ?? 0) >= 5.5);
+  } finally {
+    (globalThis as any).window = prevWindow;
+    (globalThis as any).fetch = prevFetch;
+  }
+});
+
+test('callGenerateContentWithOptimalThinking sends thinkingLevel over REST, excludes thought parts, and resolves Files API above 14.5MB', async () => {
+  const prevFetch = (globalThis as any).fetch;
+  const requests: any[] = [];
+  (globalThis as any).fetch = async (url: string, init: any) => {
+    const body = JSON.parse(init.body);
+    requests.push({ url, body });
+    if (requests.length === 4) {
+      return {
+        ok: false,
+        status: 400,
+        statusText: 'Bad Request',
+        json: async () => ({ error: { message: 'thinkingLevel not supported' } }),
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        candidates: [
+          {
+            content: {
+              parts: [
+                { thought: true, text: 'internal reasoning' },
+                { text: '{"findings":["BOLD::Normal study."]}' },
+              ],
+            },
+          },
+        ],
+      }),
+    };
+  };
+
+  try {
+    const mockClient: any = { models: { generateContent: async () => ({ text: '' }) } };
+    const text1 = await callGenerateContentWithOptimalThinking({
+      client: mockClient,
+      apiKey: 'test-key-123456',
+      model: 'gemini-4-hydrogen',
+      parts: [{ text: 'hello' }],
+      temperature: 0.1,
+      responseMimeType: 'application/json',
+    });
+    assert.equal(text1, '{"findings":["BOLD::Normal study."]}');
+    assert.equal(requests[0].body.generationConfig.thinkingConfig.thinkingLevel, 'low');
+
+    // Verify elevated reasoning taskType sends medium on gemini-4-hydrogen and low on gemini-3-flash-preview
+    const textReasoning = await callGenerateContentWithOptimalThinking({
+      client: mockClient,
+      apiKey: 'test-key-123456',
+      model: 'gemini-4-hydrogen',
+      parts: [{ text: 'merge template' }],
+      temperature: 0.1,
+      responseMimeType: 'application/json',
+      taskType: 'reasoning',
+    });
+    assert.equal(textReasoning, '{"findings":["BOLD::Normal study."]}');
+    assert.equal(requests[1].body.generationConfig.thinkingConfig.thinkingLevel, 'medium');
+
+    const textFlashPreviewReasoning = await callGenerateContentWithOptimalThinking({
+      client: mockClient,
+      apiKey: 'test-key-123456',
+      model: 'gemini-3-flash-preview',
+      parts: [{ text: 'plan batch' }],
+      temperature: 0.1,
+      taskType: 'reasoning',
+    });
+    assert.equal(textFlashPreviewReasoning, '{"findings":["BOLD::Normal study."]}');
+    assert.equal(requests[2].body.generationConfig.thinkingConfig.thinkingLevel, 'low');
+
+    // Subsequent call simulates 400 on thinkingLevel -> retries cleanly once without thinkingConfig
+    const text2 = await callGenerateContentWithOptimalThinking({
+      client: mockClient,
+      apiKey: 'test-key-123456',
+      model: 'gemini-3.8-flash',
+      parts: [{ text: 'hello' }],
+      temperature: 0.1,
+    });
+    assert.equal(text2, '{"findings":["BOLD::Normal study."]}');
+    assert.equal(requests.length, 5);
+    assert.equal(requests[3].body.generationConfig.thinkingConfig.thinkingLevel, 'medium');
+    assert.equal(requests[4].body.generationConfig.thinkingConfig, undefined);
+  } finally {
+    (globalThis as any).fetch = prevFetch;
+  }
+
+  // Verify Files API upload path vs inlineData threshold + cleanup + storage keys
+  assert.ok(SAFE_INLINE_MEDIA_BYTES > 14 * 1024 * 1024);
+  let uploadedCount = 0;
+  let deletedName = '';
+  const fakeClient: any = {
+    files: {
+      upload: async () => {
+        uploadedCount++;
+        return { name: 'files/large-1', uri: 'https://generativelanguage.googleapis.com/v1beta/files/large-1', mimeType: 'audio/ogg', state: 'ACTIVE' };
+      },
+      delete: async ({ name }: { name: string }) => {
+        deletedName = name;
+      },
+    },
+  };
+  const uploadedByKey = new Map<string, Map<number, UploadedGeminiFileRef>>();
+  const largeBlob = new Blob([new Uint8Array([0x4f, 0x67, 0x67, 0x53])], { type: 'audio/ogg' });
+  const parts = await resolveBlobDescriptorPartsForAttempt({
+    descriptors: [
+      { blob: largeBlob, cleanMime: 'audio/ogg' }, // omitted inlineBase64 simulates > 14.5MB
+      { blob: new Blob(['x']), cleanMime: 'audio/ogg', inlineBase64: 'QQ==' },
+    ],
+    client: fakeClient,
+    apiKey: 'k1',
+    uploadedByKey,
+  });
+  assert.equal(uploadedCount, 1);
+  assert.deepEqual(parts[0], { fileData: { fileUri: 'https://generativelanguage.googleapis.com/v1beta/files/large-1', mimeType: 'audio/ogg' } });
+  assert.deepEqual(parts[1], { inlineData: { mimeType: 'audio/ogg', data: 'QQ==' } });
+
+  await cleanupUploadedGeminiFiles(uploadedByKey);
+  assert.equal(deletedName, 'files/large-1');
+  assert.ok(VAD_SILENCE_TRIM_ENABLED_KEY.length > 0);
+  assert.ok(DECISION1_CHATTER_FILTER_KEY.length > 0);
+});
+
+test('generateContentWithJsonFallback fails over from exhausted free-tier 4-hydrogen quota to 14/14 sibling gemini-3.8-flash', async () => {
+  const store = new Map<string, string>();
+  store.set(USER_KEYS_STORAGE_KEY, JSON.stringify(['AIzaSyTestKeyForQuotaFailover123456']));
+  const mockLocalStorage = {
+    getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+    setItem: (k: string, v: string) => store.set(k, String(v)),
+    removeItem: (k: string) => store.delete(k),
+  };
+  const prevWindow = (globalThis as any).window;
+  const prevLocalStorage = (globalThis as any).localStorage;
+  const prevFetch = (globalThis as any).fetch;
+  (globalThis as any).window = { localStorage: mockLocalStorage };
+  (globalThis as any).localStorage = mockLocalStorage;
+
+  const calledModels: string[] = [];
+  (globalThis as any).fetch = async (url: string) => {
+    const match = url.match(/models\/([^:]+):generateContent/);
+    const m = match ? decodeURIComponent(match[1]) : '';
+    calledModels.push(m);
+    if (m === 'gemini-4-hydrogen') {
+      return {
+        ok: false,
+        status: 429,
+        statusText: 'Too Many Requests',
+        json: async () => ({ error: { message: '429 RESOURCE_EXHAUSTED quota exceeded' } }),
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        candidates: [{ content: { parts: [{ text: '{"findings":["BOLD::Failover ok."]}' }] } }],
+      }),
+    };
+  };
+
+  try {
+    resetApiKeyHealthState();
+    const out = await generateContentWithJsonFallback('gemini-4-hydrogen', [{ text: 'test' }]);
+    assert.equal(out, '{"findings":["BOLD::Failover ok."]}');
+    assert.deepEqual(calledModels, ['gemini-4-hydrogen', 'gemini-3.8-flash']);
+  } finally {
+    resetApiKeyHealthState();
+    (globalThis as any).window = prevWindow;
+    (globalThis as any).localStorage = prevLocalStorage;
+    (globalThis as any).fetch = prevFetch;
+  }
+});
+
+test('getFreeTierModelFallbackChain orders accuracy strictly and excludes gemini-3.5-flash-lite from automatic failover', () => {
+  assert.deepEqual(getFreeTierModelFallbackChain('gemini-4-hydrogen'), [
+    'gemini-4-hydrogen',
+    'gemini-3.8-flash',
+    'gemini-3.6-flash',
+    'gemini-3-flash-preview',
+    'gemini-robotics-er-2-preview',
+  ]);
+  // gemini-3.5-flash shares quota pool with gemini-3.6-flash -> skips duplicate 3.6 bucket
+  const from35 = getFreeTierModelFallbackChain('gemini-3.5-flash');
+  assert.equal(from35[0], 'gemini-3.5-flash');
+  assert.equal(from35.includes('gemini-3.6-flash'), false);
+  assert.equal(getFreeTierModelFallbackChain('gemini-4-hydrogen').includes('gemini-3.5-flash-lite'), false);
+  assert.equal(getLiveModelFallbackChain('gemini-4-hydrogen').length, FREE_TIER_QUOTA_FALLBACK_ORDER.length);
+});
+
+test('multi-account LRU scheduler tracks PT daily quota ledger, pre-skips exhausted models, informs UI, and never auto-drops to 3.5-flash-lite', async () => {
+  const store = new Map<string, string>();
+  const keys = ['AIzaSyAccountOneFreeKey00001', 'AIzaSyAccountTwoFreeKey00002', 'AIzaSyAccountThreeFreeKey0003'];
+  store.set(USER_KEYS_STORAGE_KEY, JSON.stringify(keys));
+  const mockLocalStorage = {
+    getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+    setItem: (k: string, v: string) => store.set(k, String(v)),
+    removeItem: (k: string) => store.delete(k),
+  };
+  const prevWindow = (globalThis as any).window;
+  const prevLocalStorage = (globalThis as any).localStorage;
+  const prevFetch = (globalThis as any).fetch;
+  const failoverEvents: any[] = [];
+  (globalThis as any).window = {
+    localStorage: mockLocalStorage,
+    dispatchEvent: (ev: any) => {
+      if (ev?.type === MODEL_FAILOVER_EVENT) failoverEvents.push(ev.detail);
+      return true;
+    },
+  };
+  (globalThis as any).localStorage = mockLocalStorage;
+  resetApiKeyHealthState();
+
+  try {
+    // 1. Consecutive dispatches rotate evenly across all 3 accounts (no collision)
+    const pickedOrder: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      await executeWithApiKeyFailover(
+        async (_c, apiKey) => {
+          pickedOrder.push(apiKey);
+          return 'ok';
+        },
+        { selectedModel: 'gemini-4-hydrogen', delayMs: 0 }
+      );
+    }
+    assert.equal(new Set(pickedOrder).size, 3);
+
+    // 2. Exhaust key[0] daily RPD on gemini-4-hydrogen -> LRU sweeps all 3 keys, cools key[0] for RPD,
+    //    skips key[0] cleanly afterward, while keeping key[0] immediately healthy for gemini-3.8-flash
+    for (let i = 0; i < keys.length; i++) {
+      await executeWithApiKeyFailover(
+        async (_c, apiKey) => {
+          if (apiKey === keys[0]) {
+            const err: any = new Error('429 GenerateRequestsPerDayPerProjectPerModel-FreeTier exceeded');
+            err.status = 429;
+            throw err;
+          }
+          return 'ok';
+        },
+        { selectedModel: 'gemini-4-hydrogen', delayMs: 0 }
+      );
+    }
+    const hydrogenAfterCooldown = getCandidateKeysForOperation('gemini-4-hydrogen').candidateKeys;
+    assert.equal(hydrogenAfterCooldown.includes(keys[0]), false);
+    assert.equal(hydrogenAfterCooldown.length, 2);
+
+    const for38Flash = getCandidateKeysForOperation('gemini-3.8-flash').candidateKeys;
+    assert.equal(for38Flash.length, 3);
+    assert.ok(for38Flash.includes(keys[0]));
+
+    // 3. Cross-model cascade reaches gemini-robotics-er-2-preview, emits failover events, updates quota ledger,
+    //    pre-skips exhausted 4-hydrogen on subsequent calls, and NEVER auto-uses gemini-3.5-flash-lite
+    resetApiKeyHealthState();
+    failoverEvents.length = 0;
+    const cascadeVisited: string[] = [];
+    (globalThis as any).fetch = async (url: string) => {
+      const match = url.match(/models\/([^:]+):generateContent/);
+      const m = match ? decodeURIComponent(match[1]) : '';
+      cascadeVisited.push(m);
+      if (m !== 'gemini-robotics-er-2-preview') {
+        return {
+          ok: false,
+          status: 429,
+          statusText: 'Too Many Requests',
+          json: async () => ({ error: { message: '429 PerDay RPD exhausted' } }),
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          candidates: [{ content: { parts: [{ text: '{"findings":["BOLD::Accurate robotics fallback ok."]}' }] } }],
+        }),
+      };
+    };
+
+    const cascadeOut = await generateContentWithJsonFallback('gemini-4-hydrogen', [{ text: 'test' }]);
+    assert.equal(cascadeOut, '{"findings":["BOLD::Accurate robotics fallback ok."]}');
+    assert.ok(cascadeVisited.includes('gemini-4-hydrogen'));
+    assert.ok(cascadeVisited.includes('gemini-3.8-flash'));
+    assert.ok(cascadeVisited.includes('gemini-3.6-flash'));
+    assert.ok(cascadeVisited.includes('gemini-3-flash-preview'));
+    assert.equal(cascadeVisited.includes('gemini-3.5-flash-lite'), false);
+    assert.equal(cascadeVisited[cascadeVisited.length - 1], 'gemini-robotics-er-2-preview');
+    assert.ok(failoverEvents.length > 0);
+    assert.equal(hasConfirmedDailyExhaustionAcrossAllKeys('gemini-4-hydrogen'), true);
+
+    // Subsequent call must pre-skip already RPD-exhausted models in 0ms and jump straight to robotics-er-2-preview
+    cascadeVisited.length = 0;
+    await generateContentWithJsonFallback('gemini-4-hydrogen', [{ text: 'test 2' }]);
+    assert.deepEqual(cascadeVisited, ['gemini-robotics-er-2-preview']);
+
+    const ledgerStats = getFreeTierDailyQuotaStats();
+    assert.equal(ledgerStats.totalKeys, 3);
+    const hydrogenStat = ledgerStats.models.find((m) => m.model === 'gemini-4-hydrogen');
+    assert.equal(hydrogenStat?.exhaustedKeys, 3);
+
+    // Even if all 5 accurate models hit 429, Flash-Lite must NOT be tried automatically
+    resetApiKeyHealthState();
+    const forcedVisited: string[] = [];
+    (globalThis as any).fetch = async (url: string) => {
+      const match = url.match(/models\/([^:]+):generateContent/);
+      forcedVisited.push(match ? decodeURIComponent(match[1]) : '');
+      return {
+        ok: false,
+        status: 429,
+        statusText: 'Too Many Requests',
+        json: async () => ({ error: { message: '429 PerDay RPD exhausted' } }),
+      };
+    };
+    await assert.rejects(
+      () => generateContentWithJsonFallback('gemini-4-hydrogen', [{ text: 'all exhausted' }]),
+      /Gemini 3\.5 Flash Lite was intentionally skipped/i
+    );
+    assert.equal(forcedVisited.includes('gemini-3.5-flash-lite'), false);
+  } finally {
+    resetApiKeyHealthState();
+    (globalThis as any).window = prevWindow;
+    (globalThis as any).localStorage = prevLocalStorage;
+    (globalThis as any).fetch = prevFetch;
+  }
+});
+
+test('custom keys always execute strictly before the 9 unlocked (1198) built-in keys and persist in localStorage', async () => {
+  const store = new Map<string, string>();
+  const mockLocalStorage = {
+    getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+    setItem: (k: string, v: string) => store.set(k, String(v)),
+    removeItem: (k: string) => store.delete(k),
+  };
+  const prevWindow = (globalThis as any).window;
+  const prevLocalStorage = (globalThis as any).localStorage;
+  (globalThis as any).window = {
+    localStorage: mockLocalStorage,
+    dispatchEvent: () => true,
+  };
+  (globalThis as any).localStorage = mockLocalStorage;
+  resetApiKeyHealthState();
+
+  try {
+    const unlockRes = unlockBuiltinKeys('1198');
+    assert.equal(unlockRes.success, true);
+    assert.equal(isBuiltinKeysUnlocked(), true);
+    assert.equal(store.get(SECRET_BUILTIN_KEYS_UNLOCKED_KEY), 'true');
+
+    const builtinKeys = getDefaultApiKeys();
+    assert.equal(builtinKeys.length, 9);
+
+    const customKeys = ['AIzaSyUserPriorityFirst00001', 'AIzaSyUserPrioritySecond0002'];
+    setUserApiKeys(customKeys);
+    assert.deepEqual(getUserApiKeys(), customKeys);
+
+    const candidateInfo = getCandidateKeysForOperation('gemini-4-hydrogen');
+    assert.equal(candidateInfo.isCustom, true);
+    assert.equal(candidateInfo.hasBuiltinBackup, true);
+    assert.equal(candidateInfo.candidateKeys.length, 11);
+    // First 2 candidates must be strictly the user's custom keys; remaining 9 are built-in backup
+    assert.deepEqual(new Set(candidateInfo.candidateKeys.slice(0, 2)), new Set(customKeys));
+    assert.deepEqual(new Set(candidateInfo.candidateKeys.slice(2)), new Set(builtinKeys));
+
+    // When both custom keys exhaust quota, execution seamlessly fails over into the 9 built-in keys
+    const attemptOrder: string[] = [];
+    const result = await executeWithApiKeyFailover(
+      async (_c, apiKey) => {
+        attemptOrder.push(apiKey);
+        if (customKeys.includes(apiKey)) {
+          const err: any = new Error('429 PerDay RPD exhausted on user key');
+          err.status = 429;
+          throw err;
+        }
+        return `served-by:${apiKey}`;
+      },
+      { selectedModel: 'gemini-4-hydrogen', delayMs: 0 }
+    );
+    assert.equal(attemptOrder.length, 3);
+    assert.ok(customKeys.includes(attemptOrder[0]));
+    assert.ok(customKeys.includes(attemptOrder[1]));
+    assert.ok(builtinKeys.includes(attemptOrder[2]));
+    assert.equal(result, `served-by:${attemptOrder[2]}`);
+
+    lockBuiltinKeys();
+    assert.equal(isBuiltinKeysUnlocked(), false);
+  } finally {
+    resetApiKeyHealthState();
+    (globalThis as any).window = prevWindow;
+    (globalThis as any).localStorage = prevLocalStorage;
   }
 });

@@ -26,6 +26,8 @@ import {
   clearUserApiKeys,
   getDefaultApiKeys,
   getCandidateKeysForOperation,
+  getFreeTierDailyQuotaStats,
+  resetFreeTierDailyQuotaStats,
   maskApiKey,
   testApiKeyValidity,
   isBuiltinKeysUnlocked,
@@ -33,6 +35,7 @@ import {
   lockBuiltinKeys,
   syncApiKeysWithGoogleDrive,
   API_KEYS_UPDATED_EVENT,
+  type FreeTierModelQuotaStat,
 } from '../services/apiKeyService';
 
 interface ApiKeyModalProps {
@@ -53,11 +56,15 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
   const [secretKeyInput, setSecretKeyInput] = useState('');
   const [isUnlocked, setIsUnlocked] = useState(isBuiltinKeysUnlocked());
   const [showGuide, setShowGuide] = useState(true);
+  const [quotaStats, setQuotaStats] = useState<{ datePt: string; totalKeys: number; models: FreeTierModelQuotaStat[] }>(() =>
+    getFreeTierDailyQuotaStats()
+  );
 
   // Sync state from storage
   const refreshKeys = () => {
     setUserKeys(getUserApiKeys());
     setIsUnlocked(isBuiltinKeysUnlocked());
+    setQuotaStats(getFreeTierDailyQuotaStats());
   };
 
   useEffect(() => {
@@ -288,7 +295,9 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
                     : 'bg-amber-100 text-amber-800 dark:bg-amber-900/50 dark:text-amber-300'
                 }`}
               >
-                {isUsingCustomKeys
+                {isUsingCustomKeys && isUnlocked
+                  ? `Custom (${userKeys.length}) → +9 Built-In Backup`
+                  : isUsingCustomKeys
                   ? `Custom Keys Active (${userKeys.length})`
                   : isUnlocked
                   ? `Secret Mode Active (9 Built-In Keys)`
@@ -296,9 +305,13 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
               </span>
             </div>
             <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
-              {isUsingCustomKeys ? (
+              {isUsingCustomKeys && isUnlocked ? (
                 <>
-                  The app is using <strong>ONLY your custom API key(s)</strong>. Every dictation randomly picks from your keys, and if any key fails or hits a quota limit, it automatically retries with another random key without interrupting your work.
+                  <strong>Priority Failover Active:</strong> Your <strong>{userKeys.length} custom API key(s)</strong> are always tried first with smart load balancing; if they reach quota or rate limits, the app seamlessly fails over to the <strong>9 built-in keys</strong>. Both custom keys and secret mode are saved permanently in local storage and Google Drive (when signed in).
+                </>
+              ) : isUsingCustomKeys ? (
+                <>
+                  The app is using <strong>your custom API key(s)</strong>, permanently saved in local storage and Google Drive (when signed in). Requests rotate cleanly across healthy keys and fail over automatically on quota limits.
                 </>
               ) : isUnlocked ? (
                 <>
@@ -386,10 +399,10 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
 
                 <div className="mt-3 p-3 rounded-lg bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/60 text-amber-900 dark:text-amber-200">
                   <p className="font-bold flex items-center gap-1.5 text-xs">
-                    <span>💡</span> Pro-Tip for Unlimited Daily Dictations:
+                    <span>💡</span> Free-Tier Multi-Account Pooling (For You &amp; Friends):
                   </p>
                   <p className="mt-1 leading-relaxed text-[11px] sm:text-xs text-amber-800 dark:text-amber-300">
-                    If you dictate high volumes of reports each day, you can create keys under different Google / Gmail accounts and paste all of them below! This app will automatically rotate and failover across all of them to multiply your total dictation capacity.
+                    Each free Google Cloud project gives <strong>20 RPD</strong> on Gemini 4 Hydrogen, 3.8 Flash, 3.6 Flash, 3 Flash, and Robotics ER-2 Preview (<strong>100</strong> frontier reports/day) plus <strong>500 RPD</strong> on Gemini 3.5 Flash Lite. Keys from <strong>different Google accounts / separate projects</strong> have completely independent quotas—the app spreads load across healthy keys and fails over automatically with zero rate-limit penalty. Avoid creating multiple keys under the same Google Cloud project, as those share one quota.
                   </p>
                 </div>
               </div>
@@ -560,6 +573,57 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
                         >
                           <Trash2 className="w-3.5 h-3.5" />
                         </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Daily Free-Tier Model Quota Tracker */}
+          {quotaStats.totalKeys > 0 && (
+            <div className="p-4 rounded-xl bg-slate-50 dark:bg-slate-800/30 border border-slate-200 dark:border-slate-800 space-y-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <span className="text-xs font-bold text-slate-800 dark:text-slate-200 block">
+                    Estimated Daily Free-Tier Quotas ({quotaStats.datePt} PT)
+                  </span>
+                  <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                    Across {quotaStats.totalKeys} active key pool{quotaStats.totalKeys > 1 ? 's' : ''} • Resets midnight Pacific Time • Flash Lite excluded from auto-failover
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    resetFreeTierDailyQuotaStats();
+                    refreshKeys();
+                  }}
+                  className="px-2 py-1 text-[11px] font-semibold rounded-lg bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 transition-colors shrink-0 cursor-pointer"
+                  title="Clear local daily quota counters if AI Studio quotas already reset"
+                >
+                  Reset Stats
+                </button>
+              </div>
+              <div className="space-y-1.5">
+                {quotaStats.models.map((stat) => {
+                  const isExhausted = stat.totalKeys > 0 && stat.exhaustedKeys >= stat.totalKeys;
+                  const pct = stat.totalCapacity > 0 ? Math.min(100, Math.round((stat.usedToday / stat.totalCapacity) * 100)) : 0;
+                  return (
+                    <div key={stat.model} className="text-[11px] space-y-0.5">
+                      <div className="flex items-center justify-between">
+                        <span className="font-medium text-slate-700 dark:text-slate-300">{stat.label}</span>
+                        <span className={`font-mono font-semibold ${isExhausted ? 'text-rose-600 dark:text-rose-400' : 'text-slate-600 dark:text-slate-300'}`}>
+                          {stat.usedToday} / {stat.totalCapacity} {isExhausted ? '• Daily Exhausted' : ''}
+                        </span>
+                      </div>
+                      <div className="w-full h-1.5 bg-slate-200 dark:bg-slate-700 rounded-full overflow-hidden">
+                        <div
+                          className={`h-full transition-all ${
+                            isExhausted ? 'bg-rose-500' : pct >= 75 ? 'bg-amber-500' : 'bg-emerald-500'
+                          }`}
+                          style={{ width: `${isExhausted ? 100 : pct}%` }}
+                        />
                       </div>
                     </div>
                   );

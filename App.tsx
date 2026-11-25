@@ -34,7 +34,7 @@ import { DriveReportsModal } from './components/DriveReportsModal';
 import { RotateCcw, X, ExternalLink, Power, Sparkles, Trash2, Download, ShieldCheck, BookOpen, Key } from 'lucide-react';
 import { OwnershipModal } from './components/ui/OwnershipModal';
 import { ApiKeyModal } from './components/ApiKeyModal';
-import { getUserApiKeys, API_KEYS_UPDATED_EVENT, isBuiltinKeysUnlocked, unlockBuiltinKeys, syncApiKeysWithGoogleDrive } from './services/apiKeyService';
+import { getUserApiKeys, API_KEYS_UPDATED_EVENT, MODEL_FAILOVER_EVENT, ModelFailoverEventDetail, isBuiltinKeysUnlocked, unlockBuiltinKeys, syncApiKeysWithGoogleDrive } from './services/apiKeyService';
 import ThemeSelector from './components/ThemeSelector';
 import { getUpcomingTemplate, clearUpcomingTemplate, subscribeToUpcomingTemplate, UpcomingTemplateConfig, extractTemplateTagIds, mergeTemplateImages } from './services/upcomingTemplateService';
 import MacrosAndDictionaryModal from './components/MacrosAndDictionaryModal';
@@ -46,6 +46,8 @@ import {
   filterAudioInputsForModel,
   AudioPrefilterStats,
   EXPERIMENTAL_AUDIO_FILTER_KEY,
+  VAD_SILENCE_TRIM_ENABLED_KEY,
+  DECISION1_CHATTER_FILTER_KEY,
   combineAudioBlobsToCompact,
   downloadOriginalAudioInput,
   downloadCompactedAudioBlob,
@@ -75,6 +77,7 @@ async function runAudioPrefilterSafely(
   input: Blob | Blob[],
   options: {
     enabled: boolean;
+    useDecision1?: boolean;
     abortSignal?: AbortSignal;
     onProgress?: (stage: string) => void;
     onDone?: () => void;
@@ -87,6 +90,7 @@ async function runAudioPrefilterSafely(
   try {
     const res = await filterAudioInputsForModel(input, {
       enabled: true,
+      useDecision1: Boolean(options.useDecision1),
       abortSignal: options.abortSignal,
       onProgress: options.onProgress,
     });
@@ -236,10 +240,17 @@ const App: React.FC = () => {
     return safeLocalStorage.getItem<boolean>(ERROR_CHECK_ENABLED_KEY, false);
   });
   const [isExperimentalAudioFilterEnabled, setIsExperimentalAudioFilterEnabled] = useState(() => {
-    return safeLocalStorage.getItem<boolean>(EXPERIMENTAL_AUDIO_FILTER_KEY, false);
+    const vadSaved = safeLocalStorage.getRaw(VAD_SILENCE_TRIM_ENABLED_KEY, '');
+    if (vadSaved !== '') return vadSaved === 'true';
+    return true;
   });
   const isExperimentalAudioFilterEnabledRef = useRef(isExperimentalAudioFilterEnabled);
   isExperimentalAudioFilterEnabledRef.current = isExperimentalAudioFilterEnabled;
+  const [isDecision1ChatterFilterEnabled, setIsDecision1ChatterFilterEnabled] = useState(() => {
+    return safeLocalStorage.getItem<boolean>(DECISION1_CHATTER_FILTER_KEY, false);
+  });
+  const isDecision1ChatterFilterEnabledRef = useRef(isDecision1ChatterFilterEnabled);
+  isDecision1ChatterFilterEnabledRef.current = isDecision1ChatterFilterEnabled;
   const [prefilterStats, setPrefilterStats] = useState<AudioPrefilterStats | null>(null);
   const [compactedAudioBlob, setCompactedAudioBlob] = useState<Blob | null>(null);
   const [prefilterStatusMsg, setPrefilterStatusMsg] = useState<string | null>(null);
@@ -258,6 +269,7 @@ const App: React.FC = () => {
   const [isSecretUnlocked, setIsSecretUnlocked] = useState<boolean>(() => isBuiltinKeysUnlocked());
   const [hasMultipleSingleDictations, setHasMultipleSingleDictations] = useState<boolean>(false);
   const [errorRecorderStatus, setErrorRecorderStatus] = useState<AppStatus>(AppStatus.Idle);
+  const [modelFailoverNotice, setModelFailoverNotice] = useState<ModelFailoverEventDetail | null>(null);
 
   const handleHeaderTitleClick = useCallback(() => {
     const input = window.prompt("Enter secret key:");
@@ -279,6 +291,22 @@ const App: React.FC = () => {
     };
     window.addEventListener(API_KEYS_UPDATED_EVENT, handleKeyUpdate);
     return () => window.removeEventListener(API_KEYS_UPDATED_EVENT, handleKeyUpdate);
+  }, []);
+
+  useEffect(() => {
+    let dismissTimer: ReturnType<typeof setTimeout> | null = null;
+    const handleModelFailover = (ev: Event) => {
+      const customEv = ev as CustomEvent<ModelFailoverEventDetail>;
+      if (!customEv?.detail) return;
+      setModelFailoverNotice(customEv.detail);
+      if (dismissTimer) clearTimeout(dismissTimer);
+      dismissTimer = setTimeout(() => setModelFailoverNotice(null), 6500);
+    };
+    window.addEventListener(MODEL_FAILOVER_EVENT, handleModelFailover);
+    return () => {
+      window.removeEventListener(MODEL_FAILOVER_EVENT, handleModelFailover);
+      if (dismissTimer) clearTimeout(dismissTimer);
+    };
   }, []);
 
   useEffect(() => {
@@ -439,8 +467,13 @@ const App: React.FC = () => {
   }, [isErrorCheckEnabled]);
 
   useEffect(() => {
+    safeLocalStorage.setItem(VAD_SILENCE_TRIM_ENABLED_KEY, isExperimentalAudioFilterEnabled);
     safeLocalStorage.setItem(EXPERIMENTAL_AUDIO_FILTER_KEY, isExperimentalAudioFilterEnabled);
   }, [isExperimentalAudioFilterEnabled]);
+
+  useEffect(() => {
+    safeLocalStorage.setItem(DECISION1_CHATTER_FILTER_KEY, isDecision1ChatterFilterEnabled);
+  }, [isDecision1ChatterFilterEnabled]);
 
   const toggleTheme = () => {
     setTheme(prevTheme => (prevTheme === 'light' ? 'dark' : 'light'));
@@ -1054,6 +1087,7 @@ const App: React.FC = () => {
             item.audioBlobs,
             {
               enabled: isExperimentalAudioFilterEnabledRef.current,
+              useDecision1: isDecision1ChatterFilterEnabledRef.current,
               abortSignal: itemAbortController.signal,
               onProgress: (m) => {
                 if (!itemAbortController.signal.aborted) {
@@ -1364,6 +1398,7 @@ const App: React.FC = () => {
         audioBlobs,
         {
           enabled: isExperimentalAudioFilterEnabledRef.current,
+          useDecision1: isDecision1ChatterFilterEnabledRef.current,
           abortSignal: currentAbortController.signal,
           onProgress: (m) => {
             if (!currentAbortController.signal.aborted && processingRequestIdRef.current === reqId) {
@@ -1645,6 +1680,7 @@ const App: React.FC = () => {
               audioBlob,
               {
                 enabled: isExperimentalAudioFilterEnabledRef.current,
+                useDecision1: isDecision1ChatterFilterEnabledRef.current,
                 onProgress: (m) => {
                   if (processingRequestIdRef.current === reqId) {
                     setPrefilterStatusMsg(m);
@@ -1772,6 +1808,7 @@ const App: React.FC = () => {
         blobsToProcess,
         {
           enabled: isExperimentalAudioFilterEnabledRef.current,
+          useDecision1: isDecision1ChatterFilterEnabledRef.current,
           onProgress: (m) => {
             if (processingRequestIdRef.current === reqId) {
               setPrefilterStatusMsg(m);
@@ -1913,6 +1950,7 @@ const App: React.FC = () => {
         compactedAudioBlob: continueCompactedBlob,
       } = await runAudioPrefilterSafely(newAudioBlob, {
         enabled: isExperimentalAudioFilterEnabledRef.current,
+        useDecision1: isDecision1ChatterFilterEnabledRef.current,
         contextLabel: 'Continue dictation',
       });
 
@@ -2415,6 +2453,7 @@ const App: React.FC = () => {
                               retryBlobs,
                               {
                                 enabled: isExperimentalAudioFilterEnabledRef.current,
+                                useDecision1: isDecision1ChatterFilterEnabledRef.current,
                                 onProgress: (m) => setPrefilterStatusMsg(`Report #1 retry: ${m}`),
                                 onDone: () => setPrefilterStatusMsg(null),
                                 contextLabel: 'Retry Report #1',
@@ -2475,6 +2514,7 @@ const App: React.FC = () => {
                               blob,
                               {
                                 enabled: isExperimentalAudioFilterEnabledRef.current,
+                                useDecision1: isDecision1ChatterFilterEnabledRef.current,
                                 onProgress: (m) => setPrefilterStatusMsg(m),
                                 onDone: () => setPrefilterStatusMsg(null),
                                 contextLabel: 'Retry first dictation',
@@ -2649,7 +2689,7 @@ const App: React.FC = () => {
                           onClick={handleDownloadCompacted}
                           className="inline-flex items-center gap-2 bg-amber-600 text-white font-semibold py-2 px-5 rounded-lg hover:bg-amber-700 focus:outline-none focus:ring-2 focus:ring-amber-400 focus:ring-opacity-50 transition-colors shadow-sm text-sm cursor-pointer"
                           aria-label="Download Compacted Audio"
-                          title="Download Decision-1 compacted pre-trimmed audio"
+                          title={prefilterStats?.usedDecision1 ? 'Download compacted audio trimmed by VAD + Decision-1' : 'Download VAD silence-trimmed compacted audio'}
                         >
                           <DownloadIcon className="w-4 h-4" /> Download Compacted ({formatFileSize(compactedAudioBlob.size)})
                         </button>
@@ -2814,7 +2854,7 @@ const App: React.FC = () => {
               >
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="font-bold px-1.5 py-0.5 rounded-md bg-amber-200/80 dark:bg-amber-900/70 text-amber-900 dark:text-amber-200 text-[10px] uppercase tracking-wide">
-                    Smart Pre-Trim (Experimental)
+                    {prefilterStats.usedDecision1 ? 'Smart Pre-Trim (VAD + Decision-1)' : 'VAD Silence Trim'}
                   </span>
                   <span className="font-semibold">
                     {formatPrefilterDuration(prefilterStats.originalDurationSec)} → {formatPrefilterDuration(prefilterStats.keptDurationSec)}
@@ -2858,7 +2898,7 @@ const App: React.FC = () => {
                       type="button"
                       onClick={handleDownloadCompacted}
                       className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-600 hover:bg-amber-700 text-white font-semibold transition-colors cursor-pointer"
-                      title="Download compacted audio made from Decision 1"
+                      title={prefilterStats?.usedDecision1 ? 'Download compacted audio trimmed by VAD + Decision-1' : 'Download VAD silence-trimmed compacted audio'}
                     >
                       <DownloadIcon className="w-3 h-3" />
                       <span>Compacted ({formatFileSize(compactedAudioBlob.size)})</span>
@@ -2870,7 +2910,7 @@ const App: React.FC = () => {
             {prefilterStats && !prefilterStats.applied && prefilterStats.skippedReason && isExperimentalAudioFilterEnabled && (
               <div className="mb-4 px-3.5 py-2 bg-slate-100/90 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700 rounded-xl flex flex-wrap items-center justify-between gap-2 text-xs text-slate-700 dark:text-slate-300">
                 <span>
-                  <strong className="font-semibold">Smart Pre-Trim:</strong> {prefilterStats.skippedReason}
+                  <strong className="font-semibold">{prefilterStats.usedDecision1 ? 'Smart Pre-Trim:' : 'VAD Silence Trim:'}</strong> {prefilterStats.skippedReason}
                 </span>
                 {audioBlob && (
                   <button
@@ -2909,6 +2949,7 @@ const App: React.FC = () => {
             identifiedErrors={identifiedErrors}
             errorCheckStatus={errorCheckStatus}
             isExperimentalAudioFilterEnabled={isExperimentalAudioFilterEnabled}
+            useDecision1ChatterFilter={isDecision1ChatterFilterEnabled}
             prefilterStats={prefilterStats}
             compactedAudioBlob={compactedAudioBlob}
             onOpenMacrosModal={() => setIsMacrosModalOpen(true)}
@@ -2980,7 +3021,7 @@ const App: React.FC = () => {
                   <button
                     onClick={handleDownloadCompacted}
                     className="flex items-center gap-2 bg-amber-600 text-white font-bold py-2.5 px-5 rounded-lg hover:bg-amber-700 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:ring-opacity-50 transition-colors shadow text-sm cursor-pointer"
-                    title="Download Decision-1 compacted pre-trimmed audio"
+                    title={prefilterStats?.usedDecision1 ? 'Download compacted audio trimmed by VAD + Decision-1' : 'Download VAD silence-trimmed compacted audio'}
                   >
                     <DownloadIcon className="w-4 h-4" /> Download Compacted Audio ({formatFileSize(compactedAudioBlob.size)})
                   </button>
@@ -3284,7 +3325,9 @@ const App: React.FC = () => {
                   }`}
                   aria-label="Gemini API Keys"
                   title={
-                    customKeysCount > 0
+                    customKeysCount > 0 && isSecretUnlocked
+                      ? `API Keys (${customKeysCount} custom first → 9 built-in backup)`
+                      : customKeysCount > 0
                       ? `API Keys (${customKeysCount} active)`
                       : isSecretUnlocked
                       ? 'API Keys (Secret Mode: 9 built-in keys active)'
@@ -3381,7 +3424,9 @@ const App: React.FC = () => {
                 }`}
                 aria-label="Gemini API Keys & Failover"
                 title={
-                  customKeysCount > 0
+                  customKeysCount > 0 && isSecretUnlocked
+                    ? `API Keys (${customKeysCount} custom first → 9 built-in backup)`
+                    : customKeysCount > 0
                     ? `API Keys (${customKeysCount} custom keys active)`
                     : isSecretUnlocked
                     ? 'API Keys (Secret Mode: 9 rotating keys active)'
@@ -3396,7 +3441,9 @@ const App: React.FC = () => {
                     : 'text-amber-600 dark:text-amber-400'
                 }`} />
                 <span className="text-xs font-semibold hidden md:inline">
-                  {customKeysCount > 0
+                  {customKeysCount > 0 && isSecretUnlocked
+                    ? `Custom (${customKeysCount}) + 9`
+                    : customKeysCount > 0
                     ? `Custom Keys (${customKeysCount})`
                     : isSecretUnlocked
                     ? 'Secret Keys (9)'
@@ -3551,27 +3598,27 @@ const App: React.FC = () => {
                       />
                   </button>
               </div>
-              <div className="flex items-center gap-2.5 w-full sm:w-auto justify-between sm:justify-start">
+              <div className="flex items-center gap-2.5 w-full sm:w-auto justify-between sm:justify-start flex-wrap">
                   <label
                       htmlFor="experimental-audio-filter-toggle"
                       className="text-xs sm:text-sm font-semibold text-slate-700 dark:text-slate-300 cursor-pointer flex items-center gap-1.5"
-                      title="Experimental: Strips empty no-speech pauses (Web Audio VAD) and non-radiology speech (Gemini Decision 1) before sending final audio to your selected AI model."
+                      title="Recommended: Client-side adaptive VAD removes dead silence pauses and compacts long recordings for fast inline upload with zero extra API cost and 100% clinical recall."
                   >
-                      <span>Smart Audio Pre-Trim</span>
-                      <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-md bg-amber-100 text-amber-800 dark:bg-amber-900/60 dark:text-amber-200 border border-amber-200/80 dark:border-amber-700/60">
-                        (Experimental)
+                      <span>Silence Trim (VAD)</span>
+                      <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-md bg-emerald-100 text-emerald-800 dark:bg-emerald-900/60 dark:text-emerald-200 border border-emerald-200/80 dark:border-emerald-700/60">
+                        Fast • 0 Cost
                       </span>
                   </label>
                   <button
                       type="button"
                       onClick={() => setIsExperimentalAudioFilterEnabled(prev => !prev)}
-                      className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-amber-500 focus:ring-offset-2 dark:focus:ring-offset-slate-900 ${
-                      isExperimentalAudioFilterEnabled ? 'bg-amber-600' : 'bg-gray-300 dark:bg-slate-600'
+                      className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-offset-2 dark:focus:ring-offset-slate-900 ${
+                      isExperimentalAudioFilterEnabled ? 'bg-emerald-600' : 'bg-gray-300 dark:bg-slate-600'
                       }`}
                       role="switch"
                       aria-checked={isExperimentalAudioFilterEnabled}
                       id="experimental-audio-filter-toggle"
-                      title="Experimental: Strips empty no-speech pauses (Web Audio VAD) and non-radiology speech (Gemini Decision 1) before sending final audio to your selected AI model."
+                      title="Recommended: Client-side adaptive VAD removes dead silence pauses and compacts long recordings for fast inline upload with zero extra API cost and 100% clinical recall."
                   >
                       <span
                       className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
@@ -3579,6 +3626,22 @@ const App: React.FC = () => {
                       }`}
                       />
                   </button>
+                  {isExperimentalAudioFilterEnabled && (
+                    <button
+                      type="button"
+                      id="decision1-chatter-toggle"
+                      onClick={() => setIsDecision1ChatterFilterEnabled(prev => !prev)}
+                      aria-pressed={isDecision1ChatterFilterEnabled}
+                      className={`text-[11px] font-semibold px-2 py-1 rounded-lg border transition-colors cursor-pointer ${
+                        isDecision1ChatterFilterEnabled
+                          ? 'bg-amber-100 text-amber-900 border-amber-300 dark:bg-amber-900/50 dark:text-amber-200 dark:border-amber-700'
+                          : 'bg-white/80 text-slate-600 border-slate-300 hover:bg-slate-50 dark:bg-slate-700/60 dark:text-slate-300 dark:border-slate-600'
+                      }`}
+                      title="Optional: Adds a Gemini Decision-1 pass to strip non-radiology office chatter (+~14s pre-trim latency; rare risk of dropping speech touching chatter)."
+                    >
+                      {isDecision1ChatterFilterEnabled ? '✓ + Chatter Drop (D1)' : '+ Chatter Drop (D1)'}
+                    </button>
+                  )}
               </div>
           </div>
         </header>
@@ -3728,6 +3791,7 @@ const App: React.FC = () => {
                 selectedModel={selectedModel} 
                 isErrorCheckEnabled={isErrorCheckEnabled}
                 isExperimentalAudioFilterEnabled={isExperimentalAudioFilterEnabled}
+                useDecision1ChatterFilter={isDecision1ChatterFilterEnabled}
                 initialFiles={pendingBatchFiles}
                 onClearInitialFiles={() => setPendingBatchFiles(null)}
                 onSaveToDrive={(res) => {
@@ -3749,6 +3813,7 @@ const App: React.FC = () => {
               <AutonomousModeView
                 selectedModel={selectedModel}
                 isExperimentalAudioFilterEnabled={isExperimentalAudioFilterEnabled}
+                useDecision1ChatterFilter={isDecision1ChatterFilterEnabled}
                 onApplyBatchReports={handleApplyAutonomousBatches}
                 onNavigateToBatch={() => setMode('batch')}
                 onSaveToDrive={(res) => {
@@ -4067,6 +4132,34 @@ const App: React.FC = () => {
             }
           }}
         />
+
+        {/* Model Rate-Limit Auto-Switch Toast */}
+        {modelFailoverNotice && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="fixed bottom-5 left-5 z-50 max-w-sm bg-slate-900/95 dark:bg-slate-800/95 backdrop-blur-md text-white px-4 py-3 rounded-2xl shadow-2xl border border-amber-500/40 flex items-start gap-3 animate-in fade-in duration-200"
+          >
+            <span className="mt-0.5 text-amber-400 text-sm shrink-0">⚡</span>
+            <div className="flex-1 min-w-0">
+              <p className="text-xs font-bold text-slate-100">
+                Smart Free-Tier Model Switch
+              </p>
+              <p className="text-[11px] text-amber-200/90 mt-0.5 leading-snug">
+                <span className="font-mono font-semibold">{modelFailoverNotice.fromModel}</span> reached quota across active keys — switched to{' '}
+                <span className="font-mono font-semibold text-emerald-300">{modelFailoverNotice.toModel}</span>.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setModelFailoverNotice(null)}
+              className="p-1 text-slate-400 hover:text-white rounded-md transition-colors shrink-0 cursor-pointer"
+              aria-label="Dismiss model failover notification"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
 
         {/* Gemini API Keys & Failover Modal */}
         <ApiKeyModal

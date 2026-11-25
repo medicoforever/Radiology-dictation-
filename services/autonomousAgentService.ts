@@ -12,10 +12,19 @@
  * 4. Acoustic Telemetry: Plays success and error audio chimes via Web Audio API.
  */
 
-import { Type } from "@google/genai";
+import { DEFAULT_SELECTED_MODEL } from "../constants";
 import { executeWithApiKeyFailover } from "./apiKeyService";
 import { ALL_RADNITO_TEMPLATES, BuiltInTemplateItem, getTemplateDocxBase64 } from "./builtInTemplates";
-import { mergeDictatedFindingsWithTemplate, resolveApiTargetModel } from "./geminiService";
+import {
+  callGenerateContentWithOptimalThinking,
+  cleanupUploadedGeminiFiles,
+  executeWithFreeTierModelFallback,
+  mergeDictatedFindingsWithTemplate,
+  prepareBlobPartDescriptors,
+  resolveApiTargetModel,
+  resolveBlobDescriptorPartsForAttempt,
+  UploadedGeminiFileRef,
+} from "./geminiService";
 import { autoSaveSingleDictation, autoSaveBatchDictations, isDriveConnected, SaveResult } from "./googleDriveService";
 import { generateSingleDictationHTML, generateBatchDictationHTML } from "./htmlGenerator";
 import { downloadFile } from "./docxService";
@@ -326,27 +335,6 @@ export interface AutonomousAudioPrefilterEvent {
   stats: AudioPrefilterStats | null;
 }
 
-/** Encodes an audio blob as a Gemini inlineData part, running experimental pre-filtering when enabled. */
-async function prepareInlineAudioPart(
-  audioBlob: Blob,
-  preFilterAudio: boolean,
-  onAudioPrefiltered?: (info: AutonomousAudioPrefilterEvent) => void
-): Promise<{ inlineData: { mimeType: string; data: string } }> {
-  const { filteredInput, stats, compactedAudioBlob } = await filterAudioInputsForModel(audioBlob, {
-    enabled: preFilterAudio,
-  });
-  onAudioPrefiltered?.({ compactedAudioBlob, stats });
-  const effectiveBlob = Array.isArray(filteredInput) ? filteredInput[0] : filteredInput;
-  const base64Audio = await blobToBase64(effectiveBlob);
-  const mimeType = effectiveBlob.type || audioBlob.type || 'audio/webm';
-  return {
-    inlineData: {
-      mimeType,
-      data: base64Audio,
-    },
-  };
-}
-
 /**
  * Processes an autonomous audio dictation with the user-selected model
  */
@@ -356,15 +344,19 @@ export async function parseAutonomousAudioDictation(
   attachedFiles?: AutonomousAttachedFile[],
   options?: {
     preFilterAudio?: boolean;
+    useDecision1ChatterFilter?: boolean;
     onAudioPrefiltered?: (info: AutonomousAudioPrefilterEvent) => void;
   }
 ): Promise<AutonomousExecutionPlan> {
   const targetModel = resolveApiTargetModel(selectedModel);
-  const audioPart = await prepareInlineAudioPart(
-    audioBlob,
-    options?.preFilterAudio === true,
-    options?.onAudioPrefiltered
-  );
+  const { filteredInput, stats, compactedAudioBlob } = await filterAudioInputsForModel(audioBlob, {
+    enabled: options?.preFilterAudio === true,
+    useDecision1: options?.useDecision1ChatterFilter === true,
+  });
+  options?.onAudioPrefiltered?.({ compactedAudioBlob, stats });
+  const effectiveBlob = Array.isArray(filteredInput) ? filteredInput[0] : filteredInput;
+  const descriptors = await prepareBlobPartDescriptors([effectiveBlob], { includeContextLabels: false });
+  const uploadedByKey = new Map<string, Map<number, UploadedGeminiFileRef>>();
   const macroContext = getMacroPromptContext();
 
   let attachedFilesManifest = '';
@@ -383,52 +375,58 @@ If the doctor mentions assigning any of these files or notes to a patient, set t
 ================================================================================\n`;
   }
 
-  return executeWithApiKeyFailover(
-    async (client) => {
-      const promptInstruction = `${AUTONOMOUS_AGENT_SYSTEM_PROMPT}\n${macroContext}\n${attachedFilesManifest}\nExecute autonomous orchestration for this audio dictation. Return the structured JSON execution plan now.`;
+  try {
+    return await executeWithFreeTierModelFallback(targetModel, (activeModel) =>
+      executeWithApiKeyFailover(
+        async (client, apiKey) => {
+          const promptInstruction = `${AUTONOMOUS_AGENT_SYSTEM_PROMPT}\n${macroContext}\n${attachedFilesManifest}\nExecute autonomous orchestration for this audio dictation. Return the structured JSON execution plan now.`;
 
-      const parts: any[] = [
-        audioPart,
-        {
-          text: promptInstruction
-        }
-      ];
+          const mediaParts = await resolveBlobDescriptorPartsForAttempt({
+            descriptors,
+            client,
+            apiKey,
+            uploadedByKey,
+          });
+          const parts: any[] = [
+            ...mediaParts,
+            { text: promptInstruction },
+          ];
 
-      // Request structured JSON output
-      const response = await client.models.generateContent({
-        model: targetModel,
-        contents: {
-          role: 'user',
-          parts: parts
+          const responseText = await callGenerateContentWithOptimalThinking({
+            client,
+            apiKey,
+            model: activeModel,
+            parts,
+            temperature: 0.1,
+            responseMimeType: 'application/json',
+            taskType: 'reasoning',
+          });
+
+          if (!responseText.trim()) {
+            throw new Error("Autonomous agent returned an empty response.");
+          }
+
+          // Parse JSON response
+          let cleanJson = responseText.trim();
+          if (cleanJson.startsWith('```json')) {
+            cleanJson = cleanJson.replace(/^```json\s*/, '').replace(/```\s*$/, '');
+          } else if (cleanJson.startsWith('```')) {
+            cleanJson = cleanJson.replace(/^```\s*/, '').replace(/```\s*$/, '');
+          }
+
+          const plan: AutonomousExecutionPlan = JSON.parse(cleanJson);
+          if (!plan.patients || !Array.isArray(plan.patients)) {
+            throw new Error("Invalid plan structure: 'patients' array is missing.");
+          }
+
+          return plan;
         },
-        config: {
-          responseMimeType: 'application/json',
-          temperature: 0.1,
-        }
-      });
-
-      const responseText = response.text || '';
-      if (!responseText.trim()) {
-        throw new Error("Autonomous agent returned an empty response.");
-      }
-
-      // Parse JSON response
-      let cleanJson = responseText.trim();
-      if (cleanJson.startsWith('```json')) {
-        cleanJson = cleanJson.replace(/^```json\s*/, '').replace(/```\s*$/, '');
-      } else if (cleanJson.startsWith('```')) {
-        cleanJson = cleanJson.replace(/^```\s*/, '').replace(/```\s*$/, '');
-      }
-
-      const plan: AutonomousExecutionPlan = JSON.parse(cleanJson);
-      if (!plan.patients || !Array.isArray(plan.patients)) {
-        throw new Error("Invalid plan structure: 'patients' array is missing.");
-      }
-
-      return plan;
-    },
-    { selectedModel: targetModel }
-  );
+        { selectedModel: activeModel }
+      )
+    );
+  } finally {
+    cleanupUploadedGeminiFiles(uploadedByKey).catch(() => {});
+  }
 }
 
 const AUTONOMOUS_FEEDBACK_SYSTEM_PROMPT = `You are RADDOC Autonomous Radiology Director, an expert AI medical workstation agent.
@@ -493,24 +491,28 @@ export async function parseAutonomousFeedbackDictation(
   previousResult: AutonomousExecutionResult,
   feedbackAudioBlob?: Blob | null,
   feedbackText?: string,
-  selectedModel: string = 'gemini-2.5-pro',
+  selectedModel: string = DEFAULT_SELECTED_MODEL,
   attachedFiles?: AutonomousAttachedFile[],
   options?: {
     preFilterAudio?: boolean;
+    useDecision1ChatterFilter?: boolean;
     onAudioPrefiltered?: (info: AutonomousAudioPrefilterEvent) => void;
   }
 ): Promise<AutonomousExecutionPlan> {
   const targetModel = resolveApiTargetModel(selectedModel);
   const macroContext = getMacroPromptContext();
 
-  const feedbackAudioPart =
-    feedbackAudioBlob && feedbackAudioBlob.size > 0
-      ? await prepareInlineAudioPart(
-          feedbackAudioBlob,
-          options?.preFilterAudio === true,
-          options?.onAudioPrefiltered
-        )
-      : null;
+  let feedbackDescriptors: Awaited<ReturnType<typeof prepareBlobPartDescriptors>> | null = null;
+  if (feedbackAudioBlob && feedbackAudioBlob.size > 0) {
+    const { filteredInput, stats, compactedAudioBlob } = await filterAudioInputsForModel(feedbackAudioBlob, {
+      enabled: options?.preFilterAudio === true,
+      useDecision1: options?.useDecision1ChatterFilter === true,
+    });
+    options?.onAudioPrefiltered?.({ compactedAudioBlob, stats });
+    const effectiveBlob = Array.isArray(filteredInput) ? filteredInput[0] : filteredInput;
+    feedbackDescriptors = await prepareBlobPartDescriptors([effectiveBlob], { includeContextLabels: false });
+  }
+  const uploadedByKey = new Map<string, Map<number, UploadedGeminiFileRef>>();
 
   let attachedFilesManifest = '';
   if (attachedFiles && attachedFiles.length > 0) {
@@ -546,66 +548,72 @@ ${p.findings.map(f => `  * ${f}`).join('\n')}
 ================================================================================
 `;
 
-  return executeWithApiKeyFailover(
-    async (client) => {
-      const promptInstruction = `${AUTONOMOUS_FEEDBACK_SYSTEM_PROMPT}
+  try {
+    return await executeWithFreeTierModelFallback(targetModel, (activeModel) =>
+      executeWithApiKeyFailover(
+        async (client, apiKey) => {
+          const promptInstruction = `${AUTONOMOUS_FEEDBACK_SYSTEM_PROMPT}
 ${previousContextSummary}
 ${macroContext}
 ${attachedFilesManifest}
 ${feedbackText ? `DOCTOR'S WRITTEN FEEDBACK & MODIFICATION INSTRUCTIONS:\n"""\n${feedbackText.trim()}\n"""\n` : ''}
 Execute feedback modifications now. Return the updated structured JSON execution plan.`;
 
-      const parts: any[] = [];
+          const mediaParts = feedbackDescriptors
+            ? await resolveBlobDescriptorPartsForAttempt({
+                descriptors: feedbackDescriptors,
+                client,
+                apiKey,
+                uploadedByKey,
+              })
+            : [];
+          const parts: any[] = [
+            ...mediaParts,
+            { text: promptInstruction },
+          ];
 
-      if (feedbackAudioPart) {
-        parts.push(feedbackAudioPart);
-      }
+          const responseText = await callGenerateContentWithOptimalThinking({
+            client,
+            apiKey,
+            model: activeModel,
+            parts,
+            temperature: 0.1,
+            responseMimeType: 'application/json',
+            taskType: 'reasoning',
+          });
 
-      parts.push({
-        text: promptInstruction
-      });
+          if (!responseText.trim()) {
+            throw new Error("Autonomous agent returned an empty response for feedback.");
+          }
 
-      const response = await client.models.generateContent({
-        model: targetModel,
-        contents: {
-          role: 'user',
-          parts: parts
+          let cleanJson = responseText.trim();
+          if (cleanJson.startsWith('```json')) {
+            cleanJson = cleanJson.replace(/^```json\s*/, '').replace(/```\s*$/, '');
+          } else if (cleanJson.startsWith('```')) {
+            cleanJson = cleanJson.replace(/^```\s*/, '').replace(/```\s*$/, '');
+          }
+
+          const plan: AutonomousExecutionPlan = JSON.parse(cleanJson);
+          if (!plan.patients || !Array.isArray(plan.patients)) {
+            throw new Error("Invalid plan structure: 'patients' array is missing in feedback response.");
+          }
+
+          // Preserve patient IDs if AI omitted them
+          plan.patients = plan.patients.map((p, idx) => ({
+            ...p,
+            patientId: p.patientId || previousPlan.patients[idx]?.patientId || `pt_${idx + 1}`,
+            targetMode: p.targetMode || previousPlan.patients[idx]?.targetMode || 'single',
+            findings: (p.findings && p.findings.length > 0) ? p.findings : (previousPlan.patients[idx]?.findings || [])
+          }));
+
+          return plan;
         },
-        config: {
-          responseMimeType: 'application/json',
-          temperature: 0.1,
-        }
-      });
-
-      const responseText = response.text || '';
-      if (!responseText.trim()) {
-        throw new Error("Autonomous agent returned an empty response for feedback.");
-      }
-
-      let cleanJson = responseText.trim();
-      if (cleanJson.startsWith('```json')) {
-        cleanJson = cleanJson.replace(/^```json\s*/, '').replace(/```\s*$/, '');
-      } else if (cleanJson.startsWith('```')) {
-        cleanJson = cleanJson.replace(/^```\s*/, '').replace(/```\s*$/, '');
-      }
-
-      const plan: AutonomousExecutionPlan = JSON.parse(cleanJson);
-      if (!plan.patients || !Array.isArray(plan.patients)) {
-        throw new Error("Invalid plan structure: 'patients' array is missing in feedback response.");
-      }
-
-      // Preserve patient IDs if AI omitted them
-      plan.patients = plan.patients.map((p, idx) => ({
-        ...p,
-        patientId: p.patientId || previousPlan.patients[idx]?.patientId || `pt_${idx + 1}`,
-        targetMode: p.targetMode || previousPlan.patients[idx]?.targetMode || 'single',
-        findings: (p.findings && p.findings.length > 0) ? p.findings : (previousPlan.patients[idx]?.findings || [])
-      }));
-
-      return plan;
-    },
-    { selectedModel: targetModel }
-  );
+        { selectedModel: activeModel }
+      )
+    );
+  } finally {
+    cleanupUploadedGeminiFiles(uploadedByKey).catch(() => {});
+  }
 }
 
 /**

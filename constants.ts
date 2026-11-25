@@ -4,56 +4,145 @@ export const LIVE_DICTATION_MODEL = 'gemini-4-hydrogen';
 export const GEMINI_FLASH_LITE_MODEL = 'gemini-3.5-flash-lite';
 export const DEFAULT_SELECTED_MODEL = 'gemini-4-hydrogen';
 
+export type GeminiThinkingLevel = 'minimal' | 'low' | 'medium' | 'high';
+export type GeminiThinkingTask = 'transcription' | 'live_chunk' | 'reasoning';
+
+/**
+ * Fast Free-Tier thinkingLevel baseline calibrated for 99% dictation/merging accuracy & speed:
+ * - gemini-4-hydrogen: 'low' for raw dictation/live chunks (18.0s vs 41.7s Auto, 739 vs 4,796 thk, 14/14);
+ *   'medium' for template merging / multi-patient reasoning.
+ * - gemini-3.8-flash / 3.7-flash: 'medium' (= Auto, 23.0s, 14/14; 'low' was slower 26.3s + "SDH" substitution).
+ * - gemini-3.6-flash / 3.5-flash: 'medium' (= Auto, 22.3s, 0 errors; 'minimal' hallucinates & adds hyphens).
+ * - gemini-3-flash-preview: 'low' for full dictation & merging (avoids 'minimal' missing hemotympanum & "Pachyfibrosis"
+ *   and avoids Auto 'high' 225.9s / 62.9k thk stall); 'minimal' for fast live chunks.
+ * - gemini-robotics-er-2-preview: 'low' for full dictation & merging (avoids 'minimal' dropping clinoid/petrous),
+ *   'minimal' for fast live chunks.
+ * - gemini-3.5-flash-lite: 'minimal' for manual raw speed (18.1s vs 'low' 20.2s repeat loop); 'high' for text QA/reasoning.
+ */
+export const MODEL_OPTIMAL_THINKING_LEVEL: Record<string, GeminiThinkingLevel> = {
+  'gemini-4-hydrogen': 'low',
+  'gemini-3.8-flash': 'medium',
+  'gemini-3.7-flash': 'medium',
+  'gemini-3.6-flash': 'medium',
+  'gemini-3.5-flash': 'medium',
+  'gemini-3-flash-preview': 'low',
+  'gemini-robotics-er-2-preview': 'low',
+  'gemini-3.5-flash-lite': 'minimal',
+  'gemini-3.1-flash-lite': 'minimal',
+};
+
+/**
+ * Elevated Free-Tier thinkingLevel profile for template merging, visual/DOCX integration,
+ * report edits, live final synthesis, autonomous multi-patient planning, and background QA.
+ */
+export const MODEL_REASONING_THINKING_LEVEL: Record<string, GeminiThinkingLevel> = {
+  'gemini-4-hydrogen': 'medium',
+  'gemini-3.8-flash': 'medium',
+  'gemini-3.7-flash': 'medium',
+  'gemini-3.6-flash': 'medium',
+  'gemini-3.5-flash': 'medium',
+  'gemini-3-flash-preview': 'low',
+  'gemini-robotics-er-2-preview': 'low',
+  'gemini-3.5-flash-lite': 'high',
+  'gemini-3.1-flash-lite': 'high',
+};
+
+/**
+ * Paired 14/14-accuracy Free Tier models for seamless quota failover when one free-tier pool hits 429:
+ * both run fast (18-23s on VAD inline Ogg) without dropping clinical findings.
+ */
+export const FREE_TIER_HIGH_ACCURACY_SIBLING: Record<string, string> = {
+  'gemini-4-hydrogen': 'gemini-3.8-flash',
+  'gemini-3.8-flash': 'gemini-4-hydrogen',
+};
+
+export function getOptimalThinkingLevel(
+  model?: string,
+  taskType: GeminiThinkingTask = 'transcription'
+): GeminiThinkingLevel | undefined {
+  if (!model) return undefined;
+  const clean = model.replace(/^models\//, '').trim();
+  if (taskType === 'live_chunk' && (clean === 'gemini-3-flash-preview' || clean === 'gemini-robotics-er-2-preview')) {
+    return 'minimal';
+  }
+  if (taskType === 'reasoning') {
+    return MODEL_REASONING_THINKING_LEVEL[clean];
+  }
+  return MODEL_OPTIMAL_THINKING_LEVEL[clean];
+}
+
 export interface AIModelOption {
   value: string;
   label: string;
 }
 
 export const LIVE_DICTATION_MODELS: AIModelOption[] = [
-  { value: 'gemini-4-hydrogen', label: 'gemini-4-hydrogen (Default)' },
-  { value: 'gemini-3.5-flash', label: 'gemini-3.5-flash' },
-  { value: 'gemini-3.8-flash', label: 'gemini-3.8-flash' },
-  { value: 'gemini-3.5-flash-lite', label: 'gemini-3.5-flash-lite' },
-];
-
-export const LIVE_DICTATION_CYCLE_ORDER = [
-  'gemini-4-hydrogen',
-  'gemini-3.5-flash',
-  'gemini-3.8-flash',
-  'gemini-3.5-flash-lite',
+  { value: 'gemini-4-hydrogen', label: 'gemini-4-hydrogen (Default • 20 RPD/key)' },
+  { value: 'gemini-3.8-flash', label: 'gemini-3.8-flash (20 RPD/key)' },
+  { value: 'gemini-3.6-flash', label: 'gemini-3.6-flash (20 RPD/key)' },
+  { value: 'gemini-3.5-flash-lite', label: 'gemini-3.5-flash-lite (Manual Only • 500 RPD/key)' },
 ];
 
 /**
- * Returns the candidate model chain: the selected primary model plus subsequent fallback model,
- * cycling across permitted live dictation models:
- * 1. gemini-4-hydrogen (Default)
- * 2. gemini-3.5-flash
- * 3. gemini-3.8-flash
- * 4. gemini-3.5-flash-lite
+ * Empirically verified clinical-accuracy-first Free-Tier cascade (EXCLUDES gemini-3.5-flash-lite so
+ * clinical dictation NEVER silently degrades to low-accuracy Flash-Lite on rate limits):
+ * 1. gemini-4-hydrogen (14/14, 0 errors, 18.0s)
+ * 2. gemini-3.8-flash (14/14, 0 errors, 23.0s)
+ * 3. gemini-3.6-flash (14/14 core + temporal bone/hemotympanum/clivus/clinoid intact, 22.3s)
+ * 4. gemini-3-flash-preview (13/14, preserves undisplaced fracture statuses & structured JSON)
+ * 5. gemini-robotics-er-2-preview (preserves hemotympanum/temporal/clivus, 20 RPD extra backup pool)
  */
-export function getLiveModelFallbackChain(selectedModel: string): string[] {
-  const modelOrder = LIVE_DICTATION_CYCLE_ORDER;
-  const idx = modelOrder.indexOf(selectedModel);
+export const FREE_TIER_QUOTA_FALLBACK_ORDER: string[] = [
+  'gemini-4-hydrogen',
+  'gemini-3.8-flash',
+  'gemini-3.6-flash',
+  'gemini-3-flash-preview',
+  'gemini-robotics-er-2-preview',
+];
 
-  if (idx !== -1) {
-    return [
-      modelOrder[idx],
-      ...modelOrder.filter((_, i) => i !== idx),
-    ];
-  }
+export const LIVE_DICTATION_CYCLE_ORDER = FREE_TIER_QUOTA_FALLBACK_ORDER;
 
-  return [...modelOrder];
+function getQuotaBucketForDedup(model: string): string {
+  const clean = model.replace(/^models\//, '').trim();
+  if (clean === 'gemini-3.7-flash') return 'gemini-3.8-flash';
+  if (clean === 'gemini-3.5-flash') return 'gemini-3.6-flash';
+  return clean;
 }
 
+/**
+ * Returns the candidate Free Tier model chain starting at `selectedModel` and cascading strictly
+ * through high-accuracy Free Tier models (excluding gemini-3.5-flash-lite from automatic failover).
+ */
+export function getFreeTierModelFallbackChain(selectedModel: string): string[] {
+  const primary = selectedModel?.trim() || DEFAULT_SELECTED_MODEL;
+  const seenBuckets = new Set<string>([getQuotaBucketForDedup(primary)]);
+  const chain: string[] = [primary];
+
+  for (const candidate of FREE_TIER_QUOTA_FALLBACK_ORDER) {
+    const bucket = getQuotaBucketForDedup(candidate);
+    if (!seenBuckets.has(bucket)) {
+      seenBuckets.add(bucket);
+      chain.push(candidate);
+    }
+  }
+  return chain;
+}
+
+export function getLiveModelFallbackChain(selectedModel: string): string[] {
+  return getFreeTierModelFallbackChain(selectedModel || DEFAULT_LIVE_MODEL);
+}
+
+/**
+ * Ordered strictly by verified radiology dictation accuracy (#1 -> #5 accurate, then manual/paid tiers).
+ */
 export const AVAILABLE_MODELS: AIModelOption[] = [
-  { value: 'gemini-4-hydrogen', label: 'Gemini 4 Hydrogen (Default)' },
-  { value: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash' },
-  { value: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
-  { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash' },
-  { value: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash' },
-  { value: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash Lite' },
-  { value: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro' },
-  { value: 'gemini-robotics-er-2-preview', label: 'Gemini Robotics ER-2 Preview' },
+  { value: 'gemini-4-hydrogen', label: 'Gemini 4 Hydrogen (Default • Best 14/14 • 20 RPD/key)' },
+  { value: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash (#2 Accuracy 14/14 • 20 RPD/key)' },
+  { value: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash (#3 Accuracy • 20 RPD/key)' },
+  { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash (#4 Backup • 20 RPD/key)' },
+  { value: 'gemini-robotics-er-2-preview', label: 'Gemini Robotics ER-2 Preview (#5 Backup • 20 RPD/key)' },
+  { value: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash Lite (Manual Lower-Accuracy • 500 RPD/key)' },
+  { value: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro (Paid Tier Only • 0 Free RPD)' },
 ];
 
 export const RADIOLOGY_CUSTOM_VOCABULARY = [
