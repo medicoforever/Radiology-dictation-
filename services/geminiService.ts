@@ -1,5 +1,5 @@
 import { GoogleGenAI, Type, GenerateContentResponse, Chat } from "@google/genai";
-import { DEFAULT_LIVE_MODEL, DEFAULT_GEMINI_PROMPT, REPROCESS_GEMINI_PROMPT, TEMPLATE_GEMINI_PROMPT, REPORT_TEMPLATES, ERROR_IDENTIFIER_PROMPT, INITIAL_AGENT_PROMPT, REFINEMENT_AGENT_PROMPT, SYNTHESIZER_AGENT_PROMPT, VISUAL_TEMPLATE_GEMINI_PROMPT, getLiveModelFallbackChain, DEFAULT_SELECTED_MODEL, getOptimalThinkingLevel, ReportTemplate } from '../constants';
+import { DEFAULT_LIVE_MODEL, DEFAULT_GEMINI_PROMPT, REPROCESS_GEMINI_PROMPT, TEMPLATE_GEMINI_PROMPT, REPORT_TEMPLATES, ERROR_IDENTIFIER_PROMPT, INITIAL_AGENT_PROMPT, REFINEMENT_AGENT_PROMPT, SYNTHESIZER_AGENT_PROMPT, VISUAL_TEMPLATE_GEMINI_PROMPT, getLiveModelFallbackChain, DEFAULT_SELECTED_MODEL, ReportTemplate } from '../constants';
 import { IdentifiedError } from "../types";
 import { isTableRowFinding } from "./docxService";
 import { expandMacrosInFindings, expandMacrosInSingleText, getMacroPromptContext } from "./macroDictionaryService";
@@ -395,284 +395,12 @@ export function extractErrorsFromResponse(rawText?: string | null): IdentifiedEr
   return [];
 }
 
-export const SAFE_INLINE_MEDIA_BYTES = Math.floor(14.5 * 1024 * 1024);
-
-export interface UploadedGeminiFileRef {
-  name: string;
-  uri: string;
-  mimeType: string;
-  client: GoogleGenAI;
-}
-
-export interface BlobContentPartDescriptor {
-  blob: Blob;
-  cleanMime: string;
-  headerText?: string;
-  textPartText?: string;
-  contextPartText?: string;
-  inlineBase64?: string;
-}
-
 /**
- * Invokes Gemini `generateContent` directly over REST so modern `thinkingConfig.thinkingLevel`
- * settings are preserved intact instead of being stripped by `@google/genai@0.14.0`.
- */
-export async function callGenerateContentWithOptimalThinking(params: {
-  client: GoogleGenAI;
-  apiKey: string;
-  model: string;
-  parts: any[];
-  temperature?: number;
-  responseMimeType?: string;
-  responseSchema?: any;
-  abortSignal?: AbortSignal;
-}): Promise<string> {
-  const {
-    client,
-    apiKey,
-    model,
-    parts,
-    temperature = 0.1,
-    responseMimeType,
-    responseSchema: schema,
-    abortSignal,
-  } = params;
-
-  const thinkingLevel = getOptimalThinkingLevel(model);
-
-  if (typeof fetch !== 'function' || !apiKey) {
-    const config: Record<string, any> = { temperature };
-    if (responseMimeType) config.responseMimeType = responseMimeType;
-    if (schema) config.responseSchema = schema;
-    const response: GenerateContentResponse = await client.models.generateContent({
-      model,
-      contents: { parts },
-      config,
-    });
-    return response.text?.trim() || '';
-  }
-
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
-
-  const sendRest = async (includeThinking: boolean): Promise<string> => {
-    const generationConfig: Record<string, any> = { temperature };
-    if (responseMimeType) generationConfig.responseMimeType = responseMimeType;
-    if (schema) generationConfig.responseSchema = schema;
-    if (includeThinking && thinkingLevel) {
-      generationConfig.thinkingConfig = { thinkingLevel };
-    }
-
-    const res = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'x-goog-api-key': apiKey,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts }],
-        generationConfig,
-      }),
-      signal: abortSignal,
-    });
-
-    if (!res.ok) {
-      const errBody = await res.json().catch(() => ({}));
-      const msg = errBody?.error?.message || `Gemini API HTTP ${res.status}: ${res.statusText}`;
-      const err: any = new Error(msg);
-      err.status = res.status;
-      throw err;
-    }
-
-    const data = await res.json();
-    if (data?.promptFeedback?.blockReason) {
-      const blockedErr: any = new Error(`Gemini API blocked input: ${data.promptFeedback.blockReason}`);
-      blockedErr.isNonRetryable = true;
-      throw blockedErr;
-    }
-
-    const candidateParts = data?.candidates?.[0]?.content?.parts;
-    if (!Array.isArray(candidateParts)) return '';
-    return candidateParts
-      .filter((p: any) => !p?.thought && typeof p?.text === 'string')
-      .map((p: any) => p.text)
-      .join('')
-      .trim();
-  };
-
-  try {
-    return await sendRest(Boolean(thinkingLevel));
-  } catch (err: any) {
-    if (err?.name === 'AbortError' || abortSignal?.aborted) throw err;
-    const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
-    if (
-      thinkingLevel &&
-      getErrorStatusCode(err) === 400 &&
-      (msg.includes('thinking') || msg.includes('thinkinglevel'))
-    ) {
-      console.warn(`[Gemini API] Model ${model} rejected thinkingLevel="${thinkingLevel}"; retrying without thinkingConfig...`);
-      return await sendRest(false);
-    }
-    throw err;
-  }
-}
-
-/**
- * Prepares per-blob descriptors once (detecting audio MIME headers, extracting text,
- * and pre-encoding base64 only when within the safe 14.5MB inline limit).
- */
-export async function prepareBlobPartDescriptors(
-  blobs: Blob[],
-  options: { includeContextLabels?: boolean } = {}
-): Promise<BlobContentPartDescriptor[]> {
-  const descriptors: BlobContentPartDescriptor[] = [];
-  const includeLabels = options.includeContextLabels !== false;
-
-  for (let i = 0; i < blobs.length; i++) {
-    const blob = blobs[i];
-    let cleanMime = getCleanMimeType(blob);
-    if (!blob.type || blob.type === 'application/octet-stream' || cleanMime === 'audio/ogg' || cleanMime === 'audio/webm') {
-      const detectedAudioMime = await detectAudioMimeFromHeader(blob);
-      if (detectedAudioMime) {
-        cleanMime = detectedAudioMime;
-      }
-    }
-
-    const isAudio = cleanMime.startsWith('audio/');
-    const isVideo = cleanMime.startsWith('video/');
-    const isPdf = cleanMime === 'application/pdf';
-    const isImage = cleanMime.startsWith('image/');
-    const isText = cleanMime.startsWith('text/');
-    const fileName = (blob as any).name ? `"${(blob as any).name}"` : `Segment #${i + 1}`;
-
-    let headerText: string | undefined;
-    let contextPartText: string | undefined;
-    if (includeLabels) {
-      if (blobs.length > 1) {
-        headerText = `--- Dictation / Input File #${i + 1}: ${fileName} (${cleanMime}) ---`;
-      } else if (!isAudio) {
-        contextPartText = `Context & Input File: The user has provided an input file (${isPdf ? 'PDF document' : isImage ? 'Medical scan / image' : isVideo ? 'Video recording' : isText ? 'Text / Document' : 'Document'}). Analyze, transcribe, extract, and interpret all radiological findings, clinical indications, observations, measurements, impressions, and technique thoroughly into the structured findings array following all medical and radiology transcription rules.`;
-      }
-    }
-
-    let textPartText: string | undefined;
-    if (isText) {
-      try {
-        const textContent = await blob.text();
-        textPartText = `[Dictated / Pasted Clinical Text Content for ${fileName}]:\n"""\n${textContent}\n"""\nInstruction: This is dictated / clinical text provided by the clinician. Transcribe, analyze, correct, format, and structure this text into formal radiology findings according to all radiology report and transcription rules.`;
-      } catch (e) {
-        console.warn('Could not read blob as text:', e);
-      }
-    }
-
-    const inlineBase64 = blob.size <= SAFE_INLINE_MEDIA_BYTES ? await blobToBase64(blob) : undefined;
-    descriptors.push({
-      blob,
-      cleanMime,
-      headerText,
-      contextPartText,
-      textPartText,
-      inlineBase64,
-    });
-  }
-
-  return descriptors;
-}
-
-/**
- * Resolves descriptors into Gemini `inlineData` (fast path <=14.5MB) or Files API `fileData` (>14.5MB),
- * scoped to the active API key and tracked for best-effort cleanup.
- */
-export async function resolveBlobDescriptorPartsForAttempt(params: {
-  descriptors: BlobContentPartDescriptor[];
-  client: GoogleGenAI;
-  apiKey: string;
-  uploadedByKey: Map<string, Map<number, UploadedGeminiFileRef>>;
-  abortSignal?: AbortSignal;
-}): Promise<any[]> {
-  const { descriptors, client, apiKey, uploadedByKey, abortSignal } = params;
-  const resolved: any[] = [];
-
-  for (let i = 0; i < descriptors.length; i++) {
-    if (abortSignal?.aborted) throw new DOMException('Aborted by user', 'AbortError');
-    const desc = descriptors[i];
-    if (desc.headerText) resolved.push({ text: desc.headerText });
-    if (desc.contextPartText) resolved.push({ text: desc.contextPartText });
-    if (desc.textPartText) resolved.push({ text: desc.textPartText });
-
-    if (desc.inlineBase64 !== undefined) {
-      resolved.push({
-        inlineData: {
-          mimeType: desc.cleanMime,
-          data: desc.inlineBase64,
-        },
-      });
-      continue;
-    }
-
-    let keyUploads = uploadedByKey.get(apiKey);
-    if (!keyUploads) {
-      keyUploads = new Map();
-      uploadedByKey.set(apiKey, keyUploads);
-    }
-
-    let ref = keyUploads.get(i);
-    if (!ref) {
-      const uploaded = await client.files.upload({
-        file: desc.blob,
-        config: { mimeType: desc.cleanMime },
-      });
-      let readyFile = uploaded;
-      let pollCount = 0;
-      while (readyFile.state === 'PROCESSING' && pollCount < 15 && readyFile.name) {
-        if (abortSignal?.aborted) throw new DOMException('Aborted by user', 'AbortError');
-        await new Promise((r) => setTimeout(r, 1000));
-        readyFile = await client.files.get({ name: readyFile.name });
-        pollCount++;
-      }
-      if (!readyFile.uri) {
-        throw new Error('Gemini Files API upload completed without a valid file URI.');
-      }
-      ref = {
-        name: readyFile.name || '',
-        uri: readyFile.uri,
-        mimeType: readyFile.mimeType || desc.cleanMime,
-        client,
-      };
-      keyUploads.set(i, ref);
-    }
-
-    resolved.push({
-      fileData: {
-        fileUri: ref.uri,
-        mimeType: ref.mimeType,
-      },
-    });
-  }
-
-  return resolved;
-}
-
-export async function cleanupUploadedGeminiFiles(
-  uploadedByKey: Map<string, Map<number, UploadedGeminiFileRef>>
-): Promise<void> {
-  const deletions: Promise<any>[] = [];
-  for (const keyMap of uploadedByKey.values()) {
-    for (const ref of keyMap.values()) {
-      if (ref.name) {
-        deletions.push(ref.client.files.delete({ name: ref.name }).catch(() => {}));
-      }
-    }
-  }
-  await Promise.all(deletions);
-}
-
-/**
- * Universal safe caller for Gemini models that applies optimal thinking settings and gracefully handles
- * JSON mode incompatibilities and Files API fallback (>14.5MB) across all models.
+ * Universal safe caller for Gemini models that gracefully handles JSON mode incompatibilities across all models.
  */
 export async function generateContentWithJsonFallback(
   model: string,
-  partsOrResolver: any[] | ((client: GoogleGenAI, apiKey: string) => Promise<any[]>),
+  parts: any[],
   schema: any = responseSchema,
   temperature: number = 0.1,
   abortSignal?: AbortSignal
@@ -680,24 +408,20 @@ export async function generateContentWithJsonFallback(
   const resolvedModel = resolveApiTargetModel(model);
 
   return await executeWithApiKeyFailover(
-    async (client, apiKey) => {
-      const parts = typeof partsOrResolver === 'function'
-        ? await partsOrResolver(client, apiKey)
-        : partsOrResolver;
-
-      // Strategy 1: Primary attempt with structured JSON schema + optimal thinkingLevel on the selected model
+    async (client) => {
+      // Strategy 1: Primary attempt with structured JSON schema on the selected model
       try {
-        const text = await callGenerateContentWithOptimalThinking({
-          client,
-          apiKey,
+        const response: GenerateContentResponse = await client.models.generateContent({
           model: resolvedModel,
-          parts,
-          temperature,
-          responseMimeType: "application/json",
-          responseSchema: schema,
-          abortSignal,
+          contents: { parts },
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: schema,
+            temperature,
+          }
         });
 
+        const text = response.text?.trim() || '';
         if (text) return text;
       } catch (err: any) {
         if (err?.name === 'AbortError' || abortSignal?.aborted) {
@@ -716,15 +440,15 @@ export async function generateContentWithJsonFallback(
               { text: '\n\nCRITICAL OUTPUT REQUIREMENT: Output ONLY a valid JSON object in the exact format: {"findings": ["finding 1", "finding 2", ...]}. Do NOT output any markdown wrappers or conversational text.' }
             ];
 
-            const retryText = await callGenerateContentWithOptimalThinking({
-              client,
-              apiKey,
+            const retryResponse: GenerateContentResponse = await client.models.generateContent({
               model: resolvedModel,
-              parts: partsWithJsonInstruction,
-              temperature,
-              abortSignal,
+              contents: { parts: partsWithJsonInstruction },
+              config: {
+                temperature,
+              }
             });
 
+            const retryText = retryResponse.text?.trim() || '';
             if (retryText) return retryText;
           } catch (retryErr: any) {
             console.warn(`[Gemini API] Prompt-only retry on ${resolvedModel} failed:`, retryErr);
@@ -1575,24 +1299,64 @@ export const processAudio = async (
     });
   }
 
-  const blobDescriptors = await prepareBlobPartDescriptors(audioBlobs, { includeContextLabels: true });
-  const uploadedByKey = new Map<string, Map<number, UploadedGeminiFileRef>>();
+  for (let i = 0; i < audioBlobs.length; i++) {
+    const blob = audioBlobs[i];
+    const base64Audio = await blobToBase64(blob);
+    let cleanMime = getCleanMimeType(blob);
+    if (!blob.type || blob.type === 'application/octet-stream' || cleanMime === 'audio/ogg' || cleanMime === 'audio/webm') {
+      const detectedAudioMime = await detectAudioMimeFromHeader(blob);
+      if (detectedAudioMime) {
+        cleanMime = detectedAudioMime;
+      }
+    }
+    const isAudio = cleanMime.startsWith('audio/');
+    const isVideo = cleanMime.startsWith('video/');
+    const isPdf = cleanMime === 'application/pdf';
+    const isImage = cleanMime.startsWith('image/');
+    const isText = cleanMime.startsWith('text/');
 
-  const resolveRequestParts = async (client: GoogleGenAI, apiKey: string): Promise<any[]> => {
-    const mediaParts = await resolveBlobDescriptorPartsForAttempt({
-      descriptors: blobDescriptors,
-      client,
-      apiKey,
-      uploadedByKey,
-      abortSignal,
+    const fileName = (blob as any).name ? `"${(blob as any).name}"` : `Segment #${i + 1}`;
+
+    if (audioBlobs.length > 1) {
+      parts.push({
+        text: `--- Dictation / Input File #${i + 1}: ${fileName} (${cleanMime}) ---`
+      });
+    } else if (!isAudio) {
+      parts.push({
+        text: `Context & Input File: The user has provided an input file (${isPdf ? 'PDF document' : isImage ? 'Medical scan / image' : isVideo ? 'Video recording' : isText ? 'Text / Document' : 'Document'}). Analyze, transcribe, extract, and interpret all radiological findings, clinical indications, observations, measurements, impressions, and technique thoroughly into the structured findings array following all medical and radiology transcription rules.`
+      });
+    }
+
+    if (isText) {
+      try {
+        const textContent = await blob.text();
+        parts.push({
+          text: `[Dictated / Pasted Clinical Text Content for ${fileName}]:\n"""\n${textContent}\n"""\nInstruction: This is dictated / clinical text provided by the clinician. Transcribe, analyze, correct, format, and structure this text into formal radiology findings according to all radiology report and transcription rules.`
+        });
+      } catch (e) {
+        console.warn('Could not read blob as text:', e);
+      }
+    }
+
+    parts.push({
+      inlineData: {
+        mimeType: cleanMime,
+        data: base64Audio,
+      },
     });
-    return [...parts, ...mediaParts];
-  };
+  }
+  
+  // For merge mode alone or non-audio inputs: transcribe-only models do not support non-audio formats or template reasoning.
+  // Route to multimodal reasoning models (defaulting to gemini-3.8-flash).
+  const hasNonAudio = audioBlobs.some(b => {
+    const mime = getCleanMimeType(b);
+    return !mime.startsWith('audio/');
+  });
 
   const targetModel = resolveApiTargetModel(model);
 
   try {
-    const rawResponseText = await generateContentWithJsonFallback(targetModel, resolveRequestParts, responseSchema, 0.1, abortSignal);
+    const rawResponseText = await generateContentWithJsonFallback(targetModel, parts, responseSchema, 0.1, abortSignal);
     const findings = extractFindingsFromResponse(rawResponseText);
 
     if (findings && findings.length > 0) {
@@ -1631,7 +1395,7 @@ export const processAudio = async (
         (error instanceof Error && error.message.includes("Expected a 'findings' array")));
     if (templateInfo.isTemplateMode && isSchemaOrParseError) {
       try {
-        const retryText = await generateContentWithJsonFallback(targetModel, resolveRequestParts, responseSchema, 0.1, abortSignal);
+        const retryText = await generateContentWithJsonFallback(targetModel, parts, responseSchema, 0.1, abortSignal);
         const parsedFindings = extractFindingsFromResponse(retryText);
         if (parsedFindings && parsedFindings.length > 0) {
           return parsedFindings;
@@ -1659,8 +1423,6 @@ export const processAudio = async (
       "BOLD::Ventricles, basal cisterns, and cortical sulci are normal for patient age.",
       "IMPRESSION:###NORMAL CT BRAIN STUDY WITHOUT ACUTE INTRACRANIAL ABNORMALITY."
     ];
-  } finally {
-    cleanupUploadedGeminiFiles(uploadedByKey).catch(() => {});
   }
 };
 
@@ -2026,23 +1788,22 @@ Carefully integrate these dictated findings into the "${templateName}" baseline 
 
     // Direct JSON prompt fallback using text-only parts to guarantee payload fits
     try {
-      const textOnlyParts = parts.filter(p => !p.inlineData && !p.fileData);
-      const retryText = await executeWithApiKeyFailover(
-        async (client, apiKey) => {
-          return await callGenerateContentWithOptimalThinking({
-            client,
-            apiKey,
+      const textOnlyParts = parts.filter(p => !p.inlineData);
+      const retryResponse = await executeWithApiKeyFailover(
+        async (client) => {
+          return await client.models.generateContent({
             model: targetModel,
-            parts: [
-              ...textOnlyParts,
-              { text: "\n\nCRITICAL OUTPUT REQUIREMENT: Output ONLY a valid JSON object in the exact format: {\"findings\": [\"finding 1\", \"finding 2\", ...]}" }
-            ],
-            temperature: 0.1,
-            abortSignal,
+            contents: {
+              parts: [
+                ...textOnlyParts,
+                { text: "\n\nCRITICAL OUTPUT REQUIREMENT: Output ONLY a valid JSON object in the exact format: {\"findings\": [\"finding 1\", \"finding 2\", ...]}" }
+              ]
+            }
           });
         },
-        { selectedModel: targetModel, abortSignal }
+        { selectedModel: targetModel }
       );
+      const retryText = retryResponse.text?.trim() || '';
       const parsed = extractFindingsFromResponse(retryText);
       if (parsed && parsed.length > 0) {
         return applySpokenHeadingModifications(parsed, customPrompt);
@@ -2130,14 +1891,12 @@ Follow these strict instructions to produce a clean and accurate continuation:
   try {
     const targetModel = resolveApiTargetModel(model || DEFAULT_SELECTED_MODEL);
     return await executeWithApiKeyFailover(
-      async (client, apiKey) => {
-        const resultText = await callGenerateContentWithOptimalThinking({
-          client,
-          apiKey,
+      async (client) => {
+        const response: GenerateContentResponse = await client.models.generateContent({
           model: targetModel,
-          parts: [textPart, audioPart],
-          temperature: 0.1,
+          contents: { parts: [textPart, audioPart] },
         });
+        const resultText = response.text?.trim();
         if (!resultText) {
           throw new Error("API returned an empty response for audio continuation.");
         }
@@ -2203,14 +1962,12 @@ Now, listen to the audio and provide the single, updated finding text.`;
   try {
     const targetModel = resolveApiTargetModel(model || DEFAULT_SELECTED_MODEL);
     return await executeWithApiKeyFailover(
-      async (client, apiKey) => {
-        const resultText = await callGenerateContentWithOptimalThinking({
-          client,
-          apiKey,
+      async (client) => {
+        const response: GenerateContentResponse = await client.models.generateContent({
           model: targetModel,
-          parts: [textPart, audioPart],
-          temperature: 0.1,
+          contents: { parts: [textPart, audioPart] },
         });
+        const resultText = response.text?.trim();
         if (!resultText) {
           throw new Error("API returned an empty response for finding modification.");
         }
@@ -2420,15 +2177,13 @@ export const transcribeAudioForPrompt = async (
 
   try {
     return await executeWithApiKeyFailover(
-      async (client, apiKey) => {
-        const resultText = await callGenerateContentWithOptimalThinking({
-          client,
-          apiKey,
+      async (client) => {
+        const response: GenerateContentResponse = await client.models.generateContent({
           model: primaryModel,
-          parts: [textPart, audioPart],
-          temperature: 0.1,
+          contents: { parts: [textPart, audioPart] },
         });
 
+        const resultText = response.text?.trim();
         return resultText || "";
       },
       { selectedModel: primaryModel }

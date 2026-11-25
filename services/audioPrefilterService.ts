@@ -16,8 +16,6 @@ import { executeWithApiKeyFailover } from './apiKeyService';
 import { mergeMultipleAudioBlobs, triggerAudioDownload } from './audioMerger';
 
 export const EXPERIMENTAL_AUDIO_FILTER_KEY = 'radiologyExperimentalAudioFilter';
-export const VAD_SILENCE_TRIM_ENABLED_KEY = 'radiologyVadSilenceTrimEnabled';
-export const DECISION1_CHATTER_FILTER_KEY = 'radiologyDecision1ChatterFilter';
 export const PREFILTER_DECISION_MODEL = 'gemini-decision-1';
 
 const DECISIONS_ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta/decisions';
@@ -133,8 +131,6 @@ export type DecisionsApiCaller = (
 
 export interface FilterAudioInputsOptions {
   enabled: boolean;
-  /** Opt-in Gemini Decision 1 non-radiology speech filtering (off by default to preserve 100% clinical recall). */
-  useDecision1?: boolean;
   abortSignal?: AbortSignal;
   onProgress?: (stage: string) => void;
 }
@@ -1741,7 +1737,7 @@ async function decodeBlobToMonoPcm(blob: Blob): Promise<{ samples: Float32Array;
 async function prefilterSingleAudioBlob(
   blob: Blob,
   cleanMime: string,
-  options: { useDecision1?: boolean; abortSignal?: AbortSignal; onProgress?: (stage: string) => void }
+  options: { abortSignal?: AbortSignal; onProgress?: (stage: string) => void }
 ): Promise<{
   blob: Blob;
   applied: boolean;
@@ -1812,20 +1808,11 @@ async function prefilterSingleAudioBlob(
   const afterVadDurationSec = vad.speechDurationSec;
   const silenceRemovedSec = vad.silenceRemovedSec;
 
-  const decisionRes = options.useDecision1
-    ? (options.onProgress?.('Filtering non-radiology chatter with Decision-1...'),
-      await filterWindowsWithDecision1(windows, samples, sampleRate, {
-        abortSignal: options.abortSignal,
-        onProgress: options.onProgress,
-      }))
-    : {
-        keptWindows: windows,
-        droppedWindows: [],
-        usedDecision1: false,
-        decisionLatencyMs: 0,
-        outcomes: [],
-        fallbackReason: undefined,
-      };
+  options.onProgress?.('Filtering non-radiology chatter with Decision-1...');
+  const decisionRes = await filterWindowsWithDecision1(windows, samples, sampleRate, {
+    abortSignal: options.abortSignal,
+    onProgress: options.onProgress,
+  });
 
   const keptIntervals = decisionRes.keptWindows.flatMap((w) => w.intervals);
   const nonRadiologyRemovedSec = decisionRes.droppedWindows.reduce(
@@ -2146,7 +2133,6 @@ export async function filterAudioInputsForModel(
 
     audioCount++;
     const res = await prefilterSingleAudioBlob(item, classification.mimeType, {
-      useDecision1: Boolean(options.useDecision1),
       abortSignal: options.abortSignal,
       onProgress: options.onProgress,
     });

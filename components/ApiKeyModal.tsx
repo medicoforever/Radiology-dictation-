@@ -588,7 +588,7 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, selec
               </button>
             </div>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              Verifies load balancing across active keys. Model selected: <span className="font-semibold text-blue-600 dark:text-blue-400">{selectedModel || 'gemini-3.8-flash'}</span>.
+              Verifies load balancing across active keys. Model selected: <span className="font-semibold text-blue-600 dark:text-blue-400">{selectedModel || 'gemini-4-hydrogen'}</span>.
             </p>
             {failoverTestResult && (
               <div className="mt-2 p-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-xs font-mono text-slate-700 dark:text-slate-300">

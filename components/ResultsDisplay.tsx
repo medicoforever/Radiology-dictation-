@@ -90,7 +90,6 @@ interface ResultsDisplayProps {
   onOpenMacrosModal?: () => void;
   initialExtraFiles?: File[];
   isExperimentalAudioFilterEnabled?: boolean;
-  useDecision1ChatterFilter?: boolean;
   prefilterStats?: AudioPrefilterStats | null;
   compactedAudioBlob?: Blob | null;
 }
@@ -234,7 +233,6 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   onOpenMacrosModal,
   initialExtraFiles,
   isExperimentalAudioFilterEnabled = false,
-  useDecision1ChatterFilter = false,
   prefilterStats = null,
   compactedAudioBlob = null,
 }) => {
@@ -1179,11 +1177,10 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     await startRowDictationRecording();
   };
 
-  /** Pre-filters audio inputs for Gemini only when silence/pre-trim filtering is enabled. */
+  /** Pre-filters audio inputs for Gemini only when the experimental filter is enabled. */
   const prefilterInputForGemini = async <T extends Blob | Blob[]>(input: T): Promise<T> => {
     const { filteredInput } = await filterAudioInputsForModel(input, {
       enabled: Boolean(isExperimentalAudioFilterEnabled),
-      useDecision1: Boolean(useDecision1ChatterFilter),
     });
     return filteredInput as T;
   };
@@ -3384,10 +3381,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
               <button
                 onClick={handleDownloadCompacted}
                 className="bg-amber-600 text-white font-bold py-2.5 px-5 rounded-xl hover:bg-amber-700 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:ring-opacity-50 transition-all shadow-sm w-full lg:w-auto flex items-center justify-center gap-2 min-h-[44px]"
-                title={prefilterStats?.usedDecision1
-                  ? `Download compacted audio trimmed by VAD + Decision-1 (${prefilterStats?.keptDurationSec ? `${formatPrefilterDuration(prefilterStats.keptDurationSec)}, ` : ''}${compactedAudioBlob.size >= 1024 * 1024 ? `${(compactedAudioBlob.size / (1024 * 1024)).toFixed(1)} MB` : `${Math.max(1, Math.round(compactedAudioBlob.size / 1024))} KB`})`
-                  : `Download VAD silence-trimmed compacted audio (${prefilterStats?.keptDurationSec ? `${formatPrefilterDuration(prefilterStats.keptDurationSec)}, ` : ''}${compactedAudioBlob.size >= 1024 * 1024 ? `${(compactedAudioBlob.size / (1024 * 1024)).toFixed(1)} MB` : `${Math.max(1, Math.round(compactedAudioBlob.size / 1024))} KB`})`
-                }
+                title={`Download compacted audio trimmed by Decision-1 (${prefilterStats?.keptDurationSec ? `${formatPrefilterDuration(prefilterStats.keptDurationSec)}, ` : ''}${compactedAudioBlob.size >= 1024 * 1024 ? `${(compactedAudioBlob.size / (1024 * 1024)).toFixed(1)} MB` : `${Math.max(1, Math.round(compactedAudioBlob.size / 1024))} KB`})`}
               >
                 <DownloadIcon className="w-4 h-4" />
                 Download Compacted Audio
@@ -3455,7 +3449,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                         <button
                             onClick={handleDownloadCompacted}
                             className="flex items-center justify-center gap-2 bg-amber-600 hover:bg-amber-700 active:bg-amber-800 text-white font-bold py-2 px-4 rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-400 transition-all shadow-sm text-sm whitespace-nowrap min-h-[40px] w-full sm:w-auto cursor-pointer"
-                            title={prefilterStats?.usedDecision1 ? 'Download compacted audio trimmed by VAD + Decision-1' : 'Download VAD silence-trimmed compacted audio'}
+                            title="Download Decision-1 compacted pre-trimmed audio"
                         >
                             <DownloadIcon className="w-4 h-4"/>
                             Download Compacted Audio

@@ -222,8 +222,6 @@ export const safeLocalStorage = {
         'radiologyDictationBatchMode',
         'radiologyErrorCheckEnabled',
         'radiologyExperimentalAudioFilter',
-        'radiologyVadSilenceTrimEnabled',
-        'radiologyDecision1ChatterFilter',
         'user_api_keys',
         'radiology_custom_macros_dictionary',
         'upcoming_report_template',

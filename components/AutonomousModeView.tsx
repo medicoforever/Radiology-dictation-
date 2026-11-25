@@ -62,7 +62,6 @@ interface AutonomousModeViewProps {
   onNavigateToBatch: () => void;
   onSaveToDrive?: (result: SaveResult) => void;
   isExperimentalAudioFilterEnabled?: boolean;
-  useDecision1ChatterFilter?: boolean;
 }
 
 export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
@@ -74,7 +73,6 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
   onNavigateToBatch,
   onSaveToDrive,
   isExperimentalAudioFilterEnabled = false,
-  useDecision1ChatterFilter = false,
 }) => {
   const {
     isRecording,
@@ -622,7 +620,7 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
       let sessionPrefilterStats: AudioPrefilterStats | null = null;
       setExecutionStep(
         isExperimentalAudioFilterEnabled
-          ? `Pre-trimming audio (${useDecision1ChatterFilter ? 'VAD + Decision-1' : 'VAD'}) & analyzing with ${selectedModel}...`
+          ? `Pre-trimming audio (Decision-1) & analyzing with ${selectedModel}...`
           : `Analyzing spoken audio with ${selectedModel}...`
       );
       const plan: AutonomousExecutionPlan = await parseAutonomousAudioDictation(
@@ -631,7 +629,6 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
         attachedFiles,
         {
           preFilterAudio: Boolean(isExperimentalAudioFilterEnabled),
-          useDecision1ChatterFilter: Boolean(useDecision1ChatterFilter),
           onAudioPrefiltered: ({ compactedAudioBlob: compacted, stats }) => {
             sessionCompactedBlob = compacted;
             sessionPrefilterStats = stats;
@@ -764,7 +761,6 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
         attachedFiles,
         {
           preFilterAudio: Boolean(isExperimentalAudioFilterEnabled),
-          useDecision1ChatterFilter: Boolean(useDecision1ChatterFilter),
           onAudioPrefiltered: ({ compactedAudioBlob: fbCompacted, stats: fbStats }) => {
             if (fbStats) {
               nextPrefilterStats = fbStats;
@@ -1025,7 +1021,7 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
                 type="button"
                 onClick={handleDownloadCompactedAudio}
                 className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 border border-amber-500 text-xs font-semibold text-white transition-colors cursor-pointer shadow-sm"
-                title={prefilterStats?.usedDecision1 ? 'Download compacted audio trimmed by VAD + Decision-1' : 'Download VAD silence-trimmed compacted audio'}
+                title="Download Decision-1 compacted pre-trimmed audio"
               >
                 <DownloadIcon className="w-4 h-4 text-white" />
                 <span>Compacted Audio</span>
@@ -1128,7 +1124,7 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
             {prefilterStats?.applied && compactedAudioBlob && (
               <div className="w-full flex flex-wrap items-center justify-between gap-2 px-3 py-1.5 rounded-lg bg-amber-950/50 border border-amber-700/60 text-[11px] text-amber-200">
                 <span className="font-semibold">
-                  {prefilterStats.usedDecision1 ? 'Smart Pre-Trim (D1)' : 'VAD Compacted'}: {formatPrefilterDuration(prefilterStats.originalDurationSec)} → {formatPrefilterDuration(prefilterStats.keptDurationSec)}
+                  Decision-1 Compacted: {formatPrefilterDuration(prefilterStats.originalDurationSec)} → {formatPrefilterDuration(prefilterStats.keptDurationSec)}
                 </span>
                 <span className="font-mono text-amber-300">
                   {compactedAudioBlob.type || prefilterStats.outputMimeType} • {(compactedAudioBlob.size / (1024 * 1024) >= 1 ? `${(compactedAudioBlob.size / (1024 * 1024)).toFixed(2)} MB` : `${Math.max(1, Math.round(compactedAudioBlob.size / 1024))} KB`)}
@@ -1160,7 +1156,7 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
                   type="button"
                   onClick={handleDownloadCompactedAudio}
                   className="py-3 px-3.5 rounded-xl bg-amber-600 hover:bg-amber-500 border border-amber-500 text-white font-semibold text-xs transition-colors cursor-pointer flex items-center justify-center gap-1.5"
-                  title={prefilterStats?.usedDecision1 ? 'Download compacted audio trimmed by VAD + Decision-1' : 'Download VAD silence-trimmed compacted audio'}
+                  title="Download Decision-1 compacted pre-trimmed audio"
                 >
                   <DownloadIcon className="w-4 h-4 text-white" />
                   <span>Compacted Audio</span>

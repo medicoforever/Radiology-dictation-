@@ -1,40 +1,8 @@
-export const DEFAULT_LIVE_MODEL = 'gemini-3.8-flash';
-export const GEMINI_TRANSCRIBE_LIVE_MODEL = 'gemini-3.8-flash';
-export const LIVE_DICTATION_MODEL = 'gemini-3.8-flash';
+export const DEFAULT_LIVE_MODEL = 'gemini-4-hydrogen';
+export const GEMINI_TRANSCRIBE_LIVE_MODEL = 'gemini-4-hydrogen';
+export const LIVE_DICTATION_MODEL = 'gemini-4-hydrogen';
 export const GEMINI_FLASH_LITE_MODEL = 'gemini-3.5-flash-lite';
-export const DEFAULT_SELECTED_MODEL = 'gemini-3.8-flash';
-
-export type GeminiThinkingLevel = 'minimal' | 'low' | 'medium' | 'high';
-
-/**
- * Verified optimal per-model thinkingLevel defaults from full-length trauma dictation benchmarks:
- * - gemini-3.8-flash: 'medium' (14/14 clinical accuracy, 0 formatting errors; 'minimal' is unsupported, 'low' risks "SDH" substitution)
- * - gemini-4-hydrogen / argon / carbon / neon & 3.1-pro-preview: 'low' (cuts latency & cost up to 2.3x while maintaining 14/14 recall)
- * - gemini-3-flash-preview & gemini-robotics-er-2-preview: 'minimal' (avoids excessive thinking tokens)
- * - gemini-3.6-flash / 3.5-flash: 'medium' ('minimal' drops skull-base/cisternal SAH findings)
- * - flash-lite models: 'minimal' (lowest latency)
- */
-export const MODEL_OPTIMAL_THINKING_LEVEL: Record<string, GeminiThinkingLevel> = {
-  'gemini-3.8-flash': 'medium',
-  'gemini-3.7-flash': 'medium',
-  'gemini-4-hydrogen': 'low',
-  'gemini-4-argon': 'low',
-  'gemini-4-carbon': 'low',
-  'gemini-4-neon': 'low',
-  'gemini-3.1-pro-preview': 'low',
-  'gemini-3-flash-preview': 'minimal',
-  'gemini-robotics-er-2-preview': 'minimal',
-  'gemini-3.6-flash': 'medium',
-  'gemini-3.5-flash': 'medium',
-  'gemini-3.5-flash-lite': 'minimal',
-  'gemini-3.1-flash-lite': 'minimal',
-};
-
-export function getOptimalThinkingLevel(model?: string): GeminiThinkingLevel | undefined {
-  if (!model) return undefined;
-  const clean = model.replace(/^models\//, '').trim();
-  return MODEL_OPTIMAL_THINKING_LEVEL[clean];
-}
+export const DEFAULT_SELECTED_MODEL = 'gemini-4-hydrogen';
 
 export interface AIModelOption {
   value: string;
@@ -42,25 +10,25 @@ export interface AIModelOption {
 }
 
 export const LIVE_DICTATION_MODELS: AIModelOption[] = [
-  { value: 'gemini-3.8-flash', label: 'gemini-3.8-flash (Default)' },
-  { value: 'gemini-4-hydrogen', label: 'gemini-4-hydrogen' },
+  { value: 'gemini-4-hydrogen', label: 'gemini-4-hydrogen (Default)' },
   { value: 'gemini-3.5-flash', label: 'gemini-3.5-flash' },
+  { value: 'gemini-3.8-flash', label: 'gemini-3.8-flash' },
   { value: 'gemini-3.5-flash-lite', label: 'gemini-3.5-flash-lite' },
 ];
 
 export const LIVE_DICTATION_CYCLE_ORDER = [
-  'gemini-3.8-flash',
   'gemini-4-hydrogen',
   'gemini-3.5-flash',
+  'gemini-3.8-flash',
   'gemini-3.5-flash-lite',
 ];
 
 /**
  * Returns the candidate model chain: the selected primary model plus subsequent fallback model,
  * cycling across permitted live dictation models:
- * 1. gemini-3.8-flash (Default)
- * 2. gemini-4-hydrogen
- * 3. gemini-3.5-flash
+ * 1. gemini-4-hydrogen (Default)
+ * 2. gemini-3.5-flash
+ * 3. gemini-3.8-flash
  * 4. gemini-3.5-flash-lite
  */
 export function getLiveModelFallbackChain(selectedModel: string): string[] {
@@ -78,14 +46,14 @@ export function getLiveModelFallbackChain(selectedModel: string): string[] {
 }
 
 export const AVAILABLE_MODELS: AIModelOption[] = [
-  { value: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash (Default)' },
-  { value: 'gemini-4-hydrogen', label: 'Gemini 4 Hydrogen (Fast Flagship)' },
+  { value: 'gemini-4-hydrogen', label: 'Gemini 4 Hydrogen (Default)' },
+  { value: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash' },
   { value: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
   { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash' },
-  { value: 'gemini-robotics-er-2-preview', label: 'Gemini Robotics ER-2 Preview' },
   { value: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash' },
   { value: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash Lite' },
   { value: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro' },
+  { value: 'gemini-robotics-er-2-preview', label: 'Gemini Robotics ER-2 Preview' },
 ];
 
 export const RADIOLOGY_CUSTOM_VOCABULARY = [
