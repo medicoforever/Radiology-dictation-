@@ -196,7 +196,7 @@ export async function clearUnusedAudioBlobs(validKeys: string[]): Promise<void> 
     req.onsuccess = () => {
       const keys = req.result as string[];
       for (const k of keys) {
-        if (k.startsWith('batch_audio_') && !validSet.has(k)) {
+        if ((k.startsWith('batch_audio_') || k.startsWith('batch_compacted_audio_')) && !validSet.has(k)) {
           store.delete(k);
         }
       }

@@ -28,7 +28,7 @@ import {
   getMacroPromptContext 
 } from "./macroDictionaryService";
 import { getUserTemplates } from "./templateStorage";
-import { filterAudioInputsForModel } from "./audioPrefilterService";
+import { filterAudioInputsForModel, AudioPrefilterStats } from "./audioPrefilterService";
 
 export interface AutonomousAttachedFile {
   id: string;
@@ -314,14 +314,21 @@ Respond with ONLY valid JSON adhering to this schema:
   ]
 }`;
 
+export interface AutonomousAudioPrefilterEvent {
+  compactedAudioBlob: Blob | null;
+  stats: AudioPrefilterStats | null;
+}
+
 /** Encodes an audio blob as a Gemini inlineData part, running experimental pre-filtering when enabled. */
 async function prepareInlineAudioPart(
   audioBlob: Blob,
-  preFilterAudio: boolean
+  preFilterAudio: boolean,
+  onAudioPrefiltered?: (info: AutonomousAudioPrefilterEvent) => void
 ): Promise<{ inlineData: { mimeType: string; data: string } }> {
-  const { filteredInput } = await filterAudioInputsForModel(audioBlob, {
+  const { filteredInput, stats, compactedAudioBlob } = await filterAudioInputsForModel(audioBlob, {
     enabled: preFilterAudio,
   });
+  onAudioPrefiltered?.({ compactedAudioBlob, stats });
   const effectiveBlob = Array.isArray(filteredInput) ? filteredInput[0] : filteredInput;
   const base64Audio = await blobToBase64(effectiveBlob);
   const mimeType = effectiveBlob.type || audioBlob.type || 'audio/webm';
@@ -340,10 +347,17 @@ export async function parseAutonomousAudioDictation(
   audioBlob: Blob,
   selectedModel: string,
   attachedFiles?: AutonomousAttachedFile[],
-  options?: { preFilterAudio?: boolean }
+  options?: {
+    preFilterAudio?: boolean;
+    onAudioPrefiltered?: (info: AutonomousAudioPrefilterEvent) => void;
+  }
 ): Promise<AutonomousExecutionPlan> {
   const targetModel = resolveApiTargetModel(selectedModel);
-  const audioPart = await prepareInlineAudioPart(audioBlob, options?.preFilterAudio === true);
+  const audioPart = await prepareInlineAudioPart(
+    audioBlob,
+    options?.preFilterAudio === true,
+    options?.onAudioPrefiltered
+  );
   const macroContext = getMacroPromptContext();
 
   let attachedFilesManifest = '';
@@ -474,14 +488,21 @@ export async function parseAutonomousFeedbackDictation(
   feedbackText?: string,
   selectedModel: string = 'gemini-2.5-pro',
   attachedFiles?: AutonomousAttachedFile[],
-  options?: { preFilterAudio?: boolean }
+  options?: {
+    preFilterAudio?: boolean;
+    onAudioPrefiltered?: (info: AutonomousAudioPrefilterEvent) => void;
+  }
 ): Promise<AutonomousExecutionPlan> {
   const targetModel = resolveApiTargetModel(selectedModel);
   const macroContext = getMacroPromptContext();
 
   const feedbackAudioPart =
     feedbackAudioBlob && feedbackAudioBlob.size > 0
-      ? await prepareInlineAudioPart(feedbackAudioBlob, options?.preFilterAudio === true)
+      ? await prepareInlineAudioPart(
+          feedbackAudioBlob,
+          options?.preFilterAudio === true,
+          options?.onAudioPrefiltered
+        )
       : null;
 
   let attachedFilesManifest = '';
@@ -593,6 +614,8 @@ export async function executeAutonomousPlan(
   context: {
     selectedModel: string;
     audioBlob?: Blob | null;
+    compactedAudioBlob?: Blob | null;
+    prefilterStats?: AudioPrefilterStats | null;
     attachedFiles?: AutonomousAttachedFile[];
     onApplySingleReport?: (
       findings: string[], 
@@ -605,9 +628,12 @@ export async function executeAutonomousPlan(
       templateUsed?: string
     ) => void;
     onApplyBatchReports: (batches: Array<{
+      id?: string;
       name: string;
       findings: string[];
       audioBlobs: Blob[];
+      compactedAudioBlob?: Blob | null;
+      prefilterStats?: AudioPrefilterStats | null;
       selectedModel: string;
       customPrompt?: string;
       customDocx?: DocxTemplateData | null;
@@ -797,6 +823,8 @@ export async function executeAutonomousPlan(
           name: b.name,
           findings: b.findings,
           audioBlobs: context.audioBlob ? [context.audioBlob] : [],
+          compactedAudioBlob: context.compactedAudioBlob ?? null,
+          prefilterStats: context.prefilterStats ?? null,
           selectedModel: context.selectedModel,
           customPrompt: b.customPrompt,
           customDocx: b.customDocx,

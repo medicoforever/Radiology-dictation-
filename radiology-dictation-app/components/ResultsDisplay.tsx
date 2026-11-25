@@ -41,7 +41,14 @@ import {
   deleteDictateChangesAudio, 
   hasStoredDictateChangesAudio 
 } from '../services/audioStorage';
-import { filterAudioInputsForModel, classifyBlobForPrefilter, AudioPrefilterStats } from '../services/audioPrefilterService';
+import {
+  AudioPrefilterStats,
+  classifyBlobForPrefilter,
+  downloadCompactedAudioBlob,
+  downloadOriginalAudioInput,
+  filterAudioInputsForModel,
+  formatPrefilterDuration,
+} from '../services/audioPrefilterService';
 
 interface ChatMessage {
   author: 'You' | 'AI';
@@ -83,6 +90,7 @@ interface ResultsDisplayProps {
   initialExtraFiles?: File[];
   isExperimentalAudioFilterEnabled?: boolean;
   prefilterStats?: AudioPrefilterStats | null;
+  compactedAudioBlob?: Blob | null;
 }
 
 const formatAudioDuration = (totalSeconds: number): string => {
@@ -225,6 +233,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   initialExtraFiles,
   isExperimentalAudioFilterEnabled = false,
   prefilterStats = null,
+  compactedAudioBlob = null,
 }) => {
   const [isAllCopied, setIsAllCopied] = useState<boolean>(false);
   const [selectedIndices, setSelectedIndices] = useState<Set<number>>(new Set<number>());
@@ -1023,17 +1032,25 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   const handleDownload = () => {
     const rawTarget = mergedContinuationBlob || audioBlob;
     if (!rawTarget) return;
-    const targetBlob = Array.isArray(rawTarget) ? rawTarget.find(b => b.type?.startsWith('audio/')) || rawTarget[0] : rawTarget;
-    if (!targetBlob) return;
-    triggerAudioDownload(targetBlob, mergedContinuationBlob ? 'radiology-dictation-merged' : 'radiology-dictation');
+    const baseName = mergedContinuationBlob
+      ? (compactedAudioBlob ? 'radiology-dictation-original-merged' : 'radiology-dictation-merged')
+      : (compactedAudioBlob ? 'radiology-dictation-original' : 'radiology-dictation');
+    downloadOriginalAudioInput(rawTarget, baseName).catch(err => {
+      console.error('Failed to download original audio:', err);
+    });
+  };
+
+  const handleDownloadCompacted = () => {
+    downloadCompactedAudioBlob(compactedAudioBlob, 'radiology-dictation-compacted-decision1');
   };
 
   const handleDownloadMerged = (blobToDownload?: Blob | null) => {
     const rawTarget = blobToDownload || mergedContinuationBlob || audioBlob;
     if (!rawTarget) return;
-    const targetBlob = Array.isArray(rawTarget) ? rawTarget.find(b => b.type?.startsWith('audio/')) || rawTarget[0] : rawTarget;
-    if (!targetBlob) return;
-    triggerAudioDownload(targetBlob, 'radiology-dictation-merged');
+    const baseName = compactedAudioBlob ? 'radiology-dictation-original-merged' : 'radiology-dictation-merged';
+    downloadOriginalAudioInput(rawTarget, baseName).catch(err => {
+      console.error('Failed to download merged audio:', err);
+    });
   };
   
   const handleRecordNew = useCallback(() => {
@@ -3382,10 +3399,21 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
               onClick={handleDownload}
               disabled={!audioBlob && !mergedContinuationBlob}
               className="bg-slate-600 text-white font-bold py-2.5 px-5 rounded-xl hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-500 focus:ring-opacity-50 transition-all shadow-sm disabled:bg-slate-300 dark:disabled:bg-slate-700 disabled:cursor-not-allowed w-full lg:w-auto flex items-center justify-center gap-2 min-h-[44px]"
+              title={compactedAudioBlob ? 'Download original unfiltered audio' : 'Download dictated or uploaded audio'}
             >
               <DownloadIcon className="w-4 h-4" />
-              Download Audio
+              {compactedAudioBlob ? 'Download Original Audio' : 'Download Audio'}
             </button>
+            {compactedAudioBlob && compactedAudioBlob.size > 0 && (
+              <button
+                onClick={handleDownloadCompacted}
+                className="bg-amber-600 text-white font-bold py-2.5 px-5 rounded-xl hover:bg-amber-700 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:ring-opacity-50 transition-all shadow-sm w-full lg:w-auto flex items-center justify-center gap-2 min-h-[44px]"
+                title={`Download compacted audio trimmed by Decision-1 (${prefilterStats?.keptDurationSec ? `${formatPrefilterDuration(prefilterStats.keptDurationSec)}, ` : ''}${compactedAudioBlob.size >= 1024 * 1024 ? `${(compactedAudioBlob.size / (1024 * 1024)).toFixed(1)} MB` : `${Math.max(1, Math.round(compactedAudioBlob.size / 1024))} KB`})`}
+              >
+                <DownloadIcon className="w-4 h-4" />
+                Download Compacted Audio
+              </button>
+            )}
             <button
               onClick={handleDownloadHTML}
               disabled={!findings || findings.length === 0}
@@ -3438,10 +3466,20 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                         <button
                             onClick={() => handleDownloadMerged(mergedContinuationBlob || audioBlob)}
                             className="flex items-center justify-center gap-2 bg-slate-700 hover:bg-slate-800 active:bg-slate-900 text-white font-bold py-2 px-4 rounded-lg focus:outline-none focus:ring-2 focus:ring-slate-400 transition-all shadow-sm text-sm whitespace-nowrap min-h-[40px] w-full sm:w-auto cursor-pointer"
-                            title="Download the full merged audio file recorded so far"
+                            title="Download the full merged original audio file recorded so far"
                         >
                             <DownloadIcon className="w-4 h-4"/>
-                            Download Audio (Merged)
+                            {compactedAudioBlob ? 'Download Original (Merged)' : 'Download Audio (Merged)'}
+                        </button>
+                    )}
+                    {compactedAudioBlob && compactedAudioBlob.size > 0 && (
+                        <button
+                            onClick={handleDownloadCompacted}
+                            className="flex items-center justify-center gap-2 bg-amber-600 hover:bg-amber-700 active:bg-amber-800 text-white font-bold py-2 px-4 rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-400 transition-all shadow-sm text-sm whitespace-nowrap min-h-[40px] w-full sm:w-auto cursor-pointer"
+                            title="Download Decision-1 compacted pre-trimmed audio"
+                        >
+                            <DownloadIcon className="w-4 h-4"/>
+                            Download Compacted Audio
                         </button>
                     )}
                 </div>
@@ -3453,15 +3491,26 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
       {continuationState.error && (
         <div className="mt-4 p-3.5 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800/60 rounded-xl flex flex-col sm:flex-row items-center justify-between gap-3">
           <p className="text-sm text-red-600 dark:text-red-400 font-medium" role="alert">{continuationState.error}</p>
-          {(mergedContinuationBlob || audioBlob) && (
-            <button
-              onClick={() => handleDownloadMerged(mergedContinuationBlob || audioBlob)}
-              className="flex items-center gap-2 bg-slate-700 hover:bg-slate-800 text-white font-semibold py-1.5 px-3.5 rounded-lg text-xs transition-colors shadow-sm whitespace-nowrap"
-            >
-              <DownloadIcon className="w-3.5 h-3.5"/>
-              Download Audio (Merged)
-            </button>
-          )}
+          <div className="flex items-center gap-2 flex-wrap">
+            {(mergedContinuationBlob || audioBlob) && (
+              <button
+                onClick={() => handleDownloadMerged(mergedContinuationBlob || audioBlob)}
+                className="flex items-center gap-2 bg-slate-700 hover:bg-slate-800 text-white font-semibold py-1.5 px-3.5 rounded-lg text-xs transition-colors shadow-sm whitespace-nowrap"
+              >
+                <DownloadIcon className="w-3.5 h-3.5"/>
+                {compactedAudioBlob ? 'Download Original (Merged)' : 'Download Audio (Merged)'}
+              </button>
+            )}
+            {compactedAudioBlob && compactedAudioBlob.size > 0 && (
+              <button
+                onClick={handleDownloadCompacted}
+                className="flex items-center gap-2 bg-amber-600 hover:bg-amber-700 text-white font-semibold py-1.5 px-3.5 rounded-lg text-xs transition-colors shadow-sm whitespace-nowrap"
+              >
+                <DownloadIcon className="w-3.5 h-3.5"/>
+                Download Compacted Audio
+              </button>
+            )}
+          </div>
         </div>
       )}
       </div>

@@ -11,6 +11,12 @@ import {
 import type { DocxTemplateData } from './ui/CustomPromptInput';
 import { SaveResult } from '../services/googleDriveService';
 import { triggerAudioDownload } from '../services/audioMerger';
+import {
+  AudioPrefilterStats,
+  combineAudioBlobsToCompact,
+  downloadCompactedAudioBlob,
+  formatPrefilterDuration,
+} from '../services/audioPrefilterService';
 import MicIcon from './icons/MicIcon';
 import StopIcon from './icons/StopIcon';
 import PauseIcon from './icons/PauseIcon';
@@ -44,6 +50,8 @@ interface AutonomousModeViewProps {
     name: string;
     findings: string[];
     audioBlobs: Blob[];
+    compactedAudioBlob?: Blob | null;
+    prefilterStats?: AudioPrefilterStats | null;
     selectedModel: string;
     customPrompt?: string;
     customDocx?: DocxTemplateData | null;
@@ -74,6 +82,8 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
   } = useAudioRecorder('autonomous');
 
   const [recordedBlob, setRecordedBlob] = useState<Blob | null>(null);
+  const [compactedAudioBlob, setCompactedAudioBlob] = useState<Blob | null>(null);
+  const [prefilterStats, setPrefilterStats] = useState<AudioPrefilterStats | null>(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [executionStep, setExecutionStep] = useState<string>('');
@@ -544,6 +554,8 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
     setErrorMessage(null);
     setExecutionResult(null);
     setRecordedBlob(null);
+    setCompactedAudioBlob(null);
+    setPrefilterStats(null);
     try {
       await startRecording();
     } catch (err: any) {
@@ -555,6 +567,8 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
     try {
       const blob = await stopRecording();
       setRecordedBlob(blob);
+      setCompactedAudioBlob(null);
+      setPrefilterStats(null);
     } catch (err: any) {
       setErrorMessage(err?.message || 'Failed to capture audio recording.');
     }
@@ -564,6 +578,8 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
     const file = e.target.files?.[0];
     if (file) {
       setRecordedBlob(file);
+      setCompactedAudioBlob(null);
+      setPrefilterStats(null);
       setExecutionResult(null);
       setErrorMessage(null);
     }
@@ -572,10 +588,17 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
 
   const handleDownloadLastAudio = () => {
     if (recordedBlob) {
-      triggerAudioDownload(recordedBlob, 'autonomous-dictation');
+      triggerAudioDownload(
+        recordedBlob,
+        compactedAudioBlob ? 'autonomous-dictation-original' : 'autonomous-dictation'
+      );
     } else {
       setErrorMessage('No voice audio captured yet in this session. Start dictation or upload an audio file first.');
     }
+  };
+
+  const handleDownloadCompactedAudio = () => {
+    downloadCompactedAudioBlob(compactedAudioBlob, 'autonomous-dictation-compacted-decision1');
   };
 
   const handleExecuteAutonomousSession = async () => {
@@ -584,6 +607,8 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
     setIsProcessing(true);
     setErrorMessage(null);
     setExecutionResult(null);
+    setCompactedAudioBlob(null);
+    setPrefilterStats(null);
 
     markTabActive('processing');
     const heartbeatTimer = setInterval(() => {
@@ -591,12 +616,26 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
     }, 3000);
 
     try {
-      setExecutionStep(`Analyzing spoken audio with ${selectedModel}...`);
+      let sessionCompactedBlob: Blob | null = null;
+      let sessionPrefilterStats: AudioPrefilterStats | null = null;
+      setExecutionStep(
+        isExperimentalAudioFilterEnabled
+          ? `Pre-trimming audio (Decision-1) & analyzing with ${selectedModel}...`
+          : `Analyzing spoken audio with ${selectedModel}...`
+      );
       const plan: AutonomousExecutionPlan = await parseAutonomousAudioDictation(
         recordedBlob,
         selectedModel,
         attachedFiles,
-        { preFilterAudio: Boolean(isExperimentalAudioFilterEnabled) }
+        {
+          preFilterAudio: Boolean(isExperimentalAudioFilterEnabled),
+          onAudioPrefiltered: ({ compactedAudioBlob: compacted, stats }) => {
+            sessionCompactedBlob = compacted;
+            sessionPrefilterStats = stats;
+            setCompactedAudioBlob(compacted);
+            setPrefilterStats(stats);
+          },
+        }
       );
       setLastPlan(plan);
 
@@ -604,6 +643,8 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
       const result = await executeAutonomousPlan(plan, {
         selectedModel,
         audioBlob: recordedBlob,
+        compactedAudioBlob: sessionCompactedBlob,
+        prefilterStats: sessionPrefilterStats,
         attachedFiles,
         onApplyBatchReports,
         onDriveSaved: onSaveToDrive,
@@ -630,6 +671,8 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
       sessionStorage.removeItem(`raddoc_auto_session_${curTabId}`);
     } catch (_) {}
     setRecordedBlob(null);
+    setCompactedAudioBlob(null);
+    setPrefilterStats(null);
     setExecutionResult(null);
     setLastPlan(null);
     setErrorMessage(null);
@@ -706,6 +749,8 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
     setFeedbackSuccessMessage(null);
 
     try {
+      let nextCompactedBlob: Blob | null = compactedAudioBlob;
+      let nextPrefilterStats: AudioPrefilterStats | null = prefilterStats;
       setFeedbackStep(`Analyzing feedback dictation with ${selectedModel}...`);
       const updatedPlan = await parseAutonomousFeedbackDictation(
         lastPlan,
@@ -714,8 +759,25 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
         textToUse,
         selectedModel,
         attachedFiles,
-        { preFilterAudio: Boolean(isExperimentalAudioFilterEnabled) }
+        {
+          preFilterAudio: Boolean(isExperimentalAudioFilterEnabled),
+          onAudioPrefiltered: ({ compactedAudioBlob: fbCompacted, stats: fbStats }) => {
+            if (fbStats) {
+              nextPrefilterStats = fbStats;
+            }
+            if (fbCompacted) {
+              nextCompactedBlob = compactedAudioBlob ? null : fbCompacted;
+            }
+          },
+        }
       );
+
+      if (isExperimentalAudioFilterEnabled && audioToUse && compactedAudioBlob && !nextCompactedBlob) {
+        const combined = await combineAudioBlobsToCompact([compactedAudioBlob, audioToUse]);
+        if (combined) nextCompactedBlob = combined;
+      }
+      if (nextCompactedBlob) setCompactedAudioBlob(nextCompactedBlob);
+      if (nextPrefilterStats) setPrefilterStats(nextPrefilterStats);
 
       setLastPlan(updatedPlan);
       setFeedbackStep('Applying modifications across patient reports & updating workstation...');
@@ -723,6 +785,8 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
       const newResult = await executeAutonomousPlan(updatedPlan, {
         selectedModel,
         audioBlob: audioToUse || recordedBlob,
+        compactedAudioBlob: nextCompactedBlob,
+        prefilterStats: nextPrefilterStats,
         attachedFiles,
         onApplyBatchReports,
         onDriveSaved: onSaveToDrive,
@@ -947,11 +1011,22 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
               type="button"
               onClick={handleDownloadLastAudio}
               className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold text-slate-200 transition-colors cursor-pointer shadow-sm disabled:opacity-50"
-              title="Download the last recorded or uploaded voice audio"
+              title={compactedAudioBlob ? 'Download original unfiltered voice audio' : 'Download the last recorded or uploaded voice audio'}
             >
               <DownloadIcon className="w-4 h-4 text-slate-300" />
-              <span>Download Last Audio</span>
+              <span>{compactedAudioBlob ? 'Original Audio' : 'Download Last Audio'}</span>
             </button>
+            {compactedAudioBlob && compactedAudioBlob.size > 0 && (
+              <button
+                type="button"
+                onClick={handleDownloadCompactedAudio}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 border border-amber-500 text-xs font-semibold text-white transition-colors cursor-pointer shadow-sm"
+                title="Download Decision-1 compacted pre-trimmed audio"
+              >
+                <DownloadIcon className="w-4 h-4 text-white" />
+                <span>Compacted Audio</span>
+              </button>
+            )}
             <button
               type="button"
               onClick={() => setShowAgentStateModal(true)}
@@ -1046,6 +1121,17 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
               <audio controls src={audioUrl} className="w-full h-10 rounded-lg" />
             )}
 
+            {prefilterStats?.applied && compactedAudioBlob && (
+              <div className="w-full flex flex-wrap items-center justify-between gap-2 px-3 py-1.5 rounded-lg bg-amber-950/50 border border-amber-700/60 text-[11px] text-amber-200">
+                <span className="font-semibold">
+                  Decision-1 Compacted: {formatPrefilterDuration(prefilterStats.originalDurationSec)} → {formatPrefilterDuration(prefilterStats.keptDurationSec)}
+                </span>
+                <span className="font-mono text-amber-300">
+                  {compactedAudioBlob.type || prefilterStats.outputMimeType} • {(compactedAudioBlob.size / (1024 * 1024) >= 1 ? `${(compactedAudioBlob.size / (1024 * 1024)).toFixed(2)} MB` : `${Math.max(1, Math.round(compactedAudioBlob.size / 1024))} KB`)}
+                </span>
+              </div>
+            )}
+
             <div className="flex flex-wrap items-center gap-2.5 w-full">
               <button
                 type="button"
@@ -1060,11 +1146,22 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
                 type="button"
                 onClick={handleDownloadLastAudio}
                 className="py-3 px-3.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 font-semibold text-xs transition-colors cursor-pointer flex items-center justify-center gap-1.5"
-                title="Download this audio recording"
+                title={compactedAudioBlob ? 'Download original unfiltered audio' : 'Download this audio recording'}
               >
                 <DownloadIcon className="w-4 h-4 text-slate-400" />
-                <span>Save Audio</span>
+                <span>{compactedAudioBlob ? 'Original Audio' : 'Save Audio'}</span>
               </button>
+              {compactedAudioBlob && compactedAudioBlob.size > 0 && (
+                <button
+                  type="button"
+                  onClick={handleDownloadCompactedAudio}
+                  className="py-3 px-3.5 rounded-xl bg-amber-600 hover:bg-amber-500 border border-amber-500 text-white font-semibold text-xs transition-colors cursor-pointer flex items-center justify-center gap-1.5"
+                  title="Download Decision-1 compacted pre-trimmed audio"
+                >
+                  <DownloadIcon className="w-4 h-4 text-white" />
+                  <span>Compacted Audio</span>
+                </button>
+              )}
               <button
                 type="button"
                 onClick={handleResetSession}

@@ -44,6 +44,10 @@ export function getSingleModeAudioKey(tabId = getTabId()): string {
   return `single_mode_audio_${tabId}`;
 }
 
+export function getSingleModeCompactedAudioKey(tabId = getTabId()): string {
+  return `single_mode_compacted_audio_${tabId}`;
+}
+
 export function getBatchModeStorageKey(tabId = getTabId()): string {
   return `radiologyDictationBatchMode_${tabId}`;
 }

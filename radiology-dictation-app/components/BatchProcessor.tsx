@@ -4,7 +4,16 @@ import { processAudio, createChat, blobToBase64, continueAudioDictation, base64T
 import ClinicalQaPanel, { getUrgencyBadgeMeta } from './ui/ClinicalQaPanel';
 import { saveAudioBlob, getAudioBlob, clearUnusedAudioBlobs, saveReportSession, getReportSession, deleteReportSession } from '../services/audioStorage';
 import { mergeMultipleAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
-import { filterAudioInputsForModel, AudioPrefilterStats } from '../services/audioPrefilterService';
+import {
+    filterAudioInputsForModel,
+    AudioPrefilterStats,
+    combineAudioBlobsToCompact,
+    downloadOriginalAudioInput,
+    downloadCompactedAudioBlob,
+    formatPrefilterDuration,
+    formatPrefilterRemovedSummary,
+    mergePrefilterStats,
+} from '../services/audioPrefilterService';
 import { ClipboardPaste, X, CheckSquare } from 'lucide-react';
 import { safeLocalStorage, markTabActive, getTabId, getBatchModeStorageKey } from '../services/storageService';
 import PasteTextModal from './PasteTextModal';
@@ -75,6 +84,7 @@ interface Batch {
     qaFindingsHash?: string;
     errorCheckStatus?: 'idle' | 'checking' | 'complete';
     prefilterStats?: AudioPrefilterStats | null;
+    compactedAudioBlob?: Blob | null;
 }
 
 interface BatchProcessorProps {
@@ -96,9 +106,10 @@ interface SerializableAudioBlob {
     data: string;
     type: string;
 }
-interface SerializableBatch extends Omit<Batch, 'audioBlobs' | 'chat' | 'extraFiles'> {
+interface SerializableBatch extends Omit<Batch, 'audioBlobs' | 'compactedAudioBlob' | 'chat' | 'extraFiles'> {
     audioCount?: number;
     audioBlobs?: SerializableAudioBlob[];
+    hasCompactedAudio?: boolean;
 }
 
 const parseStructuredFinding = (finding: string) => {
@@ -180,54 +191,6 @@ const getCleanMimeType = (blob: Blob): string => {
         return 'audio/webm';
     }
     return mimeType.split(';')[0];
-};
-
-/** Formats seconds into a compact human-readable duration for pre-filter badges. */
-const formatPrefilterDuration = (seconds: number): string => {
-    const safeSec = Math.max(0, seconds);
-    if (safeSec < 60) {
-        return `${safeSec.toFixed(1)}s`;
-    }
-    const mins = Math.floor(safeSec / 60);
-    const remSec = Math.round(safeSec % 60);
-    return `${mins}m ${remSec}s`;
-};
-
-/** Builds a concise summary of removed silence/chatter for the batch pre-filter pill. */
-const formatPrefilterRemovedSummary = (stats: AudioPrefilterStats): string => {
-    const removedParts: string[] = [];
-    if (stats.silenceRemovedSec > 0) {
-        removedParts.push(`-${formatPrefilterDuration(stats.silenceRemovedSec)} silence`);
-    }
-    if (stats.nonRadiologyRemovedSec > 0) {
-        removedParts.push(`-${formatPrefilterDuration(stats.nonRadiologyRemovedSec)} chatter`);
-    }
-    return removedParts.length > 0 ? ` (${removedParts.join(', ')})` : '';
-};
-
-/** Combines pre-filter telemetry when additional dictation is appended to a processed batch. */
-const mergePrefilterStats = (
-    prev: AudioPrefilterStats | null | undefined,
-    next: AudioPrefilterStats | null
-): AudioPrefilterStats | null => {
-    if (!next?.applied) return prev ?? null;
-    if (!prev?.applied) return next;
-    const mimes = Array.from(new Set([prev.outputMimeType, next.outputMimeType].filter(Boolean)));
-    return {
-        applied: true,
-        originalDurationSec: Number((prev.originalDurationSec + next.originalDurationSec).toFixed(3)),
-        keptDurationSec: Number((prev.keptDurationSec + next.keptDurationSec).toFixed(3)),
-        afterVadDurationSec: Number((prev.afterVadDurationSec + next.afterVadDurationSec).toFixed(3)),
-        silenceRemovedSec: Number((prev.silenceRemovedSec + next.silenceRemovedSec).toFixed(3)),
-        nonRadiologyRemovedSec: Number((prev.nonRadiologyRemovedSec + next.nonRadiologyRemovedSec).toFixed(3)),
-        keptSegmentsCount: prev.keptSegmentsCount + next.keptSegmentsCount,
-        droppedNonRadiologyCount: prev.droppedNonRadiologyCount + next.droppedNonRadiologyCount,
-        originalBytes: prev.originalBytes + next.originalBytes,
-        outputBytes: prev.outputBytes + next.outputBytes,
-        outputMimeType: mimes.join(', '),
-        decisionLatencyMs: prev.decisionLatencyMs + next.decisionLatencyMs,
-        usedDecision1: prev.usedDecision1 || next.usedDecision1,
-    };
 };
 
 const BatchProcessor: React.FC<BatchProcessorProps> = ({ 
@@ -714,11 +677,16 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                         }
                     }
 
-                    const { audioCount: _, audioBlobs: __, ...batchFields } = savedBatch;
+                    const compactedAudioBlob =
+                        (await getAudioBlob(`batch_compacted_audio_${currentTabId}_${savedBatch.id}`)) ||
+                        (await getAudioBlob(`batch_compacted_audio_${savedBatch.id}`));
+
+                    const { audioCount: _, audioBlobs: __, hasCompactedAudio: ___, ...batchFields } = savedBatch;
 
                     return {
                         ...batchFields,
                         audioBlobs,
+                        compactedAudioBlob: compactedAudioBlob || null,
                         chat: null,
                     };
                 }));
@@ -901,11 +869,18 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                             })
                         );
 
-                        const { chat, audioBlobs, ...rest } = batch;
+                        if (batch.compactedAudioBlob && batch.compactedAudioBlob.size > 0) {
+                            const compactedKey = `batch_compacted_audio_${currentTabId}_${batch.id}`;
+                            usedKeys.push(compactedKey);
+                            await saveAudioBlob(compactedKey, batch.compactedAudioBlob);
+                        }
+
+                        const { chat, audioBlobs, compactedAudioBlob, ...rest } = batch;
 
                         return {
                             ...rest,
                             audioCount: audioBlobs.length,
+                            hasCompactedAudio: Boolean(compactedAudioBlob && compactedAudioBlob.size > 0),
                         };
                     })
                 );
@@ -1507,13 +1482,16 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     };
 
     /** Pre-filters a single audio clip for Gemini when experimental pre-filtering is enabled. */
-    const prefilterSingleAudioBlob = async (blob: Blob): Promise<{ blob: Blob; stats: AudioPrefilterStats | null }> => {
-        const { filteredInput, stats } = await filterAudioInputsForModel(blob, {
+    const prefilterSingleAudioBlob = async (
+        blob: Blob
+    ): Promise<{ blob: Blob; stats: AudioPrefilterStats | null; compactedAudioBlob: Blob | null }> => {
+        const { filteredInput, stats, compactedAudioBlob } = await filterAudioInputsForModel(blob, {
             enabled: Boolean(isExperimentalAudioFilterEnabled),
         });
         return {
             blob: Array.isArray(filteredInput) ? filteredInput[0] : filteredInput,
             stats,
+            compactedAudioBlob,
         };
     };
 
@@ -1525,13 +1503,13 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     const prepareModelInputsForBatch = async (
         blobs: Blob[],
         mergeWhenDisabled: boolean
-    ): Promise<{ modelInput: Blob | Blob[]; prefilterStats: AudioPrefilterStats | null }> => {
+    ): Promise<{ modelInput: Blob | Blob[]; prefilterStats: AudioPrefilterStats | null; compactedAudioBlob: Blob | null }> => {
         if (isExperimentalAudioFilterEnabled) {
-            const { filteredInput, stats } = await filterAudioInputsForModel(blobs, { enabled: true });
-            return { modelInput: filteredInput, prefilterStats: stats };
+            const { filteredInput, stats, compactedAudioBlob } = await filterAudioInputsForModel(blobs, { enabled: true });
+            return { modelInput: filteredInput, prefilterStats: stats, compactedAudioBlob };
         }
         const modelInput = mergeWhenDisabled ? await mergeMultipleAudioBlobs(blobs) : blobs;
-        return { modelInput, prefilterStats: null };
+        return { modelInput, prefilterStats: null, compactedAudioBlob: null };
     };
 
     const handleProcessAll = async () => {
@@ -1547,15 +1525,18 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             batchProcessingIdRef.current[b.id] = (batchProcessingIdRef.current[b.id] || 0) + 1;
         });
 
-        setBatches(prev => prev.map(b => batchesToProcess.find(p => p.id === b.id) ? {...b, status: 'processing'} : b));
+        setBatches(prev => prev.map(b => batchesToProcess.find(p => p.id === b.id) ? {...b, status: 'processing', compactedAudioBlob: null, prefilterStats: null} : b));
 
         try {
             await Promise.all(batchesToProcess.map(async (batch) => {
                 if (batch.audioBlobs.length === 0) return;
                 const currentReqId = batchProcessingIdRef.current[batch.id];
                 try {
-                    const { modelInput, prefilterStats } = await prepareModelInputsForBatch(batch.audioBlobs, true);
+                    const { modelInput, prefilterStats, compactedAudioBlob } = await prepareModelInputsForBatch(batch.audioBlobs, true);
                     if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
+
+                    // Expose compacted audio & pre-trim stats immediately once filtering/combination finishes
+                    setBatches(prev => prev.map(b => b.id === batch.id ? { ...b, prefilterStats, compactedAudioBlob } : b));
 
                     const currentUpcoming = getUpcomingTemplate();
                     const effectivePrompt = batch.customPrompt || (currentUpcoming ? currentUpcoming.promptText : globalCustomPrompt);
@@ -1570,7 +1551,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
 
                     if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
 
-                    setBatches(prev => prev.map(b => b.id === batch.id ? { ...b, status: 'complete', findings, chat: chatSession, chatHistory: initialChatHistory, isChatting: false, prefilterStats } : b));
+                    setBatches(prev => prev.map(b => b.id === batch.id ? { ...b, status: 'complete', findings, chat: chatSession, chatHistory: initialChatHistory, isChatting: false, prefilterStats, compactedAudioBlob } : b));
                 } catch (err) {
                     if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
                     const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';
@@ -1611,11 +1592,13 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         const currentReqId = (batchProcessingIdRef.current[batchId] || 0) + 1;
         batchProcessingIdRef.current[batchId] = currentReqId;
 
-        setBatches(prev => prev.map(b => b.id === batchId ? {...b, status: 'processing', error: undefined } : b));
+        setBatches(prev => prev.map(b => b.id === batchId ? {...b, status: 'processing', error: undefined, compactedAudioBlob: null, prefilterStats: null } : b));
 
         try {
-            const { modelInput, prefilterStats } = await prepareModelInputsForBatch(allBlobs, false);
+            const { modelInput, prefilterStats, compactedAudioBlob } = await prepareModelInputsForBatch(allBlobs, false);
             if (batchProcessingIdRef.current[batchId] !== currentReqId) return;
+
+            setBatches(prev => prev.map(b => b.id === batchId ? { ...b, prefilterStats, compactedAudioBlob } : b));
 
             const findings = await processAudio(modelInput, batch.selectedModel, batch.customPrompt, batch.customImages, undefined, batch.customDocx);
             
@@ -1628,7 +1611,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             if (batchProcessingIdRef.current[batchId] !== currentReqId) return;
 
             setBatches(prev => {
-                const updated = prev.map(b => b.id === batchId ? { ...b, audioBlobs: allBlobs, extraFiles: [], status: 'complete', findings, chat: chatSession, chatHistory: initialChatHistory, isChatting: false, prefilterStats } : b);
+                const updated = prev.map(b => b.id === batchId ? { ...b, audioBlobs: allBlobs, extraFiles: [], status: 'complete', findings, chat: chatSession, chatHistory: initialChatHistory, isChatting: false, prefilterStats, compactedAudioBlob } : b);
                 saveBatchesToDrive(updated);
                 return updated;
             });
@@ -1982,11 +1965,25 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         }
         if (!blobs || !blobs.length) return;
         try {
-            const mergedBlob = await mergeMultipleAudioBlobs(blobs);
-            triggerAudioDownload(mergedBlob, batch.name.replace(/\s+/g, '_'));
+            const safeName = batch.name.replace(/\s+/g, '_');
+            const baseName = batch.compactedAudioBlob ? `${safeName}_original` : safeName;
+            await downloadOriginalAudioInput(blobs, baseName);
         } catch (err) {
-            console.error('Failed to download audio:', err);
+            console.error('Failed to download original audio:', err);
         }
+    };
+
+    const handleDownloadCompacted = async (batch: Batch) => {
+        let compacted = batch.compactedAudioBlob || null;
+        if (!compacted) {
+            const currentTabId = getTabId();
+            compacted =
+                (await getAudioBlob(`batch_compacted_audio_${currentTabId}_${batch.id}`)) ||
+                (await getAudioBlob(`batch_compacted_audio_${batch.id}`));
+        }
+        if (!compacted || compacted.size === 0) return;
+        const safeName = batch.name.replace(/\s+/g, '_');
+        downloadCompactedAudioBlob(compacted, `${safeName}_compacted_decision1`);
     };
 
     const handleDownloadHTML = () => {
@@ -2224,22 +2221,32 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             setUndoStates(prev => ({ ...prev, [batchId]: [...batch.findings!] }));
 
             try {
-                const { blob: filteredNewAudio, stats: continueStats } = await prefilterSingleAudioBlob(newAudioBlob);
-                const newFindings = await processAudio(filteredNewAudio, batch.selectedModel, batch.customPrompt, batch.customImages);
-                const updatedFindings = [...batch.findings, ...newFindings];
-                
+                const { blob: filteredNewAudio, stats: continueStats, compactedAudioBlob: continueCompacted } = await prefilterSingleAudioBlob(newAudioBlob);
                 const updatedAudioBlobs = [...batch.audioBlobs, newAudioBlob];
                 let chatAudioInput: Blob | Blob[];
+                let updatedCompactedBlob: Blob | null = batch.compactedAudioBlob ?? null;
                 if (isExperimentalAudioFilterEnabled) {
                     if (batch.audioBlobs.length > 0) {
+                        if (batch.compactedAudioBlob || continueStats?.applied) {
+                            const prevBase = batch.compactedAudioBlob || batch.audioBlobs;
+                            const nextPart = continueStats?.applied && continueCompacted ? continueCompacted : filteredNewAudio;
+                            updatedCompactedBlob = await combineAudioBlobsToCompact([
+                                ...(Array.isArray(prevBase) ? prevBase : [prevBase]),
+                                nextPart,
+                            ]);
+                        }
                         const { modelInput: priorFiltered } = await prepareModelInputsForBatch(batch.audioBlobs, false);
                         chatAudioInput = [...(Array.isArray(priorFiltered) ? priorFiltered : [priorFiltered]), filteredNewAudio];
                     } else {
+                        updatedCompactedBlob = continueStats?.applied ? continueCompacted : null;
                         chatAudioInput = [filteredNewAudio];
                     }
                 } else {
                     chatAudioInput = await mergeMultipleAudioBlobs(updatedAudioBlobs);
                 }
+
+                const newFindings = await processAudio(filteredNewAudio, batch.selectedModel, batch.customPrompt, batch.customImages);
+                const updatedFindings = [...batch.findings, ...newFindings];
 
                 const chatSession = await createChat(chatAudioInput, updatedFindings, batch.customPrompt, batch.customImages, batch.selectedModel);
                 const aiGreeting = "I have updated the transcript with your new dictation. How can I help you further?";
@@ -2250,6 +2257,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                         ...b,
                         findings: updatedFindings,
                         audioBlobs: updatedAudioBlobs,
+                        compactedAudioBlob: updatedCompactedBlob,
                         chat: chatSession,
                         chatHistory: updatedChatHistory,
                         prefilterStats: isExperimentalAudioFilterEnabled
@@ -3117,9 +3125,14 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                             >
                                                                 <ClipboardPaste className="w-4 h-4" /> + Text
                                                             </button>
-                                                            <button onClick={() => handleDownload(batch)} className="flex items-center gap-2 bg-slate-500 text-white p-2 rounded-lg hover:bg-slate-600 transition-colors text-sm px-3" aria-label={`Download audio for ${batch.name}`}>
-                                                                <DownloadIcon className="w-4 h-4" /> Download
+                                                            <button onClick={() => handleDownload(batch)} className="flex items-center gap-2 bg-slate-500 text-white p-2 rounded-lg hover:bg-slate-600 transition-colors text-sm px-3" aria-label={`Download audio for ${batch.name}`} title={batch.compactedAudioBlob ? 'Download original unfiltered audio' : 'Download audio for this batch'}>
+                                                                <DownloadIcon className="w-4 h-4" /> {batch.compactedAudioBlob ? 'Original' : 'Download'}
                                                             </button>
+                                                            {batch.compactedAudioBlob && batch.compactedAudioBlob.size > 0 && (
+                                                                <button onClick={() => handleDownloadCompacted(batch)} className="flex items-center gap-1.5 bg-amber-600 text-white p-2 rounded-lg hover:bg-amber-700 transition-colors text-sm px-3" aria-label={`Download compacted audio for ${batch.name}`} title="Download Decision-1 compacted pre-trimmed audio">
+                                                                    <DownloadIcon className="w-4 h-4" /> Compacted
+                                                                </button>
+                                                            )}
                                                         </>
                                                     )}
                                                 </>
@@ -3146,11 +3159,16 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                             )}
                                             {(batch.status === 'complete') && batch.audioBlobs.length > 0 && batch.findings === null && <span className="text-green-600 dark:text-green-400 font-semibold text-sm">Ready to Process</span>}
                                             {batch.status === 'processing' && (
-                                                <div className="flex items-center gap-2">
+                                                <div className="flex items-center gap-2 flex-wrap">
                                                     <Spinner className="w-6 h-6" />
                                                     {batch.audioBlobs.length > 0 && (
-                                                        <button onClick={() => handleDownload(batch)} className="flex items-center gap-2 bg-slate-500 text-white p-2 rounded-lg hover:bg-slate-600 transition-colors text-sm px-3" aria-label={`Download audio for ${batch.name}`}>
-                                                            <DownloadIcon className="w-4 h-4" /> Download
+                                                        <button onClick={() => handleDownload(batch)} className="flex items-center gap-2 bg-slate-500 text-white p-2 rounded-lg hover:bg-slate-600 transition-colors text-sm px-3" aria-label={`Download audio for ${batch.name}`} title={batch.compactedAudioBlob ? 'Download original unfiltered audio' : 'Download audio for this batch'}>
+                                                            <DownloadIcon className="w-4 h-4" /> {batch.compactedAudioBlob ? 'Original' : 'Download'}
+                                                        </button>
+                                                    )}
+                                                    {batch.compactedAudioBlob && batch.compactedAudioBlob.size > 0 && (
+                                                        <button onClick={() => handleDownloadCompacted(batch)} className="flex items-center gap-1.5 bg-amber-600 text-white p-2 rounded-lg hover:bg-amber-700 transition-colors text-sm px-3" aria-label={`Download compacted audio for ${batch.name}`} title="Download Decision-1 compacted pre-trimmed audio">
+                                                            <DownloadIcon className="w-4 h-4" /> Compacted
                                                         </button>
                                                     )}
                                                 </div>
@@ -3228,8 +3246,13 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                         </>
                                                     )}
                                                     {batch.audioBlobs.length > 0 && (
-                                                        <button onClick={() => handleDownload(batch)} className="flex items-center gap-1.5 bg-slate-500 text-white p-1.5 rounded-lg hover:bg-slate-600 transition-colors text-xs px-2.5" aria-label={`Download audio for ${batch.name}`} title="Download audio for this batch">
-                                                            <DownloadIcon className="w-3.5 h-3.5" /> Download Audio
+                                                        <button onClick={() => handleDownload(batch)} className="flex items-center gap-1.5 bg-slate-500 text-white p-1.5 rounded-lg hover:bg-slate-600 transition-colors text-xs px-2.5" aria-label={`Download audio for ${batch.name}`} title={batch.compactedAudioBlob ? 'Download original unfiltered audio for this batch' : 'Download audio for this batch'}>
+                                                            <DownloadIcon className="w-3.5 h-3.5" /> {batch.compactedAudioBlob ? 'Original Audio' : 'Download Audio'}
+                                                        </button>
+                                                    )}
+                                                    {batch.compactedAudioBlob && batch.compactedAudioBlob.size > 0 && (
+                                                        <button onClick={() => handleDownloadCompacted(batch)} className="flex items-center gap-1.5 bg-amber-600 text-white p-1.5 rounded-lg hover:bg-amber-700 transition-colors text-xs px-2.5 font-medium shadow-2xs" aria-label={`Download compacted audio for ${batch.name}`} title="Download Decision-1 compacted pre-trimmed audio">
+                                                            <DownloadIcon className="w-3.5 h-3.5" /> Compacted Audio
                                                         </button>
                                                     )}
                                                 </div>
@@ -3464,20 +3487,32 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                     )}
                                                   </div>
                                                   {batch.prefilterStats?.applied && (
-                                                    <span
-                                                      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-teal-50 text-teal-800 border border-teal-200 dark:bg-teal-950/50 dark:text-teal-300 dark:border-teal-800/80"
-                                                      title={`Pre-filtered audio (${batch.prefilterStats.outputMimeType}, ${(batch.prefilterStats.originalBytes / 1024).toFixed(0)} KB → ${(batch.prefilterStats.outputBytes / 1024).toFixed(0)} KB)`}
-                                                    >
-                                                      <span>Pre-Trim</span>
-                                                      <span>
-                                                        {formatPrefilterDuration(batch.prefilterStats.originalDurationSec)} → {formatPrefilterDuration(batch.prefilterStats.keptDurationSec)}
-                                                      </span>
-                                                      {formatPrefilterRemovedSummary(batch.prefilterStats) && (
-                                                        <span className="text-teal-700 dark:text-teal-300">
-                                                          {formatPrefilterRemovedSummary(batch.prefilterStats)}
+                                                    <div className="inline-flex flex-wrap items-center gap-1.5">
+                                                      <span
+                                                        className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-teal-50 text-teal-800 border border-teal-200 dark:bg-teal-950/50 dark:text-teal-300 dark:border-teal-800/80"
+                                                        title={`Pre-filtered audio (${batch.prefilterStats.outputMimeType}, ${(batch.prefilterStats.originalBytes / 1024).toFixed(0)} KB → ${(batch.prefilterStats.outputBytes / 1024).toFixed(0)} KB)`}
+                                                      >
+                                                        <span>Pre-Trim</span>
+                                                        <span>
+                                                          {formatPrefilterDuration(batch.prefilterStats.originalDurationSec)} → {formatPrefilterDuration(batch.prefilterStats.keptDurationSec)}
                                                         </span>
+                                                        {formatPrefilterRemovedSummary(batch.prefilterStats) && (
+                                                          <span className="text-teal-700 dark:text-teal-300">
+                                                            {formatPrefilterRemovedSummary(batch.prefilterStats)}
+                                                          </span>
+                                                        )}
+                                                      </span>
+                                                      {batch.compactedAudioBlob && batch.compactedAudioBlob.size > 0 && (
+                                                        <button
+                                                          type="button"
+                                                          onClick={() => handleDownloadCompacted(batch)}
+                                                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-bold bg-amber-100 hover:bg-amber-200 text-amber-900 border border-amber-300 dark:bg-amber-900/50 dark:hover:bg-amber-800/70 dark:text-amber-200 dark:border-amber-700 transition-colors cursor-pointer"
+                                                          title="Download compacted audio made from Decision 1"
+                                                        >
+                                                          <DownloadIcon className="w-3 h-3" /> Compacted ({batch.compactedAudioBlob.size >= 1024 * 1024 ? `${(batch.compactedAudioBlob.size / (1024 * 1024)).toFixed(1)} MB` : `${Math.max(1, Math.round(batch.compactedAudioBlob.size / 1024))} KB`})
+                                                        </button>
                                                       )}
-                                                    </span>
+                                                    </div>
                                                   )}
                                                 </div>
 
@@ -3826,10 +3861,20 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                                     <button
                                                                         onClick={() => handleDownload(batch)}
                                                                         className="text-sm font-semibold py-1.5 px-3 rounded-lg bg-slate-600 hover:bg-slate-700 text-white transition-colors flex items-center gap-1.5 shadow-xs"
-                                                                        title="Download original audio for this batch"
+                                                                        title="Download original unfiltered audio for this batch"
                                                                     >
                                                                         <DownloadIcon className="w-4 h-4" />
-                                                                        <span>Download Audio</span>
+                                                                        <span>{batch.compactedAudioBlob ? 'Download Original Audio' : 'Download Audio'}</span>
+                                                                    </button>
+                                                                )}
+                                                                {batch.compactedAudioBlob && batch.compactedAudioBlob.size > 0 && (
+                                                                    <button
+                                                                        onClick={() => handleDownloadCompacted(batch)}
+                                                                        className="text-sm font-semibold py-1.5 px-3 rounded-lg bg-amber-600 hover:bg-amber-700 text-white transition-colors flex items-center gap-1.5 shadow-xs"
+                                                                        title="Download Decision-1 compacted pre-trimmed audio"
+                                                                    >
+                                                                        <DownloadIcon className="w-4 h-4" />
+                                                                        <span>Download Compacted Audio</span>
                                                                     </button>
                                                                 )}
                                                             </div>
@@ -4399,10 +4444,21 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                                 onClick={() => handleDownload(batch)}
                                                                 disabled={!batch.audioBlobs.length}
                                                                 className="bg-slate-600 text-white font-bold py-2.5 px-5 rounded-xl hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-400 focus:ring-opacity-50 transition-all shadow-sm disabled:bg-slate-300 dark:disabled:bg-slate-700 disabled:cursor-not-allowed w-full lg:w-auto flex items-center justify-center gap-2 min-h-[44px]"
+                                                                title={batch.compactedAudioBlob ? 'Download original unfiltered audio' : 'Download audio'}
                                                             >
                                                                 <DownloadIcon className="w-4 h-4" />
-                                                                Download Audio
+                                                                {batch.compactedAudioBlob ? 'Download Original Audio' : 'Download Audio'}
                                                             </button>
+                                                            {batch.compactedAudioBlob && batch.compactedAudioBlob.size > 0 && (
+                                                                <button
+                                                                    onClick={() => handleDownloadCompacted(batch)}
+                                                                    className="bg-amber-600 text-white font-bold py-2.5 px-5 rounded-xl hover:bg-amber-700 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:ring-opacity-50 transition-all shadow-sm w-full lg:w-auto flex items-center justify-center gap-2 min-h-[44px]"
+                                                                    title="Download Decision-1 compacted pre-trimmed audio"
+                                                                >
+                                                                    <DownloadIcon className="w-4 h-4" />
+                                                                    Download Compacted Audio
+                                                                </button>
+                                                            )}
                                                         </div>
                                                     ) : null}
                                                     {continuationState.status === 'recording' && continuationState.batchId === batch.id && (
@@ -4480,7 +4536,15 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                             onClick={() => handleDownload(batch)}
                                                             className="flex items-center gap-2 bg-slate-600 text-white font-bold py-2.5 px-5 rounded-lg hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-500 focus:ring-opacity-50 transition-colors shadow text-sm"
                                                         >
-                                                            <DownloadIcon className="w-4 h-4" /> Download Audio File
+                                                            <DownloadIcon className="w-4 h-4" /> {batch.compactedAudioBlob ? 'Download Original Audio' : 'Download Audio File'}
+                                                        </button>
+                                                    )}
+                                                    {batch.compactedAudioBlob && batch.compactedAudioBlob.size > 0 && (
+                                                        <button
+                                                            onClick={() => handleDownloadCompacted(batch)}
+                                                            className="flex items-center gap-2 bg-amber-600 text-white font-bold py-2.5 px-5 rounded-lg hover:bg-amber-700 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:ring-opacity-50 transition-colors shadow text-sm"
+                                                        >
+                                                            <DownloadIcon className="w-4 h-4" /> Download Compacted Audio
                                                         </button>
                                                     )}
 

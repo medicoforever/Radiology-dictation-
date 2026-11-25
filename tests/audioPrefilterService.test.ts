@@ -15,6 +15,11 @@ import {
   muxOpusPacketsToOgg,
   encodePcmToWavBytes,
   filterAudioInputsForModel,
+  extractAudioBlobs,
+  combineAudioBlobsToCompact,
+  downloadOriginalAudioInput,
+  downloadCompactedAudioBlob,
+  mergePrefilterStats,
   type SpeechInterval,
 } from '../services/audioPrefilterService';
 import { safeLocalStorage } from '../services/storageService';
@@ -499,6 +504,8 @@ test('filterAudioInputsForModel end-to-end with mocked AudioContext trims silenc
     assert.ok(out[1].size < wavBlob.size * 0.5);
     assert.equal(res.stats?.applied, true);
     assert.equal(res.stats?.usedDecision1, false);
+    assert.ok(res.compactedAudioBlob instanceof Blob);
+    assert.equal(res.compactedAudioBlob, out[1]);
     assert.ok((res.stats?.silenceRemovedSec ?? 0) >= 7.0);
     assert.ok((res.stats?.keptDurationSec ?? 0) <= 2.6);
 
@@ -522,6 +529,7 @@ test('filterAudioInputsForModel end-to-end with mocked AudioContext trims silenc
     const noTrimRes = await filterAudioInputsForModel(fullSpeechWav, { enabled: true });
     assert.equal(noTrimRes.filteredInput, fullSpeechWav);
     assert.equal(noTrimRes.stats?.applied, false);
+    assert.equal(noTrimRes.compactedAudioBlob, null);
 
     // Decode failure gracefully returns original blob without crashing
     (globalThis as any).window.AudioContext = class MockFailingCtx {
@@ -536,7 +544,107 @@ test('filterAudioInputsForModel end-to-end with mocked AudioContext trims silenc
     const errRes = await filterAudioInputsForModel(fullSpeechWav, { enabled: true });
     assert.equal(errRes.filteredInput, fullSpeechWav);
     assert.equal(errRes.stats?.applied, false);
+    assert.equal(errRes.compactedAudioBlob, null);
   } finally {
     (globalThis as any).window = prevWindow;
+  }
+});
+
+test('filterAudioInputsForModel combines multi-audio inputs and downloads original + compacted cleanly', async () => {
+  const sr = 16000;
+  const pcmWithSilence = concatFloat32([
+    new Float32Array(sr * 3),
+    makeSineBurst(sr, 2.0, 0.15),
+    new Float32Array(sr * 3),
+  ]);
+  const wav1 = new Blob([encodePcmToWavBytes(pcmWithSilence, sr)], { type: 'audio/wav' });
+  const wav2 = new Blob([encodePcmToWavBytes(pcmWithSilence, sr)], { type: 'audio/wav' });
+  const pdfBlob = new Blob(['%PDF-1.4 fake'], { type: 'application/pdf' });
+
+  const extracted = await extractAudioBlobs([pdfBlob, wav1, wav2]);
+  assert.equal(extracted.length, 2);
+  assert.equal(extracted[0], wav1);
+  assert.equal(extracted[1], wav2);
+
+  const downloads: Array<{ filename: string; mimeType: string; size: number }> = [];
+  const prevWindow = (globalThis as any).window;
+  const prevDoc = (globalThis as any).document;
+  const prevCreateUrl = URL.createObjectURL;
+  const prevRevokeUrl = URL.revokeObjectURL;
+
+  (globalThis as any).window = {
+    AudioContext: class MockMultiAudioContext {
+      state = 'running';
+      createBuffer(channels: number, length: number, sampleRate: number) {
+        const chArrs = Array.from({ length: channels }, () => new Float32Array(length));
+        return {
+          numberOfChannels: channels,
+          length,
+          sampleRate,
+          getChannelData: (c: number) => chArrs[c],
+        };
+      }
+      async decodeAudioData() {
+        return {
+          sampleRate: sr,
+          numberOfChannels: 1,
+          length: pcmWithSilence.length,
+          getChannelData: () => pcmWithSilence,
+        };
+      }
+      async close() {
+        this.state = 'closed';
+      }
+    },
+    URL: {
+      revokeObjectURL: () => {},
+    },
+  };
+  (globalThis as any).document = {
+    body: { appendChild: () => {} },
+    createElement: () => ({
+      style: {},
+      href: '',
+      download: '',
+      click() {
+        const idx = downloads.length - 1;
+        if (idx >= 0) downloads[idx].filename = this.download;
+      },
+      remove() {},
+    }),
+  };
+  (URL as any).createObjectURL = (blob: Blob) => {
+    downloads.push({ filename: '', mimeType: blob.type, size: blob.size });
+    return 'blob:mock';
+  };
+  (URL as any).revokeObjectURL = () => {};
+
+  try {
+    const multiRes = await filterAudioInputsForModel([wav1, pdfBlob, wav2], { enabled: true });
+    assert.equal(multiRes.stats?.applied, true);
+    assert.ok(multiRes.compactedAudioBlob instanceof Blob);
+    assert.ok((multiRes.compactedAudioBlob?.size ?? 0) > 0);
+    assert.equal((multiRes.filteredInput as Blob[])[1], pdfBlob);
+
+    const combinedDirect = await combineAudioBlobsToCompact([pdfBlob, wav1, wav2]);
+    assert.ok(combinedDirect instanceof Blob);
+    assert.ok((combinedDirect?.size ?? 0) > 0);
+
+    const origOk = await downloadOriginalAudioInput([pdfBlob, wav1, wav2], 'radiology-dictation-original');
+    const compOk = downloadCompactedAudioBlob(multiRes.compactedAudioBlob, 'radiology-dictation-compacted-decision1');
+    assert.equal(origOk, true);
+    assert.equal(compOk, true);
+    assert.equal(downloads.length, 2);
+    assert.equal(downloads[0].filename, 'radiology-dictation-original.wav');
+    assert.equal(downloads[1].filename, 'radiology-dictation-compacted-decision1.wav');
+
+    const mergedStats = mergePrefilterStats(multiRes.stats, multiRes.stats);
+    assert.equal(mergedStats?.applied, true);
+    assert.equal(mergedStats?.keptSegmentsCount, (multiRes.stats?.keptSegmentsCount ?? 0) * 2);
+  } finally {
+    (globalThis as any).window = prevWindow;
+    (globalThis as any).document = prevDoc;
+    (URL as any).createObjectURL = prevCreateUrl;
+    (URL as any).revokeObjectURL = prevRevokeUrl;
   }
 });

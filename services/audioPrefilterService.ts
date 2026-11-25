@@ -13,6 +13,7 @@
  */
 
 import { executeWithApiKeyFailover } from './apiKeyService';
+import { mergeMultipleAudioBlobs, triggerAudioDownload } from './audioMerger';
 
 export const EXPERIMENTAL_AUDIO_FILTER_KEY = 'radiologyExperimentalAudioFilter';
 export const PREFILTER_DECISION_MODEL = 'gemini-decision-1';
@@ -1750,18 +1751,168 @@ async function prefilterSingleAudioBlob(
   };
 }
 
+export interface FilterAudioInputsResult {
+  filteredInput: Blob | Blob[];
+  stats: AudioPrefilterStats | null;
+  compactedAudioBlob: Blob | null;
+}
+
+/** Extracts only genuine audio blobs from a single Blob or mixed attachment array. */
+export async function extractAudioBlobs(input: Blob | Blob[] | null | undefined): Promise<Blob[]> {
+  if (!input) return [];
+  const items = Array.isArray(input) ? input : [input];
+  const audioBlobs: Blob[] = [];
+  for (const item of items) {
+    if (!item || item.size === 0) continue;
+    const classification = await classifyBlobForPrefilter(item);
+    if (classification.isAudio) {
+      audioBlobs.push(item);
+    }
+  }
+  return audioBlobs;
+}
+
+/**
+ * Combines one or more audio blobs into a single playable compacted audio Blob
+ * (Ogg/Opus via WebCodecs when available, falling back to compact WAV).
+ * Non-audio attachments are excluded automatically.
+ */
+export async function combineAudioBlobsToCompact(
+  input: Blob | Blob[] | null | undefined,
+  options?: { abortSignal?: AbortSignal }
+): Promise<Blob | null> {
+  const audioBlobs = await extractAudioBlobs(input);
+  if (audioBlobs.length === 0) return null;
+  if (audioBlobs.length === 1) return audioBlobs[0];
+
+  throwIfAborted(options?.abortSignal);
+
+  try {
+    const decodedList = await Promise.all(audioBlobs.map((b) => decodeBlobToMonoPcm(b)));
+    throwIfAborted(options?.abortSignal);
+
+    const maxRate = decodedList.reduce((m, d) => Math.max(m, d.sampleRate), 16000);
+    const targetRate = Math.max(16000, Math.min(OPUS_TARGET_SAMPLE_RATE, maxRate));
+    const spacerSamples = Math.max(0, Math.round(INTER_SEGMENT_SPACER_SEC * targetRate));
+
+    const resampled = decodedList.map((d) =>
+      d.sampleRate === targetRate ? d.samples : resampleMonoPcm(d.samples, d.sampleRate, targetRate)
+    );
+    const totalLen = resampled.reduce(
+      (sum, arr, idx) => sum + arr.length + (idx > 0 ? spacerSamples : 0),
+      0
+    );
+    if (totalLen === 0) return audioBlobs[0];
+
+    const combined = new Float32Array(totalLen);
+    let offset = 0;
+    for (let i = 0; i < resampled.length; i++) {
+      if (i > 0) offset += spacerSamples;
+      combined.set(resampled[i], offset);
+      offset += resampled[i].length;
+    }
+
+    const encoded = await encodeCompactAudioBlob(combined, targetRate, options?.abortSignal);
+    return encoded.blob;
+  } catch (err) {
+    if (isAbortError(err)) throw err;
+    console.warn('[AudioPrefilter] Compact combination decode failed; falling back to standard merge:', err);
+    return mergeMultipleAudioBlobs(audioBlobs);
+  }
+}
+
+/**
+ * Downloads the original unfiltered audio from a single Blob or mixed Blob[].
+ * Skips non-audio attachments (PDF, DOCX, images) and merges multiple audio clips when needed.
+ */
+export async function downloadOriginalAudioInput(
+  input: Blob | Blob[] | null | undefined,
+  baseName = 'radiology-dictation'
+): Promise<boolean> {
+  if (!input) return false;
+  let audioBlobs = await extractAudioBlobs(input);
+  if (audioBlobs.length === 0) {
+    const fallback = (Array.isArray(input) ? input : [input]).filter((b) => b && b.size > 0);
+    if (fallback.length === 0) return false;
+    audioBlobs = [fallback[0]];
+  }
+  const toDownload =
+    audioBlobs.length === 1 ? audioBlobs[0] : await mergeMultipleAudioBlobs(audioBlobs);
+  if (!toDownload || toDownload.size === 0) return false;
+  triggerAudioDownload(toDownload, baseName);
+  return true;
+}
+
+/** Downloads the compacted Decision-1 audio Blob with its proper extension. */
+export function downloadCompactedAudioBlob(
+  compactedBlob: Blob | null | undefined,
+  baseName = 'radiology-dictation-compacted-decision1'
+): boolean {
+  if (!compactedBlob || compactedBlob.size === 0) return false;
+  triggerAudioDownload(compactedBlob, baseName);
+  return true;
+}
+
+/** Formats seconds into a compact human-readable duration for pre-filter stats badges. */
+export function formatPrefilterDuration(sec: number): string {
+  if (!Number.isFinite(sec) || sec <= 0) return '0s';
+  if (sec < 60) {
+    return sec < 10 ? `${sec.toFixed(1)}s` : `${Math.round(sec)}s`;
+  }
+  const mins = Math.floor(sec / 60);
+  const remSec = Math.round(sec % 60);
+  return remSec === 60 ? `${mins + 1}m 0s` : `${mins}m ${remSec}s`;
+}
+
+/** Builds a concise summary of removed silence and non-radiology chatter for badges. */
+export function formatPrefilterRemovedSummary(stats: AudioPrefilterStats): string {
+  const removedParts: string[] = [];
+  if (stats.silenceRemovedSec > 0) {
+    removedParts.push(`-${formatPrefilterDuration(stats.silenceRemovedSec)} silence`);
+  }
+  if (stats.nonRadiologyRemovedSec > 0) {
+    removedParts.push(`-${formatPrefilterDuration(stats.nonRadiologyRemovedSec)} chatter`);
+  }
+  return removedParts.length > 0 ? ` (${removedParts.join(', ')})` : '';
+}
+
+/** Combines pre-filter telemetry when continuation dictations are appended. */
+export function mergePrefilterStats(
+  prev: AudioPrefilterStats | null | undefined,
+  next: AudioPrefilterStats | null
+): AudioPrefilterStats | null {
+  if (!next?.applied) return prev ?? null;
+  if (!prev?.applied) return next;
+  const mimes = Array.from(new Set([prev.outputMimeType, next.outputMimeType].filter(Boolean)));
+  return {
+    applied: true,
+    originalDurationSec: Number((prev.originalDurationSec + next.originalDurationSec).toFixed(3)),
+    keptDurationSec: Number((prev.keptDurationSec + next.keptDurationSec).toFixed(3)),
+    afterVadDurationSec: Number((prev.afterVadDurationSec + next.afterVadDurationSec).toFixed(3)),
+    silenceRemovedSec: Number((prev.silenceRemovedSec + next.silenceRemovedSec).toFixed(3)),
+    nonRadiologyRemovedSec: Number((prev.nonRadiologyRemovedSec + next.nonRadiologyRemovedSec).toFixed(3)),
+    keptSegmentsCount: prev.keptSegmentsCount + next.keptSegmentsCount,
+    droppedNonRadiologyCount: prev.droppedNonRadiologyCount + next.droppedNonRadiologyCount,
+    originalBytes: prev.originalBytes + next.originalBytes,
+    outputBytes: prev.outputBytes + next.outputBytes,
+    outputMimeType: mimes.join(', '),
+    decisionLatencyMs: prev.decisionLatencyMs + next.decisionLatencyMs,
+    usedDecision1: prev.usedDecision1 || next.usedDecision1,
+  };
+}
+
 /**
  * Main experimental pre-filter entry point.
- * When `options.enabled` is false, returns `{ filteredInput: input, stats: null }` immediately
- * with zero processing. Non-audio blobs (PDF, DOCX, DOC, RTF, TXT, images, videos) are
+ * When `options.enabled` is false, returns `{ filteredInput: input, stats: null, compactedAudioBlob: null }`
+ * immediately with zero processing. Non-audio blobs (PDF, DOCX, DOC, RTF, TXT, images, videos) are
  * returned unchanged at their exact original positions.
  */
 export async function filterAudioInputsForModel(
   input: Blob | Blob[],
   options: FilterAudioInputsOptions
-): Promise<{ filteredInput: Blob | Blob[]; stats: AudioPrefilterStats | null }> {
+): Promise<FilterAudioInputsResult> {
   if (!options.enabled) {
-    return { filteredInput: input, stats: null };
+    return { filteredInput: input, stats: null, compactedAudioBlob: null };
   }
 
   throwIfAborted(options.abortSignal);
@@ -1789,10 +1940,12 @@ export async function filterAudioInputsForModel(
         usedDecision1: false,
         skippedReason: 'No input blobs provided',
       },
+      compactedAudioBlob: null,
     };
   }
 
   const outputItems: Blob[] = new Array(items.length);
+  const filteredAudioBlobs: Blob[] = [];
   let audioCount = 0;
   let anyApplied = false;
   let anyUsedDecision1 = false;
@@ -1829,6 +1982,7 @@ export async function filterAudioInputsForModel(
     });
 
     outputItems[i] = res.blob;
+    filteredAudioBlobs.push(res.blob);
     if (res.applied) anyApplied = true;
     if (res.usedDecision1) anyUsedDecision1 = true;
     totalOriginalDurationSec += res.originalDurationSec;
@@ -1866,18 +2020,31 @@ export async function filterAudioInputsForModel(
         usedDecision1: false,
         skippedReason: 'No genuine audio inputs detected',
       },
+      compactedAudioBlob: null,
     };
   }
 
-  const outputMimeType =
-    outputMimes.size === 1
-      ? Array.from(outputMimes)[0]
-      : outputMimes.size > 1
-      ? Array.from(outputMimes).join(', ')
-      : 'audio/ogg';
+  let compactedAudioBlob: Blob | null = null;
+  if (anyApplied) {
+    compactedAudioBlob =
+      filteredAudioBlobs.length === 1
+        ? filteredAudioBlobs[0]
+        : await combineAudioBlobsToCompact(filteredAudioBlobs, {
+            abortSignal: options.abortSignal,
+          });
+  }
+
+  const resolvedMimeType = compactedAudioBlob?.type
+    ? compactedAudioBlob.type
+    : outputMimes.size === 1
+    ? Array.from(outputMimes)[0]
+    : outputMimes.size > 1
+    ? Array.from(outputMimes).join(', ')
+    : 'audio/ogg';
 
   return {
     filteredInput: isArray ? outputItems : outputItems[0],
+    compactedAudioBlob,
     stats: {
       applied: anyApplied,
       originalDurationSec: Number(totalOriginalDurationSec.toFixed(3)),
@@ -1888,8 +2055,8 @@ export async function filterAudioInputsForModel(
       keptSegmentsCount: totalKeptSegmentsCount,
       droppedNonRadiologyCount: totalDroppedNonRadiologyCount,
       originalBytes,
-      outputBytes,
-      outputMimeType,
+      outputBytes: compactedAudioBlob && filteredAudioBlobs.length > 1 ? compactedAudioBlob.size : outputBytes,
+      outputMimeType: resolvedMimeType,
       decisionLatencyMs: totalDecisionLatencyMs,
       usedDecision1: anyUsedDecision1,
       skippedReason: !anyApplied && skipReasons.length > 0 ? skipReasons[0] : undefined,

@@ -41,8 +41,17 @@ import MacrosAndDictionaryModal from './components/MacrosAndDictionaryModal';
 import { subscribeToMacroDictionary, syncMacrosWithGoogleDrive, expandMacrosInFindings } from './services/macroDictionaryService';
 import { FloatingNewDictationButton } from './components/FloatingNewDictationButton';
 import ErrorBoundary from './components/ErrorBoundary';
-import { safeLocalStorage, getTabId, markTabActive, isTabHeartbeatAlive, getSingleModeStorageKey, getSingleModeAudioKey, getBatchModeStorageKey } from './services/storageService';
-import { filterAudioInputsForModel, AudioPrefilterStats, EXPERIMENTAL_AUDIO_FILTER_KEY } from './services/audioPrefilterService';
+import { safeLocalStorage, getTabId, markTabActive, isTabHeartbeatAlive, getSingleModeStorageKey, getSingleModeAudioKey, getSingleModeCompactedAudioKey, getBatchModeStorageKey } from './services/storageService';
+import {
+  filterAudioInputsForModel,
+  AudioPrefilterStats,
+  EXPERIMENTAL_AUDIO_FILTER_KEY,
+  combineAudioBlobsToCompact,
+  downloadOriginalAudioInput,
+  downloadCompactedAudioBlob,
+  formatPrefilterDuration,
+  mergePrefilterStats,
+} from './services/audioPrefilterService';
 
 interface ChatMessage {
   author: 'You' | 'AI';
@@ -62,16 +71,6 @@ const formatFileSize = (bytes: number): string => {
   return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
 };
 
-const formatPrefilterDuration = (sec: number): string => {
-  if (!Number.isFinite(sec) || sec <= 0) return '0s';
-  if (sec < 60) {
-    return sec < 10 ? `${sec.toFixed(1)}s` : `${Math.round(sec)}s`;
-  }
-  const mins = Math.floor(sec / 60);
-  const remSec = Math.round(sec % 60);
-  return remSec === 60 ? `${mins + 1}m 0s` : `${mins}m ${remSec}s`;
-};
-
 async function runAudioPrefilterSafely(
   input: Blob | Blob[],
   options: {
@@ -81,9 +80,9 @@ async function runAudioPrefilterSafely(
     onDone?: () => void;
     contextLabel: string;
   }
-): Promise<{ modelInput: Blob | Blob[]; stats: AudioPrefilterStats | null }> {
+): Promise<{ modelInput: Blob | Blob[]; stats: AudioPrefilterStats | null; compactedAudioBlob: Blob | null }> {
   if (!options.enabled) {
-    return { modelInput: input, stats: null };
+    return { modelInput: input, stats: null, compactedAudioBlob: null };
   }
   try {
     const res = await filterAudioInputsForModel(input, {
@@ -91,13 +90,17 @@ async function runAudioPrefilterSafely(
       abortSignal: options.abortSignal,
       onProgress: options.onProgress,
     });
-    return { modelInput: res.filteredInput, stats: res.stats };
+    return {
+      modelInput: res.filteredInput,
+      stats: res.stats,
+      compactedAudioBlob: res.compactedAudioBlob,
+    };
   } catch (err: any) {
     if (err?.name === 'AbortError' || options.abortSignal?.aborted) {
       throw err;
     }
     console.warn(`[AudioPrefilter] ${options.contextLabel} fallback to original audio:`, err);
-    return { modelInput: input, stats: null };
+    return { modelInput: input, stats: null, compactedAudioBlob: null };
   } finally {
     options.onDone?.();
   }
@@ -220,6 +223,7 @@ const App: React.FC = () => {
   const isExperimentalAudioFilterEnabledRef = useRef(isExperimentalAudioFilterEnabled);
   isExperimentalAudioFilterEnabledRef.current = isExperimentalAudioFilterEnabled;
   const [prefilterStats, setPrefilterStats] = useState<AudioPrefilterStats | null>(null);
+  const [compactedAudioBlob, setCompactedAudioBlob] = useState<Blob | null>(null);
   const [prefilterStatusMsg, setPrefilterStatusMsg] = useState<string | null>(null);
   const [isPowerMode, setIsPowerMode] = useState<boolean>(() => {
     const saved = safeLocalStorage.getRaw(POWER_MODE_KEY, '');
@@ -291,6 +295,7 @@ const App: React.FC = () => {
     qaAssessment?: ClinicalQaAssessment | null;
     errorCheckStatus: 'idle' | 'checking' | 'complete';
     prefilterStats?: AudioPrefilterStats | null;
+    compactedAudioBlob?: Blob | null;
     timestamp: number | null;
     isLive: boolean;
     driveSyncedHash: string | null;
@@ -335,6 +340,7 @@ const App: React.FC = () => {
   const firstDictationErrorRef = useRef<string | null>(null);
   const [firstDictationError, setFirstDictationError] = useState<string | null>(null);
   const firstDictationPrefilterStatsRef = useRef<AudioPrefilterStats | null>(null);
+  const firstDictationCompactedAudioRef = useRef<Blob | null>(null);
   const isFirstDictationProcessingRef = useRef<boolean>(false);
   const [batchModeInstanceKey, setBatchModeInstanceKey] = useState<number>(Date.now());
   const handleContinueDictationRef = useRef<((newAudioBlob: Blob, premergedBlob?: Blob) => Promise<void>) | null>(null);
@@ -465,6 +471,9 @@ const App: React.FC = () => {
           }
 
           setAudioBlob(blob);
+          const compactedKey = getSingleModeCompactedAudioKey(currentTabId);
+          const loadedCompactedBlob = await getAudioBlob(compactedKey);
+          setCompactedAudioBlob(loadedCompactedBlob || null);
           setFindings(savedState.findings || []);
           setChatHistory(savedState.chatHistory || []);
           setStatus(AppStatus.Success);
@@ -546,6 +555,7 @@ const App: React.FC = () => {
       const currentTabId = getTabId();
       const singleKey = getSingleModeStorageKey(currentTabId);
       const audioKey = getSingleModeAudioKey(currentTabId);
+      const compactedKey = getSingleModeCompactedAudioKey(currentTabId);
 
       // Only save when we have a successful result to resume from
       if (status === AppStatus.Success && findings.length > 0) {
@@ -559,6 +569,7 @@ const App: React.FC = () => {
             customImages,
             customDocx,
             hasAudio: !!audioBlob,
+            hasCompactedAudio: !!compactedAudioBlob,
             timestamp: activeDictationTimestampRef.current || Date.now(),
             isLive: activeDictationIsLiveRef.current,
             driveSynced: isSynced,
@@ -577,6 +588,11 @@ const App: React.FC = () => {
           } else {
             await deleteAudioBlob(audioKey);
           }
+          if (compactedAudioBlob) {
+            await saveAudioBlob(compactedKey, compactedAudioBlob);
+          } else {
+            await deleteAudioBlob(compactedKey);
+          }
           await deleteAudioBlob('single_mode_audio').catch(() => {});
         } catch (err) {
           console.error("Failed to save state:", err);
@@ -585,13 +601,14 @@ const App: React.FC = () => {
         safeLocalStorage.removeItem(singleKey);
         safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
         deleteAudioBlob(audioKey).catch(() => {});
+        deleteAudioBlob(compactedKey).catch(() => {});
         deleteAudioBlob('single_mode_audio').catch(() => {});
         deleteReportSession(singleKey).catch(() => {});
         deleteReportSession(SINGLE_MODE_STORAGE_KEY).catch(() => {});
       }
     };
     saveState();
-  }, [status, findings, audioBlob, chatHistory, selectedModel, customPrompt, customImages, isRestored, prefilterStats]);
+  }, [status, findings, audioBlob, compactedAudioBlob, chatHistory, selectedModel, customPrompt, customImages, isRestored, prefilterStats]);
 
   // Listen for Google Drive auth reconnection to sync offline/pending dictations, custom API keys & macros dictionary
   useEffect(() => {
@@ -729,6 +746,7 @@ const App: React.FC = () => {
     firstDictationErrorRef.current = null;
     firstDictationSuccessMetaRef.current = null;
     firstDictationPrefilterStatsRef.current = null;
+    firstDictationCompactedAudioRef.current = null;
     setFirstDictationError(null);
     isFirstDictationProcessingRef.current = false;
     isSeparatingConcurrentRef.current = false;
@@ -787,7 +805,7 @@ const App: React.FC = () => {
   }, []);
 
   const serializeBatchesForStorage = (batches: any[]) =>
-    batches.map(({ audioBlobs, chat, ...rest }) => ({
+    batches.map(({ audioBlobs, compactedAudioBlob: _compacted, chat, ...rest }) => ({
       ...rest,
       audioCount: Array.isArray(audioBlobs) ? audioBlobs.length : (rest.audioCount || 0),
     }));
@@ -901,12 +919,17 @@ const App: React.FC = () => {
         const name1 = firstErrorMsg ? `Report ${firstReportNum} (Interrupted)` : getTitle(firstFindings, `Report ${firstReportNum}`);
         await saveAudioBlob(`batch_audio_${curTabId}_${batch1Id}_0`, firstAudio);
         await saveAudioBlob(`batch_audio_${batch1Id}_0`, firstAudio);
+        if (firstDictationCompactedAudioRef.current) {
+          await saveAudioBlob(`batch_compacted_audio_${curTabId}_${batch1Id}`, firstDictationCompactedAudioRef.current);
+          await saveAudioBlob(`batch_compacted_audio_${batch1Id}`, firstDictationCompactedAudioRef.current);
+        }
 
         const batch1 = {
           id: batch1Id,
           name: name1,
           audioCount: 1,
           audioBlobs: [firstAudio],
+          compactedAudioBlob: firstDictationCompactedAudioRef.current || null,
           findings: firstErrorMsg ? [
             "BOLD::Previous dictation encountered an error during analysis.",
             `[Error: ${firstErrorMsg}]. Your recorded audio is preserved below. You can retry processing or view findings.`
@@ -996,8 +1019,9 @@ const App: React.FC = () => {
         let findings: string[] = [];
         let itemStatus: 'complete' | 'error' = 'complete';
         let itemPrefilterStats: AudioPrefilterStats | null = null;
+        let itemCompactedAudio: Blob | null = null;
         try {
-          const { modelInput: filteredItemInput, stats } = await runAudioPrefilterSafely(
+          const { modelInput: filteredItemInput, stats, compactedAudioBlob: compactedItemBlob } = await runAudioPrefilterSafely(
             item.audioBlobs,
             {
               enabled: isExperimentalAudioFilterEnabledRef.current,
@@ -1014,6 +1038,11 @@ const App: React.FC = () => {
             }
           );
           itemPrefilterStats = stats;
+          itemCompactedAudio = compactedItemBlob;
+          if (itemCompactedAudio) {
+            await saveAudioBlob(`batch_compacted_audio_${curTabId}_${batchId}`, itemCompactedAudio);
+            await saveAudioBlob(`batch_compacted_audio_${batchId}`, itemCompactedAudio);
+          }
           findings = await processAudio(
             filteredItemInput,
             selectedModel,
@@ -1055,6 +1084,7 @@ const App: React.FC = () => {
           targetBatch.name = reportName;
           targetBatch.status = itemStatus;
           targetBatch.audioBlobs = item.audioBlobs;
+          targetBatch.compactedAudioBlob = itemCompactedAudio;
           targetBatch.prefilterStats = itemPrefilterStats;
           if (itemStatus === 'error') {
             targetBatch.error = findings[1] || 'Error processing dictation';
@@ -1227,11 +1257,13 @@ const App: React.FC = () => {
     setError(null);
     setFindings([]);
     setPrefilterStats(null);
+    setCompactedAudioBlob(null);
     setPrefilterStatusMsg(null);
     firstDictationFindingsRef.current = null;
     firstDictationErrorRef.current = null;
     firstDictationSuccessMetaRef.current = null;
     firstDictationPrefilterStatsRef.current = null;
+    firstDictationCompactedAudioRef.current = null;
     setFirstDictationError(null);
     isFirstDictationProcessingRef.current = true;
     currentFirstBatchAddedRef.current = false;
@@ -1285,7 +1317,11 @@ const App: React.FC = () => {
     const imagesToUse = overrideImages !== undefined ? overrideImages : customImages;
 
     try {
-      const { modelInput: filteredInput, stats: currentPrefilterStats } = await runAudioPrefilterSafely(
+      const {
+        modelInput: filteredInput,
+        stats: currentPrefilterStats,
+        compactedAudioBlob: currentCompactedAudio,
+      } = await runAudioPrefilterSafely(
         audioBlobs,
         {
           enabled: isExperimentalAudioFilterEnabledRef.current,
@@ -1307,7 +1343,9 @@ const App: React.FC = () => {
 
       const filteredBlobsForChat = Array.isArray(filteredInput) ? filteredInput : [filteredInput];
       firstDictationPrefilterStatsRef.current = currentPrefilterStats;
+      firstDictationCompactedAudioRef.current = currentCompactedAudio;
       setPrefilterStats(currentPrefilterStats);
+      setCompactedAudioBlob(currentCompactedAudio);
 
       const processedText = await processAudio(
         filteredInput,
@@ -1518,6 +1556,7 @@ const App: React.FC = () => {
     setError(null);
     setFindings([]);
     setPrefilterStats(null);
+    setCompactedAudioBlob(null);
     setPrefilterStatusMsg(null);
     setAudioBlob(audioBlob); // Set the captured audio blob from the live session
 
@@ -1541,7 +1580,7 @@ const App: React.FC = () => {
         // If live transcript was empty (e.g. browser speech engine couldn't stream in iframe) but audio was captured, transcribe the audioBlob
         if (processedText.length === 0 && audioBlob && audioBlob.size > 2000) {
           try {
-            const { modelInput: liveInput, stats: liveStats } = await runAudioPrefilterSafely(
+            const { modelInput: liveInput, stats: liveStats, compactedAudioBlob: liveCompactedAudio } = await runAudioPrefilterSafely(
               audioBlob,
               {
                 enabled: isExperimentalAudioFilterEnabledRef.current,
@@ -1560,6 +1599,7 @@ const App: React.FC = () => {
             );
             if (processingRequestIdRef.current !== reqId) return; // cancelled
             setPrefilterStats(liveStats);
+            setCompactedAudioBlob(liveCompactedAudio);
             processedText = await processAudio(liveInput, selectedModel, customPrompt, customImages);
           } catch (audioProcessErr) {
             console.warn("Live audio background transcription fallback notice:", audioProcessErr);
@@ -1634,6 +1674,7 @@ const App: React.FC = () => {
     setStatus(AppStatus.Processing);
     setError(null);
     setPrefilterStats(null);
+    setCompactedAudioBlob(null);
     setPrefilterStatusMsg(null);
     
     try {
@@ -1648,7 +1689,7 @@ const App: React.FC = () => {
         setAudioBlob(blobsToProcess.length === 1 ? blobsToProcess[0] : blobsToProcess);
       }
 
-      const { modelInput: filteredInputs, stats: reprocessStats } = await runAudioPrefilterSafely(
+      const { modelInput: filteredInputs, stats: reprocessStats, compactedAudioBlob: reprocessCompactedAudio } = await runAudioPrefilterSafely(
         blobsToProcess,
         {
           enabled: isExperimentalAudioFilterEnabledRef.current,
@@ -1667,6 +1708,7 @@ const App: React.FC = () => {
       );
       if (processingRequestIdRef.current !== reqId) return; // cancelled
       setPrefilterStats(reprocessStats);
+      setCompactedAudioBlob(reprocessCompactedAudio);
 
       // Reprocess clean from the original input audio/template/prompt without feeding in previous model output
       const processedText = await processAudio(filteredInputs, selectedModel, customPrompt, customImages, undefined, customDocx);
@@ -1766,10 +1808,31 @@ const App: React.FC = () => {
         }));
       } catch (_) {}
 
-      const { modelInput: filteredNewBlob } = await runAudioPrefilterSafely(newAudioBlob, {
+      const {
+        modelInput: filteredNewBlob,
+        stats: continueStats,
+        compactedAudioBlob: continueCompactedBlob,
+      } = await runAudioPrefilterSafely(newAudioBlob, {
         enabled: isExperimentalAudioFilterEnabledRef.current,
         contextLabel: 'Continue dictation',
       });
+
+      if (isExperimentalAudioFilterEnabledRef.current) {
+        setPrefilterStats(prev => mergePrefilterStats(prev, continueStats));
+        if (compactedAudioBlob || continueStats?.applied) {
+          const prevBase = compactedAudioBlob || audioBlob;
+          const nextPart =
+            continueStats?.applied && continueCompactedBlob
+              ? continueCompactedBlob
+              : (Array.isArray(filteredNewBlob) ? filteredNewBlob[0] : filteredNewBlob);
+          const combinedParts = [
+            ...(prevBase ? (Array.isArray(prevBase) ? prevBase : [prevBase]) : []),
+            ...(nextPart ? [nextPart] : []),
+          ];
+          const combinedCompacted = await combineAudioBlobsToCompact(combinedParts);
+          setCompactedAudioBlob(combinedCompacted);
+        }
+      }
 
       const newFindings = await processAudio(filteredNewBlob, selectedModel, customPrompt, customImages, undefined, customDocx);
       
@@ -1825,7 +1888,7 @@ const App: React.FC = () => {
       console.error("Error during dictation continuation:", err);
       throw err; // Propagate error to the UI component
     }
-  }, [audioBlob, findings, selectedModel, customPrompt, customImages]);
+  }, [audioBlob, compactedAudioBlob, findings, selectedModel, customPrompt, customImages]);
   handleContinueDictationRef.current = handleContinueDictation;
 
   const handleSendMessage = async (message: string | Blob) => {
@@ -1878,6 +1941,7 @@ const App: React.FC = () => {
         qaAssessment,
         errorCheckStatus,
         prefilterStats,
+        compactedAudioBlob,
         timestamp: activeDictationTimestampRef.current,
         isLive: activeDictationIsLiveRef.current,
         driveSyncedHash: driveSyncedHashRef.current,
@@ -1912,9 +1976,11 @@ const App: React.FC = () => {
       const curTabId = getTabId();
       const singleKey = getSingleModeStorageKey(curTabId);
       const audioKey = getSingleModeAudioKey(curTabId);
+      const compactedKey = getSingleModeCompactedAudioKey(curTabId);
       safeLocalStorage.removeItem(singleKey);
       safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
       deleteAudioBlob(audioKey).catch(() => {});
+      deleteAudioBlob(compactedKey).catch(() => {});
       deleteAudioBlob('single_mode_audio').catch(() => {});
       deleteReportSession(singleKey).catch(() => {});
       deleteReportSession(SINGLE_MODE_STORAGE_KEY).catch(() => {});
@@ -1939,6 +2005,7 @@ const App: React.FC = () => {
     firstDictationErrorRef.current = null;
     firstDictationSuccessMetaRef.current = null;
     firstDictationPrefilterStatsRef.current = null;
+    firstDictationCompactedAudioRef.current = null;
     setFirstDictationError(null);
     isFirstDictationProcessingRef.current = false;
     activeConcurrentBatchesRef.current = [];
@@ -1979,6 +2046,7 @@ const App: React.FC = () => {
     setQaAssessment(null);
     setErrorCheckStatus('idle');
     setPrefilterStats(null);
+    setCompactedAudioBlob(null);
     setPrefilterStatusMsg(null);
     activeDictationTimestampRef.current = null;
     activeDictationIsLiveRef.current = false;
@@ -2011,6 +2079,7 @@ const App: React.FC = () => {
     setQaAssessment(prev.qaAssessment ?? null);
     setErrorCheckStatus(prev.errorCheckStatus);
     setPrefilterStats(prev.prefilterStats ?? null);
+    setCompactedAudioBlob(prev.compactedAudioBlob ?? null);
     setPrefilterStatusMsg(null);
     activeDictationTimestampRef.current = prev.timestamp;
     activeDictationIsLiveRef.current = prev.isLive;
@@ -2025,6 +2094,7 @@ const App: React.FC = () => {
         customPrompt: prev.customPrompt,
         customImages: prev.customImages,
         customDocx: prev.customDocx || null,
+        hasCompactedAudio: !!(prev.compactedAudioBlob && prev.compactedAudioBlob.size > 0),
         timestamp: prev.timestamp,
         isLive: prev.isLive,
         driveSyncedHash: prev.driveSyncedHash,
@@ -2033,11 +2103,15 @@ const App: React.FC = () => {
       const curTabId = getTabId();
       const singleKey = getSingleModeStorageKey(curTabId);
       const audioKey = getSingleModeAudioKey(curTabId);
+      const compactedKey = getSingleModeCompactedAudioKey(curTabId);
       await saveReportSession(singleKey, stateToSave);
       safeLocalStorage.removeItem(singleKey);
       safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
       if (prev.audioBlob) {
         await saveAudioBlob(audioKey, prev.audioBlob);
+      }
+      if (prev.compactedAudioBlob) {
+        await saveAudioBlob(compactedKey, prev.compactedAudioBlob);
       }
     } catch (e) {
       console.warn("Failed to re-persist undone session:", e);
@@ -2069,9 +2143,11 @@ const App: React.FC = () => {
       const curTabId = getTabId();
       const singleKey = getSingleModeStorageKey(curTabId);
       const audioKey = getSingleModeAudioKey(curTabId);
+      const compactedKey = getSingleModeCompactedAudioKey(curTabId);
       safeLocalStorage.removeItem(singleKey);
       safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
       deleteAudioBlob(audioKey).catch(() => {});
+      deleteAudioBlob(compactedKey).catch(() => {});
       deleteAudioBlob('single_mode_audio').catch(() => {});
       deleteReportSession(singleKey).catch(() => {});
       deleteReportSession(SINGLE_MODE_STORAGE_KEY).catch(() => {});
@@ -2093,22 +2169,14 @@ const App: React.FC = () => {
 
   const handleDownload = () => {
     if (!audioBlob) return;
-    try {
-      const url = URL.createObjectURL(audioBlob);
-      const a = document.createElement('a');
-      document.body.appendChild(a);
-      a.style.display = 'none';
-      a.href = url;
-      
-      const extension = audioBlob.type === 'audio/mpeg' ? 'mp3' : audioBlob.type === 'audio/wav' ? 'wav' : (audioBlob.type.split('/')[1] || 'webm').split(';')[0];
-      a.download = `radiology-dictation.${extension}`;
-      
-      a.click();
-      window.URL.revokeObjectURL(url);
-      a.remove();
-    } catch (err) {
-        console.error('Failed to download audio:', err)
-    }
+    const baseName = compactedAudioBlob ? 'radiology-dictation-original' : 'radiology-dictation';
+    downloadOriginalAudioInput(audioBlob, baseName).catch(err => {
+      console.error('Failed to download audio:', err);
+    });
+  };
+
+  const handleDownloadCompacted = () => {
+    downloadCompactedAudioBlob(compactedAudioBlob, 'radiology-dictation-compacted-decision1');
   };
 
   const renderSingleModeContent = () => {
@@ -2217,7 +2285,7 @@ const App: React.FC = () => {
                             ? targetBatch.audioBlobs
                             : [blob];
                           try {
-                            const { modelInput: retryInput, stats: retryStats } = await runAudioPrefilterSafely(
+                            const { modelInput: retryInput, stats: retryStats, compactedAudioBlob: retryCompacted } = await runAudioPrefilterSafely(
                               retryBlobs,
                               {
                                 enabled: isExperimentalAudioFilterEnabledRef.current,
@@ -2226,6 +2294,11 @@ const App: React.FC = () => {
                                 contextLabel: 'Retry Report #1',
                               }
                             );
+                            const curTabId = getTabId();
+                            if (retryCompacted) {
+                              await saveAudioBlob(`batch_compacted_audio_${curTabId}_${targetBatch.id}`, retryCompacted);
+                              await saveAudioBlob(`batch_compacted_audio_${targetBatch.id}`, retryCompacted);
+                            }
                             const retriedFindings = await processAudio(
                               retryInput,
                               selectedModel,
@@ -2239,10 +2312,10 @@ const App: React.FC = () => {
                             targetBatch.status = 'complete';
                             targetBatch.error = undefined;
                             targetBatch.prefilterStats = retryStats;
+                            targetBatch.compactedAudioBlob = retryCompacted;
                             targetBatch.name = (firstLine.length > 0 && firstLine.length < 80 && !firstLine.toLowerCase().startsWith('clinical'))
                               ? firstLine
                               : 'Report 1';
-                            const curTabId = getTabId();
                             const curBatchKey = getBatchModeStorageKey(curTabId);
                             const serializable = serializeBatchesForStorage(activeConcurrentBatchesRef.current);
                             await saveReportSession(curBatchKey, serializable);
@@ -2258,7 +2331,7 @@ const App: React.FC = () => {
                         } else {
                           isFirstDictationProcessingRef.current = true;
                           try {
-                            const { modelInput: retryInput, stats: retryStats } = await runAudioPrefilterSafely(
+                            const { modelInput: retryInput, stats: retryStats, compactedAudioBlob: retryCompacted } = await runAudioPrefilterSafely(
                               blob,
                               {
                                 enabled: isExperimentalAudioFilterEnabledRef.current,
@@ -2267,6 +2340,10 @@ const App: React.FC = () => {
                                 contextLabel: 'Retry first dictation',
                               }
                             );
+                            firstDictationPrefilterStatsRef.current = retryStats;
+                            firstDictationCompactedAudioRef.current = retryCompacted;
+                            setPrefilterStats(retryStats);
+                            setCompactedAudioBlob(retryCompacted);
                             const retriedFindings = await processAudio(
                               retryInput,
                               selectedModel,
@@ -2277,8 +2354,6 @@ const App: React.FC = () => {
                             );
                             isFirstDictationProcessingRef.current = false;
                             firstDictationFindingsRef.current = retriedFindings;
-                            firstDictationPrefilterStatsRef.current = retryStats;
-                            setPrefilterStats(retryStats);
                             setFindings(retriedFindings);
                             setTimeout(() => flushQueuedConcurrentIfReadyRef.current(), 0);
                           } catch (retryErr: any) {
@@ -2407,9 +2482,19 @@ const App: React.FC = () => {
                         <button
                           onClick={handleDownload}
                           className="inline-flex items-center gap-2 bg-slate-600 text-white font-semibold py-2 px-5 rounded-lg hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-400 focus:ring-opacity-50 transition-colors shadow-sm text-sm cursor-pointer"
-                          aria-label="Download Audio / File"
+                          aria-label={compactedAudioBlob ? 'Download Original Audio' : 'Download Audio / File'}
                         >
-                          <DownloadIcon className="w-4 h-4" /> Download Audio
+                          <DownloadIcon className="w-4 h-4" /> {compactedAudioBlob ? 'Download Original Audio' : 'Download Audio'}
+                        </button>
+                      )}
+                      {compactedAudioBlob && compactedAudioBlob.size > 0 && !isSeparatingConcurrent && !isSessionReady && (
+                        <button
+                          onClick={handleDownloadCompacted}
+                          className="inline-flex items-center gap-2 bg-amber-600 text-white font-semibold py-2 px-5 rounded-lg hover:bg-amber-700 focus:outline-none focus:ring-2 focus:ring-amber-400 focus:ring-opacity-50 transition-colors shadow-sm text-sm cursor-pointer"
+                          aria-label="Download Compacted Audio"
+                          title="Download Decision-1 compacted pre-trimmed audio"
+                        >
+                          <DownloadIcon className="w-4 h-4" /> Download Compacted ({formatFileSize(compactedAudioBlob.size)})
                         </button>
                       )}
                     </div>
@@ -2593,14 +2678,53 @@ const App: React.FC = () => {
                     </>
                   )}
                 </div>
-                <div className="flex items-center gap-2 text-[11px] font-mono text-amber-800 dark:text-amber-300">
-                  <span className="px-1.5 py-0.5 rounded bg-white/80 dark:bg-slate-800/80 border border-amber-200/80 dark:border-amber-700/50">
-                    {prefilterStats.outputMimeType}
+                <div className="flex flex-wrap items-center gap-2 text-[11px] text-amber-800 dark:text-amber-300">
+                  <span className="font-mono px-1.5 py-0.5 rounded bg-white/80 dark:bg-slate-800/80 border border-amber-200/80 dark:border-amber-700/50">
+                    {compactedAudioBlob?.type || prefilterStats.outputMimeType}
                   </span>
-                  <span>
-                    {formatFileSize(prefilterStats.originalBytes)} → {formatFileSize(prefilterStats.outputBytes)}
+                  <span className="font-mono">
+                    {formatFileSize(prefilterStats.originalBytes)} → {formatFileSize(compactedAudioBlob ? compactedAudioBlob.size : prefilterStats.outputBytes)}
                   </span>
+                  {audioBlob && (
+                    <button
+                      type="button"
+                      onClick={handleDownload}
+                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-slate-700 hover:bg-slate-800 text-white font-semibold transition-colors cursor-pointer"
+                      title="Download original unfiltered audio"
+                    >
+                      <DownloadIcon className="w-3 h-3" />
+                      <span>Original</span>
+                    </button>
+                  )}
+                  {compactedAudioBlob && compactedAudioBlob.size > 0 && (
+                    <button
+                      type="button"
+                      onClick={handleDownloadCompacted}
+                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-600 hover:bg-amber-700 text-white font-semibold transition-colors cursor-pointer"
+                      title="Download compacted audio made from Decision 1"
+                    >
+                      <DownloadIcon className="w-3 h-3" />
+                      <span>Compacted ({formatFileSize(compactedAudioBlob.size)})</span>
+                    </button>
+                  )}
                 </div>
+              </div>
+            )}
+            {prefilterStats && !prefilterStats.applied && prefilterStats.skippedReason && isExperimentalAudioFilterEnabled && (
+              <div className="mb-4 px-3.5 py-2 bg-slate-100/90 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700 rounded-xl flex flex-wrap items-center justify-between gap-2 text-xs text-slate-700 dark:text-slate-300">
+                <span>
+                  <strong className="font-semibold">Smart Pre-Trim:</strong> {prefilterStats.skippedReason}
+                </span>
+                {audioBlob && (
+                  <button
+                    type="button"
+                    onClick={handleDownload}
+                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-slate-700 hover:bg-slate-800 text-white font-semibold text-[11px] transition-colors cursor-pointer"
+                  >
+                    <DownloadIcon className="w-3 h-3" />
+                    <span>Download Original Audio</span>
+                  </button>
+                )}
               </div>
             )}
             <ResultsDisplay 
@@ -2629,6 +2753,7 @@ const App: React.FC = () => {
             errorCheckStatus={errorCheckStatus}
             isExperimentalAudioFilterEnabled={isExperimentalAudioFilterEnabled}
             prefilterStats={prefilterStats}
+            compactedAudioBlob={compactedAudioBlob}
             onOpenMacrosModal={() => setIsMacrosModalOpen(true)}
             />
           </ErrorBoundary>
@@ -2691,7 +2816,16 @@ const App: React.FC = () => {
                     onClick={handleDownload}
                     className="flex items-center gap-2 bg-slate-600 text-white font-bold py-2.5 px-5 rounded-lg hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-500 focus:ring-opacity-50 transition-colors shadow text-sm cursor-pointer"
                   >
-                    <DownloadIcon className="w-4 h-4" /> Download Audio File
+                    <DownloadIcon className="w-4 h-4" /> {compactedAudioBlob ? 'Download Original Audio' : 'Download Audio File'}
+                  </button>
+                )}
+                {compactedAudioBlob && compactedAudioBlob.size > 0 && (
+                  <button
+                    onClick={handleDownloadCompacted}
+                    className="flex items-center gap-2 bg-amber-600 text-white font-bold py-2.5 px-5 rounded-lg hover:bg-amber-700 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:ring-opacity-50 transition-colors shadow text-sm cursor-pointer"
+                    title="Download Decision-1 compacted pre-trimmed audio"
+                  >
+                    <DownloadIcon className="w-4 h-4" /> Download Compacted Audio ({formatFileSize(compactedAudioBlob.size)})
                   </button>
                 )}
                 <button
@@ -2785,6 +2919,8 @@ const App: React.FC = () => {
     name: string;
     findings: string[];
     audioBlobs: Blob[];
+    compactedAudioBlob?: Blob | null;
+    prefilterStats?: AudioPrefilterStats | null;
     selectedModel: string;
     customPrompt?: string;
     customDocx?: DocxTemplateData | null;
@@ -2826,6 +2962,14 @@ const App: React.FC = () => {
             }
           }
         }
+        if (b.compactedAudioBlob && b.compactedAudioBlob.size > 0) {
+          try {
+            await saveAudioBlob(`batch_compacted_audio_${currentTabId}_${batchId}`, b.compactedAudioBlob);
+            await saveAudioBlob(`batch_compacted_audio_${batchId}`, b.compactedAudioBlob);
+          } catch (e) {
+            console.warn('Failed to save compacted autonomous batch audio to IndexedDB:', e);
+          }
+        }
 
         const formattedBatch = {
           id: batchId,
@@ -2833,6 +2977,8 @@ const App: React.FC = () => {
           audioCount: b.audioBlobs && b.audioBlobs.length > 0 
             ? b.audioBlobs.length 
             : (existingIdx !== -1 ? currentBatches[existingIdx].audioCount : 0),
+          hasCompactedAudio: b.compactedAudioBlob ? true : (existingIdx !== -1 ? currentBatches[existingIdx].hasCompactedAudio : false),
+          prefilterStats: b.prefilterStats ?? (existingIdx !== -1 ? currentBatches[existingIdx].prefilterStats : null),
           findings: b.findings,
           status: 'complete',
           selectedModel: b.selectedModel || selectedModel,
@@ -2889,6 +3035,7 @@ const App: React.FC = () => {
   ) => {
     setFindings(loadedFindings);
     setPrefilterStats(null);
+    setCompactedAudioBlob(null);
     setPrefilterStatusMsg(null);
     setStatus(AppStatus.Success);
     setMode('single');
