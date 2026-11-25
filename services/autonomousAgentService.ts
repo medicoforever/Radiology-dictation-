@@ -27,7 +27,8 @@ import {
   expandMacrosInFindings, 
   getMacroPromptContext 
 } from "./macroDictionaryService";
-import { getUserTemplates } from "./templateStorage";
+import { getUserTemplates, findTemplateByIdOrNumber } from "./templateStorage";
+import { buildCombinedTemplateBundle } from "./upcomingTemplateService";
 import { filterAudioInputsForModel, AudioPrefilterStats } from "./audioPrefilterService";
 
 export interface AutonomousAttachedFile {
@@ -135,9 +136,15 @@ export function findTemplateByFuzzyName(query?: string, customTemplates?: BuiltI
     ? [...customTemplates, ...ALL_RADNITO_TEMPLATES]
     : ALL_RADNITO_TEMPLATES;
 
-  // 1. Exact or startsWith match
+  // 1. Exact or startsWith match (including explicit numeric IDs like "1" -> "tpl_001" or "C1")
+  const idClean = q.replace(/^(?:template\s*(?:id|number|no\.?)?\s*[:#-]?\s*)/i, '').trim();
+  const normalizedBuiltinId = /^\d+$/.test(idClean) ? `tpl_${idClean.padStart(3, '0')}` : idClean;
   const exact = pool.find(
-    t => t.name.toLowerCase() === q || t.id.toLowerCase() === q
+    t =>
+      t.name.toLowerCase() === q ||
+      t.id.toLowerCase() === q ||
+      t.id.toLowerCase() === normalizedBuiltinId ||
+      ((t as any).templateId && String((t as any).templateId).toLowerCase() === idClean)
   );
   if (exact) return exact;
 
@@ -750,24 +757,34 @@ export async function executeAutonomousPlan(
         let bpPrompt = bp.customPrompt || '';
 
         if (bp.targetTemplateName) {
-          const matched = findTemplateByFuzzyName(bp.targetTemplateName, userCustomTemplatePool);
-          if (matched) {
-            templateUsed = matched.name;
-            try {
-              const docxB64 = matched.docxBase64 || await getTemplateDocxBase64(matched.id);
-              if (docxB64) {
-                bpDocx = {
-                  data: docxB64,
-                  size: Math.round((docxB64.length * 3) / 4),
-                  name: `${matched.name}.docx`,
-                  extractedText: matched.lines ? matched.lines.join('\n') : matched.name
-                };
-              }
-            } catch (e) {
-              console.warn('Could not load docx for batch template:', e);
-            }
+          // Support single or multiple templates separated by +, comma, or "and" / "template id X"
+          const rawParts = bp.targetTemplateName
+            .split(/\s*\+\s*|\s*,\s*|\s+\band\b\s+/i)
+            .map(s => s.trim())
+            .filter(Boolean);
+          const candidateParts = rawParts.length > 0 ? rawParts : [bp.targetTemplateName];
+          const resolvedTemplates: BuiltInTemplateItem[] = [];
 
-            bpPrompt = `[TEMPLATE_ID: ${matched.id}] Merged with template: ${matched.name}. ${bp.mergeDirectives || ''}`.trim();
+          for (const part of candidateParts) {
+            const idExtract = part.replace(/^(?:template\s*(?:id|number|no\.?)?\s*[:#-]?\s*)/i, '').trim();
+            let matched: BuiltInTemplateItem | null = null;
+            if (/^(?:c\d+|tpl_\d+|\d+)$/i.test(idExtract)) {
+              const found = await findTemplateByIdOrNumber(idExtract);
+              if (found) matched = found as BuiltInTemplateItem;
+            }
+            if (!matched) {
+              matched = findTemplateByFuzzyName(part, userCustomTemplatePool);
+            }
+            if (matched && !resolvedTemplates.some(r => r.id === matched!.id)) {
+              resolvedTemplates.push(matched);
+            }
+          }
+
+          if (resolvedTemplates.length > 0) {
+            const bundle = await buildCombinedTemplateBundle(resolvedTemplates);
+            templateUsed = bundle.name;
+            bpDocx = bundle.docxData;
+            bpPrompt = `${bundle.promptText} ${bp.mergeDirectives || ''}`.trim();
 
             let effectiveBpDirectives = bp.mergeDirectives || '';
             const handedOverBpNotes = context.attachedFiles?.filter(
@@ -783,10 +800,13 @@ export async function executeAutonomousPlan(
             try {
               finalFindings = await mergeDictatedFindingsWithTemplate(
                 finalFindings,
-                matched,
+                resolvedTemplates.length === 1 ? resolvedTemplates[0] : resolvedTemplates,
                 context.selectedModel,
                 undefined,
-                effectiveBpDirectives
+                `${bundle.promptText}\n${effectiveBpDirectives}`.trim(),
+                bpDocx,
+                undefined,
+                bundle.images
               );
             } catch (mergeErr) {
               console.warn(`Batch template merge for ${bp.patientName} failed:`, mergeErr);

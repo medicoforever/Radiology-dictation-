@@ -5,6 +5,7 @@ import { isTableRowFinding } from "./docxService";
 import { expandMacrosInFindings, expandMacrosInSingleText, getMacroPromptContext } from "./macroDictionaryService";
 import { executeWithApiKeyFailover, getRandomAIClient, getClientForApiKey } from "./apiKeyService";
 import { findTemplateByIdOrNumber } from "./templateStorage";
+import { buildCombinedTemplateBundle, extractTemplateTagIds, mergeTemplateImages, DocxTemplateData as BundleDocxTemplateData } from "./upcomingTemplateService";
 
 export const getAI = (): GoogleGenAI => {
   return getRandomAIClient();
@@ -495,13 +496,16 @@ export function findBuiltinTemplates(promptOrId?: string): (typeof REPORT_TEMPLA
     return [directId];
   }
 
-  // 2. Explicit ID tags in prompt: [TEMPLATE_ID: tpl_001, tpl_002] or [TEMPLATE_IDS: ...] or multiple tags
+  // 2. Explicit ID tags in prompt: [TEMPLATE_ID: tpl_001, tpl_002] or [TEMPLATE_IDS: ...] or [TEMPLATE_ID: 1, 15]
   const idTagMatches = [...raw.matchAll(/\[(?:TEMPLATE_ID|TEMPLATE_IDS|TEMPLATES|TEMPLATE|ID):\s*([^\]]+)\]/gi)];
   for (const match of idTagMatches) {
     const idsStr = match[1];
     const parts = idsStr.split(/[,;\s]+/).map(p => p.trim()).filter(Boolean);
     for (const part of parts) {
-      const cleanPart = part.replace(/^builtin_/i, '').toLowerCase();
+      let cleanPart = part.replace(/^builtin_/i, '').toLowerCase();
+      if (/^\d+$/.test(cleanPart)) {
+        cleanPart = `tpl_${cleanPart.padStart(3, '0')}`;
+      }
       const byId = REPORT_TEMPLATES.find(t => t.id && t.id.toLowerCase() === cleanPart);
       if (byId && !matched.some(m => m.id === byId.id)) {
         matched.push(byId);
@@ -583,6 +587,34 @@ export type CustomDocxInput = {
   size?: number;
 } | null;
 
+export interface SpokenTemplateResolution {
+  templateIds: string[];
+  templateName: string;
+  promptText: string;
+  docxData: BundleDocxTemplateData | null;
+  images: Array<{ data: string; mimeType: string }>;
+}
+
+export interface ProcessAudioOptions {
+  onSpokenTemplateResolved?: (resolved: SpokenTemplateResolution) => void;
+  mergeBaseFindings?: string[];
+}
+
+function parseCombinedNamesFromPrompt(customPrompt?: string): string[] {
+  if (!customPrompt) return [];
+  const match = customPrompt.match(/Use combined report templates:\s*([^\n.]+)/i);
+  if (!match) return [];
+  const quoted = [...match[1].matchAll(/"([^"]+)"/g)].map(m => m[1].trim()).filter(Boolean);
+  if (quoted.length > 0) return quoted;
+  return match[1].split(/\s+(?:and|\+)\s+|,/i).map(s => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
+}
+
+function parseSingleTemplateNameFromPrompt(customPrompt?: string): string | null {
+  if (!customPrompt) return null;
+  const m = customPrompt.match(/Merged with template:\s*([^\n.]+?)(?:\.|\n|$)/i);
+  return m && m[1] ? m[1].trim() : null;
+}
+
 export function detectAndExtractTemplate(
   customPrompt?: string,
   customImages?: Array<{ data: string; mimeType: string }> | null,
@@ -591,35 +623,85 @@ export function detectAndExtractTemplate(
   const docxText = ((customDocx?.text || customDocx?.extractedText || '')).trim();
   const docxHtml = customDocx?.html || customDocx?.extractedHtml;
 
-  // Check if built-in templates are specified via prompt or template ID tag
+  // Check if built-in templates or explicit template IDs are specified via prompt or multi-section docxText
   const matchedBuiltins = findBuiltinTemplates(customPrompt);
+  const explicitTagIds = extractTemplateTagIds(customPrompt);
+  const parsedDocxSections = docxText
+    ? docxText
+        .split(/(?=^===\s*TEMPLATE:)/m)
+        .map(s => s.trim())
+        .filter(s => /^===\s*TEMPLATE:/i.test(s))
+        .map(block => {
+          const headerMatch = block.match(/^===\s*TEMPLATE:\s*(.+?)\s*===/i);
+          const name = headerMatch ? headerMatch[1].trim() : 'Template Section';
+          const body = block.replace(/^===\s*TEMPLATE:[^\n]*\n?/i, '').trim();
+          const builtinMatch = matchedBuiltins.find(b => b.name.toLowerCase() === name.toLowerCase());
+          return {
+            name,
+            content: body || (builtinMatch?.lines?.join('\n') || builtinMatch?.content || ''),
+            skillPrompt: builtinMatch?.skillPrompt || '',
+          };
+        })
+    : [];
 
-  if (matchedBuiltins.length > 1) {
-    const templateNames = matchedBuiltins.map(t => t.name).join(' + ');
+  const isExplicitCombined =
+    matchedBuiltins.length > 1 ||
+    explicitTagIds.length > 1 ||
+    parsedDocxSections.length > 1 ||
+    /Use combined report templates:/i.test(customPrompt || '');
+
+  if (isExplicitCombined) {
+    let combinedSections: Array<{ name: string; content: string; skillPrompt?: string }> = [];
+    if (parsedDocxSections.length > 1) {
+      combinedSections = parsedDocxSections;
+    } else if (matchedBuiltins.length > 1 && explicitTagIds.length <= matchedBuiltins.length) {
+      combinedSections = matchedBuiltins.map(t => ({
+        name: t.name,
+        content: t.lines && t.lines.length > 0 ? t.lines.join('\n') : (t.content || ''),
+        skillPrompt: t.skillPrompt || '',
+      }));
+    } else {
+      const promptNames = parseCombinedNamesFromPrompt(customPrompt);
+      const count = Math.max(promptNames.length, matchedBuiltins.length, explicitTagIds.length);
+      for (let idx = 0; idx < count; idx++) {
+        const name = promptNames[idx] || matchedBuiltins[idx]?.name || explicitTagIds[idx] || `Template ${idx + 1}`;
+        const builtinMatch =
+          matchedBuiltins.find(b => b.name.toLowerCase() === name.toLowerCase()) ||
+          matchedBuiltins[idx];
+        combinedSections.push({
+          name,
+          content:
+            (builtinMatch?.lines && builtinMatch.lines.length > 0
+              ? builtinMatch.lines.join('\n')
+              : builtinMatch?.content) || '',
+          skillPrompt: builtinMatch?.skillPrompt || '',
+        });
+      }
+    }
+
+    const templateNames = combinedSections.map(s => s.name).join(' + ');
     const templateContent = (docxText.length > 0)
       ? docxText
-      : matchedBuiltins.map((t, idx) => {
-          const content = t.lines && t.lines.length > 0 ? t.lines.join('\n') : (t.content || '');
-          return `================================================================================\nTEMPLATE ${idx + 1}: "${t.name}"\n--------------------------------------------------------------------------------\n${content}\n${t.skillPrompt ? `CLINICAL SKILL DIRECTIVES FOR THIS SECTION:\n${t.skillPrompt}\n` : ''}`;
+      : combinedSections.map((t, idx) => {
+          return `================================================================================\nTEMPLATE ${idx + 1}: "${t.name}"\n--------------------------------------------------------------------------------\n${t.content}\n${t.skillPrompt ? `CLINICAL SKILL DIRECTIVES FOR THIS SECTION:\n${t.skillPrompt}\n` : ''}`;
         }).join('\n\n');
 
     const templateContextPrompt = `
 ================================================================================
-ACTIVE COMBINED RADIOLOGY REPORT TEMPLATES (${matchedBuiltins.length} TEMPLATES COMBINED):
-${matchedBuiltins.map((t, idx) => {
-  const content = t.lines && t.lines.length > 0 ? t.lines.join('\n') : (t.content || '');
+ACTIVE COMBINED RADIOLOGY REPORT TEMPLATES (${combinedSections.length} TEMPLATES COMBINED):
+${combinedSections.map((t, idx) => {
   return `--------------------------------------------------------------------------------
 TEMPLATE ${idx + 1}: "${t.name}"
 BASELINE TEMPLATE CONTENT:
 """
-${content}
+${t.content}
 """
 ${t.skillPrompt ? `AUTHORITATIVE CLINICAL SKILL & PHRASING DIRECTIVES:\n${t.skillPrompt}` : ''}
 `;
 }).join('\n')}
 ================================================================================
 CRITICAL MULTI-TEMPLATE COMBINATION & MERGE DIRECTIVES:
-1. UNIFIED COHESIVE REPORT: Combine these ${matchedBuiltins.length} templates into a single, comprehensive, seamlessly integrated multi-study report.
+1. UNIFIED COHESIVE REPORT: Combine these ${combinedSections.length} templates into a single, comprehensive, seamlessly integrated multi-study report.
    - Maintain the logical clinical order of anatomical regions (e.g. Brain sections followed by Cervical Spine sections; Chest followed by Abdomen and Pelvis).
    - Combine the study title/header into a unified examination title (e.g. "CT SCAN OF BRAIN AND CERVICAL SPINE (PLAIN)").
    - Group Technique / Protocol lines under the Technique section.
@@ -689,7 +771,8 @@ CRITICAL TEMPLATE MERGE DIRECTIVES:
   // 1. DOCX Template
   if (customDocx && docxText.length > 0) {
     const templateContent = docxText;
-    const templateName = customDocx.name ? customDocx.name.replace(/\.[^/.]+$/, '').replace(/^\d+[-_ ]*/, '') : 'Uploaded DOCX Template';
+    const promptTemplateName = parseSingleTemplateNameFromPrompt(customPrompt);
+    const templateName = promptTemplateName || (customDocx.name ? customDocx.name.replace(/\.[^/.]+$/, '').replace(/^\d+[-_ ]*/, '') : 'Uploaded DOCX Template');
     const templateContextPrompt = `
 ================================================================================
 ACTIVE DOCX REPORT TEMPLATE: "${templateName}"
@@ -720,15 +803,19 @@ CRITICAL TEMPLATE MERGE DIRECTIVES:
 
   // 2. Visual Template (Images)
   if (customImages && customImages.length > 0) {
+    const explicitPromptName = parseSingleTemplateNameFromPrompt(customPrompt);
+    const promptTextTrimmed = customPrompt?.trim() || '';
     return {
       isTemplateMode: true,
       templateType: 'image',
-      templateName: 'Visual Image Template',
-      userInstructions: customPrompt?.trim() || '',
+      templateName: explicitPromptName || 'Visual Image Template',
+      templateContent: promptTextTrimmed || undefined,
+      userInstructions: promptTextTrimmed,
       templateContextPrompt: `
 ================================================================================
-ACTIVE VISUAL TEMPLATE: The user has provided ${customImages.length} image(s) of a report template.
+ACTIVE VISUAL TEMPLATE: The user has provided ${customImages.length} image(s) of a report template${explicitPromptName ? ` ("${explicitPromptName}")` : ''}.
 Use them as a strict visual guide for the layout, sections, and formatting of the final report.
+${promptTextTrimmed ? `ADDITIONAL TEMPLATE CONTEXT:\n${promptTextTrimmed}\n` : ''}
 Populate the template with findings from the dictation. Normal sections without abnormal dictations should be populated with standard normal template findings without BOLD::.
 Prefix dictated/abnormal lines with 'BOLD::'.
 ================================================================================
@@ -741,8 +828,9 @@ Prefix dictated/abnormal lines with 'BOLD::'.
     const trimmed = customPrompt.trim();
 
     // Check for custom text template indicators:
-    // a) Keywords indicating template merge mode
-    const hasTemplateKeyword = /(template|report template|normal report|standard report|merge with|integrate into template|normal template|use template|format as template|merge dictation)/i.test(trimmed);
+    // a) Keywords indicating template merge mode or explicit [TEMPLATE_ID: ...] tag
+    const hasTemplateIdTag = explicitTagIds.length > 0;
+    const hasTemplateKeyword = hasTemplateIdTag || /(template|report template|normal report|standard report|merge with|integrate into template|normal template|use template|format as template|merge dictation)/i.test(trimmed);
     
     // b) Structural radiology template indicators
     const lines = trimmed.split('\n').map(l => l.trim()).filter(Boolean);
@@ -752,7 +840,8 @@ Prefix dictated/abnormal lines with 'BOLD::'.
 
     if (hasTemplateKeyword || hasRadiologyHeaders || isMultiLineTemplate) {
       const templateContent = trimmed;
-      const templateName = lines[0] && lines[0].length < 60 ? lines[0].replace(/^#+\s*/, '') : 'Custom Text Template';
+      const explicitName = parseSingleTemplateNameFromPrompt(trimmed);
+      const templateName = explicitName || (lines[0] && lines[0].length < 60 ? lines[0].replace(/^#+\s*/, '') : 'Custom Text Template');
       const templateContextPrompt = `
 ================================================================================
 ACTIVE CUSTOM TEXT REPORT TEMPLATE: "${templateName}"
@@ -788,39 +877,115 @@ CRITICAL TEMPLATE MERGE DIRECTIVES:
   };
 }
 
+const ID_ATOM_PATTERN = `(?:(?:builtin_)?(?:tpl_|cust_|template_)\\d+|(?:see|sea|c|custom)[\\s-]*(?:zero|one|won|two|to|too|three|four|for|five|six|seven|eight|ate|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fourty|fifty|sixty|seventy|eighty|ninety|\\d+)(?:[\\s-]*(?:one|won|two|to|too|three|four|for|five|six|seven|eight|ate|nine))?|(?:one|two|three)\\s+hundred(?:\\s+and)?(?:\\s+(?:twenty|thirty|forty|fourty|fifty|sixty|seventy|eighty|ninety))?(?:[\\s-]+(?:one|won|two|to|too|three|four|for|five|six|seven|eight|ate|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen))?|(?:twenty|thirty|forty|fourty|fifty|sixty|seventy|eighty|ninety)(?:[\\s-]+(?:one|won|two|to|too|three|four|for|five|six|seven|eight|ate|nine))?|(?:zero|one|won|two|to|too|three|four|for|five|six|seven|eight|ate|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen)|\\d+)`;
+
+const SPOKEN_UNIT_WORDS: Record<string, string> = {
+  zero: '0', one: '1', won: '1', two: '2', to: '2', too: '2', three: '3', four: '4', for: '4',
+  five: '5', six: '6', seven: '7', eight: '8', ate: '8', nine: '9', ten: '10',
+  eleven: '11', twelve: '12', thirteen: '13', fourteen: '14', fifteen: '15',
+  sixteen: '16', seventeen: '17', eighteen: '18', nineteen: '19',
+};
+
+function splitSpokenIdList(rawSegment: string): string[] {
+  if (!rawSegment) return [];
+  // Protect "hundred and <X>" from being split at "and"
+  const protectedText = rawSegment
+    .replace(/\bhundred\s+and\b/gi, 'hundred__and')
+    .replace(/\b(?:template\s+(?:ids?|numbers?|no\.?)|templates?)\s*[:#-]*/gi, ',')
+    .replace(/\b(?:and|also|plus|with|&|\+)\b/gi, ',');
+  const rawTokens = protectedText
+    .split(/[,;]+/)
+    .map(t => t.replace(/hundred__and/g, 'hundred and').trim())
+    .filter(Boolean);
+
+  const ids: string[] = [];
+  for (const tok of rawTokens) {
+    // Also extract atomic matches inside space-separated runs like "5 15"
+    const subMatches = [...tok.matchAll(new RegExp(ID_ATOM_PATTERN, 'gi'))].map(m => m[0].trim()).filter(Boolean);
+    const candidates = subMatches.length > 0 ? subMatches : [tok];
+    for (let candidate of candidates) {
+      // Normalize phonetic "see 1" / "sea two" / "c two" / "custom 2" -> "C2" or "C <rest>"
+      const customPrefixed = candidate.match(/^(?:see|sea|custom|c)[\s-]+(.+)$/i);
+      if (customPrefixed) {
+        const tail = customPrefixed[1].trim().toLowerCase();
+        candidate = /^\d+$/.test(tail)
+          ? `C${tail}`
+          : SPOKEN_UNIT_WORDS[tail]
+            ? `C${SPOKEN_UNIT_WORDS[tail]}`
+            : `C ${tail}`;
+      }
+      if (candidate && !ids.some(x => x.toLowerCase() === candidate.toLowerCase())) {
+        ids.push(candidate);
+      }
+    }
+  }
+  return ids;
+}
+
 /**
- * Detects and extracts spoken template ID directive token: {template id [ID]}
- * e.g. "{template id 1}", "{template id 42}", "{template id C1}", "{template id tpl_001}"
+ * Detects and extracts spoken template ID directive token(s): {template id [ID]} or spoken "template id X and Y"
+ * Supports single or multiple IDs (e.g. "{template id 1}", "{template id 5, 15}", "add template id 5 and template id C1").
  */
 export function extractSpokenTemplateDirective(findings: string[]): {
   templateId: string | null;
+  templateIds: string[];
+  mode: 'add' | 'replace';
   cleanedFindings: string[];
 } {
   if (!findings || findings.length === 0) {
-    return { templateId: null, cleanedFindings: [] };
+    return { templateId: null, templateIds: [], mode: 'add', cleanedFindings: [] };
   }
 
-  let detectedId: string | null = null;
+  const detectedIds: string[] = [];
+  let mode: 'add' | 'replace' = 'add';
   const cleaned: string[] = [];
 
-  const bracedRegex = /\{\s*template\s+id\s*(?:number|no\.?)?\s*[:\s#-]*([a-zA-Z0-9_\-\s]+?)\s*\}\.?/i;
-  const unbracedIdPattern = `(?:(?:builtin_)?(?:tpl_|cust_|template_)\\d+|[c](?:ustom)?[\\s-]*\\d+|(?:see|sea|c|custom)\\s+(?:zero|one|won|two|to|too|three|four|for|five|six|seven|eight|ate|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)|(?:one|two|three)\\s+hundred(?:\\s+and)?(?:\\s+(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety))?(?:[\\s-](?:one|two|three|four|five|six|seven|eight|nine))?|(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)(?:[\\s-](?:one|two|three|four|five|six|seven|eight|nine))?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|\\d+)`;
+  const bracedRegex = /\{\s*((?:add|use|apply|insert|combine|switch(?:\s+to)?|change(?:\s+to)?|replace(?:\s+with)?|merge(?:\s+with)?)\s+)?template(?:s|\s+ids?|\s+numbers?|\s+no\.?)?\s*[:\s#-]*([a-zA-Z0-9_,\-&\+\s]+?)\s*\}\.?/gi;
   const unbracedRegex = new RegExp(
-    `(?:^|\\b)(?:(?:add|use|apply|insert|merge(?:\\s+with)?)\\s+)?template\\s+id\\s*(?:number|no\\.?)?\\s*[:\\s#-]*(` + unbracedIdPattern + `)\\b\\.?`,
-    'i'
+    `(?:^|\\b)((?:add|use|apply|insert|combine|also\\s+(?:add|use)|switch(?:\\s+to)?|change(?:\\s+to)?|replace(?:\\s+with)?|merge(?:\\s+with)?)\\s+)?(?:template\\s+(?:ids?|numbers?|no\\.?)|combined\\s+templates?)\\s*[:\\s#-]*(` +
+      ID_ATOM_PATTERN +
+      `(?:\\s*(?:,|;|&|\\+|\\band\\b|\\balso\\b|\\bwith\\b)\\s*(?:(?:template\\s+(?:ids?|numbers?|no\\.?)\\s*[:\\s#-]*))?` +
+      ID_ATOM_PATTERN +
+      `)*)\\b\\.?`,
+    'gi'
   );
 
   for (const rawFinding of findings) {
     if (!rawFinding) continue;
     const isBold = /^BOLD::/i.test(rawFinding);
-    const content = rawFinding.replace(/^BOLD::/i, '').trim();
+    let working = rawFinding.replace(/^BOLD::/i, '').trim();
+    let matchedInLine = false;
 
-    const match = content.match(bracedRegex) || content.match(unbracedRegex);
-    if (match && !detectedId) {
-      detectedId = match[1].trim();
-      const matchedRegex = content.match(bracedRegex) ? bracedRegex : unbracedRegex;
-      const stripped = content.replace(matchedRegex, '').replace(/^[:\s\-.,]+/, '').trim();
-      if (stripped.length > 0) {
+    const consumeMatches = (regex: RegExp) => {
+      regex.lastIndex = 0;
+      const matches = [...working.matchAll(regex)];
+      if (matches.length === 0) return;
+      matchedInLine = true;
+      for (const m of matches) {
+        const actionVerb = (m[1] || '').toLowerCase();
+        if (/(?:switch|change|replace)/i.test(actionVerb)) {
+          mode = 'replace';
+        }
+        const ids = splitSpokenIdList(m[2] || '');
+        for (const id of ids) {
+          if (!detectedIds.some(existing => existing.toLowerCase() === id.toLowerCase())) {
+            detectedIds.push(id);
+          }
+        }
+      }
+      working = working.replace(regex, ' ');
+    };
+
+    consumeMatches(bracedRegex);
+    consumeMatches(unbracedRegex);
+
+    if (matchedInLine) {
+      const stripped = working
+        .replace(/\s+/g, ' ')
+        .replace(/^[:\s\-.,;]+/, '')
+        .replace(/[:\s\-.,;]+$/, '')
+        .trim();
+      if (stripped.length > 0 && !/^(?:please|and|also|instead)$/i.test(stripped)) {
         cleaned.push(isBold ? `BOLD::${stripped}` : stripped);
       }
     } else {
@@ -828,7 +993,124 @@ export function extractSpokenTemplateDirective(findings: string[]): {
     }
   }
 
-  return { templateId: detectedId, cleanedFindings: cleaned };
+  return {
+    templateId: detectedIds[0] || null,
+    templateIds: detectedIds,
+    mode,
+    cleanedFindings: cleaned,
+  };
+}
+
+async function resolveAndApplySpokenTemplates(
+  findings: string[],
+  opts: {
+    templateInfo: DetectedTemplateInfo;
+    model: string;
+    audioBlobs: Blob[];
+    customPrompt?: string;
+    customImages?: Array<{ data: string; mimeType: string }> | null;
+    customDocx?: CustomDocxInput;
+    abortSignal?: AbortSignal;
+    onSpokenTemplateResolved?: (resolved: SpokenTemplateResolution) => void;
+    mergeBaseFindings?: string[];
+  }
+): Promise<string[]> {
+  const { templateIds, mode, cleanedFindings } = extractSpokenTemplateDirective(findings);
+  if (templateIds.length === 0) {
+    return findings;
+  }
+
+  const normalizeCompareId = (id: string): string => {
+    const clean = id.trim().replace(/^builtin_/i, '').toLowerCase();
+    return /^\d+$/.test(clean) ? `tpl_${clean.padStart(3, '0')}` : clean;
+  };
+
+  const activeTagIds = extractTemplateTagIds(opts.customPrompt);
+  const activeSet = new Set(activeTagIds.map(normalizeCompareId));
+  const spokenCompareIds = templateIds.map(normalizeCompareId);
+
+  // If the only emitted template IDs are already active in the prompt, just strip the echo token cleanly
+  const hasNewSpokenId = spokenCompareIds.some(id => !activeSet.has(id));
+  if (opts.templateInfo.isTemplateMode && !hasNewSpokenId) {
+    return cleanedFindings.length > 0 ? cleanedFindings : findings;
+  }
+
+  const targetIds: string[] = [];
+  const pushUniqueId = (id: string) => {
+    const norm = normalizeCompareId(id);
+    if (!targetIds.some(x => normalizeCompareId(x) === norm)) {
+      targetIds.push(id);
+    }
+  };
+
+  if (opts.templateInfo.isTemplateMode && mode === 'add' && activeTagIds.length > 0) {
+    activeTagIds.forEach(pushUniqueId);
+  }
+  templateIds.forEach(pushUniqueId);
+
+  const resolvedList = (await Promise.all(targetIds.map(id => findTemplateByIdOrNumber(id)))).filter(
+    (tpl): tpl is NonNullable<typeof tpl> => Boolean(tpl)
+  );
+
+  // Also preserve an untagged uploaded DOCX template if user spoke "add template id X" on top of it
+  const templatesToBundle: any[] = [];
+  if (
+    opts.templateInfo.isTemplateMode &&
+    mode === 'add' &&
+    activeTagIds.length === 0 &&
+    opts.customDocx &&
+    (opts.customDocx.extractedText || opts.customDocx.text)
+  ) {
+    templatesToBundle.push({
+      id: 'custom_docx_base',
+      name: opts.templateInfo.templateName || opts.customDocx.name || 'Base Template',
+      lines: ((opts.customDocx.extractedText || opts.customDocx.text) || '').split('\n').filter(Boolean),
+      docxBase64: opts.customDocx.data,
+      fileName: opts.customDocx.name,
+      images: opts.customImages || [],
+    });
+  }
+  templatesToBundle.push(...resolvedList);
+
+  if (templatesToBundle.length === 0) {
+    return cleanedFindings;
+  }
+
+  const bundle = await buildCombinedTemplateBundle(templatesToBundle);
+  const mergedImages = mergeTemplateImages(opts.customImages, bundle.images);
+
+  try {
+    opts.onSpokenTemplateResolved?.({
+      templateIds: targetIds,
+      templateName: bundle.name,
+      promptText: bundle.promptText,
+      docxData: bundle.docxData,
+      images: mergedImages,
+    });
+  } catch (cbErr) {
+    console.warn('onSpokenTemplateResolved callback notice:', cbErr);
+  }
+
+  const spokenCleaned = cleanedFindings.length > 0 ? cleanedFindings : findings;
+  const findingsToMerge =
+    opts.mergeBaseFindings && opts.mergeBaseFindings.length > 0
+      ? [...opts.mergeBaseFindings, ...spokenCleaned]
+      : spokenCleaned;
+  const merged = await mergeDictatedFindingsWithTemplate(
+    findingsToMerge,
+    templatesToBundle.length === 1 ? templatesToBundle[0] : templatesToBundle,
+    opts.model,
+    opts.audioBlobs,
+    bundle.promptText,
+    bundle.docxData,
+    opts.abortSignal,
+    mergedImages
+  );
+
+  if (merged && merged.length > 0) {
+    return merged;
+  }
+  return findingsToMerge;
 }
 
 export const processAudio = async (
@@ -838,7 +1120,8 @@ export const processAudio = async (
   customImages?: Array<{ data: string; mimeType: string }> | null,
   existingFindings?: string[],
   customDocx?: CustomDocxInput,
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  options?: ProcessAudioOptions
 ): Promise<string[]> => {
   const audioBlobs = Array.isArray(audioBlob) ? audioBlob : [audioBlob];
   if (audioBlobs.length === 0) {
@@ -862,11 +1145,15 @@ export const processAudio = async (
   }
   
   const macroContext = getMacroPromptContext();
+  const spokenTemplateReminder = templateInfo.isTemplateMode
+    ? `SPOKEN TEMPLATE ID ADDITION/SWITCH: If the radiologist explicitly speaks another Template ID in the audio (e.g., "add template id 15", "combine with template id C1", "switch to template id 42"), emit "{add template id [ID]}" (or "{template id [ID1, ID2]}") at the very beginning of the "findings" array. Do NOT emit unless explicit numeric or C-code IDs were spoken.`
+    : '';
   const prompt = [
     customPrompt 
       ? `${basePrompt}\n\nCustom Instructions (Reminder):\n${customPrompt}` 
       : basePrompt,
-    macroContext
+    macroContext,
+    spokenTemplateReminder
   ].filter(Boolean).join('\n\n');
 
   const parts: any[] = [];
@@ -965,40 +1252,24 @@ export const processAudio = async (
     const findings = extractFindingsFromResponse(rawResponseText);
 
     if (findings && findings.length > 0) {
-      // Check if user spoke a template ID directive (e.g. "{template id 1}", "template id 42", "template id C1")
-      // and user had NOT already attached a template manually prior to dictation
-      if (!templateInfo.isTemplateMode) {
-        const { templateId, cleanedFindings } = extractSpokenTemplateDirective(findings);
-        if (templateId) {
-          console.info(`[Spoken Template Directive] Detected template ID "${templateId}" in audio dictation. Resolving template...`);
-          const matchedTemplate = await findTemplateByIdOrNumber(templateId);
-          if (matchedTemplate) {
-            console.info(`[Spoken Template Directive] Found matching template "${matchedTemplate.name}" (ID: ${matchedTemplate.templateId || templateId}). Merging dictated findings into template...`);
-            try {
-              const merged = await mergeDictatedFindingsWithTemplate(
-                cleanedFindings,
-                matchedTemplate,
-                targetModel,
-                audioBlobs,
-                customPrompt,
-                customDocx,
-                abortSignal
-              );
-              if (merged && merged.length > 0) {
-                return merged;
-              }
-            } catch (mergeErr: any) {
-              if (mergeErr?.name === 'AbortError' || abortSignal?.aborted) throw mergeErr;
-              console.warn("Spoken template merge error, falling back to cleaned findings:", mergeErr);
-            }
-          } else {
-            console.warn(`[Spoken Template Directive] No template found for ID "${templateId}". Proceeding with pure dictated findings.`);
-          }
-          return cleanedFindings;
-        }
+      try {
+        return await resolveAndApplySpokenTemplates(findings, {
+          templateInfo,
+          model: targetModel,
+          audioBlobs,
+          customPrompt,
+          customImages,
+          customDocx,
+          abortSignal,
+          onSpokenTemplateResolved: options?.onSpokenTemplateResolved,
+          mergeBaseFindings: options?.mergeBaseFindings,
+        });
+      } catch (mergeErr: any) {
+        if (mergeErr?.name === 'AbortError' || abortSignal?.aborted) throw mergeErr;
+        console.warn("Spoken template merge error, falling back to cleaned findings:", mergeErr);
+        const { cleanedFindings } = extractSpokenTemplateDirective(findings);
+        return cleanedFindings.length > 0 ? cleanedFindings : findings;
       }
-
-      return findings;
     } else {
       throw new Error("Invalid data structure in API response. Expected a 'findings' array.");
     }
@@ -1197,7 +1468,8 @@ export const mergeDictatedFindingsWithTemplate = async (
   audioBlob?: Blob | Blob[] | null,
   customPrompt?: string,
   customDocx?: CustomDocxInput,
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  customImages?: Array<{ data: string; mimeType: string }> | null
 ): Promise<string[]> => {
   if (!dictatedFindings || dictatedFindings.length === 0) {
     throw new Error("No dictated findings available to merge with template.");
@@ -1351,6 +1623,20 @@ Carefully integrate these dictated findings into the "${templateName}" baseline 
     { text: dictatedFindingsDirective },
     ...(macroContext ? [{ text: macroContext }] : []),
   ];
+
+  if (customImages && customImages.length > 0) {
+    for (const img of customImages) {
+      parts.push({
+        inlineData: {
+          mimeType: img.mimeType || 'image/png',
+          data: img.data,
+        },
+      });
+    }
+    parts.push({
+      text: `Reference template image(s) provided above: follow their structure and visual sections along with the text template.`,
+    });
+  }
 
   if (customPrompt && customPrompt.trim()) {
     parts.push({
@@ -1596,7 +1882,8 @@ export const modifyReportWithAudio = async (
   model: string, 
   customPrompt?: string,
   customImages?: Array<{ data: string; mimeType: string }> | null,
-  customDocx?: CustomDocxInput
+  customDocx?: CustomDocxInput,
+  options?: ProcessAudioOptions
 ): Promise<string[]> => {
   const blobs: Blob[] = Array.isArray(audioBlob) ? audioBlob : [audioBlob];
   const inputParts: any[] = [];
@@ -1714,7 +2001,7 @@ ${JSON.stringify({ findings: currentFindings })}
     prompt += `\n\n${macroContext}`;
   }
 
-  prompt += `\n\nSPOKEN TEMPLATE ID DIRECTIVE (STRICT): If the audio/instruction explicitly speaks "template id [ID]" (e.g. "template id 1", "template id C1"), output "{template id [ID]}" at the start of the "findings" array. Do NOT trigger on vague requests like "add ct brain".`;
+  prompt += `\n\nSPOKEN TEMPLATE ID DIRECTIVE (STRICT): If the audio/instruction explicitly speaks one or more Template IDs (e.g. "template id 1", "template id C1", "add template id 15", "combine templates 5 and 15"), output "{template id [ID]}" or "{add template id [ID]}" or "{template id [ID1, ID2]}" at the start of the "findings" array. Do NOT trigger on vague requests like "add ct brain" without an explicit ID.`;
 
   const parts: any[] = [];
   
@@ -1740,25 +2027,15 @@ ${JSON.stringify({ findings: currentFindings })}
     const findings = extractFindingsFromResponse(rawResponseText);
 
     if (findings && findings.length > 0) {
-      if (!templateInfo.isTemplateMode) {
-        const { templateId, cleanedFindings } = extractSpokenTemplateDirective(findings);
-        if (templateId) {
-          const matchedTemplate = await findTemplateByIdOrNumber(templateId);
-          if (matchedTemplate) {
-            const merged = await mergeDictatedFindingsWithTemplate(
-              cleanedFindings,
-              matchedTemplate,
-              targetModel,
-              blobs,
-              customPrompt,
-              customDocx
-            );
-            if (merged && merged.length > 0) return merged;
-          }
-          return cleanedFindings;
-        }
-      }
-      return findings;
+      return await resolveAndApplySpokenTemplates(findings, {
+        templateInfo,
+        model: targetModel,
+        audioBlobs: blobs,
+        customPrompt,
+        customImages,
+        customDocx,
+        onSpokenTemplateResolved: options?.onSpokenTemplateResolved,
+      });
     } else {
       throw new Error("Invalid data structure in API response. Expected a 'findings' array.");
     }

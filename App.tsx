@@ -5,7 +5,7 @@ import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react'
 import AudioRecorder from './components/AudioRecorder';
 import ResultsDisplay from './components/ResultsDisplay';
 import { AppStatus, IdentifiedError } from './types';
-import { processAudio, createChat, blobToBase64, base64ToBlob, createChatFromText, findBuiltinTemplates, runClinicalQaErrorCheck, ClinicalQaAssessment } from './services/geminiService';
+import { processAudio, createChat, blobToBase64, base64ToBlob, createChatFromText, findBuiltinTemplates, runClinicalQaErrorCheck, ClinicalQaAssessment, SpokenTemplateResolution } from './services/geminiService';
 import ClinicalQaPanel from './components/ui/ClinicalQaPanel';
 import Spinner from './components/ui/Spinner';
 import { Chat } from '@google/genai';
@@ -36,7 +36,7 @@ import { OwnershipModal } from './components/ui/OwnershipModal';
 import { ApiKeyModal } from './components/ApiKeyModal';
 import { getUserApiKeys, API_KEYS_UPDATED_EVENT, isBuiltinKeysUnlocked, unlockBuiltinKeys, syncApiKeysWithGoogleDrive } from './services/apiKeyService';
 import ThemeSelector from './components/ThemeSelector';
-import { getUpcomingTemplate, clearUpcomingTemplate, subscribeToUpcomingTemplate, UpcomingTemplateConfig } from './services/upcomingTemplateService';
+import { getUpcomingTemplate, clearUpcomingTemplate, subscribeToUpcomingTemplate, UpcomingTemplateConfig, extractTemplateTagIds, mergeTemplateImages } from './services/upcomingTemplateService';
 import MacrosAndDictionaryModal from './components/MacrosAndDictionaryModal';
 import { subscribeToMacroDictionary, syncMacrosWithGoogleDrive, expandMacrosInFindings } from './services/macroDictionaryService';
 import { FloatingNewDictationButton } from './components/FloatingNewDictationButton';
@@ -167,19 +167,37 @@ const App: React.FC = () => {
   const [singleExtraFiles, setSingleExtraFiles] = useState<File[]>([]);
   const [upcomingTemplate, setUpcomingTemplateState] = useState<UpcomingTemplateConfig | null>(() => getUpcomingTemplate());
 
-  const activeTemplateDisplayName = useMemo(() => {
-    if (customDocx && customDocx.name) {
-      return customDocx.name;
-    }
-    const matched = findBuiltinTemplates(customPrompt);
-    if (matched && matched.length > 0) {
+  const formatActiveTemplateLabel = (promptVal: string, docxVal: DocxTemplateData | null, upcomingVal: UpcomingTemplateConfig | null) => {
+    const matched = findBuiltinTemplates(promptVal);
+    const tagIds = extractTemplateTagIds(promptVal);
+    if (matched.length > 0 && tagIds.length <= matched.length) {
       return matched.map(t => t.name).join(' + ');
     }
-    if (upcomingTemplate && upcomingTemplate.name) {
-      return upcomingTemplate.name;
+    const combinedMatch = promptVal.match(/Use combined report templates:\s*([^\n.]+)/i);
+    if (combinedMatch && combinedMatch[1]) {
+      const quoted = [...combinedMatch[1].matchAll(/"([^"]+)"/g)].map(m => m[1].trim()).filter(Boolean);
+      if (quoted.length > 0) return quoted.join(' + ');
+    }
+    const singleMatch = promptVal.match(/Merged with template:\s*([^\n.]+?)(?:\.|\n|$)/i);
+    if (singleMatch && singleMatch[1]) {
+      return singleMatch[1].trim();
+    }
+    if (docxVal && docxVal.name) {
+      return docxVal.name;
+    }
+    if (matched.length > 0) {
+      return matched.map(t => t.name).join(' + ');
+    }
+    if (upcomingVal && upcomingVal.name) {
+      return upcomingVal.name;
     }
     return null;
-  }, [customPrompt, customDocx, upcomingTemplate]);
+  };
+
+  const activeTemplateDisplayName = useMemo(
+    () => formatActiveTemplateLabel(customPrompt, customDocx, upcomingTemplate),
+    [customPrompt, customDocx, upcomingTemplate]
+  );
 
   useEffect(() => {
     const initialUpcoming = getUpcomingTemplate();
@@ -331,6 +349,7 @@ const App: React.FC = () => {
   const firstDictationSuccessMetaRef = useRef<{
     blobs: Blob[];
     prompt: string;
+    docx?: DocxTemplateData | null;
     images: Array<{ data: string; mimeType: string }>;
     reqId: number;
   } | null>(null);
@@ -341,6 +360,9 @@ const App: React.FC = () => {
   const [firstDictationError, setFirstDictationError] = useState<string | null>(null);
   const firstDictationPrefilterStatsRef = useRef<AudioPrefilterStats | null>(null);
   const firstDictationCompactedAudioRef = useRef<Blob | null>(null);
+  const firstDictationCustomPromptRef = useRef<string>('');
+  const firstDictationCustomDocxRef = useRef<DocxTemplateData | null>(null);
+  const firstDictationCustomImagesRef = useRef<Array<{ data: string; mimeType: string }>>([]);
   const isFirstDictationProcessingRef = useRef<boolean>(false);
   const [batchModeInstanceKey, setBatchModeInstanceKey] = useState<number>(Date.now());
   const handleContinueDictationRef = useRef<((newAudioBlob: Blob, premergedBlob?: Blob) => Promise<void>) | null>(null);
@@ -370,12 +392,10 @@ const App: React.FC = () => {
     setConcurrentCustomImages([]);
   }, []);
 
-  const concurrentActiveTemplateDisplayName = useMemo(() => {
-    if (concurrentCustomDocx && concurrentCustomDocx.name) return concurrentCustomDocx.name;
-    const matched = findBuiltinTemplates(concurrentCustomPrompt);
-    if (matched && matched.length > 0) return matched.map(t => t.name).join(' + ');
-    return null;
-  }, [concurrentCustomPrompt, concurrentCustomDocx]);
+  const concurrentActiveTemplateDisplayName = useMemo(
+    () => formatActiveTemplateLabel(concurrentCustomPrompt, concurrentCustomDocx, null),
+    [concurrentCustomPrompt, concurrentCustomDocx]
+  );
 
   useEffect(() => {
     const allThemeClasses = [
@@ -815,8 +835,14 @@ const App: React.FC = () => {
     blobsForChat: Blob[],
     promptToUse: string,
     imagesToUse: Array<{ data: string; mimeType: string }>,
-    reqId: number
+    reqId: number,
+    docxToUse?: DocxTemplateData | null
   ) => {
+    if (processingRequestIdRef.current === reqId) {
+      if (promptToUse) setCustomPrompt(promptToUse);
+      if (docxToUse !== undefined) setCustomDocx(docxToUse);
+      if (imagesToUse && imagesToUse.length > 0) setCustomImages(imagesToUse);
+    }
     try {
       const chatSession = await createChat(blobsForChat, processedText, promptToUse, imagesToUse, selectedModel);
       if (processingRequestIdRef.current === reqId) {
@@ -937,9 +963,9 @@ const App: React.FC = () => {
           status: firstErrorMsg ? ('error' as const) : ('complete' as const),
           error: firstErrorMsg || undefined,
           selectedModel,
-          customPrompt,
-          customImages,
-          customDocx: customDocx || null,
+          customPrompt: firstDictationCustomPromptRef.current || customPrompt,
+          customImages: firstDictationCustomImagesRef.current.length > 0 ? firstDictationCustomImagesRef.current : customImages,
+          customDocx: firstDictationCustomPromptRef.current ? (firstDictationCustomDocxRef.current || null) : (customDocx || null),
           prefilterStats: firstDictationPrefilterStatsRef.current || null,
         };
         updatedBatches.push(batch1);
@@ -1020,6 +1046,9 @@ const App: React.FC = () => {
         let itemStatus: 'complete' | 'error' = 'complete';
         let itemPrefilterStats: AudioPrefilterStats | null = null;
         let itemCompactedAudio: Blob | null = null;
+        let itemPrompt = item.customPrompt;
+        let itemDocx = item.customDocx || null;
+        let itemImages = item.customImages;
         try {
           const { modelInput: filteredItemInput, stats, compactedAudioBlob: compactedItemBlob } = await runAudioPrefilterSafely(
             item.audioBlobs,
@@ -1050,7 +1079,14 @@ const App: React.FC = () => {
             item.customImages,
             undefined,
             item.customDocx,
-            itemAbortController.signal
+            itemAbortController.signal,
+            {
+              onSpokenTemplateResolved: (resolved: SpokenTemplateResolution) => {
+                itemPrompt = resolved.promptText;
+                itemDocx = resolved.docxData;
+                itemImages = mergeTemplateImages(item.customImages, resolved.images);
+              },
+            }
           );
         } catch (err: any) {
           if (err?.name === 'AbortError' || itemAbortController.signal.aborted) {
@@ -1086,6 +1122,9 @@ const App: React.FC = () => {
           targetBatch.audioBlobs = item.audioBlobs;
           targetBatch.compactedAudioBlob = itemCompactedAudio;
           targetBatch.prefilterStats = itemPrefilterStats;
+          targetBatch.customPrompt = itemPrompt;
+          targetBatch.customDocx = itemDocx;
+          targetBatch.customImages = itemImages;
           if (itemStatus === 'error') {
             targetBatch.error = findings[1] || 'Error processing dictation';
           }
@@ -1213,7 +1252,7 @@ const App: React.FC = () => {
         firstDictationSuccessMetaRef.current = null;
         setFindings(restoredFindings);
         if (meta) {
-          finalizeFirstDictationSuccess(restoredFindings, meta.blobs, meta.prompt, meta.images, meta.reqId);
+          finalizeFirstDictationSuccess(restoredFindings, meta.blobs, meta.prompt, meta.images, meta.reqId, meta.docx);
         } else {
           setStatus(AppStatus.Success);
         }
@@ -1347,6 +1386,13 @@ const App: React.FC = () => {
       setPrefilterStats(currentPrefilterStats);
       setCompactedAudioBlob(currentCompactedAudio);
 
+      let effectivePrompt = promptToUse;
+      let effectiveDocx = docxToUse;
+      let effectiveImages = imagesToUse;
+      firstDictationCustomPromptRef.current = promptToUse;
+      firstDictationCustomDocxRef.current = docxToUse;
+      firstDictationCustomImagesRef.current = imagesToUse;
+
       const processedText = await processAudio(
         filteredInput,
         selectedModel,
@@ -1354,7 +1400,18 @@ const App: React.FC = () => {
         imagesToUse,
         undefined,
         docxToUse,
-        currentAbortController.signal
+        currentAbortController.signal,
+        {
+          onSpokenTemplateResolved: (resolved: SpokenTemplateResolution) => {
+            if (currentAbortController.signal.aborted || processingRequestIdRef.current !== reqId) return;
+            effectivePrompt = resolved.promptText;
+            effectiveDocx = resolved.docxData;
+            effectiveImages = mergeTemplateImages(imagesToUse, resolved.images);
+            firstDictationCustomPromptRef.current = effectivePrompt;
+            firstDictationCustomDocxRef.current = effectiveDocx;
+            firstDictationCustomImagesRef.current = effectiveImages;
+          },
+        }
       );
       clearInterval(processingHeartbeatTimer);
       markTabActive('idle');
@@ -1365,8 +1422,9 @@ const App: React.FC = () => {
       firstDictationAudioRef.current = primaryBlob;
       firstDictationSuccessMetaRef.current = {
         blobs: filteredBlobsForChat,
-        prompt: promptToUse,
-        images: imagesToUse,
+        prompt: effectivePrompt,
+        docx: effectiveDocx,
+        images: effectiveImages,
         reqId,
       };
       setFindings(processedText);
@@ -1389,7 +1447,7 @@ const App: React.FC = () => {
         return;
       }
 
-      await finalizeFirstDictationSuccess(processedText, filteredBlobsForChat, promptToUse, imagesToUse, reqId);
+      await finalizeFirstDictationSuccess(processedText, filteredBlobsForChat, effectivePrompt, effectiveImages, reqId, effectiveDocx);
     } catch (err: any) {
       clearInterval(processingHeartbeatTimer);
       markTabActive('idle');
@@ -1577,6 +1635,9 @@ const App: React.FC = () => {
     try {
         let processedText = transcript.split('\n').map(l => l.trim()).filter(line => line !== '');
 
+        let livePrompt = customPrompt;
+        let liveImages = customImages;
+
         // If live transcript was empty (e.g. browser speech engine couldn't stream in iframe) but audio was captured, transcribe the audioBlob
         if (processedText.length === 0 && audioBlob && audioBlob.size > 2000) {
           try {
@@ -1600,7 +1661,25 @@ const App: React.FC = () => {
             if (processingRequestIdRef.current !== reqId) return; // cancelled
             setPrefilterStats(liveStats);
             setCompactedAudioBlob(liveCompactedAudio);
-            processedText = await processAudio(liveInput, selectedModel, customPrompt, customImages);
+            processedText = await processAudio(
+              liveInput,
+              selectedModel,
+              customPrompt,
+              customImages,
+              undefined,
+              customDocx,
+              undefined,
+              {
+                onSpokenTemplateResolved: (resolved: SpokenTemplateResolution) => {
+                  if (processingRequestIdRef.current !== reqId) return;
+                  livePrompt = resolved.promptText;
+                  liveImages = mergeTemplateImages(customImages, resolved.images);
+                  setCustomPrompt(resolved.promptText);
+                  setCustomDocx(resolved.docxData);
+                  if (liveImages.length > 0) setCustomImages(liveImages);
+                },
+              }
+            );
           } catch (audioProcessErr) {
             console.warn("Live audio background transcription fallback notice:", audioProcessErr);
           }
@@ -1621,7 +1700,7 @@ const App: React.FC = () => {
         
         // Use the custom prompt from single mode for the follow-up chat
         try {
-          const chatSession = await createChatFromText(processedText, customPrompt, customImages, selectedModel);
+          const chatSession = await createChatFromText(processedText, livePrompt, liveImages, selectedModel);
           if (processingRequestIdRef.current === reqId) {
             setChat(chatSession);
           }
@@ -1711,12 +1790,32 @@ const App: React.FC = () => {
       setCompactedAudioBlob(reprocessCompactedAudio);
 
       // Reprocess clean from the original input audio/template/prompt without feeding in previous model output
-      const processedText = await processAudio(filteredInputs, selectedModel, customPrompt, customImages, undefined, customDocx);
+      let reprocessPrompt = customPrompt;
+      let reprocessImages = customImages;
+      const processedText = await processAudio(
+        filteredInputs,
+        selectedModel,
+        customPrompt,
+        customImages,
+        undefined,
+        customDocx,
+        undefined,
+        {
+          onSpokenTemplateResolved: (resolved: SpokenTemplateResolution) => {
+            if (processingRequestIdRef.current !== reqId) return;
+            reprocessPrompt = resolved.promptText;
+            reprocessImages = mergeTemplateImages(customImages, resolved.images);
+            setCustomPrompt(resolved.promptText);
+            setCustomDocx(resolved.docxData);
+            if (reprocessImages.length > 0) setCustomImages(reprocessImages);
+          },
+        }
+      );
       if (processingRequestIdRef.current !== reqId) return; // cancelled
       setFindings(processedText);
 
       // Recreate chat with the new findings
-      const chatSession = await createChat(filteredInputs, processedText, customPrompt, customImages, selectedModel);
+      const chatSession = await createChat(filteredInputs, processedText, reprocessPrompt, reprocessImages, selectedModel);
       if (processingRequestIdRef.current !== reqId) return; // cancelled
       setChat(chatSession);
       const aiGreeting = "I have re-processed the audio with your new instructions. How can I help you further?";
@@ -1834,37 +1933,64 @@ const App: React.FC = () => {
         }
       }
 
-      const newFindings = await processAudio(filteredNewBlob, selectedModel, customPrompt, customImages, undefined, customDocx);
-      
-      // Consolidate findings cleanly: keep findings grouped together and synthesize impression at the end
-      const priorNonImpression = findings.filter(f => !f.startsWith('IMPRESSION:'));
-      const priorImpression = findings.find(f => f.startsWith('IMPRESSION:'));
-      const newNonImpression = newFindings.filter(f => !f.startsWith('IMPRESSION:'));
-      const newImpression = newFindings.find(f => f.startsWith('IMPRESSION:'));
-
-      const filteredNewNonImpression = newNonImpression.filter((f, idx) => {
-        if (idx === 0 && priorNonImpression.length > 0 && f.replace(/^BOLD::/i, '').trim().toUpperCase() === priorNonImpression[0].replace(/^BOLD::/i, '').trim().toUpperCase()) {
-          return false;
+      let continuePrompt = customPrompt;
+      let continueImages = customImages;
+      let hadSpokenTemplateOnContinue = false;
+      const newFindings = await processAudio(
+        filteredNewBlob,
+        selectedModel,
+        customPrompt,
+        customImages,
+        undefined,
+        customDocx,
+        undefined,
+        {
+          mergeBaseFindings: findings,
+          onSpokenTemplateResolved: (resolved: SpokenTemplateResolution) => {
+            hadSpokenTemplateOnContinue = true;
+            continuePrompt = resolved.promptText;
+            continueImages = mergeTemplateImages(customImages, resolved.images);
+            setCustomPrompt(resolved.promptText);
+            setCustomDocx(resolved.docxData);
+            if (continueImages.length > 0) setCustomImages(continueImages);
+          },
         }
-        return true;
-      });
+      );
 
-      let finalImpression = newImpression || priorImpression;
-      if (priorImpression && newImpression && priorImpression !== newImpression) {
-        const priorPoints = priorImpression.replace(/^IMPRESSION:###?/i, '').split('###').filter(Boolean);
-        const newPoints = newImpression.replace(/^IMPRESSION:###?/i, '').split('###').filter(Boolean);
-        const combinedPoints = Array.from(new Set([...priorPoints, ...newPoints]));
-        finalImpression = `IMPRESSION:###${combinedPoints.join('###')}`;
+      let updatedFindings: string[];
+      if (hadSpokenTemplateOnContinue) {
+        updatedFindings = newFindings;
+      } else {
+        // Consolidate findings cleanly: keep findings grouped together and synthesize impression at the end
+        const priorNonImpression = findings.filter(f => !f.startsWith('IMPRESSION:'));
+        const priorImpression = findings.find(f => f.startsWith('IMPRESSION:'));
+        const newNonImpression = newFindings.filter(f => !f.startsWith('IMPRESSION:'));
+        const newImpression = newFindings.find(f => f.startsWith('IMPRESSION:'));
+
+        const filteredNewNonImpression = newNonImpression.filter((f, idx) => {
+          if (idx === 0 && priorNonImpression.length > 0 && f.replace(/^BOLD::/i, '').trim().toUpperCase() === priorNonImpression[0].replace(/^BOLD::/i, '').trim().toUpperCase()) {
+            return false;
+          }
+          return true;
+        });
+
+        let finalImpression = newImpression || priorImpression;
+        if (priorImpression && newImpression && priorImpression !== newImpression) {
+          const priorPoints = priorImpression.replace(/^IMPRESSION:###?/i, '').split('###').filter(Boolean);
+          const newPoints = newImpression.replace(/^IMPRESSION:###?/i, '').split('###').filter(Boolean);
+          const combinedPoints = Array.from(new Set([...priorPoints, ...newPoints]));
+          finalImpression = `IMPRESSION:###${combinedPoints.join('###')}`;
+        }
+
+        updatedFindings = [
+          ...priorNonImpression,
+          ...filteredNewNonImpression,
+          ...(finalImpression ? [finalImpression] : [])
+        ];
       }
-
-      const updatedFindings = [
-        ...priorNonImpression,
-        ...filteredNewNonImpression,
-        ...(finalImpression ? [finalImpression] : [])
-      ];
       setFindings(updatedFindings);
       
-      const chatSession = await createChat(mergedBlob, updatedFindings, customPrompt, customImages, selectedModel);
+      const chatSession = await createChat(mergedBlob, updatedFindings, continuePrompt, continueImages, selectedModel);
       setChat(chatSession);
 
       const aiGreeting = "I have updated the transcript with your new dictation. How can I help you further?";
@@ -1888,7 +2014,7 @@ const App: React.FC = () => {
       console.error("Error during dictation continuation:", err);
       throw err; // Propagate error to the UI component
     }
-  }, [audioBlob, compactedAudioBlob, findings, selectedModel, customPrompt, customImages]);
+  }, [audioBlob, compactedAudioBlob, findings, selectedModel, customPrompt, customImages, customDocx]);
   handleContinueDictationRef.current = handleContinueDictation;
 
   const handleSendMessage = async (message: string | Blob) => {
@@ -2299,13 +2425,24 @@ const App: React.FC = () => {
                               await saveAudioBlob(`batch_compacted_audio_${curTabId}_${targetBatch.id}`, retryCompacted);
                               await saveAudioBlob(`batch_compacted_audio_${targetBatch.id}`, retryCompacted);
                             }
+                            let retryPrompt = targetBatch.customPrompt || customPromptRef.current;
+                            let retryDocx = targetBatch.customDocx || customDocxRef.current;
+                            let retryImages = targetBatch.customImages || customImages;
                             const retriedFindings = await processAudio(
                               retryInput,
                               selectedModel,
-                              targetBatch.customPrompt || customPromptRef.current,
-                              targetBatch.customImages || customImages,
+                              retryPrompt,
+                              retryImages,
                               undefined,
-                              targetBatch.customDocx || customDocxRef.current
+                              retryDocx,
+                              undefined,
+                              {
+                                onSpokenTemplateResolved: (resolved: SpokenTemplateResolution) => {
+                                  retryPrompt = resolved.promptText;
+                                  retryDocx = resolved.docxData;
+                                  retryImages = mergeTemplateImages(retryImages, resolved.images);
+                                },
+                              }
                             );
                             const firstLine = (retriedFindings[0] || '').replace(/^BOLD::/i, '').replace(/[*_#~`]+/g, '').trim();
                             targetBatch.findings = retriedFindings;
@@ -2313,6 +2450,9 @@ const App: React.FC = () => {
                             targetBatch.error = undefined;
                             targetBatch.prefilterStats = retryStats;
                             targetBatch.compactedAudioBlob = retryCompacted;
+                            targetBatch.customPrompt = retryPrompt;
+                            targetBatch.customDocx = retryDocx;
+                            targetBatch.customImages = retryImages;
                             targetBatch.name = (firstLine.length > 0 && firstLine.length < 80 && !firstLine.toLowerCase().startsWith('clinical'))
                               ? firstLine
                               : 'Report 1';
@@ -2344,13 +2484,30 @@ const App: React.FC = () => {
                             firstDictationCompactedAudioRef.current = retryCompacted;
                             setPrefilterStats(retryStats);
                             setCompactedAudioBlob(retryCompacted);
+                            let resolvedRetryPrompt = customPromptRef.current;
+                            let resolvedRetryDocx = customDocxRef.current;
+                            let resolvedRetryImages = customImages;
                             const retriedFindings = await processAudio(
                               retryInput,
                               selectedModel,
-                              customPromptRef.current,
-                              customImages,
+                              resolvedRetryPrompt,
+                              resolvedRetryImages,
                               undefined,
-                              customDocxRef.current
+                              resolvedRetryDocx,
+                              undefined,
+                              {
+                                onSpokenTemplateResolved: (resolved: SpokenTemplateResolution) => {
+                                  resolvedRetryPrompt = resolved.promptText;
+                                  resolvedRetryDocx = resolved.docxData;
+                                  resolvedRetryImages = mergeTemplateImages(resolvedRetryImages, resolved.images);
+                                  firstDictationCustomPromptRef.current = resolvedRetryPrompt;
+                                  firstDictationCustomDocxRef.current = resolvedRetryDocx;
+                                  firstDictationCustomImagesRef.current = resolvedRetryImages;
+                                  setCustomPrompt(resolvedRetryPrompt);
+                                  setCustomDocx(resolvedRetryDocx);
+                                  if (resolvedRetryImages.length > 0) setCustomImages(resolvedRetryImages);
+                                },
+                              }
                             );
                             isFirstDictationProcessingRef.current = false;
                             firstDictationFindingsRef.current = retriedFindings;
@@ -3060,7 +3217,12 @@ const App: React.FC = () => {
     if (loadedPrompt) {
       setCustomPrompt(loadedPrompt);
     } else if (templateUsed) {
-      setCustomPrompt(`[TEMPLATE_ID: ${templateUsed}] Merged with template: ${templateUsed}`);
+      const looksLikeIds = templateUsed.split(/[,;\s]+/).every(p => /^(?:c\d+|tpl_\d+|\d+)$/i.test(p.trim()));
+      setCustomPrompt(
+        looksLikeIds
+          ? `[TEMPLATE_ID: ${templateUsed}] Merged with template: ${templateUsed}`
+          : `Merged with template: ${templateUsed}`
+      );
     }
     if (loadedDocx) {
       setCustomDocx(loadedDocx);

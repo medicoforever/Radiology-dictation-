@@ -148,6 +148,238 @@ export const setUpcomingTemplate = async (template: ReportTemplate | ReportTempl
   return config;
 };
 
+export type { DocxTemplateData };
+
+export interface CombinedTemplateBundle {
+  id: string;
+  name: string;
+  promptText: string;
+  lines: string[];
+  docxData: DocxTemplateData | null;
+  images: Array<{ data: string; mimeType: string }>;
+}
+
+/**
+ * Deduplicates and merges reference template image arrays by base64 payload.
+ */
+export function mergeTemplateImages(
+  existing?: Array<{ data: string; mimeType: string }> | null,
+  incoming?: Array<{ data: string; mimeType: string }> | null
+): Array<{ data: string; mimeType: string }> {
+  const result: Array<{ data: string; mimeType: string }> = [];
+  const seen = new Set<string>();
+  for (const img of [...(existing || []), ...(incoming || [])]) {
+    if (img?.data && !seen.has(img.data)) {
+      seen.add(img.data);
+      result.push({ data: img.data, mimeType: img.mimeType || 'image/png' });
+    }
+  }
+  return result;
+}
+
+/**
+ * Normalizes any built-in or custom template item to a canonical [TEMPLATE_ID] token
+ * (e.g. 'tpl_001' for built-ins, 'C1' for custom templates).
+ */
+export function normalizeTemplateTagId(t: any): string {
+  if (!t) return '';
+  const rawId = String(t.id || '').trim();
+  const stripped = rawId.replace(/^builtin_/i, '');
+  if (/^tpl_\d+$/i.test(stripped)) {
+    return stripped.toLowerCase();
+  }
+  const rawDisplayId = String(t.templateId || '').trim();
+  if (/^c\d+$/i.test(rawDisplayId)) {
+    return rawDisplayId.toUpperCase();
+  }
+  if (/^\d+$/.test(stripped)) {
+    return `tpl_${stripped.padStart(3, '0')}`;
+  }
+  if (/^\d+$/.test(rawDisplayId) && t.isBuiltIn !== false && !t.isCustom && !rawId.startsWith('custom_')) {
+    return `tpl_${rawDisplayId.padStart(3, '0')}`;
+  }
+  return rawDisplayId || stripped || String(t.name || '');
+}
+
+/**
+ * Extracts all template ID tokens from a prompt's [TEMPLATE_ID: ...] / [TEMPLATE_IDS: ...] tags,
+ * including both built-in IDs (tpl_001 / numeric) and custom template IDs (C1 / custom_...).
+ */
+export function extractTemplateTagIds(promptOrId?: string): string[] {
+  if (!promptOrId) return [];
+  const raw = String(promptOrId).trim();
+  if (!raw) return [];
+  const results: string[] = [];
+  const matches = [...raw.matchAll(/\[(?:TEMPLATE_ID|TEMPLATE_IDS|TEMPLATES|TEMPLATE|ID):\s*([^\]]+)\]/gi)];
+  for (const m of matches) {
+    const parts = m[1]
+      .split(/[,;\s]+/)
+      .map(p => p.trim())
+      .filter(Boolean);
+    for (const part of parts) {
+      let clean = part.replace(/^builtin_/i, '');
+      if (/^\d+$/.test(clean)) {
+        clean = `tpl_${clean.padStart(3, '0')}`;
+      } else if (/^tpl_\d+$/i.test(clean)) {
+        clean = clean.toLowerCase();
+      } else if (/^c\d+$/i.test(clean)) {
+        clean = clean.toUpperCase();
+      }
+      if (clean && !results.some(r => r.toLowerCase() === clean.toLowerCase())) {
+        results.push(clean);
+      }
+    }
+  }
+  return results;
+}
+
+function extractLinesFromTemplateItem(t: any): string[] {
+  if (Array.isArray(t?.lines) && t.lines.length > 0) {
+    return t.lines.filter((l: any) => typeof l === 'string' && l.trim().length > 0);
+  }
+  const rawText = t?.docxFile?.extractedText || t?.extractedText || t?.text || '';
+  if (typeof rawText === 'string' && rawText.trim().length > 0) {
+    return rawText.split('\n').map(l => l.trim()).filter(Boolean);
+  }
+  if (typeof t?.content === 'string' && t.content.trim().length > 0) {
+    try {
+      const parsed = JSON.parse(t.content);
+      return [
+        parsed.title,
+        parsed.technique,
+        ...(Array.isArray(parsed.normal_findings) ? parsed.normal_findings : []),
+        parsed.default_impression,
+      ]
+        .filter((x: any) => typeof x === 'string' && x.trim().length > 0);
+    } catch {
+      return t.content.split('\n').map((l: string) => l.trim()).filter(Boolean);
+    }
+  }
+  return [];
+}
+
+/**
+ * Builds a unified prompt, DOCX structure/text payload, and reference images array
+ * for 1 or N templates (built-in, custom uploaded, or mixed).
+ */
+export async function buildCombinedTemplateBundle(
+  templateInput: any | any[]
+): Promise<CombinedTemplateBundle> {
+  const rawList = (Array.isArray(templateInput) ? templateInput : [templateInput]).filter(Boolean);
+  const items: any[] = [];
+  const seenIds = new Set<string>();
+  for (const item of rawList) {
+    const tagId = normalizeTemplateTagId(item);
+    const dedupKey = (tagId || item.id || item.name || '').toLowerCase();
+    if (!seenIds.has(dedupKey)) {
+      seenIds.add(dedupKey);
+      items.push(item);
+    }
+  }
+
+  if (items.length === 0) {
+    return {
+      id: '',
+      name: '',
+      promptText: '',
+      lines: [],
+      docxData: null,
+      images: [],
+    };
+  }
+
+  const tagIds: string[] = [];
+  const names: string[] = [];
+  const allLines: string[] = [];
+  const sectionBlocks: string[] = [];
+  const skillNotes: string[] = [];
+  const combinedImages: Array<{ data: string; mimeType: string }> = [];
+  const seenImageData = new Set<string>();
+
+  let firstDocxBase64: string | undefined = undefined;
+  let firstDocxName: string | undefined = undefined;
+  let totalDocxSize = 0;
+
+  for (const t of items) {
+    const tagId = normalizeTemplateTagId(t);
+    tagIds.push(tagId);
+    names.push(String(t.name || tagId));
+
+    const itemLines = extractLinesFromTemplateItem(t);
+    allLines.push(...itemLines);
+    const blockText = itemLines.join('\n').trim();
+    sectionBlocks.push(
+      items.length > 1
+        ? `=== TEMPLATE: ${t.name || tagId} ===\n${blockText || t.name || tagId}`
+        : blockText
+    );
+
+    if (typeof t.skillPrompt === 'string' && t.skillPrompt.trim()) {
+      skillNotes.push(
+        items.length > 1
+          ? `[TEMPLATE INSTRUCTIONS FOR "${t.name}"]: ${t.skillPrompt.trim()}`
+          : t.skillPrompt.trim()
+      );
+    }
+
+    const imgs: Array<{ data: string; mimeType: string }> = [
+      ...(Array.isArray(t.images) ? t.images : []),
+      ...(Array.isArray(t.customImages) ? t.customImages : []),
+    ];
+    for (const img of imgs) {
+      if (img?.data && !seenImageData.has(img.data)) {
+        seenImageData.add(img.data);
+        combinedImages.push({ data: img.data, mimeType: img.mimeType || 'image/png' });
+      }
+    }
+
+    let docxB64: string | undefined = t.docxFile?.data || t.docxBase64 || t.docxData?.data;
+    if (!docxB64 && /^tpl_\d+$/i.test(tagId)) {
+      try {
+        docxB64 = await getTemplateDocxBase64(tagId);
+      } catch (e) {
+        console.warn(`Could not fetch docxBase64 for ${tagId}:`, e);
+      }
+    }
+    if (docxB64) {
+      if (!firstDocxBase64) {
+        firstDocxBase64 = docxB64;
+        firstDocxName = t.docxFile?.name || t.fileName || t.docxData?.name;
+      }
+      totalDocxSize += t.docxFile?.size || Math.round((docxB64.length * 3) / 4);
+    }
+  }
+
+  const combinedId = tagIds.join(',');
+  const combinedName = names.join(' + ');
+  const combinedExtractedText = sectionBlocks.filter(Boolean).join('\n\n').trim();
+  const skillSuffix = skillNotes.length > 0 ? `\n\n${skillNotes.join('\n')}` : '';
+
+  const promptText =
+    items.length === 1
+      ? `[TEMPLATE_ID: ${tagIds[0]}] Merged with template: ${names[0]}.${skillSuffix}`
+      : `[TEMPLATE_ID: ${tagIds.join(', ')}] Use combined report templates: ${names.map(n => `"${n}"`).join(' and ')}. Merge dictated clinical findings logically into the combined sections of ALL ${items.length} templates in exact sequence without omitting any template or heading, and generate a synthesized impression.${skillSuffix}`;
+
+  const docxData: DocxTemplateData | null =
+    firstDocxBase64 || combinedExtractedText
+      ? {
+          name: items.length === 1 ? (firstDocxName || `${names[0]}.docx`) : `${combinedName}.docx`,
+          data: firstDocxBase64 || '',
+          size: totalDocxSize || combinedExtractedText.length,
+          extractedText: combinedExtractedText,
+        }
+      : null;
+
+  return {
+    id: combinedId,
+    name: combinedName,
+    promptText,
+    lines: allLines,
+    docxData,
+    images: combinedImages,
+  };
+}
+
 export const clearUpcomingTemplate = (): void => {
   safeLocalStorage.removeItem(UPCOMING_TEMPLATE_KEY);
 

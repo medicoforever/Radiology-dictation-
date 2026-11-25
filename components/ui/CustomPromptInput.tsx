@@ -16,7 +16,7 @@ import SearchIcon from '../icons/SearchIcon';
 import { saveUserTemplate, getUserTemplates, deleteUserTemplate, UserTemplate, getTemplateDisplayId, allotNextCustomTemplateId } from '../../services/templateStorage';
 import { parseDocx } from '../../services/docxService';
 import { getTemplateDocxBase64 } from '../../services/builtInTemplates';
-import { getUpcomingTemplate, setUpcomingTemplate, clearUpcomingTemplate, subscribeToUpcomingTemplate, UpcomingTemplateConfig } from '../../services/upcomingTemplateService';
+import { getUpcomingTemplate, setUpcomingTemplate, clearUpcomingTemplate, subscribeToUpcomingTemplate, UpcomingTemplateConfig, buildCombinedTemplateBundle, extractTemplateTagIds } from '../../services/upcomingTemplateService';
 
 export interface DocxTemplateData {
   name: string;
@@ -76,26 +76,31 @@ const CustomPromptInput: React.FC<{
 
   const handleApplySavedCombination = async (forUpcoming = false) => {
     if (selectedSavedTemplateIds.length === 0) return;
-    const selected = savedTemplates.filter(t => selectedSavedTemplateIds.includes(t.id));
+    const selected = selectedSavedTemplateIds
+      .map(id => savedTemplates.find(t => t.id === id))
+      .filter((t): t is UserTemplate => Boolean(t));
     if (selected.length === 0) return;
 
     if (selected.length === 1) {
-      handleApplyCustomTemplate(selected[0], forUpcoming);
+      await handleApplyCustomTemplate(selected[0], forUpcoming);
       setSelectedSavedTemplateIds([]);
       return;
     }
 
-    const reportTemplates: ReportTemplate[] = selected.map(t => {
+    const reportTemplates = selected.map(t => {
       const cleanId = t.id.startsWith('builtin_') ? t.id.replace('builtin_', '') : t.id;
       return {
         id: cleanId,
+        templateId: t.templateId,
         name: t.name,
         category: t.category || (t.id.includes('ct') ? 'CT' : t.id.includes('mri') ? 'MRI' : 'GENERAL'),
         modality: t.modality || (t.id.includes('ct') ? 'CT' : t.id.includes('mri') ? 'MRI' : undefined),
-        lines: t.lines || (t.text ? t.text.split('\n') : []),
+        lines: t.lines && t.lines.length > 0 ? t.lines : (t.text ? t.text.split('\n').filter(Boolean) : []),
         content: t.text || (t.lines ? t.lines.join('\n') : ''),
         docxBase64: t.docxFile?.data,
         fileName: t.docxFile?.name,
+        images: t.images || [],
+        isCustom: !t.isBuiltIn && !t.id.startsWith('builtin_'),
       };
     });
 
@@ -112,8 +117,26 @@ const CustomPromptInput: React.FC<{
     if (appliedTemplateName) {
       return appliedTemplateName;
     }
-    if (activeUpcoming) {
-      return activeUpcoming.name;
+    const promptTagIds = extractTemplateTagIds(prompt);
+    if (promptTagIds.length > 0) {
+      const matchedBuiltins = findBuiltinTemplates(prompt);
+      const resolvedNames = promptTagIds.map(tagId => {
+        const cleanNorm = tagId.replace(/^builtin_/i, '').toLowerCase();
+        const builtinMatch = matchedBuiltins.find(b => b.id.toLowerCase() === cleanNorm);
+        if (builtinMatch) return builtinMatch.name;
+        const customMatch = savedTemplates.find(st =>
+          (st.templateId && st.templateId.toLowerCase() === cleanNorm) ||
+          st.id.replace(/^builtin_/i, '').toLowerCase() === cleanNorm
+        );
+        return customMatch?.name || tagId;
+      });
+      if (resolvedNames.length > 0) {
+        return resolvedNames.join(' + ');
+      }
+    }
+    const singlePromptMatch = prompt.match(/Merged with template:\s*([^\n.]+?)(?:\.|\n|$)/i);
+    if (singlePromptMatch && singlePromptMatch[1]) {
+      return singlePromptMatch[1].trim();
     }
     const matched = findBuiltinTemplates(prompt);
     if (matched.length > 0) {
@@ -122,16 +145,21 @@ const CustomPromptInput: React.FC<{
     if (customDocx) {
       return customDocx.name;
     }
+    if (activeUpcoming) {
+      return activeUpcoming.name;
+    }
     return null;
-  }, [appliedTemplateName, activeUpcoming, prompt, customDocx]);
+  }, [appliedTemplateName, activeUpcoming, prompt, customDocx, savedTemplates]);
 
   const isCombinedTemplateActive = useMemo(() => {
+    if (extractTemplateTagIds(prompt).length > 1) return true;
+    if ((customDocx?.extractedText?.match(/===\s*TEMPLATE:/gi)?.length ?? 0) > 1) return true;
     if (activeTemplateDisplayName && (activeTemplateDisplayName.includes('+') || activeTemplateDisplayName.toLowerCase().includes('combined'))) {
       return true;
     }
     const matched = findBuiltinTemplates(prompt);
     return matched.length > 1;
-  }, [activeTemplateDisplayName, prompt]);
+  }, [activeTemplateDisplayName, prompt, customDocx]);
 
   const handleClearActiveTemplates = () => {
     onPromptChange('');
@@ -214,85 +242,25 @@ const CustomPromptInput: React.FC<{
   }, [savedTemplates, savedModalityFilter, savedSearchQuery]);
 
   const handleSelectTemplate = async (template: ReportTemplate | ReportTemplate[]) => {
-    if (Array.isArray(template)) {
-      if (template.length === 1) {
-        return handleSelectTemplate(template[0]);
-      }
-      const ids = template.map(t => t.id).filter(Boolean);
-      const names = template.map(t => `"${t.name}"`).join(' and ');
-      const promptText = `[TEMPLATE_ID: ${ids.join(', ')}] Use combined report templates: ${names}. Integrate my dictation into a unified multi-region report with findings properly placed in their respective anatomical sections and generate a synthesized impression.`;
-      onPromptChange(promptText);
+    const items = Array.isArray(template) ? template : [template];
+    const bundle = await buildCombinedTemplateBundle(items);
+    onPromptChange(bundle.promptText);
 
-      const combinedExtractedText = template.map(t => {
-        const content = t.lines ? t.lines.join('\n') : (t.content || '');
-        return `=== TEMPLATE: ${t.name} ===\n${content}`;
-      }).join('\n\n');
-
-      let firstDocx = '';
-      for (const t of template) {
-        if (t.docxBase64) {
-          firstDocx = t.docxBase64;
-          break;
-        } else if (t.id) {
-          try {
-            const d = await getTemplateDocxBase64(t.id);
-            if (d) {
-              firstDocx = d;
-              break;
-            }
-          } catch (e) {}
-        }
-      }
-
-      const combinedDocxObj: DocxTemplateData = {
-        name: `${template.map(t => t.name).join(' + ')}.docx`,
-        data: firstDocx,
-        size: firstDocx ? Math.round(firstDocx.length * 0.75) : 0,
-        extractedText: combinedExtractedText,
-      };
-
-      if (onCustomDocxChange) {
-        onCustomDocxChange(combinedDocxObj);
-      }
-      if (onTemplateApplied) {
-        onTemplateApplied(promptText, combinedDocxObj);
-      }
-
-      setAppliedTemplateName(`Combined (${template.length}): ${template.map(t => t.name).join(' + ')}`);
-      setIsModalOpen(false);
-      setTimeout(() => setAppliedTemplateName(null), 4000);
-      return;
-    }
-
-    // 1. Tag prompt with exact template ID and quoted name for 100% deterministic detection
-    const promptText = `[TEMPLATE_ID: ${template.id}] Use the normal "${template.name}" report template. Integrate my dictation and generate a new impression.`;
-    onPromptChange(promptText);
-
-    // 2. Fetch docxBase64 asynchronously if not already present
-    let docx = template.docxBase64;
-    if (!docx && template.id) {
-      try {
-        docx = await getTemplateDocxBase64(template.id);
-      } catch (err) {
-        console.warn('Error loading docx for template:', err);
-      }
-    }
-
-    // 3. Always update customDocx so old template is guaranteed to be replaced!
-    const docxObj: DocxTemplateData = {
-      name: template.fileName || `${template.name}.docx`,
-      data: docx || '',
-      size: docx ? Math.round(docx.length * 0.75) : 0,
-      extractedText: template.lines ? template.lines.join('\n') : template.content,
-    };
     if (onCustomDocxChange) {
-      onCustomDocxChange(docxObj);
+      onCustomDocxChange(bundle.docxData);
+    }
+    if (onImagesChange && bundle.images.length > 0) {
+      onImagesChange(bundle.images);
     }
     if (onTemplateApplied) {
-      onTemplateApplied(promptText, docxObj);
+      onTemplateApplied(bundle.promptText, bundle.docxData);
     }
 
-    setAppliedTemplateName(`Built-in ${template.name}`);
+    setAppliedTemplateName(
+      items.length > 1
+        ? `Combined (${items.length}): ${bundle.name}`
+        : `Template: ${bundle.name}`
+    );
     setIsModalOpen(false);
     setTimeout(() => setAppliedTemplateName(null), 4000);
   };
@@ -522,37 +490,22 @@ const CustomPromptInput: React.FC<{
   };
 
   const handleApplyCustomTemplate = async (template: UserTemplate, forUpcoming = false) => {
-    const cleanId = template.id.startsWith('builtin_') ? template.id.replace('builtin_', '') : null;
-    const isBuiltIn = template.isBuiltIn || Boolean(cleanId);
-
-    let docxData = template.docxFile || null;
-
-    if (isBuiltIn && cleanId && (!docxData || !docxData.data)) {
-      try {
-        const docxBase64 = await getTemplateDocxBase64(cleanId);
-        if (docxBase64) {
-          docxData = {
-            name: `${template.name}.docx`,
-            data: docxBase64,
-            size: Math.round(docxBase64.length * 0.75),
-            extractedText: template.text || '',
-          };
-        }
-      } catch (err) {
-        console.warn('Could not load docx for builtin template:', err);
-      }
-    }
-
-    const tag = cleanId ? `[TEMPLATE_ID: ${cleanId}] ` : `[TEMPLATE: ${template.name}] `;
-    const promptText = isBuiltIn && cleanId
-      ? `${tag}Use the normal "${template.name}" report template. Integrate my dictation and generate a new impression.`
-      : (template.text ? `${tag}${template.text}` : `${tag}Use the custom "${template.name}" report template. Integrate dictation into the layout and synthesize a new impression.`);
+    const bundle = await buildCombinedTemplateBundle(template);
+    const hasCustomBody =
+      !template.isBuiltIn &&
+      !template.id.startsWith('builtin_') &&
+      typeof template.text === 'string' &&
+      template.text.trim().length > 0 &&
+      !bundle.promptText.includes(template.text.trim());
+    const promptText = hasCustomBody
+      ? `${bundle.promptText}\n${template.text.trim()}`
+      : bundle.promptText;
 
     if (forUpcoming) {
       await setUpcomingTemplate({
         ...template,
-        docxBase64: docxData?.data,
-        lines: template.lines,
+        docxBase64: bundle.docxData?.data,
+        lines: bundle.lines,
         text: promptText,
       });
       setActiveUpcoming(getUpcomingTemplate());
@@ -561,13 +514,13 @@ const CustomPromptInput: React.FC<{
     onPromptChange(promptText);
 
     if (onImagesChange) {
-      onImagesChange(template.images || []);
+      onImagesChange(bundle.images.length > 0 ? bundle.images : (template.images || []));
     }
     if (onCustomDocxChange) {
-      onCustomDocxChange(docxData);
+      onCustomDocxChange(bundle.docxData);
     }
     if (onTemplateApplied) {
-      onTemplateApplied(promptText, docxData);
+      onTemplateApplied(promptText, bundle.docxData);
     }
     setAppliedTemplateName(forUpcoming ? `${template.name} (Active for Upcoming Reports)` : template.name);
     setTimeout(() => {
@@ -582,6 +535,7 @@ const CustomPromptInput: React.FC<{
         onClose={() => setIsModalOpen(false)}
         templates={REPORT_TEMPLATES}
         onSelectTemplate={handleSelectTemplate}
+        currentPrompt={prompt}
       />
       <button
         onClick={() => setIsOpen(!isOpen)}

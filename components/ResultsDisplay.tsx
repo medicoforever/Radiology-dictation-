@@ -26,6 +26,7 @@ import UploadIcon from './icons/UploadIcon';
 import SparklesIcon from './icons/SparklesIcon';
 import TemplateSelectionModal from './ui/TemplateSelectionModal';
 import { getTemplateDocxBase64 } from '../services/builtInTemplates';
+import { buildCombinedTemplateBundle, mergeTemplateImages } from '../services/upcomingTemplateService';
 import ImageIcon from './icons/ImageIcon';
 import { mergeAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
 import {  generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText , isSummaryLeadIn, formatImpressionOutput, isReportTitle as isDocxReportTitle, isAnatomicalSubheading, isPureCorrelationOrRecommendation, sanitizeHtmlForClipboard, escapeHtml } from '../services/docxService';
@@ -262,8 +263,14 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         ? 'Reference Image Template'
         : (customPrompt?.match(/normal (.*?) report template/i)?.[1] || 'Radiology Template')));
 
-  // State to toggle RTF editor view (defaults to open in template merge mode, or user toggleable)
+  // State to toggle RTF editor view (defaults to open in template merge mode, auto-opens on any template addition)
   const [showRtfEditor, setShowRtfEditor] = useState<boolean>(true);
+
+  useEffect(() => {
+    if (isTemplateMergeMode) {
+      setShowRtfEditor(true);
+    }
+  }, [isTemplateMergeMode, customPrompt, customDocx]);
 
   // State for Post-Dictation Template Merging
   const [isTemplateModalOpen, setIsTemplateModalOpen] = useState<boolean>(false);
@@ -276,69 +283,20 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     setUndoState(findings); // Save snapshot for instant undo
 
     const templates = Array.isArray(template) ? template : [template];
-    const isMulti = templates.length > 1;
-    const templateName = templates.map(t => t.name).join(' + ');
+    const bundle = await buildCombinedTemplateBundle(templates);
+    const templateName = bundle.name;
     setMergingTemplateName(templateName);
 
-    let docxData: DocxTemplateData;
-    let promptText: string;
-
-    if (isMulti) {
-      const ids = templates.map(t => t.id).filter(Boolean).join(', ');
-      const names = templates.map(t => `"${t.name}"`).join(' and ');
-      promptText = `[TEMPLATE_ID: ${ids}] Use combined report templates: ${names}. Integrate my dictation into a unified multi-region report with findings properly placed in their respective anatomical sections and generate a synthesized impression.`;
-
-      const combinedExtractedText = templates.map(t => {
-        const content = t.lines ? t.lines.join('\n') : (t.content || '');
-        return `=== TEMPLATE: ${t.name} ===\n${content}`;
-      }).join('\n\n');
-
-      let firstDocx = '';
-      for (const t of templates) {
-        if (t.docxBase64) {
-          firstDocx = t.docxBase64;
-          break;
-        } else if (t.id) {
-          try {
-            const d = await getTemplateDocxBase64(t.id);
-            if (d) {
-              firstDocx = d;
-              break;
-            }
-          } catch (e) {}
-        }
-      }
-
-      docxData = {
-        name: `${templateName}.docx`,
-        data: firstDocx,
-        size: firstDocx ? Math.round(firstDocx.length * 0.75) : 0,
-        extractedText: combinedExtractedText,
-      };
-    } else {
-      const singleT = templates[0];
-      let docx = singleT.docxBase64;
-      if (!docx && singleT.id) {
-        try {
-          docx = await getTemplateDocxBase64(singleT.id);
-        } catch (err) {
-          console.warn('Error loading docx for template:', err);
-        }
-      }
-      const extractedText = singleT.lines ? singleT.lines.join('\n') : singleT.content;
-      docxData = {
-        name: singleT.fileName || `${singleT.name}.docx`,
-        data: docx || '',
-        size: docx ? Math.round(docx.length * 0.75) : 0,
-        extractedText,
-      };
-      promptText = `[TEMPLATE_ID: ${singleT.id}] Use the normal "${singleT.name}" report template. Integrate my dictation and generate a new impression.`;
-    }
+    const combinedImgs = mergeTemplateImages(customImages, bundle.images);
 
     if (onCustomDocxChange) {
-      onCustomDocxChange(docxData);
+      onCustomDocxChange(bundle.docxData);
     }
-    onCustomPromptChange(promptText);
+    onCustomPromptChange(bundle.promptText);
+    if (onCustomImagesChange && bundle.images.length > 0) {
+      onCustomImagesChange(combinedImgs);
+    }
+    setShowRtfEditor(true);
 
     try {
       const merged = await mergeDictatedFindingsWithTemplate(
@@ -346,10 +304,13 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         templates,
         selectedModel,
         audioBlob,
-        promptText,
-        docxData
+        bundle.promptText,
+        bundle.docxData,
+        undefined,
+        combinedImgs
       );
       onAllFindingsUpdate(merged);
+      setShowRtfEditor(true);
       showNotification(`Merged with ${templateName}!`);
     } catch (err) {
       console.error("Failed to merge dictated findings with template:", err);
@@ -1232,7 +1193,18 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
       filteredInputs,
       selectedModel,
       customPrompt,
-      customImages
+      customImages,
+      customDocx,
+      {
+        onSpokenTemplateResolved: (resolved) => {
+          onCustomPromptChange(resolved.promptText);
+          onCustomDocxChange?.(resolved.docxData);
+          if (onCustomImagesChange && resolved.images && resolved.images.length > 0) {
+            onCustomImagesChange(resolved.images);
+          }
+          setShowRtfEditor(true);
+        },
+      }
     );
     onAllFindingsUpdate(newFindings);
   };
@@ -1950,6 +1922,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         onClose={() => setIsTemplateModalOpen(false)}
         templates={REPORT_TEMPLATES}
         onSelectTemplate={handleSelectTemplateToMerge}
+        currentPrompt={customPrompt}
       />
       {copier && copier.visible && (
         <SelectionCopier 

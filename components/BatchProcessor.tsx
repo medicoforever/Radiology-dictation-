@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useAudioRecorder } from '../hooks/useAudioRecorder';
-import { processAudio, createChat, blobToBase64, continueAudioDictation, base64ToBlob, modifyFindingWithAudio, modifyReportWithAudio, runComplexImpressionGeneration, transcribeAudioForPrompt, detectAndExtractTemplate, mergeDictatedFindingsWithTemplate, runClinicalQaErrorCheck, ClinicalQaAssessment } from '../services/geminiService';
+import { processAudio, createChat, blobToBase64, continueAudioDictation, base64ToBlob, modifyFindingWithAudio, modifyReportWithAudio, runComplexImpressionGeneration, transcribeAudioForPrompt, detectAndExtractTemplate, mergeDictatedFindingsWithTemplate, runClinicalQaErrorCheck, ClinicalQaAssessment, SpokenTemplateResolution } from '../services/geminiService';
 import ClinicalQaPanel, { getUrgencyBadgeMeta } from './ui/ClinicalQaPanel';
 import { saveAudioBlob, getAudioBlob, clearUnusedAudioBlobs, saveReportSession, getReportSession, deleteReportSession } from '../services/audioStorage';
 import { mergeMultipleAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
@@ -20,7 +20,7 @@ import PasteTextModal from './PasteTextModal';
 import RichTextReportEditor from './RichTextReportEditor';
 import TemplateSelectionModal from './ui/TemplateSelectionModal';
 import { getTemplateDocxBase64 } from '../services/builtInTemplates';
-import { getUpcomingTemplate, clearUpcomingTemplate, subscribeToUpcomingTemplate, UpcomingTemplateConfig } from '../services/upcomingTemplateService';
+import { getUpcomingTemplate, clearUpcomingTemplate, subscribeToUpcomingTemplate, UpcomingTemplateConfig, buildCombinedTemplateBundle, mergeTemplateImages } from '../services/upcomingTemplateService';
 
 import Spinner from './ui/Spinner';
 import MicIcon from './icons/MicIcon';
@@ -288,74 +288,23 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         if (!targetBatch || !targetBatch.findings) return;
 
         const templates = Array.isArray(template) ? template : [template];
-        const isMulti = templates.length > 1;
-        const templateName = templates.map(t => t.name).join(' + ');
+        const bundle = await buildCombinedTemplateBundle(templates);
+        const templateName = bundle.name;
 
         setMergingBatchId(batchId);
         setMergingTemplateName(templateName);
         setUndoStates(prev => ({ ...prev, [batchId]: [...targetBatch.findings!] }));
 
-        let docxData: DocxTemplateData;
-        let promptText: string;
+        const mergedImages = mergeTemplateImages(targetBatch.customImages, bundle.images);
 
-        if (isMulti) {
-            const ids = templates.map(t => t.id).filter(Boolean).join(', ');
-            const names = templates.map(t => `"${t.name}"`).join(' and ');
-            promptText = `[TEMPLATE_ID: ${ids}] Use combined report templates: ${names}. Integrate my dictation into a unified multi-region report with findings properly placed in their respective anatomical sections and generate a synthesized impression.`;
-
-            const combinedExtractedText = templates.map(t => {
-                const content = t.lines ? t.lines.join('\n') : (t.content || '');
-                return `=== TEMPLATE: ${t.name} ===\n${content}`;
-            }).join('\n\n');
-
-            let firstDocx = '';
-            for (const t of templates) {
-                if (t.docxBase64) {
-                    firstDocx = t.docxBase64;
-                    break;
-                } else if (t.id) {
-                    try {
-                        const d = await getTemplateDocxBase64(t.id);
-                        if (d) {
-                            firstDocx = d;
-                            break;
-                        }
-                    } catch (e) {}
-                }
-            }
-
-            docxData = {
-                name: `${templateName}.docx`,
-                data: firstDocx,
-                size: firstDocx ? Math.round(firstDocx.length * 0.75) : 0,
-                extractedText: combinedExtractedText,
-            };
-        } else {
-            const singleT = templates[0];
-            let docx = singleT.docxBase64;
-            if (!docx && singleT.id) {
-                try {
-                    docx = await getTemplateDocxBase64(singleT.id);
-                } catch (err) {
-                    console.warn('Error loading docx for template:', err);
-                }
-            }
-            const extractedText = singleT.lines ? singleT.lines.join('\n') : singleT.content;
-            docxData = {
-                name: singleT.fileName || `${singleT.name}.docx`,
-                data: docx || '',
-                size: docx ? Math.round(docx.length * 0.75) : 0,
-                extractedText,
-            };
-            promptText = `[TEMPLATE_ID: ${singleT.id}] Use the normal "${singleT.name}" report template. Integrate my dictation and generate a new impression.`;
-        }
-
-        // Update batch configuration with template
+        // Update batch configuration with template & open RTF editor immediately
         setBatches(prev => prev.map(b => b.id === batchId ? {
             ...b,
-            customPrompt: promptText,
-            customDocx: docxData,
+            customPrompt: bundle.promptText,
+            customDocx: bundle.docxData,
+            customImages: mergedImages,
         } : b));
+        setBatchRtfViewIds(prev => ({ ...prev, [batchId]: true }));
 
         try {
             const mergedFindings = await mergeDictatedFindingsWithTemplate(
@@ -363,14 +312,17 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                 templates,
                 targetBatch.selectedModel || selectedModel,
                 targetBatch.audioBlobs,
-                promptText,
-                docxData
+                bundle.promptText,
+                bundle.docxData,
+                undefined,
+                mergedImages
             );
 
             setBatches(prev => prev.map(b => b.id === batchId ? {
                 ...b,
                 findings: mergedFindings,
             } : b));
+            setBatchRtfViewIds(prev => ({ ...prev, [batchId]: true }));
 
             showNotification(`Merged ${targetBatch.name} with ${templateName}!`);
 
@@ -1541,17 +1493,47 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                     const currentUpcoming = getUpcomingTemplate();
                     const effectivePrompt = batch.customPrompt || (currentUpcoming ? currentUpcoming.promptText : globalCustomPrompt);
                     const effectiveDocx = batch.customDocx || (currentUpcoming ? (currentUpcoming.docxData || null) : globalCustomDocx);
-                    const findings = await processAudio(modelInput, batch.selectedModel, effectivePrompt, batch.customImages, undefined, effectiveDocx);
+                    let spokenPrompt = effectivePrompt;
+                    let spokenDocx = effectiveDocx;
+                    let spokenImages = batch.customImages;
+                    let hadSpokenTemplate = false;
+                    const makeSpokenHandler = () => (resolved: SpokenTemplateResolution) => {
+                        hadSpokenTemplate = true;
+                        spokenPrompt = resolved.promptText;
+                        spokenDocx = resolved.docxData;
+                        spokenImages = mergeTemplateImages(batch.customImages, resolved.images);
+                        setBatchRtfViewIds(prev => ({ ...prev, [batch.id]: true }));
+                    };
+                    const findings = await processAudio(
+                        modelInput,
+                        batch.selectedModel,
+                        effectivePrompt,
+                        batch.customImages,
+                        undefined,
+                        effectiveDocx,
+                        undefined,
+                        { onSpokenTemplateResolved: makeSpokenHandler() }
+                    );
                     
                     if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
 
-                    const chatSession = await createChat(modelInput, findings, effectivePrompt, batch.customImages, batch.selectedModel);
+                    const chatSession = await createChat(modelInput, findings, spokenPrompt, spokenImages, batch.selectedModel);
                     const aiGreeting = "I have reviewed the audio and transcript for this dictation. How can I help you further?";
                     const initialChatHistory = [{ author: 'AI' as const, text: `${findings.join('\n\n')}\n\n${aiGreeting}` }];
 
                     if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
 
-                    setBatches(prev => prev.map(b => b.id === batch.id ? { ...b, status: 'complete', findings, chat: chatSession, chatHistory: initialChatHistory, isChatting: false, prefilterStats, compactedAudioBlob } : b));
+                    setBatches(prev => prev.map(b => b.id === batch.id ? {
+                        ...b,
+                        status: 'complete',
+                        findings,
+                        chat: chatSession,
+                        chatHistory: initialChatHistory,
+                        isChatting: false,
+                        prefilterStats,
+                        compactedAudioBlob,
+                        ...(hadSpokenTemplate ? { customPrompt: spokenPrompt, customDocx: spokenDocx, customImages: spokenImages } : {}),
+                    } : b));
                 } catch (err) {
                     if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
                     const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';
@@ -1600,18 +1582,51 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
 
             setBatches(prev => prev.map(b => b.id === batchId ? { ...b, prefilterStats, compactedAudioBlob } : b));
 
-            const findings = await processAudio(modelInput, batch.selectedModel, batch.customPrompt, batch.customImages, undefined, batch.customDocx);
+            let spokenPrompt = batch.customPrompt;
+            let spokenDocx = batch.customDocx;
+            let spokenImages = batch.customImages;
+            let hadSpokenTemplate = false;
+            const findings = await processAudio(
+                modelInput,
+                batch.selectedModel,
+                batch.customPrompt,
+                batch.customImages,
+                undefined,
+                batch.customDocx,
+                undefined,
+                {
+                    onSpokenTemplateResolved: (resolved: SpokenTemplateResolution) => {
+                        hadSpokenTemplate = true;
+                        spokenPrompt = resolved.promptText;
+                        spokenDocx = resolved.docxData;
+                        spokenImages = mergeTemplateImages(batch.customImages, resolved.images);
+                        setBatchRtfViewIds(prev => ({ ...prev, [batchId]: true }));
+                    },
+                }
+            );
             
             if (batchProcessingIdRef.current[batchId] !== currentReqId) return;
 
-            const chatSession = await createChat(modelInput, findings, batch.customPrompt, batch.customImages, batch.selectedModel);
+            const chatSession = await createChat(modelInput, findings, spokenPrompt, spokenImages, batch.selectedModel);
             const aiGreeting = "I have reviewed the audio and transcript for this dictation. How can I help you further?";
             const initialChatHistory = [{ author: 'AI' as const, text: `${findings.join('\n\n')}\n\n${aiGreeting}` }];
 
             if (batchProcessingIdRef.current[batchId] !== currentReqId) return;
 
             setBatches(prev => {
-                const updated = prev.map(b => b.id === batchId ? { ...b, audioBlobs: allBlobs, extraFiles: [], status: 'complete', findings, chat: chatSession, chatHistory: initialChatHistory, isChatting: false, prefilterStats, compactedAudioBlob } : b);
+                const updated = prev.map(b => b.id === batchId ? {
+                    ...b,
+                    audioBlobs: allBlobs,
+                    extraFiles: [],
+                    status: 'complete',
+                    findings,
+                    chat: chatSession,
+                    chatHistory: initialChatHistory,
+                    isChatting: false,
+                    prefilterStats,
+                    compactedAudioBlob,
+                    ...(hadSpokenTemplate ? { customPrompt: spokenPrompt, customDocx: spokenDocx, customImages: spokenImages } : {}),
+                } : b);
                 saveBatchesToDrive(updated);
                 return updated;
             });
@@ -2245,10 +2260,32 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                     chatAudioInput = await mergeMultipleAudioBlobs(updatedAudioBlobs);
                 }
 
-                const newFindings = await processAudio(filteredNewAudio, batch.selectedModel, batch.customPrompt, batch.customImages);
-                const updatedFindings = [...batch.findings, ...newFindings];
+                let spokenPrompt = batch.customPrompt;
+                let spokenDocx = batch.customDocx;
+                let spokenImages = batch.customImages;
+                let hadSpokenTemplate = false;
+                const newFindings = await processAudio(
+                    filteredNewAudio,
+                    batch.selectedModel,
+                    batch.customPrompt,
+                    batch.customImages,
+                    undefined,
+                    batch.customDocx,
+                    undefined,
+                    {
+                        mergeBaseFindings: batch.findings || undefined,
+                        onSpokenTemplateResolved: (resolved: SpokenTemplateResolution) => {
+                            hadSpokenTemplate = true;
+                            spokenPrompt = resolved.promptText;
+                            spokenDocx = resolved.docxData;
+                            spokenImages = mergeTemplateImages(batch.customImages, resolved.images);
+                            setBatchRtfViewIds(prev => ({ ...prev, [batchId]: true }));
+                        },
+                    }
+                );
+                const updatedFindings = hadSpokenTemplate ? newFindings : [...batch.findings, ...newFindings];
 
-                const chatSession = await createChat(chatAudioInput, updatedFindings, batch.customPrompt, batch.customImages, batch.selectedModel);
+                const chatSession = await createChat(chatAudioInput, updatedFindings, spokenPrompt, spokenImages, batch.selectedModel);
                 const aiGreeting = "I have updated the transcript with your new dictation. How can I help you further?";
                 const updatedChatHistory = [{ author: 'AI' as const, text: `${updatedFindings.join('\n\n')}\n\n${aiGreeting}` }];
 
@@ -2263,6 +2300,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                         prefilterStats: isExperimentalAudioFilterEnabled
                             ? mergePrefilterStats(b.prefilterStats, continueStats)
                             : b.prefilterStats,
+                        ...(hadSpokenTemplate ? { customPrompt: spokenPrompt, customDocx: spokenDocx, customImages: spokenImages } : {}),
                     } : b);
                     saveBatchesToDrive(updated);
                     return updated;
@@ -2311,10 +2349,30 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     
             try {
                 const { blob: filteredModAudio } = await prefilterSingleAudioBlob(audioBlob);
-                const newFindings = await modifyReportWithAudio(batchToModify.findings, filteredModAudio, batchToModify.selectedModel, batchToModify.customPrompt, batchToModify.customImages);
+                let spokenPrompt = batchToModify.customPrompt;
+                let spokenDocx = batchToModify.customDocx;
+                let spokenImages = batchToModify.customImages;
+                let hadSpokenTemplate = false;
+                const newFindings = await modifyReportWithAudio(
+                    batchToModify.findings,
+                    filteredModAudio,
+                    batchToModify.selectedModel,
+                    batchToModify.customPrompt,
+                    batchToModify.customImages,
+                    batchToModify.customDocx,
+                    {
+                        onSpokenTemplateResolved: (resolved: SpokenTemplateResolution) => {
+                            hadSpokenTemplate = true;
+                            spokenPrompt = resolved.promptText;
+                            spokenDocx = resolved.docxData;
+                            spokenImages = mergeTemplateImages(batchToModify.customImages, resolved.images);
+                            setBatchRtfViewIds(prev => ({ ...prev, [batchId]: true }));
+                        },
+                    }
+                );
                 
                 const { modelInput: chatAudioInput } = await prepareModelInputsForBatch(batchToModify.audioBlobs, true);
-                const chatSession = await createChat(chatAudioInput, newFindings, batchToModify.customPrompt, batchToModify.customImages, batchToModify.selectedModel);
+                const chatSession = await createChat(chatAudioInput, newFindings, spokenPrompt, spokenImages, batchToModify.selectedModel);
                 const aiGreeting = "I have updated the transcript with your new dictation. How can I help you further?";
                 const updatedChatHistory = [{ author: 'AI' as const, text: `${newFindings.join('\n\n')}\n\n${aiGreeting}` }];
     
@@ -2324,6 +2382,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                     chat: chatSession,
                     chatHistory: updatedChatHistory,
                     isChatting: false,
+                    ...(hadSpokenTemplate ? { customPrompt: spokenPrompt, customDocx: spokenDocx, customImages: spokenImages } : {}),
                  } : b));
                 setModificationState({ batchId: null, status: 'idle' });
             } catch (err) {
@@ -2813,6 +2872,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                 onClose={() => setTemplateModalBatchId(null)}
                 templates={REPORT_TEMPLATES}
                 onSelectTemplate={handleSelectBatchTemplateToMerge}
+                currentPrompt={batches.find(b => b.id === templateModalBatchId)?.customPrompt || ''}
             />
             {copier && copier.visible && (
                 <SelectionCopier

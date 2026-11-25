@@ -2,9 +2,18 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { ReportTemplate } from '../../constants';
 import SearchIcon from '../icons/SearchIcon';
 import CloseIcon from '../icons/CloseIcon';
-import { FileText, Check, Sparkles, Filter, Eye } from 'lucide-react';
+import { FileText, Check, Sparkles, Filter, Eye, ArrowUp, ArrowDown } from 'lucide-react';
 import { isTableRowFinding, parseTableRow } from '../../services/docxService';
 import { getUpcomingTemplate, setUpcomingTemplate, clearUpcomingTemplate, subscribeToUpcomingTemplate, UpcomingTemplateConfig } from '../../services/upcomingTemplateService';
+import { getUserTemplates, getTemplateDisplayId } from '../../services/templateStorage';
+import { extractTemplateTagIds } from '../../services/upcomingTemplateService';
+
+export type ModalTemplateItem = ReportTemplate & {
+  isCustom?: boolean;
+  templateId?: string;
+  images?: Array<{ data: string; mimeType: string }>;
+  skillPrompt?: string;
+};
 
 interface TemplateSelectionModalProps {
   isOpen: boolean;
@@ -12,6 +21,7 @@ interface TemplateSelectionModalProps {
   templates: ReportTemplate[];
   onSelectTemplate: (template: ReportTemplate | ReportTemplate[]) => void;
   onSelectTemplates?: (templates: ReportTemplate[]) => void;
+  currentPrompt?: string;
 }
 
 interface RegionTag {
@@ -62,12 +72,22 @@ const REGION_TAGS: RegionTag[] = [
   },
 ];
 
-const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen, onClose, templates, onSelectTemplate, onSelectTemplates }) => {
+const getModalTemplateKey = (t: ModalTemplateItem): string => {
+  return String(t.id || t.templateId || t.name).toLowerCase();
+};
+
+const getDisplayBadgeId = (t: ModalTemplateItem): string => {
+  if (t.templateId) return t.templateId;
+  return getTemplateDisplayId(t as any) || (t.id || '').replace(/^builtin_/, '').replace('tpl_', '').replace(/^0+/, '') || '1';
+};
+
+const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen, onClose, templates, onSelectTemplate, onSelectTemplates, currentPrompt }) => {
   const [searchQuery, setSearchQuery] = useState('');
-  const [modalityFilter, setModalityFilter] = useState<'ALL' | 'CT' | 'MRI' | 'US' | 'DX' | 'OTHER'>('ALL');
+  const [modalityFilter, setModalityFilter] = useState<'ALL' | 'CUSTOM' | 'CT' | 'MRI' | 'US' | 'DX' | 'OTHER'>('ALL');
   const [regionFilter, setRegionFilter] = useState<string>('ALL');
-  const [selectedPreview, setSelectedPreview] = useState<ReportTemplate | null>(null);
-  const [selectedTemplates, setSelectedTemplates] = useState<ReportTemplate[]>([]);
+  const [customTemplates, setCustomTemplates] = useState<ModalTemplateItem[]>([]);
+  const [selectedPreview, setSelectedPreview] = useState<ModalTemplateItem | null>(null);
+  const [selectedTemplates, setSelectedTemplates] = useState<ModalTemplateItem[]>([]);
   const [previewTab, setPreviewTab] = useState<'combined' | string>('combined');
   const [activeUpcoming, setActiveUpcoming] = useState<UpcomingTemplateConfig | null>(() => getUpcomingTemplate());
   const [useForUpcoming, setUseForUpcoming] = useState<boolean>(false);
@@ -82,6 +102,51 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
   }, []);
 
   useEffect(() => {
+    if (!isOpen) return;
+    let cancelled = false;
+    const loadCustoms = async () => {
+      try {
+        const all = await getUserTemplates();
+        if (cancelled) return;
+        const userOnly: ModalTemplateItem[] = all
+          .filter(t => !t.isBuiltIn)
+          .map(t => ({
+            id: t.id,
+            templateId: t.templateId,
+            name: t.name,
+            category: t.category || 'CUSTOM',
+            modality: t.modality || 'CUSTOM',
+            description: t.docxFile?.name
+              ? `Custom DOCX template (${t.docxFile.name})`
+              : t.images?.length
+                ? `Custom template (${t.images.length} image guide)`
+                : 'Custom saved report template',
+            lines: t.lines && t.lines.length > 0 ? t.lines : (t.text ? t.text.split('\n').filter(Boolean) : [t.name]),
+            content: t.docxFile?.extractedText || t.text || (t.lines ? t.lines.join('\n') : t.name),
+            docxBase64: t.docxFile?.data,
+            fileName: t.docxFile?.name,
+            images: t.images || [],
+            isCustom: true,
+          }));
+        setCustomTemplates(userOnly);
+      } catch (err) {
+        console.warn('Could not load custom templates for modal:', err);
+      }
+    };
+    loadCustoms();
+    const handleRefresh = () => loadCustoms();
+    window.addEventListener('radiology_templates_updated', handleRefresh);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('radiology_templates_updated', handleRefresh);
+    };
+  }, [isOpen]);
+
+  const allAvailableTemplates = useMemo<ModalTemplateItem[]>(() => {
+    return [...customTemplates, ...templates];
+  }, [customTemplates, templates]);
+
+  useEffect(() => {
     if (!isOpen) {
       setSearchQuery('');
       setModalityFilter('ALL');
@@ -92,15 +157,40 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
       setUseForUpcoming(false);
       setMobileTab('list');
     } else {
-      setActiveUpcoming(getUpcomingTemplate());
+      const currentUp = getUpcomingTemplate();
+      setActiveUpcoming(currentUp);
+      const sourcePrompt = currentPrompt || currentUp?.promptText || '';
+      const activeIds = extractTemplateTagIds(sourcePrompt);
+      if (activeIds.length > 0) {
+        const preSelected: ModalTemplateItem[] = [];
+        for (const rawId of activeIds) {
+          const norm = rawId.replace(/^builtin_/i, '').toLowerCase();
+          const match = allAvailableTemplates.find(t => {
+            const tId = (t.id || '').replace(/^builtin_/i, '').toLowerCase();
+            const disp = getDisplayBadgeId(t).toLowerCase();
+            return tId === norm || disp === norm;
+          });
+          if (match && !preSelected.some(p => getModalTemplateKey(p) === getModalTemplateKey(match))) {
+            preSelected.push(match);
+          }
+        }
+        if (preSelected.length > 0) {
+          setSelectedTemplates(preSelected);
+          setSelectedPreview(preSelected[0]);
+          if (preSelected.length >= 2) {
+            setPreviewTab('combined');
+          }
+        }
+      }
     }
-  }, [isOpen]);
+  }, [isOpen, currentPrompt, allAvailableTemplates]);
 
-  const toggleTemplateSelection = (template: ReportTemplate) => {
+  const toggleTemplateSelection = (template: ModalTemplateItem) => {
+    const targetKey = getModalTemplateKey(template);
     setSelectedTemplates(prev => {
-      const exists = prev.some(t => t.id === template.id || t.name === template.name);
+      const exists = prev.some(t => getModalTemplateKey(t) === targetKey);
       if (exists) {
-        const next = prev.filter(t => t.id !== template.id && t.name !== template.name);
+        const next = prev.filter(t => getModalTemplateKey(t) !== targetKey);
         return next;
       } else {
         const next = [...prev, template];
@@ -110,6 +200,17 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
         setSelectedPreview(template);
         return next;
       }
+    });
+  };
+
+  const moveSelectedTemplate = (index: number, direction: -1 | 1) => {
+    setSelectedTemplates(prev => {
+      const targetIdx = index + direction;
+      if (targetIdx < 0 || targetIdx >= prev.length) return prev;
+      const copy = [...prev];
+      const [item] = copy.splice(index, 1);
+      copy.splice(targetIdx, 0, item);
+      return copy;
     });
   };
 
@@ -125,31 +226,35 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
     }
   };
 
+  const customCount = customTemplates.length;
+
   const ctCount = useMemo(() => {
-    return templates.filter(t => (t.modality || t.category || '').toUpperCase().includes('CT')).length;
-  }, [templates]);
+    return allAvailableTemplates.filter(t => (t.modality || t.category || '').toUpperCase().includes('CT')).length;
+  }, [allAvailableTemplates]);
 
   const mriCount = useMemo(() => {
-    return templates.filter(t => (t.modality || t.category || '').toUpperCase().includes('MR')).length;
-  }, [templates]);
+    return allAvailableTemplates.filter(t => (t.modality || t.category || '').toUpperCase().includes('MR')).length;
+  }, [allAvailableTemplates]);
 
   const usCount = useMemo(() => {
-    return templates.filter(t => (t.modality || t.category || '').toUpperCase().includes('US')).length;
-  }, [templates]);
+    return allAvailableTemplates.filter(t => (t.modality || t.category || '').toUpperCase().includes('US')).length;
+  }, [allAvailableTemplates]);
 
   const dxCount = useMemo(() => {
-    return templates.filter(t => (t.modality || t.category || '').toUpperCase().includes('DX') || t.name.toUpperCase().includes('X-RAY')).length;
-  }, [templates]);
+    return allAvailableTemplates.filter(t => (t.modality || t.category || '').toUpperCase().includes('DX') || t.name.toUpperCase().includes('X-RAY')).length;
+  }, [allAvailableTemplates]);
 
   const otherCount = useMemo(() => {
-    return templates.filter(t => ['MG', 'NM', 'PT'].includes((t.modality || t.category || '').toUpperCase())).length;
-  }, [templates]);
+    return allAvailableTemplates.filter(t => ['MG', 'NM', 'PT'].includes((t.modality || t.category || '').toUpperCase())).length;
+  }, [allAvailableTemplates]);
 
   const filteredTemplates = useMemo(() => {
-    let list = templates;
+    let list = allAvailableTemplates;
 
-    // Modality filter
-    if (modalityFilter === 'CT') {
+    // Modality / source filter
+    if (modalityFilter === 'CUSTOM') {
+      list = list.filter(t => Boolean(t.isCustom));
+    } else if (modalityFilter === 'CT') {
       list = list.filter(t => (t.modality || t.category || '').toUpperCase().includes('CT'));
     } else if (modalityFilter === 'MRI') {
       list = list.filter(t => (t.modality || t.category || '').toUpperCase().includes('MR'));
@@ -185,15 +290,15 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
       const q = searchQuery.toLowerCase().trim();
       const parts = q.split(/\s+/).filter(Boolean);
       list = list.filter(t => {
-        const displayId = (t.id || '').replace('tpl_', '').replace(/^0+/, '');
-        const idText = `id:${displayId} id ${displayId} #${displayId} tpl_${displayId} ${t.id || ''}`.toLowerCase();
+        const displayId = getDisplayBadgeId(t);
+        const idText = `id:${displayId} id ${displayId} #${displayId} tpl_${displayId} ${t.id || ''} ${t.isCustom ? 'custom' : ''}`.toLowerCase();
         const nameLower = t.name.toLowerCase();
         return parts.every(part => nameLower.includes(part) || idText.includes(part));
       });
     }
 
     return list;
-  }, [templates, modalityFilter, regionFilter, searchQuery]);
+  }, [allAvailableTemplates, modalityFilter, regionFilter, searchQuery]);
 
   // Set default preview to first filtered template
   useEffect(() => {
@@ -308,7 +413,7 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
               </h2>
             </div>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              Select any of {templates.length} authoritative clinical normal report templates with native DOCX formatting.
+              Select 1 template or click <strong className="text-blue-600 dark:text-blue-400">+ Add</strong> on multiple templates ({allAvailableTemplates.length} built-in &amp; custom) to combine them into a unified report.
             </p>
           </div>
           <button 
@@ -382,8 +487,21 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
                     : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
                 }`}
               >
-                All ({templates.length})
+                All ({allAvailableTemplates.length})
               </button>
+              {customCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setModalityFilter('CUSTOM')}
+                  className={`text-xs font-semibold px-2.5 py-1.5 rounded-lg transition-all shrink-0 ${
+                    modalityFilter === 'CUSTOM'
+                      ? 'bg-fuchsia-600 text-white shadow-xs'
+                      : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+                  }`}
+                >
+                  Custom ({customCount})
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => setModalityFilter('CT')}
@@ -538,24 +656,50 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
                 <div className="flex items-center justify-between gap-2">
                   <div className="flex items-center gap-1.5 text-xs font-bold text-blue-900 dark:text-blue-100 min-w-0">
                     <Sparkles className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400 shrink-0" />
-                    <span className="truncate">Combined Selection ({selectedTemplates.length} templates)</span>
+                    <span className="truncate">
+                      {selectedTemplates.length === 1
+                        ? '1 Template Staged — click + Add on another to combine'
+                        : `Combined Selection (${selectedTemplates.length} templates)`}
+                    </span>
                   </div>
                   <button
                     type="button"
                     onClick={() => setSelectedTemplates([])}
-                    className="text-[11px] font-semibold text-slate-500 hover:text-red-600 dark:text-slate-400 dark:hover:text-red-400 cursor-pointer"
+                    className="text-[11px] font-semibold text-slate-500 hover:text-red-600 dark:text-slate-400 dark:hover:text-red-400 cursor-pointer shrink-0"
                   >
                     Clear all
                   </button>
                 </div>
-                <div className="flex flex-wrap gap-1 max-h-24 overflow-y-auto pr-1">
+                <div className="flex flex-wrap gap-1.5 max-h-28 overflow-y-auto pr-1">
                   {selectedTemplates.map((t, idx) => (
                     <span
-                      key={t.id || t.name}
-                      className="inline-flex items-center gap-1 text-[11px] font-medium bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200 px-2 py-0.5 rounded-md border border-blue-200 dark:border-blue-800 shadow-2xs"
+                      key={getModalTemplateKey(t)}
+                      className="inline-flex items-center gap-1 text-[11px] font-medium bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200 px-2 py-1 rounded-lg border border-blue-200 dark:border-blue-800 shadow-2xs"
                     >
-                      <span className="w-3.5 h-3.5 rounded-full bg-blue-600 text-white text-[9px] flex items-center justify-center font-bold shrink-0">{idx + 1}</span>
-                      <span className="truncate max-w-[220px] sm:max-w-xs">{t.name}</span>
+                      <span className="w-4 h-4 rounded-full bg-blue-600 text-white text-[9px] flex items-center justify-center font-bold shrink-0">{idx + 1}</span>
+                      <span className="truncate max-w-[180px] sm:max-w-xs">{t.name}</span>
+                      {selectedTemplates.length > 1 && (
+                        <>
+                          <button
+                            type="button"
+                            disabled={idx === 0}
+                            onClick={() => moveSelectedTemplate(idx, -1)}
+                            className="p-0.5 text-slate-400 hover:text-blue-600 disabled:opacity-30 cursor-pointer"
+                            title="Move earlier in combined report"
+                          >
+                            <ArrowUp className="w-3 h-3" />
+                          </button>
+                          <button
+                            type="button"
+                            disabled={idx === selectedTemplates.length - 1}
+                            onClick={() => moveSelectedTemplate(idx, 1)}
+                            className="p-0.5 text-slate-400 hover:text-blue-600 disabled:opacity-30 cursor-pointer"
+                            title="Move later in combined report"
+                          >
+                            <ArrowDown className="w-3 h-3" />
+                          </button>
+                        </>
+                      )}
                       <button
                         type="button"
                         onClick={() => toggleTemplateSelection(t)}
@@ -567,52 +711,56 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
                     </span>
                   ))}
                 </div>
-                <button
-                  type="button"
-                  onClick={() => handleConfirmSelect(selectedTemplates)}
-                  className="w-full py-1.5 px-3 bg-blue-600 hover:bg-blue-700 active:scale-98 text-white text-xs font-bold rounded-lg shadow-xs flex items-center justify-center gap-1.5 transition-all cursor-pointer"
-                >
-                  <Check className="w-3.5 h-3.5" />
-                  <span>Apply Combined ({selectedTemplates.length} Templates)</span>
-                </button>
+                {selectedTemplates.length >= 2 && (
+                  <button
+                    type="button"
+                    onClick={() => handleConfirmSelect(selectedTemplates, useForUpcoming)}
+                    className="w-full py-1.5 px-3 bg-blue-600 hover:bg-blue-700 active:scale-98 text-white text-xs font-bold rounded-lg shadow-xs flex items-center justify-center gap-1.5 transition-all cursor-pointer"
+                  >
+                    <Check className="w-3.5 h-3.5" />
+                    <span>Apply Combined ({selectedTemplates.length} Templates)</span>
+                  </button>
+                )}
               </div>
             )}
 
             {filteredTemplates.length > 0 ? (
               <ul className="space-y-1.5">
                 {filteredTemplates.map((template) => {
-                  const isSelected = selectedPreview?.name === template.name;
-                  const isMultiSelected = selectedTemplates.some(t => t.id === template.id || t.name === template.name);
-                  const multiIndex = selectedTemplates.findIndex(t => t.id === template.id || t.name === template.name);
+                  const templateKey = getModalTemplateKey(template);
+                  const displayBadgeId = getDisplayBadgeId(template);
+                  const isSelected = selectedPreview ? getModalTemplateKey(selectedPreview) === templateKey : false;
+                  const multiIndex = selectedTemplates.findIndex(t => getModalTemplateKey(t) === templateKey);
+                  const isMultiSelected = multiIndex !== -1;
                   const isCurrentUpcoming = Boolean(activeUpcoming && (activeUpcoming.id === template.id || activeUpcoming.name === template.name));
                   const isCT = (template.modality || template.category || '').toUpperCase().includes('CT');
-                  const isMRI = (template.modality || template.category || '').toUpperCase().includes('MRI');
+                  const isMRI = (template.modality || template.category || '').toUpperCase().includes('MR');
                   const linesCount = template.lines?.length || 0;
 
                   return (
-                    <li key={template.id || template.name}>
+                    <li key={templateKey}>
                       <div
                         role="button"
                         tabIndex={0}
                         onClick={() => {
                           setSelectedPreview(template);
                           if (selectedTemplates.length >= 2) {
-                            setPreviewTab(template.id || template.name);
+                            setPreviewTab(templateKey);
                           }
                         }}
                         onDoubleClick={() => {
                           if (selectedTemplates.length >= 2 && isMultiSelected) {
-                            handleConfirmSelect(selectedTemplates);
+                            handleConfirmSelect(selectedTemplates, useForUpcoming);
                           } else {
-                            handleConfirmSelect(template);
+                            handleConfirmSelect(template, useForUpcoming);
                           }
                         }}
                         onKeyDown={(e) => { 
                           if (e.key === 'Enter') {
                             if (selectedTemplates.length >= 2 && isMultiSelected) {
-                              handleConfirmSelect(selectedTemplates);
+                              handleConfirmSelect(selectedTemplates, useForUpcoming);
                             } else {
-                              handleConfirmSelect(template);
+                              handleConfirmSelect(template, useForUpcoming);
                             }
                           }
                         }}
@@ -624,37 +772,41 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
                             : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-800/60'
                         }`}
                       >
-                        {/* Checkbox button to toggle multi-template combination */}
+                        {/* Clear Add / Added (#N) button for multi-template combination */}
                         <button
                           type="button"
                           onClick={(e) => {
                             e.stopPropagation();
                             toggleTemplateSelection(template);
                           }}
-                          className={`mt-0.5 p-1 rounded-lg border transition-all shrink-0 cursor-pointer ${
+                          className={`mt-0.5 px-2 py-1 rounded-lg border transition-all shrink-0 cursor-pointer text-[11px] font-bold flex items-center gap-1 ${
                             isMultiSelected
                               ? 'bg-blue-600 text-white border-blue-600 shadow-xs ring-2 ring-blue-300 dark:ring-blue-800'
-                              : 'bg-slate-100 hover:bg-blue-50 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-400 border-slate-300 dark:border-slate-600 hover:border-blue-400'
+                              : 'bg-blue-50/80 hover:bg-blue-100 text-blue-700 dark:bg-slate-800 dark:hover:bg-blue-950 dark:text-blue-300 border-blue-200 dark:border-slate-600 hover:border-blue-400'
                           }`}
-                          title={isMultiSelected ? `Remove ${template.name} from combined selection` : `Select ${template.name} to combine with another template`}
-                          aria-label={isMultiSelected ? `Deselect ${template.name}` : `Select ${template.name} for combination`}
+                          title={isMultiSelected ? `Remove ${template.name} from combined selection` : `Add ${template.name} to combine with other templates`}
+                          aria-label={isMultiSelected ? `Deselect ${template.name}` : `Add ${template.name} to combination`}
                         >
                           {isMultiSelected ? (
-                            <div className="w-4 h-4 flex items-center justify-center font-bold text-[10px]">
-                              {multiIndex + 1}
-                            </div>
+                            <>
+                              <Check className="w-3 h-3" />
+                              <span>#{multiIndex + 1}</span>
+                            </>
                           ) : (
-                            <div className="w-4 h-4 flex items-center justify-center text-[10px] text-slate-400 font-bold">
-                              +
-                            </div>
+                            <span>+ Add</span>
                           )}
                         </button>
 
                         <div className="min-w-0 flex-1">
                           <div className="flex items-center gap-1.5 mb-1 flex-wrap">
-                            <span className="text-[10px] font-mono font-bold px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-800 dark:bg-indigo-950 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800" title={`Dictate "template id ${(template.id || '').replace('tpl_', '').replace(/^0+/, '') || '1'}" in audio to merge this template`}>
-                              ID: {(template.id || '').replace('tpl_', '').replace(/^0+/, '') || '1'}
+                            <span className="text-[10px] font-mono font-bold px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-800 dark:bg-indigo-950 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800" title={`Dictate "template id ${displayBadgeId}" in audio to merge this template`}>
+                              ID: {displayBadgeId}
                             </span>
+                            {template.isCustom && (
+                              <span className="text-[9px] font-extrabold uppercase px-1.5 py-0.5 rounded bg-fuchsia-100 text-fuchsia-800 dark:bg-fuchsia-950 dark:text-fuchsia-300 border border-fuchsia-200 dark:border-fuchsia-800">
+                                Custom
+                              </span>
+                            )}
                             <span
                               className={`text-[9px] font-extrabold uppercase px-1.5 py-0.5 rounded tracking-wide ${
                                 isCT
@@ -680,7 +832,7 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
                           <p className="font-bold text-sm text-slate-800 dark:text-slate-100 break-words whitespace-normal leading-snug flex items-center gap-1.5 flex-wrap">
                             <span>{template.name}</span>
                             <span className="text-[11px] font-mono font-bold px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-700">
-                              #{(template.id || '').replace('tpl_', '').replace(/^0+/, '') || '1'}
+                              #{displayBadgeId}
                             </span>
                           </p>
                           <p className="text-xs text-slate-500 dark:text-slate-400 line-clamp-1 mt-0.5">
@@ -695,16 +847,16 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
                               onClick={(e) => {
                                 e.stopPropagation();
                                 if (selectedTemplates.length >= 2 && isMultiSelected) {
-                                  handleConfirmSelect(selectedTemplates, false);
+                                  handleConfirmSelect(selectedTemplates, useForUpcoming);
                                 } else {
-                                  handleConfirmSelect(template, false);
+                                  handleConfirmSelect(template, useForUpcoming);
                                 }
                               }}
                               className="flex items-center gap-1 px-2.5 py-1.5 bg-blue-600 hover:bg-blue-700 active:scale-95 text-white text-xs font-bold rounded-lg shadow-xs transition-all cursor-pointer"
-                              title={selectedTemplates.length >= 2 && isMultiSelected ? `Apply combined ${selectedTemplates.length} templates` : `Use ${template.name} for this report only`}
+                              title={selectedTemplates.length >= 2 && isMultiSelected ? `Apply combined ${selectedTemplates.length} templates` : `Use ${template.name} only`}
                             >
                               <Check className="w-3.5 h-3.5" />
-                              <span>{selectedTemplates.length >= 2 && isMultiSelected ? `Combine (${selectedTemplates.length})` : 'Select'}</span>
+                              <span>{selectedTemplates.length >= 2 && isMultiSelected ? `Combine (${selectedTemplates.length})` : selectedTemplates.length >= 1 ? 'Use Only' : 'Select'}</span>
                             </button>
                             <button
                               type="button"
@@ -779,16 +931,18 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
                   <Sparkles className="w-3.5 h-3.5" />
                   <span>Combined Report Preview ({selectedTemplates.length})</span>
                 </button>
-                {selectedTemplates.map((t, idx) => (
+                {selectedTemplates.map((t, idx) => {
+                  const tKey = getModalTemplateKey(t);
+                  return (
                   <button
-                    key={t.id || t.name}
+                    key={tKey}
                     type="button"
                     onClick={() => {
-                      setPreviewTab(t.id || t.name);
+                      setPreviewTab(tKey);
                       setSelectedPreview(t);
                     }}
                     className={`text-xs font-semibold px-2.5 py-1.5 rounded-lg transition-all cursor-pointer truncate max-w-[240px] sm:max-w-xs shrink-0 ${
-                      previewTab === (t.id || t.name)
+                      previewTab === tKey
                         ? 'bg-blue-100 dark:bg-blue-900/60 text-blue-800 dark:text-blue-200 font-bold border border-blue-300 dark:border-blue-700'
                         : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200 bg-white/60 dark:bg-slate-900/60'
                     }`}
@@ -796,7 +950,7 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
                   >
                     {idx + 1}. {t.name}
                   </button>
-                ))}
+                );})}
               </div>
             )}
 
@@ -823,7 +977,7 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
 
                   <button
                     type="button"
-                    onClick={() => handleConfirmSelect(selectedTemplates, false)}
+                    onClick={() => handleConfirmSelect(selectedTemplates, useForUpcoming)}
                     className="flex items-center gap-1.5 px-4 py-2 bg-blue-600 hover:bg-blue-700 active:scale-95 text-white text-xs sm:text-sm font-bold rounded-xl shadow-md transition-all flex-shrink-0 cursor-pointer"
                   >
                     <Sparkles className="w-4 h-4 text-yellow-300" /> Combine &amp; Use ({selectedTemplates.length})
@@ -926,8 +1080,13 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
                   <div>
                     <div className="flex items-center gap-2 mb-1 flex-wrap">
                       <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded bg-indigo-100 text-indigo-800 dark:bg-indigo-950 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800">
-                        Template ID: {(selectedPreview.id || '').replace('tpl_', '').replace(/^0+/, '') || '1'}
+                        Template ID: {getDisplayBadgeId(selectedPreview)}
                       </span>
+                      {selectedPreview.isCustom && (
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-fuchsia-100 text-fuchsia-800 dark:bg-fuchsia-950 dark:text-fuchsia-300 uppercase">
+                          Custom Template
+                        </span>
+                      )}
                       <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-300 uppercase tracking-wide">
                         {selectedPreview.modality || 'Radiology Template'}
                       </span>
@@ -940,21 +1099,43 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
                     <h3 className="text-base sm:text-lg font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2 flex-wrap">
                       <span>{parsedPreview.title}</span>
                       <span className="text-xs font-mono font-bold px-2 py-0.5 rounded bg-indigo-50 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-700">
-                        #{(selectedPreview.id || '').replace('tpl_', '').replace(/^0+/, '') || '1'}
+                        #{getDisplayBadgeId(selectedPreview)}
                       </span>
                     </h3>
                     <p className="text-xs text-indigo-600 dark:text-indigo-400 mt-0.5">
-                      💡 Voice shortcut: Dictate <strong className="font-mono">"template id {(selectedPreview.id || '').replace('tpl_', '').replace(/^0+/, '') || '1'}"</strong> in your audio to automatically merge this template!
+                      💡 Voice shortcut: Dictate <strong className="font-mono">"template id {getDisplayBadgeId(selectedPreview)}"</strong> in your audio to automatically merge this template!
                     </p>
                   </div>
 
-                  <button
-                    type="button"
-                    onClick={() => handleConfirmSelect(selectedPreview, false)}
-                    className="flex items-center gap-1.5 px-4 py-2 bg-blue-600 hover:bg-blue-700 active:scale-95 text-white text-xs sm:text-sm font-bold rounded-xl shadow-md transition-all flex-shrink-0 cursor-pointer"
-                  >
-                    <Check className="w-4 h-4" /> Use Template
-                  </button>
+                  {(() => {
+                    const previewKey = getModalTemplateKey(selectedPreview);
+                    const previewIdx = selectedTemplates.findIndex(t => getModalTemplateKey(t) === previewKey);
+                    const isAdded = previewIdx !== -1;
+                    return (
+                      <div className="flex items-center gap-2 flex-shrink-0 flex-wrap justify-end">
+                        <button
+                          type="button"
+                          onClick={() => toggleTemplateSelection(selectedPreview)}
+                          className={`flex items-center gap-1 px-3 py-2 text-xs font-bold rounded-xl border transition-all cursor-pointer ${
+                            isAdded
+                              ? 'bg-emerald-600 hover:bg-emerald-700 text-white border-emerald-600 shadow-xs'
+                              : 'bg-blue-50 hover:bg-blue-100 text-blue-700 dark:bg-slate-800 dark:hover:bg-blue-950 dark:text-blue-300 border-blue-300 dark:border-blue-700'
+                          }`}
+                        >
+                          {isAdded ? <Check className="w-3.5 h-3.5" /> : null}
+                          <span>{isAdded ? `In Combine (#${previewIdx + 1})` : '+ Add to Combine'}</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleConfirmSelect(selectedTemplates.length >= 2 && isAdded ? selectedTemplates : selectedPreview, useForUpcoming)}
+                          className="flex items-center gap-1.5 px-4 py-2 bg-blue-600 hover:bg-blue-700 active:scale-95 text-white text-xs sm:text-sm font-bold rounded-xl shadow-md transition-all cursor-pointer"
+                        >
+                          <Check className="w-4 h-4" />
+                          <span>{selectedTemplates.length >= 2 && isAdded ? `Apply Combined (${selectedTemplates.length})` : 'Use Template'}</span>
+                        </button>
+                      </div>
+                    );
+                  })()}
                 </div>
 
                 {/* Report Content Preview Body */}
@@ -1093,7 +1274,7 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
                     {selectedTemplates.length >= 2 && (
                       <button
                         type="button"
-                        onClick={() => handleConfirmSelect(selectedTemplates, false)}
+                        onClick={() => handleConfirmSelect(selectedTemplates, useForUpcoming)}
                         className="flex items-center justify-center gap-1.5 px-3.5 py-2 bg-blue-600 hover:bg-blue-700 active:scale-95 text-white text-xs font-bold rounded-xl shadow-xs transition-colors cursor-pointer"
                         title="Apply the combined selected templates"
                       >
@@ -1131,10 +1312,10 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
           </div>
         </div>
 
-        {/* Persistent Sticky Bottom Combine Bar for Multi-Template Selection (Always visible on mobile & desktop when 2+ templates selected) */}
-        {selectedTemplates.length >= 2 && (
+        {/* Persistent Sticky Bottom Dock when 1+ templates are staged for selection/combination */}
+        {selectedTemplates.length >= 1 && (
           <div className="p-3 sm:px-6 bg-blue-50/95 dark:bg-slate-950/95 backdrop-blur-md border-t-2 border-blue-500 dark:border-blue-600 shadow-2xl flex flex-col sm:flex-row items-center justify-between gap-2.5 z-40 shrink-0">
-            <div className="flex items-center justify-between w-full sm:w-auto gap-2">
+            <div className="flex items-center justify-between w-full sm:w-auto gap-2 min-w-0">
               <div className="flex items-center gap-2 min-w-0">
                 <span className="w-6 h-6 rounded-full bg-blue-600 text-white font-bold text-xs flex items-center justify-center shrink-0">
                   {selectedTemplates.length}
@@ -1144,22 +1325,24 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
                     {selectedTemplates.map(t => t.name).join(' + ')}
                   </p>
                   <p className="text-[11px] text-blue-700 dark:text-blue-300 hidden sm:block">
-                    Multi-template cohesive report combination
+                    {selectedTemplates.length === 1
+                      ? 'Click "+ Add" on any other template above to combine more regions'
+                      : 'Multi-template cohesive report combination (use ↑/↓ above to reorder)'}
                   </p>
                 </div>
               </div>
-              <div className="flex items-center gap-1.5 sm:hidden shrink-0">
+              <div className="flex items-center gap-1.5 shrink-0">
                 <button
                   type="button"
                   onClick={() => setMobileTab(mobileTab === 'list' ? 'preview' : 'list')}
-                  className="text-[11px] font-bold px-2 py-1 rounded-lg bg-blue-100 dark:bg-blue-900/60 text-blue-800 dark:text-blue-200 cursor-pointer"
+                  className="sm:hidden text-[11px] font-bold px-2 py-1 rounded-lg bg-blue-100 dark:bg-blue-900/60 text-blue-800 dark:text-blue-200 cursor-pointer"
                 >
                   {mobileTab === 'list' ? '👁️ Preview' : '📋 List'}
                 </button>
                 <button
                   type="button"
                   onClick={() => setSelectedTemplates([])}
-                  className="text-[11px] font-semibold text-slate-500 hover:text-red-600 dark:text-slate-400 px-1 py-1 cursor-pointer"
+                  className="text-[11px] font-semibold text-slate-500 hover:text-red-600 dark:text-slate-400 px-1.5 py-1 cursor-pointer"
                 >
                   Clear
                 </button>
@@ -1169,18 +1352,22 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
             <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
               <button
                 type="button"
-                onClick={() => handleConfirmSelect(selectedTemplates, false)}
+                onClick={() => handleConfirmSelect(selectedTemplates.length === 1 ? selectedTemplates[0] : selectedTemplates, useForUpcoming)}
                 className="flex-1 sm:flex-initial flex items-center justify-center gap-2 px-5 py-2.5 bg-blue-600 hover:bg-blue-700 active:scale-95 text-white text-xs sm:text-sm font-bold rounded-xl shadow-lg transition-all cursor-pointer min-h-[44px]"
               >
                 <Sparkles className="w-4 h-4 text-yellow-300" />
-                <span>Combine &amp; Apply ({selectedTemplates.length} Templates)</span>
+                <span>
+                  {selectedTemplates.length === 1
+                    ? 'Use Staged Template'
+                    : `Combine & Apply (${selectedTemplates.length} Templates)`}
+                </span>
               </button>
 
               <button
                 type="button"
-                onClick={() => handleConfirmSelect(selectedTemplates, true)}
+                onClick={() => handleConfirmSelect(selectedTemplates.length === 1 ? selectedTemplates[0] : selectedTemplates, true)}
                 className="flex items-center justify-center gap-1 px-3.5 py-2.5 bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white text-xs sm:text-sm font-bold rounded-xl shadow-md transition-all cursor-pointer min-h-[44px]"
-                title="Combine and set as active for upcoming reports"
+                title={selectedTemplates.length === 1 ? 'Set as active for upcoming reports' : 'Combine and set as active for upcoming reports'}
               >
                 <span>📌</span>
                 <span className="hidden sm:inline">Use for Upcoming</span>
