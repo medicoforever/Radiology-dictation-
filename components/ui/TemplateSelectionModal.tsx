@@ -6,6 +6,7 @@ import { FileText, Check, Sparkles, Filter, Eye, ArrowUp, ArrowDown } from 'luci
 import { isTableRowFinding, parseTableRow } from '../../services/docxService';
 import { getUpcomingTemplate, setUpcomingTemplate, clearUpcomingTemplate, subscribeToUpcomingTemplate, UpcomingTemplateConfig } from '../../services/upcomingTemplateService';
 import { getUserTemplates, getTemplateDisplayId } from '../../services/templateStorage';
+import { getBuiltInTemplateNumber } from '../../services/builtInTemplates';
 import { extractTemplateTagIds } from '../../services/upcomingTemplateService';
 
 export type ModalTemplateItem = ReportTemplate & {
@@ -77,6 +78,10 @@ const getModalTemplateKey = (t: ModalTemplateItem): string => {
 };
 
 const getDisplayBadgeId = (t: ModalTemplateItem): string => {
+  if (!t.isCustom) {
+    const seqNum = getBuiltInTemplateNumber(t.id);
+    if (seqNum !== null) return String(seqNum);
+  }
   if (t.templateId) return t.templateId;
   return getTemplateDisplayId(t as any) || (t.id || '').replace(/^builtin_/, '').replace('tpl_', '').replace(/^0+/, '') || '1';
 };
@@ -291,8 +296,9 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
       const parts = q.split(/\s+/).filter(Boolean);
       list = list.filter(t => {
         const displayId = getDisplayBadgeId(t);
-        const spacedId = displayId.replace(/_/g, ' ');
-        const idText = `id:${displayId} id ${displayId} ${spacedId} #${displayId} tpl_${displayId} ${t.id || ''} ${t.isCustom ? 'custom' : ''}`.toLowerCase();
+        const rawSuffix = (t.id || '').replace(/^builtin_/, '').replace(/^tpl_/, '');
+        const spacedSuffix = rawSuffix.replace(/_/g, ' ');
+        const idText = `id:${displayId} id ${displayId} #${displayId} tpl_${displayId} ${rawSuffix} ${spacedSuffix} ${t.id || ''} ${t.isCustom ? 'custom' : ''}`.toLowerCase();
         const nameLower = t.name.toLowerCase();
         return parts.every(part => nameLower.includes(part) || idText.includes(part));
       });

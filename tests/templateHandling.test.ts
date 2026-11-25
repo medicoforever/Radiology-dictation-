@@ -12,7 +12,8 @@ import {
   mergeTemplateImages,
   buildCombinedTemplateBundle,
 } from '../services/upcomingTemplateService';
-import { findTemplateByIdOrNumber } from '../services/templateStorage';
+import { findTemplateByIdOrNumber, getTemplateDisplayId } from '../services/templateStorage';
+import { getBuiltInTemplateNumber, resolveBuiltInTemplateByNumber } from '../services/builtInTemplates';
 import { REPORT_TEMPLATES } from '../constants';
 
 test('normalizeTemplateTagId and extractTemplateTagIds handle built-in and custom IDs uniformly', () => {
@@ -213,4 +214,44 @@ test('supplemental add_XXX template IDs (e.g. add_128) resolve across canonicali
   ]);
   assert.deepEqual(combinedSpoken.templateIds, ['add_128', '1']);
   assert.deepEqual(combinedSpoken.cleanedFindings, ['mild fatty liver']);
+});
+
+test('all 300 built-in templates expose easy sequential IDs 1-300 (73-300 for supplemental) while preserving legacy add_XXX support', async () => {
+  assert.equal(getBuiltInTemplateNumber('tpl_001'), 1);
+  assert.equal(getBuiltInTemplateNumber('tpl_072'), 72);
+  assert.equal(getBuiltInTemplateNumber('tpl_add_001'), 73);
+  assert.equal(getBuiltInTemplateNumber('tpl_add_128'), 200);
+  assert.equal(getBuiltInTemplateNumber('tpl_add_228'), 300);
+
+  assert.equal(resolveBuiltInTemplateByNumber(1)?.id, 'tpl_001');
+  assert.equal(resolveBuiltInTemplateByNumber(72)?.id, 'tpl_072');
+  assert.equal(resolveBuiltInTemplateByNumber(73)?.id, 'tpl_add_001');
+  assert.equal(resolveBuiltInTemplateByNumber(200)?.id, 'tpl_add_128');
+  assert.equal(resolveBuiltInTemplateByNumber(300)?.id, 'tpl_add_228');
+
+  // Display badge never exposes awkward "add_128"
+  assert.equal(getTemplateDisplayId({ id: 'builtin_tpl_add_128', isBuiltIn: true }), '200');
+  assert.equal(getTemplateDisplayId({ id: 'tpl_add_128', templateId: 'add_128' }), '200');
+  assert.equal(getTemplateDisplayId({ id: 'cust_2', templateId: 'C2' }), 'C2');
+
+  // Canonicalization & prompt tags map "200" cleanly to tpl_add_128
+  assert.equal(canonicalizeTemplateIdToken('200'), 'tpl_add_128');
+  assert.equal(canonicalizeTemplateIdToken('73'), 'tpl_add_001');
+  assert.deepEqual(extractTemplateTagIds('[TEMPLATE_ID: 1, 200]'), ['tpl_001', 'tpl_add_128']);
+  const bySimpleNum = findBuiltinTemplates('[TEMPLATE_ID: 200]');
+  assert.equal(bySimpleNum.length, 1);
+  assert.equal(bySimpleNum[0].id, 'tpl_add_128');
+
+  // Lookup by simple number or spoken number words resolves exact supplemental template
+  const r200 = await findTemplateByIdOrNumber('200');
+  assert.equal(r200?.id, 'tpl_add_128');
+  assert.equal(r200?.templateId, '200');
+  const rWord200 = await findTemplateByIdOrNumber('two hundred');
+  assert.equal(rWord200?.id, 'tpl_add_128');
+  const r300 = await findTemplateByIdOrNumber('300');
+  assert.equal(r300?.id, 'tpl_add_228');
+
+  // Spoken directive extraction with simple sequential IDs
+  const spoken200 = extractSpokenTemplateDirective(['add template id 1 and template id 200']);
+  assert.deepEqual(spoken200.templateIds, ['1', '200']);
 });

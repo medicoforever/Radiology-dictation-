@@ -1,5 +1,5 @@
 // IndexedDB service for storing custom report templates permanently in the browser
-import { ALL_RADNITO_TEMPLATES } from './builtInTemplates';
+import { ALL_RADNITO_TEMPLATES, getBuiltInTemplateNumber, resolveBuiltInTemplateByNumber } from './builtInTemplates';
 import { isDriveConnected, loadJsonFileFromRootFolder, saveJsonFileToRootFolder } from './googleDriveService';
 
 export interface UserTemplate {
@@ -30,15 +30,23 @@ const HIDDEN_BUILTINS_KEY = 'rad_hidden_builtin_templates';
 const DRIVE_CUSTOM_TEMPLATES_FILE = 'raddoc_custom_templates.json';
 
 /**
- * Helper to get clean, human-readable Template ID (number or C-number)
- * e.g. "tpl_001" -> "1", "tpl_042" -> "42", "cust_1" / "template_1" -> "C1"
+ * Helper to get clean, human-readable Template ID (sequential number 1-300 or custom C-number)
+ * e.g. "tpl_001" -> "1", "tpl_add_128" -> "200", "cust_1" / "template_1" -> "C1"
  */
 export function getTemplateDisplayId(template: { id?: string; templateId?: string; isBuiltIn?: boolean }): string {
-  if (template.templateId) return template.templateId;
   const rawId = template.id || '';
-  if (rawId.startsWith('builtin_tpl_') || rawId.startsWith('tpl_')) {
-    const num = rawId.replace('builtin_', '').replace('tpl_', '').replace(/^0+/, '');
-    return num || '1';
+  if (rawId.startsWith('builtin_tpl_') || rawId.startsWith('tpl_') || template.isBuiltIn) {
+    const seqNum = getBuiltInTemplateNumber(rawId);
+    if (seqNum !== null) {
+      return String(seqNum);
+    }
+  }
+  if (template.templateId) {
+    const asBuiltInNum = getBuiltInTemplateNumber(template.templateId);
+    if (asBuiltInNum !== null && /^tpl_|^add_/i.test(template.templateId)) {
+      return String(asBuiltInNum);
+    }
+    return template.templateId;
   }
   if (rawId.startsWith('cust_') || rawId.startsWith('template_cust_')) {
     const num = rawId.replace('template_cust_', '').replace('cust_', '').replace(/^0+/, '');
@@ -296,12 +304,13 @@ export async function getUserTemplates(): Promise<UserTemplate[]> {
         }
       }
 
-      const displayId = t.id.replace('tpl_', '').replace(/^0+/, '') || '1';
+      const seqNum = getBuiltInTemplateNumber(t.id);
+      const displayId = seqNum !== null ? String(seqNum) : (t.id.replace('tpl_', '').replace(/^0+/, '') || '1');
 
       return {
         id: `builtin_${t.id}`,
         templateId: displayId,
-        templateNumber: parseInt(displayId, 10) || 1,
+        templateNumber: seqNum || parseInt(displayId, 10) || 1,
         name: t.name,
         text: extractedText,
         images: [],
@@ -471,9 +480,10 @@ export async function findTemplateByIdOrNumber(
         t.id.toLowerCase() === `tpl_add_${addNum}`
       );
       if (matchedAdd) {
+        const displayNum = getBuiltInTemplateNumber(matchedAdd.id);
         return {
           ...matchedAdd,
-          templateId: matchedAdd.id.replace(/^tpl_/i, ''),
+          templateId: displayNum ? String(displayNum) : matchedAdd.id.replace(/^tpl_/i, ''),
         };
       }
     }
@@ -493,25 +503,19 @@ export async function findTemplateByIdOrNumber(
 
   const normalizedCustomId = isCustomToken && parsedNum ? `c${parsedNum}` : '';
 
-  // 1. Check built-in templates (ALL_RADNITO_TEMPLATES) if not explicitly prefixed as custom
+  // 1. Check built-in templates (ALL_RADNITO_TEMPLATES 1..300) if not explicitly prefixed as custom
   if (!isCustomToken) {
-    const exactBuiltin = ALL_RADNITO_TEMPLATES.find(t =>
-      t.id.toLowerCase() === cleanLower ||
-      (parsedNum && t.id.toLowerCase() === `tpl_${String(parsedNum).padStart(3, '0')}`)
-    );
+    const exactBuiltin = ALL_RADNITO_TEMPLATES.find(t => t.id.toLowerCase() === cleanLower);
     if (exactBuiltin) {
+      const displayNum = getBuiltInTemplateNumber(exactBuiltin.id);
       return {
         ...exactBuiltin,
-        templateId: exactBuiltin.id.replace('tpl_', '').replace(/^0+/, '') || '1'
+        templateId: displayNum ? String(displayNum) : (exactBuiltin.id.replace('tpl_', '').replace(/^0+/, '') || '1')
       };
     }
 
     if (parsedNum && !isNaN(parsedNum) && parsedNum > 0 && parsedNum <= ALL_RADNITO_TEMPLATES.length) {
-      const padded = String(parsedNum).padStart(3, '0');
-      const matchedBuiltin = ALL_RADNITO_TEMPLATES.find(t =>
-        t.id === `tpl_${padded}` ||
-        parseInt(t.id.replace('tpl_', ''), 10) === parsedNum
-      );
+      const matchedBuiltin = resolveBuiltInTemplateByNumber(parsedNum);
       if (matchedBuiltin) {
         return {
           ...matchedBuiltin,

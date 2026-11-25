@@ -1254,7 +1254,7 @@ export const processAudio = async (
   
   const macroContext = getMacroPromptContext();
   const spokenTemplateReminder = templateInfo.isTemplateMode
-    ? `SPOKEN TEMPLATE ID ADDITION/SWITCH: If the radiologist explicitly speaks another Template ID in the audio (e.g., "add template id 15", "template id add_128", "add template id add 128", "combine with template id C1", "switch to template id 42"), emit "{add template id [ID]}" (e.g. "{add template id add_128}" or "{template id 1, add_128}") at the very beginning of the "findings" array. Preserve "add_" prefixes when spoken (e.g. "add 128" / "add underscore 128" -> "add_128"). Do NOT emit unless explicit numeric, add_XXX, or C-code IDs were spoken.`
+    ? `SPOKEN TEMPLATE ID ADDITION/SWITCH: If the radiologist explicitly speaks another Template ID in the audio (e.g., "add template id 15", "template id 200", "combine with template id C1", "switch to template id 42"), emit "{add template id [ID]}" (e.g. "{add template id 200}" or "{template id 1, 200}") at the very beginning of the "findings" array. Do NOT emit unless explicit numeric (1-300), add_XXX, or C-code IDs were spoken.`
     : '';
   const prompt = [
     customPrompt 
@@ -2109,7 +2109,7 @@ ${JSON.stringify({ findings: currentFindings })}
     prompt += `\n\n${macroContext}`;
   }
 
-  prompt += `\n\nSPOKEN TEMPLATE ID DIRECTIVE (STRICT): If the audio/instruction explicitly speaks one or more Template IDs (e.g. "template id 1", "template id add_128", "template id add 128", "template id C1", "add template id 15", "combine templates 5 and add_128"), output "{template id [ID]}" or "{add template id [ID]}" or "{template id [ID1, ID2]}" (preserving "add_" prefixes like "add_128") at the start of the "findings" array. Do NOT trigger on vague requests like "add ct brain" without an explicit ID.`;
+  prompt += `\n\nSPOKEN TEMPLATE ID DIRECTIVE (STRICT): If the audio/instruction explicitly speaks one or more Template IDs (e.g. "template id 1", "template id 200", "template id C1", "add template id 15", "combine templates 5 and 200"), output "{template id [ID]}" or "{add template id [ID]}" or "{template id [ID1, ID2]}" at the start of the "findings" array. Do NOT trigger on vague requests like "add ct brain" without an explicit ID.`;
 
   const parts: any[] = [];
   

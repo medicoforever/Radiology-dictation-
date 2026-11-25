@@ -1,6 +1,6 @@
 import { ReportTemplate } from '../constants';
 import { DocxTemplateData } from '../components/ui/CustomPromptInput';
-import { getTemplateDocxBase64 } from './builtInTemplates';
+import { getTemplateDocxBase64, resolveBuiltInTemplateByNumber } from './builtInTemplates';
 import { safeLocalStorage } from './storageService';
 
 export interface UpcomingTemplateConfig {
@@ -202,9 +202,17 @@ export function canonicalizeTemplateIdToken(rawToken?: string): string {
     return `tpl_add_${addMatch[1].padStart(3, '0')}`;
   }
 
-  const builtinMatch = cleaned.match(/^(?:tpl[\s_-]*)?(\d+)$/i);
-  if (builtinMatch) {
-    return `tpl_${builtinMatch[1].padStart(3, '0')}`;
+  const explicitTplMatch = cleaned.match(/^tpl_(\d+)$/i);
+  if (explicitTplMatch) {
+    return `tpl_${explicitTplMatch[1].padStart(3, '0')}`;
+  }
+
+  const numericMatch = cleaned.match(/^(\d+)$/i);
+  if (numericMatch) {
+    const num = parseInt(numericMatch[1], 10);
+    const resolved = resolveBuiltInTemplateByNumber(num);
+    if (resolved) return resolved.id;
+    return `tpl_${numericMatch[1].padStart(3, '0')}`;
   }
 
   const customMatch = cleaned.match(/^c(\d+)$/i);

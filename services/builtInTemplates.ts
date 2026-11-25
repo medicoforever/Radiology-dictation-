@@ -2318,10 +2318,49 @@ const BASE_RADNITO_TEMPLATES: BuiltInTemplateItem[] = [
 
 import { ADDITIONAL_TEMPLATES } from './additionalTemplates';
 
+export const BASE_BUILTIN_COUNT = BASE_RADNITO_TEMPLATES.length;
+
 export const ALL_RADNITO_TEMPLATES: BuiltInTemplateItem[] = [
   ...BASE_RADNITO_TEMPLATES,
   ...ADDITIONAL_TEMPLATES
 ];
+
+/**
+ * Maps any internal built-in template ID ('tpl_001'..'tpl_072' or 'tpl_add_001'..'tpl_add_228')
+ * to a single simple sequential 1-based number (1..300) for easy reading and voice dictation.
+ */
+export function getBuiltInTemplateNumber(rawId?: string): number | null {
+  if (!rawId) return null;
+  const clean = String(rawId).trim().replace(/^builtin_/i, '').toLowerCase();
+  const addMatch = clean.match(/^(?:tpl_)?add_(\d+)$/);
+  if (addMatch) {
+    const addNum = parseInt(addMatch[1], 10);
+    return !isNaN(addNum) && addNum > 0 ? BASE_BUILTIN_COUNT + addNum : null;
+  }
+  const baseMatch = clean.match(/^(?:tpl_)?(\d+)$/);
+  if (baseMatch) {
+    const num = parseInt(baseMatch[1], 10);
+    return !isNaN(num) && num > 0 ? num : null;
+  }
+  return null;
+}
+
+/**
+ * Resolves a simple sequential template number (1..300) back to its built-in template item.
+ */
+export function resolveBuiltInTemplateByNumber(num: number): BuiltInTemplateItem | undefined {
+  if (!num || isNaN(num) || num < 1) return undefined;
+  if (num <= BASE_BUILTIN_COUNT) {
+    const padded = String(num).padStart(3, '0');
+    return ALL_RADNITO_TEMPLATES.find(t => t.id === `tpl_${padded}`) || ALL_RADNITO_TEMPLATES[num - 1];
+  }
+  const addNum = num - BASE_BUILTIN_COUNT;
+  const paddedAdd = String(addNum).padStart(3, '0');
+  return (
+    ALL_RADNITO_TEMPLATES.find(t => t.id === `tpl_add_${paddedAdd}` || t.id === `tpl_add_${addNum}`) ||
+    ALL_RADNITO_TEMPLATES[num - 1]
+  );
+}
 
 // In-memory cache for docxBase64 strings loaded from /templatesData.json
 let docxCache: Record<string, string> | null = null;
