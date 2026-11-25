@@ -5,7 +5,7 @@ import { isTableRowFinding } from "./docxService";
 import { expandMacrosInFindings, expandMacrosInSingleText, getMacroPromptContext } from "./macroDictionaryService";
 import { executeWithApiKeyFailover, getRandomAIClient, getClientForApiKey } from "./apiKeyService";
 import { findTemplateByIdOrNumber } from "./templateStorage";
-import { buildCombinedTemplateBundle, extractTemplateTagIds, mergeTemplateImages, DocxTemplateData as BundleDocxTemplateData } from "./upcomingTemplateService";
+import { buildCombinedTemplateBundle, canonicalizeTemplateIdToken, extractTemplateTagIds, mergeTemplateImages, DocxTemplateData as BundleDocxTemplateData } from "./upcomingTemplateService";
 
 export const getAI = (): GoogleGenAI => {
   return getRandomAIClient();
@@ -490,22 +490,22 @@ export function findBuiltinTemplates(promptOrId?: string): (typeof REPORT_TEMPLA
   const raw = promptOrId.trim();
   const matched: (typeof REPORT_TEMPLATES)[number][] = [];
 
-  // 1. Direct ID match (e.g. single "tpl_001")
-  const directId = REPORT_TEMPLATES.find(t => t.id && t.id.toLowerCase() === raw.toLowerCase());
+  // 1. Direct ID match (e.g. single "tpl_001", "tpl_add_128", "add_128", or "1")
+  const directCanon = canonicalizeTemplateIdToken(raw).toLowerCase();
+  const directId = REPORT_TEMPLATES.find(
+    t => t.id && (t.id.toLowerCase() === raw.toLowerCase() || t.id.toLowerCase() === directCanon)
+  );
   if (directId) {
     return [directId];
   }
 
-  // 2. Explicit ID tags in prompt: [TEMPLATE_ID: tpl_001, tpl_002] or [TEMPLATE_IDS: ...] or [TEMPLATE_ID: 1, 15]
+  // 2. Explicit ID tags in prompt: [TEMPLATE_ID: tpl_001, tpl_add_128] or [TEMPLATE_ID: 1, add_128]
   const idTagMatches = [...raw.matchAll(/\[(?:TEMPLATE_ID|TEMPLATE_IDS|TEMPLATES|TEMPLATE|ID):\s*([^\]]+)\]/gi)];
   for (const match of idTagMatches) {
-    const idsStr = match[1];
+    const idsStr = match[1].replace(/\b((?:builtin_)?(?:tpl[\s_-]*)?add)[\s_-]+(\d+)\b/gi, '$1_$2');
     const parts = idsStr.split(/[,;\s]+/).map(p => p.trim()).filter(Boolean);
     for (const part of parts) {
-      let cleanPart = part.replace(/^builtin_/i, '').toLowerCase();
-      if (/^\d+$/.test(cleanPart)) {
-        cleanPart = `tpl_${cleanPart.padStart(3, '0')}`;
-      }
+      const cleanPart = canonicalizeTemplateIdToken(part).toLowerCase();
       const byId = REPORT_TEMPLATES.find(t => t.id && t.id.toLowerCase() === cleanPart);
       if (byId && !matched.some(m => m.id === byId.id)) {
         matched.push(byId);
@@ -877,14 +877,71 @@ CRITICAL TEMPLATE MERGE DIRECTIVES:
   };
 }
 
-const ID_ATOM_PATTERN = `(?:(?:builtin_)?(?:tpl_|cust_|template_)\\d+|(?:see|sea|c|custom)[\\s-]*(?:zero|one|won|two|to|too|three|four|for|five|six|seven|eight|ate|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fourty|fifty|sixty|seventy|eighty|ninety|\\d+)(?:[\\s-]*(?:one|won|two|to|too|three|four|for|five|six|seven|eight|ate|nine))?|(?:one|two|three)\\s+hundred(?:\\s+and)?(?:\\s+(?:twenty|thirty|forty|fourty|fifty|sixty|seventy|eighty|ninety))?(?:[\\s-]+(?:one|won|two|to|too|three|four|for|five|six|seven|eight|ate|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen))?|(?:twenty|thirty|forty|fourty|fifty|sixty|seventy|eighty|ninety)(?:[\\s-]+(?:one|won|two|to|too|three|four|for|five|six|seven|eight|ate|nine))?|(?:zero|one|won|two|to|too|three|four|for|five|six|seven|eight|ate|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen)|\\d+)`;
+const UNIT_OR_TEEN_PATTERN = `(?:zero|oh|o|one|won|two|to|too|three|four|for|five|six|seven|eight|ate|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen)`;
+const TENS_WORD_PATTERN = `(?:twenty|thirty|forty|fourty|fifty|sixty|seventy|eighty|ninety)`;
+const SPOKEN_NUM_PHRASE = `(?:(?:one|two|three)\\s+hundred(?:\\s+and)?(?:\\s+${TENS_WORD_PATTERN})?(?:[\\s-]+${UNIT_OR_TEEN_PATTERN})?|(?:one|two|three)[\\s-]+(?:${TENS_WORD_PATTERN}(?:[\\s-]+${UNIT_OR_TEEN_PATTERN})?|${UNIT_OR_TEEN_PATTERN}(?:[\\s-]+${UNIT_OR_TEEN_PATTERN})?)|${TENS_WORD_PATTERN}(?:[\\s-]+${UNIT_OR_TEEN_PATTERN})?|${UNIT_OR_TEEN_PATTERN}|\\d+)`;
+const SPOKEN_JOINER = `(?:[\\s_-]*(?:underscore|under\\s+score|dash|hyphen)[\\s_-]*|[\\s_-]+)`;
+const ADD_ID_ATOM_PATTERN = `(?:(?:builtin_)?(?:tpl[\\s_-]*)?add${SPOKEN_JOINER}${SPOKEN_NUM_PHRASE})`;
+const CUSTOM_ID_ATOM_PATTERN = `(?:(?:see|sea|custom|c)(?:[\\s_-]*\\d+|${SPOKEN_JOINER}(?:${TENS_WORD_PATTERN}(?:[\\s-]+${UNIT_OR_TEEN_PATTERN})?|${UNIT_OR_TEEN_PATTERN})))`;
+const ID_ATOM_PATTERN = `(?:${ADD_ID_ATOM_PATTERN}|(?:builtin_)?(?:tpl_|cust_|template_)\\d+|${CUSTOM_ID_ATOM_PATTERN}|${SPOKEN_NUM_PHRASE})`;
 
 const SPOKEN_UNIT_WORDS: Record<string, string> = {
-  zero: '0', one: '1', won: '1', two: '2', to: '2', too: '2', three: '3', four: '4', for: '4',
+  zero: '0', oh: '0', o: '0', one: '1', won: '1', two: '2', to: '2', too: '2', three: '3', four: '4', for: '4',
   five: '5', six: '6', seven: '7', eight: '8', ate: '8', nine: '9', ten: '10',
   eleven: '11', twelve: '12', thirteen: '13', fourteen: '14', fifteen: '15',
   sixteen: '16', seventeen: '17', eighteen: '18', nineteen: '19',
 };
+
+const SPOKEN_TENS_WORDS: Record<string, number> = {
+  twenty: 20, thirty: 30, forty: 40, fourty: 40, fifty: 50, sixty: 60, seventy: 70, eighty: 80, ninety: 90,
+};
+
+function parseSpokenDigitsOrNumber(phrase: string): string | null {
+  const clean = phrase.trim().toLowerCase().replace(/[-\s]+/g, ' ');
+  if (!clean) return null;
+  if (/^\d+$/.test(clean)) return String(parseInt(clean, 10));
+  const tokens = clean.split(' ').filter(t => t && t !== 'and');
+  if (tokens.length === 0) return null;
+
+  if (!tokens.includes('hundred')) {
+    const first = SPOKEN_UNIT_WORDS[tokens[0]] !== undefined ? parseInt(SPOKEN_UNIT_WORDS[tokens[0]], 10) : NaN;
+    if (tokens.length === 3 && !isNaN(first) && first >= 0 && first <= 9) {
+      const sTen = SPOKEN_TENS_WORDS[tokens[1]];
+      const sOne = SPOKEN_UNIT_WORDS[tokens[1]] !== undefined ? parseInt(SPOKEN_UNIT_WORDS[tokens[1]], 10) : NaN;
+      const tOne = SPOKEN_UNIT_WORDS[tokens[2]] !== undefined ? parseInt(SPOKEN_UNIT_WORDS[tokens[2]], 10) : NaN;
+      if (first >= 1 && sTen !== undefined && !isNaN(tOne) && tOne >= 1 && tOne <= 9) {
+        return String(first * 100 + sTen + tOne);
+      }
+      if (!isNaN(sOne) && sOne >= 0 && sOne <= 9 && !isNaN(tOne) && tOne >= 0 && tOne <= 9) {
+        return String(first * 100 + sOne * 10 + tOne);
+      }
+    }
+    if (tokens.length === 2 && !isNaN(first) && first >= 1 && first <= 9) {
+      const sTen = SPOKEN_TENS_WORDS[tokens[1]];
+      const sTeen = SPOKEN_UNIT_WORDS[tokens[1]] !== undefined ? parseInt(SPOKEN_UNIT_WORDS[tokens[1]], 10) : NaN;
+      if (sTen !== undefined) return String(first * 100 + sTen);
+      if (!isNaN(sTeen) && sTeen >= 10 && sTeen <= 19) return String(first * 100 + sTeen);
+    }
+  }
+
+  let total = 0;
+  let current = 0;
+  for (const tok of tokens) {
+    if (SPOKEN_UNIT_WORDS[tok] !== undefined) {
+      current += parseInt(SPOKEN_UNIT_WORDS[tok], 10);
+    } else if (SPOKEN_TENS_WORDS[tok] !== undefined) {
+      current += SPOKEN_TENS_WORDS[tok];
+    } else if (tok === 'hundred') {
+      current = (current === 0 ? 1 : current) * 100;
+    } else if (/^\d+$/.test(tok)) {
+      current += parseInt(tok, 10);
+    } else {
+      return null;
+    }
+  }
+  total += current;
+  return total > 0 ? String(total) : null;
+}
 
 function splitSpokenIdList(rawSegment: string): string[] {
   if (!rawSegment) return [];
@@ -900,19 +957,26 @@ function splitSpokenIdList(rawSegment: string): string[] {
 
   const ids: string[] = [];
   for (const tok of rawTokens) {
-    // Also extract atomic matches inside space-separated runs like "5 15"
+    // Extract atomic matches inside runs like "add_128" or "5 15"
     const subMatches = [...tok.matchAll(new RegExp(ID_ATOM_PATTERN, 'gi'))].map(m => m[0].trim()).filter(Boolean);
     const candidates = subMatches.length > 0 ? subMatches : [tok];
     for (let candidate of candidates) {
-      // Normalize phonetic "see 1" / "sea two" / "c two" / "custom 2" -> "C2" or "C <rest>"
-      const customPrefixed = candidate.match(/^(?:see|sea|custom|c)[\s-]+(.+)$/i);
-      if (customPrefixed) {
-        const tail = customPrefixed[1].trim().toLowerCase();
-        candidate = /^\d+$/.test(tail)
-          ? `C${tail}`
-          : SPOKEN_UNIT_WORDS[tail]
-            ? `C${SPOKEN_UNIT_WORDS[tail]}`
-            : `C ${tail}`;
+      const addPrefixed = candidate.match(/^(?:builtin_)?(?:tpl[\s_-]*)?add(?:[\s_-]*(?:underscore|under\s+score|dash|hyphen)[\s_-]*|[\s_-]+)(.+)$/i);
+      if (addPrefixed) {
+        const tail = addPrefixed[1].trim();
+        const numParsed = parseSpokenDigitsOrNumber(tail);
+        candidate = numParsed ? `add_${numParsed.padStart(3, '0')}` : `add_${tail.replace(/\s+/g, '_')}`;
+      } else {
+        // Normalize phonetic "see 1" / "sea two" / "c two" / "custom 2" -> "C2" or "C <rest>"
+        const customPrefixed = candidate.match(/^(?:see|sea|custom|c)[\s-]+(.+)$/i);
+        if (customPrefixed) {
+          const tail = customPrefixed[1].trim().toLowerCase();
+          candidate = /^\d+$/.test(tail)
+            ? `C${tail}`
+            : SPOKEN_UNIT_WORDS[tail]
+              ? `C${SPOKEN_UNIT_WORDS[tail]}`
+              : `C ${tail}`;
+        }
       }
       if (candidate && !ids.some(x => x.toLowerCase() === candidate.toLowerCase())) {
         ids.push(candidate);
@@ -924,7 +988,7 @@ function splitSpokenIdList(rawSegment: string): string[] {
 
 /**
  * Detects and extracts spoken template ID directive token(s): {template id [ID]} or spoken "template id X and Y"
- * Supports single or multiple IDs (e.g. "{template id 1}", "{template id 5, 15}", "add template id 5 and template id C1").
+ * Supports numeric IDs, supplemental "add_XXX" / "add XXX" IDs, custom C-IDs, and multiple combined IDs.
  */
 export function extractSpokenTemplateDirective(findings: string[]): {
   templateId: string | null;
@@ -940,46 +1004,93 @@ export function extractSpokenTemplateDirective(findings: string[]): {
   let mode: 'add' | 'replace' = 'add';
   const cleaned: string[] = [];
 
-  const bracedRegex = /\{\s*((?:add|use|apply|insert|combine|switch(?:\s+to)?|change(?:\s+to)?|replace(?:\s+with)?|merge(?:\s+with)?)\s+)?template(?:s|\s+ids?|\s+numbers?|\s+no\.?)?\s*[:\s#-]*([a-zA-Z0-9_,\-&\+\s]+?)\s*\}\.?/gi;
+  const listTailPattern = `(` +
+    ID_ATOM_PATTERN +
+    `(?:\\s*(?:,|;|&|\\+|\\band\\b|\\balso\\b|\\bwith\\b)\\s*(?:(?:template\\s+(?:ids?|numbers?|no\\.?)\\s*[:\\s#-]*))?` +
+    ID_ATOM_PATTERN +
+    `)*)`;
+
+  const bracedTemplateRegex = /\{\s*((?:add|use|apply|insert|combine|switch(?:\s+to)?|change(?:\s+to)?|replace(?:\s+with)?|merge(?:\s+with)?)\s+)?template(?:s|\s+ids?|\s+numbers?|\s+no\.?)?\s*[:\s#-]*([a-zA-Z0-9_,\-&\+\s]+?)\s*\}\.?/gi;
+  const bracedPrefixedIdRegex = /\{\s*((?:use|apply|add|merge(?:\s+with)?)?\s*)?((?:(?:builtin_)?(?:tpl[\s_-]*)?add[\s_-]*\d+|tpl_\d+|c\d+)(?:\s*(?:,|;|&|\+|\band\b)\s*[a-zA-Z0-9_\s-]+)*)\s*\}\.?/gi;
+
+  // Matches "template id 5", "template id add_128", "add template id add 128", or omitted-"id" explicit prefix ("template add_128", "template add 128", "template C1")
   const unbracedRegex = new RegExp(
-    `(?:^|\\b)((?:add|use|apply|insert|combine|also\\s+(?:add|use)|switch(?:\\s+to)?|change(?:\\s+to)?|replace(?:\\s+with)?|merge(?:\\s+with)?)\\s+)?(?:template\\s+(?:ids?|numbers?|no\\.?)|combined\\s+templates?)\\s*[:\\s#-]*(` +
-      ID_ATOM_PATTERN +
-      `(?:\\s*(?:,|;|&|\\+|\\band\\b|\\balso\\b|\\bwith\\b)\\s*(?:(?:template\\s+(?:ids?|numbers?|no\\.?)\\s*[:\\s#-]*))?` +
-      ID_ATOM_PATTERN +
-      `)*)\\b\\.?`,
+    `(?:^|\\b)((?:add|use|apply|insert|combine|also\\s+(?:add|use)|switch(?:\\s+to)?|change(?:\\s+to)?|replace(?:\\s+with)?|merge(?:\\s+with)?)\\s+)?(?:template(?:s)?\\s+(?:ids?|numbers?|no\\.?)|combined\\s+templates?)\\s*[:\\s#-]*` +
+      listTailPattern +
+      `\\b\\.?`,
     'gi'
   );
+  const explicitPrefixedTagRegex = new RegExp(
+    `(?:^|\\b)((?:add|use|apply|insert|combine|also\\s+(?:add|use)|switch(?:\\s+to)?|change(?:\\s+to)?|replace(?:\\s+with)?|merge(?:\\s+with)?)\\s+)?(?:template\\s+(?:` +
+      ADD_ID_ATOM_PATTERN +
+      `|` +
+      CUSTOM_ID_ATOM_PATTERN +
+      `|(?:builtin_)?(?:tpl_|cust_)\\d+)|(?:tpl_add_\\d+|add_\\d+|add_(?:${UNIT_OR_TEEN_PATTERN}|${TENS_WORD_PATTERN})))(?:\\s*(?:,|;|&|\\+|\\band\\b|\\balso\\b|\\bwith\\b)\\s*(?:template(?:\\s+(?:ids?|numbers?|no\\.?))?\\s*[:\\s#-]*)?` +
+      ID_ATOM_PATTERN +
+      `)*\\b\\.?`,
+    'gi'
+  );
+
+  const candidateRegexes: Array<{ regex: RegExp; rawTokenGroupIndex: number }> = [
+    { regex: bracedTemplateRegex, rawTokenGroupIndex: 2 },
+    { regex: bracedPrefixedIdRegex, rawTokenGroupIndex: 2 },
+    { regex: unbracedRegex, rawTokenGroupIndex: 2 },
+    { regex: explicitPrefixedTagRegex, rawTokenGroupIndex: 99 },
+  ];
 
   for (const rawFinding of findings) {
     if (!rawFinding) continue;
     const isBold = /^BOLD::/i.test(rawFinding);
     let working = rawFinding.replace(/^BOLD::/i, '').trim();
-    let matchedInLine = false;
 
-    const consumeMatches = (regex: RegExp) => {
+    const rawMatches: Array<{ start: number; end: number; verb: string; idSegment: string }> = [];
+    for (const { regex, rawTokenGroupIndex } of candidateRegexes) {
       regex.lastIndex = 0;
-      const matches = [...working.matchAll(regex)];
-      if (matches.length === 0) return;
-      matchedInLine = true;
-      for (const m of matches) {
-        const actionVerb = (m[1] || '').toLowerCase();
-        if (/(?:switch|change|replace)/i.test(actionVerb)) {
+      for (const m of working.matchAll(regex)) {
+        if (m.index === undefined) continue;
+        const full = m[0];
+        const idSegment = (m[rawTokenGroupIndex] !== undefined
+          ? m[rawTokenGroupIndex]
+          : full
+              .replace(/^[\{\s]+/, '')
+              .replace(/[\}\s]+$/, '')
+              .replace(/^(?:add|use|apply|insert|combine|also\s+(?:add|use)|switch(?:\s+to)?|change(?:\s+to)?|replace(?:\s+with)?|merge(?:\s+with)?)\s+/i, '')
+              .replace(/^(?:template(?:s)?\s+(?:ids?|numbers?|no\.?)?\s*[:\s#-]*)/i, '')) || '';
+        rawMatches.push({
+          start: m.index,
+          end: m.index + full.length,
+          verb: (m[1] || '').toLowerCase(),
+          idSegment,
+        });
+      }
+    }
+
+    if (rawMatches.length > 0) {
+      rawMatches.sort((a, b) => (a.start - b.start) || ((b.end - b.start) - (a.end - a.start)));
+      const accepted: typeof rawMatches = [];
+      for (const item of rawMatches) {
+        const prev = accepted[accepted.length - 1];
+        if (prev && item.start < prev.end) continue;
+        accepted.push(item);
+      }
+
+      for (const item of accepted) {
+        if (/(?:switch|change|replace)/i.test(item.verb)) {
           mode = 'replace';
         }
-        const ids = splitSpokenIdList(m[2] || '');
+        const ids = splitSpokenIdList(item.idSegment);
         for (const id of ids) {
           if (!detectedIds.some(existing => existing.toLowerCase() === id.toLowerCase())) {
             detectedIds.push(id);
           }
         }
       }
-      working = working.replace(regex, ' ');
-    };
 
-    consumeMatches(bracedRegex);
-    consumeMatches(unbracedRegex);
+      for (let idx = accepted.length - 1; idx >= 0; idx--) {
+        const span = accepted[idx];
+        working = `${working.slice(0, span.start)} ${working.slice(span.end)}`;
+      }
 
-    if (matchedInLine) {
       const stripped = working
         .replace(/\s+/g, ' ')
         .replace(/^[:\s\-.,;]+/, '')
@@ -1020,10 +1131,7 @@ async function resolveAndApplySpokenTemplates(
     return findings;
   }
 
-  const normalizeCompareId = (id: string): string => {
-    const clean = id.trim().replace(/^builtin_/i, '').toLowerCase();
-    return /^\d+$/.test(clean) ? `tpl_${clean.padStart(3, '0')}` : clean;
-  };
+  const normalizeCompareId = (id: string): string => canonicalizeTemplateIdToken(id).toLowerCase();
 
   const activeTagIds = extractTemplateTagIds(opts.customPrompt);
   const activeSet = new Set(activeTagIds.map(normalizeCompareId));
@@ -1146,7 +1254,7 @@ export const processAudio = async (
   
   const macroContext = getMacroPromptContext();
   const spokenTemplateReminder = templateInfo.isTemplateMode
-    ? `SPOKEN TEMPLATE ID ADDITION/SWITCH: If the radiologist explicitly speaks another Template ID in the audio (e.g., "add template id 15", "combine with template id C1", "switch to template id 42"), emit "{add template id [ID]}" (or "{template id [ID1, ID2]}") at the very beginning of the "findings" array. Do NOT emit unless explicit numeric or C-code IDs were spoken.`
+    ? `SPOKEN TEMPLATE ID ADDITION/SWITCH: If the radiologist explicitly speaks another Template ID in the audio (e.g., "add template id 15", "template id add_128", "add template id add 128", "combine with template id C1", "switch to template id 42"), emit "{add template id [ID]}" (e.g. "{add template id add_128}" or "{template id 1, add_128}") at the very beginning of the "findings" array. Preserve "add_" prefixes when spoken (e.g. "add 128" / "add underscore 128" -> "add_128"). Do NOT emit unless explicit numeric, add_XXX, or C-code IDs were spoken.`
     : '';
   const prompt = [
     customPrompt 
@@ -2001,7 +2109,7 @@ ${JSON.stringify({ findings: currentFindings })}
     prompt += `\n\n${macroContext}`;
   }
 
-  prompt += `\n\nSPOKEN TEMPLATE ID DIRECTIVE (STRICT): If the audio/instruction explicitly speaks one or more Template IDs (e.g. "template id 1", "template id C1", "add template id 15", "combine templates 5 and 15"), output "{template id [ID]}" or "{add template id [ID]}" or "{template id [ID1, ID2]}" at the start of the "findings" array. Do NOT trigger on vague requests like "add ct brain" without an explicit ID.`;
+  prompt += `\n\nSPOKEN TEMPLATE ID DIRECTIVE (STRICT): If the audio/instruction explicitly speaks one or more Template IDs (e.g. "template id 1", "template id add_128", "template id add 128", "template id C1", "add template id 15", "combine templates 5 and add_128"), output "{template id [ID]}" or "{add template id [ID]}" or "{template id [ID1, ID2]}" (preserving "add_" prefixes like "add_128") at the start of the "findings" array. Do NOT trigger on vague requests like "add ct brain" without an explicit ID.`;
 
   const parts: any[] = [];
   

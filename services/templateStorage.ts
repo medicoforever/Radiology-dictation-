@@ -367,7 +367,7 @@ function spokenWordsToNumber(input: string): number | null {
   const s = input.trim().toLowerCase().replace(/[-\s]+/g, ' ');
   if (/^\d+$/.test(s)) return parseInt(s, 10);
   const ones: Record<string, number> = {
-    zero: 0, one: 1, won: 1, two: 2, to: 2, too: 2, three: 3, four: 4, for: 4, five: 5,
+    zero: 0, oh: 0, o: 0, one: 1, won: 1, two: 2, to: 2, too: 2, three: 3, four: 4, for: 4, five: 5,
     six: 6, seven: 7, eight: 8, ate: 8, nine: 9, ten: 10,
     eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15,
     sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19,
@@ -377,6 +377,33 @@ function spokenWordsToNumber(input: string): number | null {
   };
   const tokens = s.split(' ').filter(t => t && t !== 'and');
   if (tokens.length === 0) return null;
+
+  // Handle common spoken 3-digit shorthands without "hundred": e.g. "one twenty eight" -> 128, "one oh five" -> 105, "one two eight" -> 128
+  if (!tokens.includes('hundred')) {
+    const first = ones[tokens[0]];
+    if (tokens.length === 3 && first !== undefined && first >= 0 && first <= 9) {
+      const secondTen = tens[tokens[1]];
+      const secondOne = ones[tokens[1]];
+      const third = ones[tokens[2]];
+      if (first >= 1 && secondTen !== undefined && third !== undefined && third >= 1 && third <= 9) {
+        return first * 100 + secondTen + third;
+      }
+      if (secondOne !== undefined && secondOne >= 0 && secondOne <= 9 && third !== undefined && third >= 0 && third <= 9) {
+        return first * 100 + secondOne * 10 + third;
+      }
+    }
+    if (tokens.length === 2 && first !== undefined && first >= 1 && first <= 9) {
+      const secondTen = tens[tokens[1]];
+      const secondTeen = ones[tokens[1]];
+      if (secondTen !== undefined) {
+        return first * 100 + secondTen;
+      }
+      if (secondTeen !== undefined && secondTeen >= 10 && secondTeen <= 19) {
+        return first * 100 + secondTeen;
+      }
+    }
+  }
+
   let total = 0;
   let current = 0;
   for (const tok of tokens) {
@@ -398,8 +425,9 @@ function spokenWordsToNumber(input: string): number | null {
 
 /**
  * Resolve any template by dictated ID or number
- * Matches built-in templates (1-300 or tpl_001) or custom templates (C1, C2, etc.)
- * Strictly rejects vague names without an explicit numeric or C-ID.
+ * Matches built-in templates (1-72 or tpl_001), supplemental templates (add_001-add_228 or tpl_add_128),
+ * or custom templates (C1, C2, etc.).
+ * Strictly rejects vague names without an explicit numeric, add_XXX, or C-ID.
  */
 export async function findTemplateByIdOrNumber(
   idOrNum: string
@@ -418,13 +446,40 @@ export async function findTemplateByIdOrNumber(
   if (!idOrNum || !idOrNum.trim()) return null;
   const raw = idOrNum.trim().toLowerCase();
   const clean = raw
-    .replace(/^\{?\s*(?:template\s+id|template|id)\s*(?:number|no\.?)?\s*[:\s#-]*/i, '')
+    .replace(/^\{?\s*(?:add\s+template\s+id|template\s+id|template|id)\s*(?:number|no\.?)?\s*[:\s#-]*/i, '')
     .replace(/\}?$/, '')
     .replace(/[.,!?;:]+$/, '')
+    .replace(/\b(?:underscore|under\s+score|dash|hyphen)\b/gi, '_')
+    .replace(/\s+/g, ' ')
     .trim();
   if (!clean) return null;
 
   const cleanNoSpaces = clean.replace(/[\s\-]+/g, '');
+  const cleanLower = cleanNoSpaces.toLowerCase();
+
+  // 0. Check supplemental ADDITIONAL_TEMPLATES ("add_128", "add 128", "tpl_add_128", "builtin_tpl_add_128")
+  const addTokenMatch = clean.match(/^(?:builtin_)?(?:tpl[\s_-]*)?add(?:[\s_-]+|(?=\d))(.*)$/i);
+  if (addTokenMatch) {
+    const addTail = addTokenMatch[1].replace(/^[\s_#-]+/, '').trim();
+    const addNum = /^\d+$/.test(addTail.replace(/^0+/, ''))
+      ? parseInt(addTail.replace(/^0+/, ''), 10)
+      : spokenWordsToNumber(addTail);
+    if (addNum && !isNaN(addNum) && addNum > 0) {
+      const paddedAddId = `tpl_add_${String(addNum).padStart(3, '0')}`;
+      const matchedAdd = ALL_RADNITO_TEMPLATES.find(t =>
+        t.id.toLowerCase() === paddedAddId ||
+        t.id.toLowerCase() === `tpl_add_${addNum}`
+      );
+      if (matchedAdd) {
+        return {
+          ...matchedAdd,
+          templateId: matchedAdd.id.replace(/^tpl_/i, ''),
+        };
+      }
+    }
+    return null;
+  }
+
   const isCustomToken = /^(?:c|see|sea|custom|cust)(?:[\s\-_]|\d|$)/i.test(clean);
   const strippedPrefix = clean
     .replace(/^(?:builtin_)?(?:tpl_|template_|cust_|custom\s+|see\s+|sea\s+|c(?=\s*\d|\s+[a-z]))/i, '')
@@ -437,7 +492,6 @@ export async function findTemplateByIdOrNumber(
     : spokenWordsToNumber(strippedPrefix);
 
   const normalizedCustomId = isCustomToken && parsedNum ? `c${parsedNum}` : '';
-  const cleanLower = cleanNoSpaces.toLowerCase();
 
   // 1. Check built-in templates (ALL_RADNITO_TEMPLATES) if not explicitly prefixed as custom
   if (!isCustomToken) {

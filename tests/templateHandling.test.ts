@@ -8,9 +8,11 @@ import {
 import {
   normalizeTemplateTagId,
   extractTemplateTagIds,
+  canonicalizeTemplateIdToken,
   mergeTemplateImages,
   buildCombinedTemplateBundle,
 } from '../services/upcomingTemplateService';
+import { findTemplateByIdOrNumber } from '../services/templateStorage';
 import { REPORT_TEMPLATES } from '../constants';
 
 test('normalizeTemplateTagId and extractTemplateTagIds handle built-in and custom IDs uniformly', () => {
@@ -141,8 +143,74 @@ test('extractSpokenTemplateDirective parses single, multi-ID, spoken-word, C-ID,
     'C5-C6 disc osteophyte complex causing spinal canal narrowing.',
     '15 mm simple cortical cyst in the right kidney.',
     'Please add ct brain normal report without id.',
+    'Please add 128 ml of intravenous contrast.',
   ]);
   assert.deepEqual(noMatch.templateIds, []);
   assert.equal(noMatch.templateId, null);
-  assert.equal(noMatch.cleanedFindings.length, 3);
+  assert.equal(noMatch.cleanedFindings.length, 4);
+});
+
+test('supplemental add_XXX template IDs (e.g. add_128) resolve across canonicalization, spoken extraction, lookup, and prompt tags', async () => {
+  // 1. Canonicalization & [TEMPLATE_ID: ...] parsing
+  assert.equal(canonicalizeTemplateIdToken('add_128'), 'tpl_add_128');
+  assert.equal(canonicalizeTemplateIdToken('add 128'), 'tpl_add_128');
+  assert.equal(canonicalizeTemplateIdToken('add underscore 5'), 'tpl_add_005');
+  assert.deepEqual(
+    extractTemplateTagIds('[TEMPLATE_ID: 1, add_128, add 45] Use combined'),
+    ['tpl_001', 'tpl_add_128', 'tpl_add_045']
+  );
+
+  // 2. findBuiltinTemplates with add_128 and spaced [TEMPLATE_ID: add 128]
+  const builtinMatches = findBuiltinTemplates('[TEMPLATE_ID: tpl_001, add_128] Use combined');
+  assert.equal(builtinMatches.length, 2);
+  assert.equal(builtinMatches[0].id, 'tpl_001');
+  assert.equal(builtinMatches[1].id, 'tpl_add_128');
+
+  const spacedTagMatch = findBuiltinTemplates('[TEMPLATE_ID: add 128]');
+  assert.equal(spacedTagMatch.length, 1);
+  assert.equal(spacedTagMatch[0].id, 'tpl_add_128');
+
+  // 3. findTemplateByIdOrNumber across spoken and typed forms of add_128 and add_005
+  for (const variant of [
+    'add_128',
+    'add 128',
+    'add underscore 128',
+    'tpl_add_128',
+    'add one twenty eight',
+    'add one hundred and twenty eight',
+  ]) {
+    const resolved = await findTemplateByIdOrNumber(variant);
+    assert.ok(resolved, `Expected findTemplateByIdOrNumber("${variant}") to resolve`);
+    assert.equal(resolved!.id, 'tpl_add_128');
+  }
+  const addFive = await findTemplateByIdOrNumber('add 5');
+  assert.ok(addFive);
+  assert.equal(addFive!.id, 'tpl_add_005');
+
+  // 4. extractSpokenTemplateDirective for spoken & braced add_128 variants
+  assert.deepEqual(
+    extractSpokenTemplateDirective(['{template id add_128}', 'Normal study.']).templateIds,
+    ['add_128']
+  );
+  assert.deepEqual(
+    extractSpokenTemplateDirective(['{add_128}', 'Normal study.']).templateIds,
+    ['add_128']
+  );
+  assert.deepEqual(
+    extractSpokenTemplateDirective(['add template id add 128', 'Normal study.']).templateIds,
+    ['add_128']
+  );
+  assert.deepEqual(
+    extractSpokenTemplateDirective(['template id add underscore 128 liver is normal']).templateIds,
+    ['add_128']
+  );
+  assert.deepEqual(
+    extractSpokenTemplateDirective(['template id add one twenty eight']).templateIds,
+    ['add_128']
+  );
+  const combinedSpoken = extractSpokenTemplateDirective([
+    'use add_128 and template id 1 mild fatty liver',
+  ]);
+  assert.deepEqual(combinedSpoken.templateIds, ['add_128', '1']);
+  assert.deepEqual(combinedSpoken.cleanedFindings, ['mild fatty liver']);
 });

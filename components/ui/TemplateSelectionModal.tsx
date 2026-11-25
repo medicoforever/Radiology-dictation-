@@ -291,7 +291,8 @@ const TemplateSelectionModal: React.FC<TemplateSelectionModalProps> = ({ isOpen,
       const parts = q.split(/\s+/).filter(Boolean);
       list = list.filter(t => {
         const displayId = getDisplayBadgeId(t);
-        const idText = `id:${displayId} id ${displayId} #${displayId} tpl_${displayId} ${t.id || ''} ${t.isCustom ? 'custom' : ''}`.toLowerCase();
+        const spacedId = displayId.replace(/_/g, ' ');
+        const idText = `id:${displayId} id ${displayId} ${spacedId} #${displayId} tpl_${displayId} ${t.id || ''} ${t.isCustom ? 'custom' : ''}`.toLowerCase();
         const nameLower = t.name.toLowerCase();
         return parts.every(part => nameLower.includes(part) || idText.includes(part));
       });

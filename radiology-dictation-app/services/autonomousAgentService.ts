@@ -28,7 +28,7 @@ import {
   getMacroPromptContext 
 } from "./macroDictionaryService";
 import { getUserTemplates, findTemplateByIdOrNumber } from "./templateStorage";
-import { buildCombinedTemplateBundle } from "./upcomingTemplateService";
+import { buildCombinedTemplateBundle, canonicalizeTemplateIdToken } from "./upcomingTemplateService";
 import { filterAudioInputsForModel, AudioPrefilterStats } from "./audioPrefilterService";
 
 export interface AutonomousAttachedFile {
@@ -136,9 +136,9 @@ export function findTemplateByFuzzyName(query?: string, customTemplates?: BuiltI
     ? [...customTemplates, ...ALL_RADNITO_TEMPLATES]
     : ALL_RADNITO_TEMPLATES;
 
-  // 1. Exact or startsWith match (including explicit numeric IDs like "1" -> "tpl_001" or "C1")
+  // 1. Exact or startsWith match (including explicit numeric IDs like "1" -> "tpl_001", "add_128" -> "tpl_add_128", or "C1")
   const idClean = q.replace(/^(?:template\s*(?:id|number|no\.?)?\s*[:#-]?\s*)/i, '').trim();
-  const normalizedBuiltinId = /^\d+$/.test(idClean) ? `tpl_${idClean.padStart(3, '0')}` : idClean;
+  const normalizedBuiltinId = canonicalizeTemplateIdToken(idClean).toLowerCase();
   const exact = pool.find(
     t =>
       t.name.toLowerCase() === q ||
@@ -766,9 +766,12 @@ export async function executeAutonomousPlan(
           const resolvedTemplates: BuiltInTemplateItem[] = [];
 
           for (const part of candidateParts) {
-            const idExtract = part.replace(/^(?:template\s*(?:id|number|no\.?)?\s*[:#-]?\s*)/i, '').trim();
+            const idExtract = part
+              .replace(/^(?:template\s*(?:id|number|no\.?)?\s*[:#-]?\s*)/i, '')
+              .replace(/\b(?:underscore|under\s+score|dash|hyphen)\b/gi, '_')
+              .trim();
             let matched: BuiltInTemplateItem | null = null;
-            if (/^(?:c\d+|tpl_\d+|\d+)$/i.test(idExtract)) {
+            if (/^(?:c\d+|(?:builtin_)?(?:tpl[\s_-]*)?add[\s_-]*\d+|tpl_\d+|\d+)$/i.test(idExtract)) {
               const found = await findTemplateByIdOrNumber(idExtract);
               if (found) matched = found as BuiltInTemplateItem;
             }

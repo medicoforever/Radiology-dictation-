@@ -178,32 +178,73 @@ export function mergeTemplateImages(
 }
 
 /**
+ * Canonicalizes a raw template ID token:
+ * - '1' / 'tpl_1' / 'builtin_tpl_001' -> 'tpl_001'
+ * - 'add_128' / 'add 128' / 'tpl_add_128' / 'add underscore 128' -> 'tpl_add_128'
+ * - 'c1' -> 'C1'
+ */
+export function canonicalizeTemplateIdToken(rawToken?: string): string {
+  if (!rawToken) return '';
+  const cleaned = String(rawToken)
+    .trim()
+    .replace(/^builtin_/i, '')
+    .replace(/\b(?:underscore|under\s+score|dash|hyphen)\b/gi, '_')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned) return '';
+
+  const addMatch = cleaned.match(/^(?:tpl[\s_-]*)?add(?:[\s_-]|_)*(\d+)$/i);
+  if (addMatch) {
+    const n = parseInt(addMatch[1], 10);
+    if (!isNaN(n) && n > 0) {
+      return `tpl_add_${String(n).padStart(3, '0')}`;
+    }
+    return `tpl_add_${addMatch[1].padStart(3, '0')}`;
+  }
+
+  const builtinMatch = cleaned.match(/^(?:tpl[\s_-]*)?(\d+)$/i);
+  if (builtinMatch) {
+    return `tpl_${builtinMatch[1].padStart(3, '0')}`;
+  }
+
+  const customMatch = cleaned.match(/^c(\d+)$/i);
+  if (customMatch) {
+    return `C${customMatch[1]}`;
+  }
+
+  return cleaned;
+}
+
+/**
  * Normalizes any built-in or custom template item to a canonical [TEMPLATE_ID] token
- * (e.g. 'tpl_001' for built-ins, 'C1' for custom templates).
+ * (e.g. 'tpl_001', 'tpl_add_128' for built-ins, 'C1' for custom templates).
  */
 export function normalizeTemplateTagId(t: any): string {
   if (!t) return '';
   const rawId = String(t.id || '').trim();
   const stripped = rawId.replace(/^builtin_/i, '');
-  if (/^tpl_\d+$/i.test(stripped)) {
-    return stripped.toLowerCase();
+  if (/^tpl_(?:add_)?\d+$/i.test(stripped)) {
+    return canonicalizeTemplateIdToken(stripped);
   }
   const rawDisplayId = String(t.templateId || '').trim();
   if (/^c\d+$/i.test(rawDisplayId)) {
     return rawDisplayId.toUpperCase();
   }
+  if (/^(?:tpl_)?add[_\s-]*\d+$/i.test(rawDisplayId)) {
+    return canonicalizeTemplateIdToken(rawDisplayId);
+  }
   if (/^\d+$/.test(stripped)) {
-    return `tpl_${stripped.padStart(3, '0')}`;
+    return canonicalizeTemplateIdToken(stripped);
   }
   if (/^\d+$/.test(rawDisplayId) && t.isBuiltIn !== false && !t.isCustom && !rawId.startsWith('custom_')) {
-    return `tpl_${rawDisplayId.padStart(3, '0')}`;
+    return canonicalizeTemplateIdToken(rawDisplayId);
   }
   return rawDisplayId || stripped || String(t.name || '');
 }
 
 /**
  * Extracts all template ID tokens from a prompt's [TEMPLATE_ID: ...] / [TEMPLATE_IDS: ...] tags,
- * including both built-in IDs (tpl_001 / numeric) and custom template IDs (C1 / custom_...).
+ * including built-in IDs (tpl_001, tpl_add_128, add_128, numeric) and custom IDs (C1, custom_...).
  */
 export function extractTemplateTagIds(promptOrId?: string): string[] {
   if (!promptOrId) return [];
@@ -212,19 +253,14 @@ export function extractTemplateTagIds(promptOrId?: string): string[] {
   const results: string[] = [];
   const matches = [...raw.matchAll(/\[(?:TEMPLATE_ID|TEMPLATE_IDS|TEMPLATES|TEMPLATE|ID):\s*([^\]]+)\]/gi)];
   for (const m of matches) {
-    const parts = m[1]
+    const normalizedStr = m[1]
+      .replace(/\b((?:builtin_)?(?:tpl[\s_-]*)?add)[\s_-]+(\d+)\b/gi, '$1_$2');
+    const parts = normalizedStr
       .split(/[,;\s]+/)
       .map(p => p.trim())
       .filter(Boolean);
     for (const part of parts) {
-      let clean = part.replace(/^builtin_/i, '');
-      if (/^\d+$/.test(clean)) {
-        clean = `tpl_${clean.padStart(3, '0')}`;
-      } else if (/^tpl_\d+$/i.test(clean)) {
-        clean = clean.toLowerCase();
-      } else if (/^c\d+$/i.test(clean)) {
-        clean = clean.toUpperCase();
-      }
+      const clean = canonicalizeTemplateIdToken(part);
       if (clean && !results.some(r => r.toLowerCase() === clean.toLowerCase())) {
         results.push(clean);
       }
@@ -334,7 +370,7 @@ export async function buildCombinedTemplateBundle(
     }
 
     let docxB64: string | undefined = t.docxFile?.data || t.docxBase64 || t.docxData?.data;
-    if (!docxB64 && /^tpl_\d+$/i.test(tagId)) {
+    if (!docxB64 && /^tpl_(?:add_)?\d+$/i.test(tagId)) {
       try {
         docxB64 = await getTemplateDocxBase64(tagId);
       } catch (e) {
