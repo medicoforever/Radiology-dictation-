@@ -5,6 +5,7 @@ import Spinner from './ui/Spinner';
 import { useAudioRecorder } from '../hooks/useAudioRecorder';
 import MicIcon from './icons/MicIcon';
 import TrashIcon from './icons/TrashIcon';
+import { getModelDisplayLabel } from '../constants';
 
 interface ChatMessage {
   author: 'You' | 'AI';
@@ -95,7 +96,7 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({ history, isChatting, onSe
         <h3 className="text-xl font-bold text-slate-800 dark:text-slate-100">Follow-up Chat</h3>
         {selectedModel && (
           <span className="text-xs font-medium px-2.5 py-1 rounded-full bg-blue-50 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300 border border-blue-200 dark:border-blue-800">
-            Model: {selectedModel}
+            Model: {getModelDisplayLabel(selectedModel)}
           </span>
         )}
       </div>

@@ -428,23 +428,53 @@ export interface DictateChangesAudioRecord {
     size: number;
     mimeType: string;
     name?: string;
+    scopeKey?: string;
   } | null;
 }
 
-/**
- * Saves the dictate changes audio recording into IndexedDB and stores metadata.
- */
-export async function saveDictateChangesAudio(blob: Blob, name?: string): Promise<void> {
+function getDictateChangesKeys(scopeKey?: string): { audioKey: string; metaKey: string; isScoped: boolean } {
+  const cleanScope = (scopeKey || '').trim().replace(/[^a-zA-Z0-9_-]/g, '_');
+  if (!cleanScope || cleanScope === 'default') {
+    return {
+      audioKey: DICTATE_CHANGES_AUDIO_KEY,
+      metaKey: DICTATE_CHANGES_META_KEY,
+      isScoped: false,
+    };
+  }
+  return {
+    audioKey: `${DICTATE_CHANGES_AUDIO_KEY}__${cleanScope}`,
+    metaKey: `${DICTATE_CHANGES_META_KEY}__${cleanScope}`,
+    isScoped: true,
+  };
+}
+
+function getBrowserLocalStorage(): Storage | null {
   try {
-    await saveAudioBlob(DICTATE_CHANGES_AUDIO_KEY, blob);
+    if (typeof window !== 'undefined' && window.localStorage) return window.localStorage;
+  } catch {}
+  try {
+    if (typeof localStorage !== 'undefined') return localStorage;
+  } catch {}
+  return null;
+}
+
+/**
+ * Saves the dictate changes audio recording into IndexedDB and stores metadata,
+ * partitioned optionally by `scopeKey` (e.g. tab/report session) to prevent cross-report leakage.
+ */
+export async function saveDictateChangesAudio(blob: Blob, name?: string, scopeKey?: string): Promise<void> {
+  try {
+    const { audioKey, metaKey, isScoped } = getDictateChangesKeys(scopeKey);
+    await saveAudioBlob(audioKey, blob);
     const meta = {
       timestamp: Date.now(),
       size: blob.size,
       mimeType: blob.type || 'audio/webm',
-      name: name || 'Recorded Voice Changes'
+      name: name || 'Recorded Voice Changes',
+      ...(isScoped ? { scopeKey } : {}),
     };
     try {
-      localStorage.setItem(DICTATE_CHANGES_META_KEY, JSON.stringify(meta));
+      getBrowserLocalStorage()?.setItem(metaKey, JSON.stringify(meta));
     } catch {}
   } catch (err) {
     console.debug('Failed to save dictate changes audio to IndexedDB:', err);
@@ -452,16 +482,17 @@ export async function saveDictateChangesAudio(blob: Blob, name?: string): Promis
 }
 
 /**
- * Retrieves the stored dictate changes audio and its metadata from IndexedDB.
+ * Retrieves the stored dictate changes audio and its metadata from IndexedDB for the given scope.
  */
-export async function getDictateChangesAudio(): Promise<DictateChangesAudioRecord | null> {
+export async function getDictateChangesAudio(scopeKey?: string): Promise<DictateChangesAudioRecord | null> {
   try {
-    const blob = await getAudioBlob(DICTATE_CHANGES_AUDIO_KEY);
+    const { audioKey, metaKey } = getDictateChangesKeys(scopeKey);
+    const blob = await getAudioBlob(audioKey);
     if (!blob || blob.size === 0) return null;
 
-    let meta: { timestamp: number; size: number; mimeType: string; name?: string } | null = null;
+    let meta: DictateChangesAudioRecord['meta'] = null;
     try {
-      const raw = localStorage.getItem(DICTATE_CHANGES_META_KEY);
+      const raw = getBrowserLocalStorage()?.getItem(metaKey);
       if (raw) meta = JSON.parse(raw);
     } catch {}
 
@@ -471,7 +502,8 @@ export async function getDictateChangesAudio(): Promise<DictateChangesAudioRecor
         timestamp: Date.now(),
         size: blob.size,
         mimeType: blob.type || 'audio/webm',
-        name: 'Stored Changes Audio'
+        name: 'Stored Changes Audio',
+        ...(scopeKey ? { scopeKey } : {}),
       }
     };
   } catch (err) {
@@ -481,12 +513,14 @@ export async function getDictateChangesAudio(): Promise<DictateChangesAudioRecor
 }
 
 /**
- * Checks whether a dictate changes audio recording is currently stored in browser.
+ * Checks whether a dictate changes audio recording is currently stored in browser for the given scope.
  */
-export function hasStoredDictateChangesAudio(): boolean {
-  if (typeof window === 'undefined') return false;
+export function hasStoredDictateChangesAudio(scopeKey?: string): boolean {
   try {
-    return Boolean(localStorage.getItem(DICTATE_CHANGES_META_KEY));
+    const ls = getBrowserLocalStorage();
+    if (!ls) return false;
+    const { metaKey } = getDictateChangesKeys(scopeKey);
+    return Boolean(ls.getItem(metaKey));
   } catch {
     return false;
   }
@@ -494,13 +528,53 @@ export function hasStoredDictateChangesAudio(): boolean {
 
 /**
  * Deletes the stored dictate changes audio from IndexedDB and clears metadata.
+ * When `scopeKey` is given, deletes that scope plus legacy unscoped keys;
+ * when omitted (or `'__all__'`), clears legacy unscoped AND all scoped dictate-changes entries.
  */
-export async function deleteDictateChangesAudio(): Promise<void> {
+export async function deleteDictateChangesAudio(scopeKey?: string): Promise<void> {
   try {
-    await deleteAudioBlob(DICTATE_CHANGES_AUDIO_KEY);
+    const cleanAll = !scopeKey || scopeKey === '__all__';
+    const { audioKey, metaKey, isScoped } = getDictateChangesKeys(scopeKey);
+
+    await deleteAudioBlob(audioKey);
+    if (isScoped) {
+      await deleteAudioBlob(DICTATE_CHANGES_AUDIO_KEY);
+    }
+
     try {
-      localStorage.removeItem(DICTATE_CHANGES_META_KEY);
+      const ls = getBrowserLocalStorage();
+      if (ls) {
+        ls.removeItem(metaKey);
+        if (isScoped || cleanAll) {
+          ls.removeItem(DICTATE_CHANGES_META_KEY);
+        }
+        if (cleanAll) {
+          for (let i = ls.length - 1; i >= 0; i--) {
+            const k = ls.key(i);
+            if (k && k.startsWith(DICTATE_CHANGES_META_KEY)) {
+              ls.removeItem(k);
+            }
+          }
+        }
+      }
     } catch {}
+
+    if (cleanAll) {
+      const db = await getDB();
+      if (db) {
+        const tx = db.transaction(STORE_BLOBS, 'readwrite');
+        const store = tx.objectStore(STORE_BLOBS);
+        const req = store.getAllKeys();
+        req.onsuccess = () => {
+          const keys = (req.result as string[]) || [];
+          for (const k of keys) {
+            if (typeof k === 'string' && k.startsWith(DICTATE_CHANGES_AUDIO_KEY)) {
+              store.delete(k);
+            }
+          }
+        };
+      }
+    }
   } catch (err) {
     console.debug('Failed to delete dictate changes audio:', err);
   }

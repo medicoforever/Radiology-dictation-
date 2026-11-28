@@ -6,6 +6,10 @@ import {
 } from '../services/soundService';
 import { processLiveAudioChunk, synthesizeLiveReport, LiveHistoryContext, CustomDocxInput } from '../services/geminiService';
 import { DEFAULT_SELECTED_MODEL, DEFAULT_LIVE_MODEL } from '../constants';
+
+export const LIVE_CHUNK_MIN_SPEECH_SEC = 3.0;
+export const LIVE_CHUNK_SILENCE_MS = 900;
+export const LIVE_CHUNK_MAX_SEC = 12.0;
 import {
   initLiveAudioSessionCache,
   cacheAudioChunk,
@@ -714,8 +718,8 @@ export const useLiveSession = () => {
       const unprocessedSamples = totalSamples - lastProcessedSampleRef.current;
       const unprocessedSec = unprocessedSamples / 16000;
 
-      // Ensure at least 2.0s of audio has accumulated before attempting dispatch
-      if (unprocessedSec < 2.0) {
+      // Ensure at least 3.0s of audio has accumulated before attempting dispatch (5 RPM friendly)
+      if (unprocessedSec < LIVE_CHUNK_MIN_SPEECH_SEC) {
         return;
       }
 
@@ -727,10 +731,10 @@ export const useLiveSession = () => {
 
       if (hasSpeechInWindow) {
         // Speech was detected in this segment.
-        // Trigger condition:
-        // 1. Natural clause/sentence boundary: doctor finished speaking and paused for >= 750ms, with >= 2.5s audio
-        // 2. OR sustained speech length reached >= 7.5s (to keep display updated progressively)
-        if ((timeSinceSpeech >= 750 && unprocessedSec >= 2.5) || unprocessedSec >= 7.5) {
+        // Trigger condition (5 RPM friendly cadence):
+        // 1. Natural clause/sentence boundary: doctor finished speaking and paused for >= 900ms, with >= 3.0s audio
+        // 2. OR sustained speech length reached >= 12.0s (to keep display updated progressively)
+        if ((timeSinceSpeech >= LIVE_CHUNK_SILENCE_MS && unprocessedSec >= LIVE_CHUNK_MIN_SPEECH_SEC) || unprocessedSec >= LIVE_CHUNK_MAX_SEC) {
           shouldProcess = true;
         }
       } else {

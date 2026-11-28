@@ -201,7 +201,13 @@ export const safeLocalStorage = {
       }
       for (let i = 0; i < window.localStorage.length; i++) {
         const k = window.localStorage.key(i);
-        if (k && (k.startsWith('has_unsaved_session_') || k.startsWith('in_flight_recording_meta_') || k.startsWith('tab_heartbeat_'))) {
+        if (
+          k &&
+          (k.startsWith('has_unsaved_session_') ||
+            k.startsWith('in_flight_recording_meta_') ||
+            k.startsWith('tab_heartbeat_') ||
+            k.startsWith('dictate_changes_audio_meta'))
+        ) {
           try {
             window.localStorage.removeItem(k);
           } catch (_) {}
@@ -223,6 +229,11 @@ export const safeLocalStorage = {
         'radiologyErrorCheckEnabled',
         'radiologyExperimentalAudioFilter',
         'user_api_keys',
+        'raddoc_user_gemini_api_keys',
+        'raddoc_builtin_keys_unlocked',
+        'raddoc_strict_selected_model_only',
+        'raddoc_medium_prose_polish',
+        'raddoc_retry_top_tier_all_keys_on_503',
         'radiology_custom_macros_dictionary',
         'upcoming_report_template',
         'radiologyBatchGlobalImages',
@@ -238,6 +249,29 @@ export const safeLocalStorage = {
           console.warn(`safeLocalStorage: Removing corrupted key "${k}":`, e);
           window.localStorage.removeItem(k);
         }
+      }
+
+      const enumKeys: Record<string, Set<string>> = {
+        raddoc_model_fallback_policy: new Set(['top_and_medium', 'top_only', 'selected_only']),
+      };
+      for (const [k, allowed] of Object.entries(enumKeys)) {
+        try {
+          const raw = window.localStorage.getItem(k);
+          if (raw !== null && !allowed.has(raw)) {
+            console.warn(`safeLocalStorage: Removing invalid enum value for key "${k}"`);
+            window.localStorage.removeItem(k);
+          }
+        } catch (_) {}
+      }
+
+      try {
+        const overloadedRaw = window.sessionStorage?.getItem('raddoc_overloaded_models_v1');
+        if (overloadedRaw) {
+          JSON.parse(overloadedRaw);
+        }
+      } catch (e) {
+        console.warn('safeLocalStorage: Removing corrupted sessionStorage overloaded models state:', e);
+        window.sessionStorage?.removeItem('raddoc_overloaded_models_v1');
       }
     } catch (_) {}
   },

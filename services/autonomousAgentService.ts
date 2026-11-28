@@ -12,10 +12,21 @@
  * 4. Acoustic Telemetry: Plays success and error audio chimes via Web Audio API.
  */
 
-import { Type } from "@google/genai";
+import { DEFAULT_SELECTED_MODEL, ROBOTICS_QUALITY_DIRECTIVES, getModelQualityTier } from "../constants";
 import { executeWithApiKeyFailover } from "./apiKeyService";
 import { ALL_RADNITO_TEMPLATES, BuiltInTemplateItem, getTemplateDocxBase64 } from "./builtInTemplates";
-import { mergeDictatedFindingsWithTemplate, resolveApiTargetModel } from "./geminiService";
+import {
+  blobToBase64,
+  callGenerateContentWithOptimalThinking,
+  cleanupUploadedGeminiFiles,
+  executeWithFreeTierModelFallback,
+  getFailoverKeyOptionsForModel,
+  mergeDictatedFindingsWithTemplate,
+  prepareBlobPartDescriptors,
+  resolveApiTargetModel,
+  resolveBlobDescriptorPartsForAttempt,
+  UploadedGeminiFileRef,
+} from "./geminiService";
 import { autoSaveSingleDictation, autoSaveBatchDictations, isDriveConnected, SaveResult } from "./googleDriveService";
 import { generateSingleDictationHTML, generateBatchDictationHTML } from "./htmlGenerator";
 import { downloadFile } from "./docxService";
@@ -29,6 +40,7 @@ import {
 } from "./macroDictionaryService";
 import { getUserTemplates, findTemplateByIdOrNumber } from "./templateStorage";
 import { buildCombinedTemplateBundle, canonicalizeTemplateIdToken } from "./upcomingTemplateService";
+import { extractSpokenTemplateDirective } from "./templateHandling";
 import { filterAudioInputsForModel, AudioPrefilterStats } from "./audioPrefilterService";
 
 export interface AutonomousAttachedFile {
@@ -45,6 +57,7 @@ export interface AutonomousPatientItem {
   patientName: string;
   targetMode: 'single' | 'batch';
   findings: string[];
+  templateIds?: string[];
   targetTemplateName?: string;
   mergeDirectives?: string;
   customPrompt?: string;
@@ -88,9 +101,11 @@ export interface AutonomousExecutionResult {
     attachedFilesCount?: number;
   } | null;
   batchPatients: Array<{
+    patientId?: string;
     name: string;
     findings: string[];
     templateUsed?: string;
+    templateIds?: string[];
     attachedFilesCount?: number;
   }>;
   driveSaved: boolean;
@@ -106,21 +121,7 @@ export interface AutonomousExecutionResult {
   error?: string;
 }
 
-/**
- * Converts a Blob to a base64 string
- */
-async function blobToBase64(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      const res = reader.result as string;
-      const base64 = res.includes(',') ? res.split(',')[1] : res;
-      resolve(base64);
-    };
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
-}
+// Uses shared Node/browser-safe blobToBase64 imported from ./geminiService
 
 /**
  * Fuzzy matches a template name against authoritative built-in templates (300)
@@ -211,10 +212,18 @@ YOUR CORE TASKS:
      * NEVER route to 'single' mode.
      * ZERO COMBINED REDUNDANCY: Each patient gets their own separate report.
 
-3. TEMPLATE ASSIGNMENT & SPOKEN STRUCTURAL/HEADING MODIFICATIONS:
-   - Identify if a template is requested for any patient (e.g., "CT Brain Trauma", "Chest X-Ray Normal", "MRI Lumbar Spine", "Abdomen USG", "PNS Sinusitis").
+3. TEMPLATE ASSIGNMENT, PER-PATIENT TEMPLATE IDs & SPOKEN HEADING MODIFICATIONS:
+   - Identify if a template is requested for EACH patient independently:
+     * **Explicit Template IDs ("templateIds")**: Always extract spoken Template IDs per patient into that patient's "templateIds" array!
+       - Built-in numeric IDs '1' through '300': convert spoken number words to numeric strings (e.g. "template id 1" -> "1", "template id forty two" -> "42", "template id two hundred" -> "200").
+       - Supplemental aliases if explicitly spoken: "add_128" / "add underscore 128" -> "add_128".
+       - Custom template IDs: "template id C1" / "see one" -> "C1".
+       - Multiple IDs on one patient: e.g. "template id 5 and 200" -> ["5", "200"].
+       - Per-patient isolation: If Patient 1 requests template ID 1 and Patient 2 requests template ID 200, set "templateIds": ["1"] on Patient 1 and "templateIds": ["200"] on Patient 2!
+     * **Named Templates ("targetTemplateName")**: If a named template is requested (e.g., "CT Brain Trauma", "Chest X-Ray Normal", "MRI Lumbar Spine"), set "targetTemplateName" cleanly.
+     * VAGUE PHRASES FORBIDDEN FOR IDs: Do NOT invent numeric "templateIds" unless explicit Template ID numbers, 'add_XXX', or 'C' codes were spoken.
    - Spoken Template & Heading Alterations: The doctor may dictate structural modifications to the template in the same breath as scan findings (e.g., "change the CT extremity heading in that template to CT right arm", "change title to CT SCAN OF RIGHT FOREARM", "rename pelvis heading to lower abdomen", "omit bladder section"). Capture these in "mergeDirectives" and ensure the target heading/title in the generated report reflects the modified heading.
-   - Crucial: Strip and remove spoken alteration commands from the patient's "findings" array so they never appear as report body findings.
+   - Crucial: Strip and remove spoken template ID commands and alteration commands from the patient's "findings" array so they never appear as report body findings.
    - Extract any specific merge instructions (e.g., "merge focusing on rib fractures", "when merging, omit normal sinus paragraphs", "replace impression with acute findings").
 
 4. SPOKEN MACRO & DICTIONARY CREATION:
@@ -299,6 +308,7 @@ Respond with ONLY valid JSON adhering to this schema:
         "Partial right cervical rib noted on the right side.",
         "Mild mucosal thickening in the right maxillary sinus."
       ],
+      "templateIds": ["1"],
       "targetTemplateName": "C.T.SCAN OF BRAIN (PLAIN)",
       "mergeDirectives": "Include maxillary sinus finding from addendum",
       "customPrompt": "",
@@ -313,6 +323,7 @@ Respond with ONLY valid JSON adhering to this schema:
         "Lungs appear clear with no focal consolidation or pleural effusion.",
         "Normal cardiothoracic ratio."
       ],
+      "templateIds": ["200"],
       "targetTemplateName": "CHEST PA VIEW",
       "mergeDirectives": "",
       "customPrompt": "",
@@ -324,27 +335,6 @@ Respond with ONLY valid JSON adhering to this schema:
 export interface AutonomousAudioPrefilterEvent {
   compactedAudioBlob: Blob | null;
   stats: AudioPrefilterStats | null;
-}
-
-/** Encodes an audio blob as a Gemini inlineData part, running experimental pre-filtering when enabled. */
-async function prepareInlineAudioPart(
-  audioBlob: Blob,
-  preFilterAudio: boolean,
-  onAudioPrefiltered?: (info: AutonomousAudioPrefilterEvent) => void
-): Promise<{ inlineData: { mimeType: string; data: string } }> {
-  const { filteredInput, stats, compactedAudioBlob } = await filterAudioInputsForModel(audioBlob, {
-    enabled: preFilterAudio,
-  });
-  onAudioPrefiltered?.({ compactedAudioBlob, stats });
-  const effectiveBlob = Array.isArray(filteredInput) ? filteredInput[0] : filteredInput;
-  const base64Audio = await blobToBase64(effectiveBlob);
-  const mimeType = effectiveBlob.type || audioBlob.type || 'audio/webm';
-  return {
-    inlineData: {
-      mimeType,
-      data: base64Audio,
-    },
-  };
 }
 
 /**
@@ -360,11 +350,13 @@ export async function parseAutonomousAudioDictation(
   }
 ): Promise<AutonomousExecutionPlan> {
   const targetModel = resolveApiTargetModel(selectedModel);
-  const audioPart = await prepareInlineAudioPart(
-    audioBlob,
-    options?.preFilterAudio === true,
-    options?.onAudioPrefiltered
-  );
+  const { filteredInput, stats, compactedAudioBlob } = await filterAudioInputsForModel(audioBlob, {
+    enabled: options?.preFilterAudio === true,
+  });
+  options?.onAudioPrefiltered?.({ compactedAudioBlob, stats });
+  const effectiveBlob = Array.isArray(filteredInput) ? filteredInput[0] : filteredInput;
+  const descriptors = await prepareBlobPartDescriptors([effectiveBlob], { includeContextLabels: false });
+  const uploadedByKey = new Map<string, Map<number, UploadedGeminiFileRef>>();
   const macroContext = getMacroPromptContext();
 
   let attachedFilesManifest = '';
@@ -383,52 +375,55 @@ If the doctor mentions assigning any of these files or notes to a patient, set t
 ================================================================================\n`;
   }
 
-  return executeWithApiKeyFailover(
-    async (client) => {
-      const promptInstruction = `${AUTONOMOUS_AGENT_SYSTEM_PROMPT}\n${macroContext}\n${attachedFilesManifest}\nExecute autonomous orchestration for this audio dictation. Return the structured JSON execution plan now.`;
+  try {
+    return await executeWithFreeTierModelFallback(
+      targetModel,
+      (activeModel, hasMoreFallbackModels) =>
+        executeWithApiKeyFailover(
+          async (client, apiKey) => {
+            const mediaParts = await resolveBlobDescriptorPartsForAttempt({
+              descriptors,
+              client,
+              apiKey,
+              uploadedByKey,
+            });
+            const roboticsHint = getModelQualityTier(activeModel) === 'medium' ? `\n\n${ROBOTICS_QUALITY_DIRECTIVES}` : '';
+            const promptInstruction = `${AUTONOMOUS_AGENT_SYSTEM_PROMPT}\n${macroContext}\n${attachedFilesManifest}${roboticsHint}\nExecute autonomous orchestration for this audio dictation. Return the structured JSON execution plan now.`;
 
-      const parts: any[] = [
-        audioPart,
-        {
-          text: promptInstruction
-        }
-      ];
+            const responseText = await callGenerateContentWithOptimalThinking({
+              client,
+              apiKey,
+              model: activeModel,
+              parts: [...mediaParts, { text: promptInstruction }],
+              temperature: 0.1,
+              responseMimeType: 'application/json',
+              taskType: 'reasoning',
+            });
 
-      // Request structured JSON output
-      const response = await client.models.generateContent({
-        model: targetModel,
-        contents: {
-          role: 'user',
-          parts: parts
-        },
-        config: {
-          responseMimeType: 'application/json',
-          temperature: 0.1,
-        }
-      });
+            if (!responseText.trim()) {
+              throw new Error("Autonomous agent returned an empty response.");
+            }
 
-      const responseText = response.text || '';
-      if (!responseText.trim()) {
-        throw new Error("Autonomous agent returned an empty response.");
-      }
+            let cleanJson = responseText.trim();
+            if (cleanJson.startsWith('```json')) {
+              cleanJson = cleanJson.replace(/^```json\s*/, '').replace(/```\s*$/, '');
+            } else if (cleanJson.startsWith('```')) {
+              cleanJson = cleanJson.replace(/^```\s*/, '').replace(/```\s*$/, '');
+            }
 
-      // Parse JSON response
-      let cleanJson = responseText.trim();
-      if (cleanJson.startsWith('```json')) {
-        cleanJson = cleanJson.replace(/^```json\s*/, '').replace(/```\s*$/, '');
-      } else if (cleanJson.startsWith('```')) {
-        cleanJson = cleanJson.replace(/^```\s*/, '').replace(/```\s*$/, '');
-      }
+            const plan: AutonomousExecutionPlan = JSON.parse(cleanJson);
+            if (!plan.patients || !Array.isArray(plan.patients)) {
+              throw new Error("Invalid plan structure: 'patients' array is missing.");
+            }
 
-      const plan: AutonomousExecutionPlan = JSON.parse(cleanJson);
-      if (!plan.patients || !Array.isArray(plan.patients)) {
-        throw new Error("Invalid plan structure: 'patients' array is missing.");
-      }
-
-      return plan;
-    },
-    { selectedModel: targetModel }
-  );
+            return plan;
+          },
+          { selectedModel: activeModel, ...getFailoverKeyOptionsForModel(activeModel, hasMoreFallbackModels) }
+        )
+    );
+  } finally {
+    cleanupUploadedGeminiFiles(uploadedByKey).catch(() => {});
+  }
 }
 
 const AUTONOMOUS_FEEDBACK_SYSTEM_PROMPT = `You are RADDOC Autonomous Radiology Director, an expert AI medical workstation agent.
@@ -447,10 +442,10 @@ CRITICAL DIRECTIVES FOR APPLYING FEEDBACK:
 2. MODIFICATIONS & FINDINGS REFINEMENT:
    - Specific Finding Edits: If the doctor corrects or adds a finding (e.g. "change liver finding to mild fatty infiltration", "remove the fracture sentence", "add 3mm nodule in right upper lobe"), modify that patient's findings accordingly.
    - Impression Edits: If the doctor changes or refines the impression (e.g. "change impression to acute uncomplicated appendicitis", "add recommendation for surgical review"), update the impression lines following the Smart Bullet Formatting in Impression rules.
-3. SPOKEN TEMPLATE & HEADING ALTERATIONS:
-   - If the doctor says "change template to [X]" or "use [X] template instead", update targetTemplateName to match.
+3. SPOKEN TEMPLATE, TEMPLATE ID & HEADING ALTERATIONS:
+   - If the doctor says "change template to [X]" or "use [X] template instead" or specifies a Template ID ("use template id 5", "template id 200", "template id C1"), update "templateIds" and/or "targetTemplateName" accordingly.
    - If the doctor says "change heading to [X]" (e.g. "change CT extremity heading to CT right arm"), update mergeDirectives to include the heading alteration.
-   - Crucial: Strip and remove spoken modification commands from the patient's "findings" array so they never appear as report body findings.
+   - Crucial: Strip and remove spoken modification and template ID commands from the patient's "findings" array so they never appear as report body findings.
 4. CLINICAL FIDELITY VS. EXPLICIT SYNTHESIS:
    - What the doctor speaks is the ground truth. Preserve the real clinical observations faithfully.
    - Full textbook multi-sequence pathology generation activates ONLY if the doctor explicitly commands "by yourself".
@@ -493,24 +488,26 @@ export async function parseAutonomousFeedbackDictation(
   previousResult: AutonomousExecutionResult,
   feedbackAudioBlob?: Blob | null,
   feedbackText?: string,
-  selectedModel: string = 'gemini-2.5-pro',
+  selectedModel: string = DEFAULT_SELECTED_MODEL,
   attachedFiles?: AutonomousAttachedFile[],
   options?: {
     preFilterAudio?: boolean;
     onAudioPrefiltered?: (info: AutonomousAudioPrefilterEvent) => void;
   }
 ): Promise<AutonomousExecutionPlan> {
-  const targetModel = resolveApiTargetModel(selectedModel);
+  const targetModel = resolveApiTargetModel(selectedModel || DEFAULT_SELECTED_MODEL);
   const macroContext = getMacroPromptContext();
 
-  const feedbackAudioPart =
-    feedbackAudioBlob && feedbackAudioBlob.size > 0
-      ? await prepareInlineAudioPart(
-          feedbackAudioBlob,
-          options?.preFilterAudio === true,
-          options?.onAudioPrefiltered
-        )
-      : null;
+  let descriptors: Awaited<ReturnType<typeof prepareBlobPartDescriptors>> = [];
+  if (feedbackAudioBlob && feedbackAudioBlob.size > 0) {
+    const { filteredInput, stats, compactedAudioBlob } = await filterAudioInputsForModel(feedbackAudioBlob, {
+      enabled: options?.preFilterAudio === true,
+    });
+    options?.onAudioPrefiltered?.({ compactedAudioBlob, stats });
+    const effectiveBlob = Array.isArray(filteredInput) ? filteredInput[0] : filteredInput;
+    descriptors = await prepareBlobPartDescriptors([effectiveBlob], { includeContextLabels: false });
+  }
+  const uploadedByKey = new Map<string, Map<number, UploadedGeminiFileRef>>();
 
   let attachedFilesManifest = '';
   if (attachedFiles && attachedFiles.length > 0) {
@@ -546,66 +543,69 @@ ${p.findings.map(f => `  * ${f}`).join('\n')}
 ================================================================================
 `;
 
-  return executeWithApiKeyFailover(
-    async (client) => {
-      const promptInstruction = `${AUTONOMOUS_FEEDBACK_SYSTEM_PROMPT}
+  try {
+    return await executeWithFreeTierModelFallback(
+      targetModel,
+      (activeModel, hasMoreFallbackModels) =>
+        executeWithApiKeyFailover(
+          async (client, apiKey) => {
+            const mediaParts = descriptors.length > 0
+              ? await resolveBlobDescriptorPartsForAttempt({
+                  descriptors,
+                  client,
+                  apiKey,
+                  uploadedByKey,
+                })
+              : [];
+            const roboticsHint = getModelQualityTier(activeModel) === 'medium' ? `\n\n${ROBOTICS_QUALITY_DIRECTIVES}` : '';
+            const promptInstruction = `${AUTONOMOUS_FEEDBACK_SYSTEM_PROMPT}
 ${previousContextSummary}
 ${macroContext}
 ${attachedFilesManifest}
-${feedbackText ? `DOCTOR'S WRITTEN FEEDBACK & MODIFICATION INSTRUCTIONS:\n"""\n${feedbackText.trim()}\n"""\n` : ''}
+${feedbackText ? `DOCTOR'S WRITTEN FEEDBACK & MODIFICATION INSTRUCTIONS:\n"""\n${feedbackText.trim()}\n"""\n` : ''}${roboticsHint}
 Execute feedback modifications now. Return the updated structured JSON execution plan.`;
 
-      const parts: any[] = [];
+            const responseText = await callGenerateContentWithOptimalThinking({
+              client,
+              apiKey,
+              model: activeModel,
+              parts: [...mediaParts, { text: promptInstruction }],
+              temperature: 0.1,
+              responseMimeType: 'application/json',
+              taskType: 'reasoning',
+            });
 
-      if (feedbackAudioPart) {
-        parts.push(feedbackAudioPart);
-      }
+            if (!responseText.trim()) {
+              throw new Error("Autonomous agent returned an empty response for feedback.");
+            }
 
-      parts.push({
-        text: promptInstruction
-      });
+            let cleanJson = responseText.trim();
+            if (cleanJson.startsWith('```json')) {
+              cleanJson = cleanJson.replace(/^```json\s*/, '').replace(/```\s*$/, '');
+            } else if (cleanJson.startsWith('```')) {
+              cleanJson = cleanJson.replace(/^```\s*/, '').replace(/```\s*$/, '');
+            }
 
-      const response = await client.models.generateContent({
-        model: targetModel,
-        contents: {
-          role: 'user',
-          parts: parts
-        },
-        config: {
-          responseMimeType: 'application/json',
-          temperature: 0.1,
-        }
-      });
+            const plan: AutonomousExecutionPlan = JSON.parse(cleanJson);
+            if (!plan.patients || !Array.isArray(plan.patients)) {
+              throw new Error("Invalid plan structure: 'patients' array is missing in feedback response.");
+            }
 
-      const responseText = response.text || '';
-      if (!responseText.trim()) {
-        throw new Error("Autonomous agent returned an empty response for feedback.");
-      }
+            plan.patients = plan.patients.map((p, idx) => ({
+              ...p,
+              patientId: p.patientId || previousPlan.patients[idx]?.patientId || `pt_${idx + 1}`,
+              targetMode: p.targetMode || previousPlan.patients[idx]?.targetMode || 'single',
+              findings: (p.findings && p.findings.length > 0) ? p.findings : (previousPlan.patients[idx]?.findings || [])
+            }));
 
-      let cleanJson = responseText.trim();
-      if (cleanJson.startsWith('```json')) {
-        cleanJson = cleanJson.replace(/^```json\s*/, '').replace(/```\s*$/, '');
-      } else if (cleanJson.startsWith('```')) {
-        cleanJson = cleanJson.replace(/^```\s*/, '').replace(/```\s*$/, '');
-      }
-
-      const plan: AutonomousExecutionPlan = JSON.parse(cleanJson);
-      if (!plan.patients || !Array.isArray(plan.patients)) {
-        throw new Error("Invalid plan structure: 'patients' array is missing in feedback response.");
-      }
-
-      // Preserve patient IDs if AI omitted them
-      plan.patients = plan.patients.map((p, idx) => ({
-        ...p,
-        patientId: p.patientId || previousPlan.patients[idx]?.patientId || `pt_${idx + 1}`,
-        targetMode: p.targetMode || previousPlan.patients[idx]?.targetMode || 'single',
-        findings: (p.findings && p.findings.length > 0) ? p.findings : (previousPlan.patients[idx]?.findings || [])
-      }));
-
-      return plan;
-    },
-    { selectedModel: targetModel }
-  );
+            return plan;
+          },
+          { selectedModel: activeModel, ...getFailoverKeyOptionsForModel(activeModel, hasMoreFallbackModels) }
+        )
+    );
+  } finally {
+    cleanupUploadedGeminiFiles(uploadedByKey).catch(() => {});
+  }
 }
 
 /**
@@ -712,11 +712,12 @@ export async function executeAutonomousPlan(
     // Every patient gets their own independent report card with template merging, RTF editing, and Drive sync.
     const batchPatientItems = plan.patients;
 
-    const processedBatches: Array<{ 
+    const processedBatches: Array<{
       patientId: string;
-      name: string; 
-      findings: string[]; 
-      templateUsed?: string; 
+      name: string;
+      findings: string[];
+      templateUsed?: string;
+      templateIds?: string[];
       customPrompt?: string;
       customDocx?: DocxTemplateData | null;
       customImages?: Array<{ data: string; mimeType: string }>;
@@ -745,41 +746,70 @@ export async function executeAutonomousPlan(
       console.warn('Could not load user custom templates for autonomous agent:', e);
     }
 
-// All patients are processed cleanly as batch items below
-
-    // 2. Process Batch Mode Patients (if any)
+    // 2. Process Batch Mode Patients deterministically in parallel (preserving order)
     if (batchPatientItems.length > 0) {
-      for (const bp of batchPatientItems) {
-        // Expand user voice macros into findings
-        let finalFindings = expandMacrosInFindings([...bp.findings]);
-        let templateUsed: string | undefined = undefined;
-        let bpDocx: DocxTemplateData | null = null;
-        let bpPrompt = bp.customPrompt || '';
+      const resolvedBatches = await Promise.all(
+        batchPatientItems.map(async (bp, bpIdx) => {
+          // Expand voice macros & strip any inline spoken {template id ...} directives cleanly
+          const expandedRaw = expandMacrosInFindings([...bp.findings]);
+          const spokenDir = extractSpokenTemplateDirective(expandedRaw);
+          let finalFindings = spokenDir.cleanedFindings.length > 0 ? spokenDir.cleanedFindings : expandedRaw;
+          let templateUsed: string | undefined = undefined;
+          let bpDocx: DocxTemplateData | null = null;
+          let bpPrompt = bp.customPrompt || '';
 
-        if (bp.targetTemplateName) {
-          // Support single or multiple templates separated by +, comma, or "and" / "template id X"
-          const rawParts = bp.targetTemplateName
-            .split(/\s*\+\s*|\s*,\s*|\s+\band\b\s+/i)
-            .map(s => s.trim())
+          const rawNameParts = bp.targetTemplateName
+            ? bp.targetTemplateName
+                .split(/\s*\+\s*|\s*,\s*|\s+\band\b\s+/i)
+                .map(s => s.trim())
+                .filter(Boolean)
+            : [];
+
+          const explicitIdTokens = [
+            ...(Array.isArray(bp.templateIds) ? bp.templateIds : []),
+            ...spokenDir.templateIds,
+          ]
+            .map(t => String(t || '').trim())
             .filter(Boolean);
-          const candidateParts = rawParts.length > 0 ? rawParts : [bp.targetTemplateName];
-          const resolvedTemplates: BuiltInTemplateItem[] = [];
 
-          for (const part of candidateParts) {
+          const candidateTokens: string[] = [];
+          const pushCandidate = (tok: string) => {
+            const cleanTok = tok.trim();
+            if (cleanTok && !candidateTokens.some(existing => existing.toLowerCase() === cleanTok.toLowerCase())) {
+              candidateTokens.push(cleanTok);
+            }
+          };
+          explicitIdTokens.forEach(pushCandidate);
+          rawNameParts.forEach(pushCandidate);
+
+          const resolvedTemplates: BuiltInTemplateItem[] = [];
+          const resolvedTemplateIds: string[] = [];
+
+          for (const part of candidateTokens) {
             const idExtract = part
               .replace(/^(?:template\s*(?:id|number|no\.?)?\s*[:#-]?\s*)/i, '')
               .replace(/\b(?:underscore|under\s+score|dash|hyphen)\b/gi, '_')
               .trim();
             let matched: BuiltInTemplateItem | null = null;
-            if (/^(?:c\d+|(?:builtin_)?(?:tpl[\s_-]*)?add[\s_-]*\d+|tpl_\d+|\d+)$/i.test(idExtract)) {
+            if (
+              /^(?:c\d+|see\s+\w+|sea\s+\w+|custom\s+\w+|(?:builtin_)?(?:tpl[\s_-]*)?add[\s_-]*[\da-z\s]+|tpl_\d+|\d+)$/i.test(
+                idExtract
+              )
+            ) {
               const found = await findTemplateByIdOrNumber(idExtract);
               if (found) matched = found as BuiltInTemplateItem;
+            }
+            if (!matched) {
+              const byIdFallback = await findTemplateByIdOrNumber(part);
+              if (byIdFallback) matched = byIdFallback as BuiltInTemplateItem;
             }
             if (!matched) {
               matched = findTemplateByFuzzyName(part, userCustomTemplatePool);
             }
             if (matched && !resolvedTemplates.some(r => r.id === matched!.id)) {
               resolvedTemplates.push(matched);
+              const dispId = (matched as any).templateId || matched.id;
+              if (dispId) resolvedTemplateIds.push(String(dispId));
             }
           }
 
@@ -815,29 +845,32 @@ export async function executeAutonomousPlan(
               console.warn(`Batch template merge for ${bp.patientName} failed:`, mergeErr);
             }
           }
-        }
 
-        // Resolve handed-over attached files for this batch item
-        const bpFiles = await resolveFilesForIndices(bp.attachedFileIndices);
-        if (bpFiles.fileNames.length > 0) {
-          handedOverFilesSummary.push({
-            patientName: bp.patientName,
-            fileNames: bpFiles.fileNames
-          });
-        }
+          // Resolve handed-over attached files for this batch item
+          const bpFiles = await resolveFilesForIndices(bp.attachedFileIndices);
+          if (bpFiles.fileNames.length > 0) {
+            handedOverFilesSummary.push({
+              patientName: bp.patientName,
+              fileNames: bpFiles.fileNames
+            });
+          }
 
-        processedBatches.push({
-          patientId: bp.patientId || `pt_${processedBatches.length + 1}`,
-          name: bp.patientName,
-          findings: finalFindings,
-          templateUsed,
-          customPrompt: bpPrompt || bp.mergeDirectives || '',
-          customDocx: bpDocx,
-          customImages: bpFiles.images,
-          extraFiles: bpFiles.otherFiles,
-          attachedFilesCount: bpFiles.fileNames.length
-        });
-      }
+          return {
+            patientId: bp.patientId || `pt_${bpIdx + 1}`,
+            name: bp.patientName,
+            findings: finalFindings,
+            templateUsed,
+            templateIds: resolvedTemplateIds.length > 0 ? resolvedTemplateIds : explicitIdTokens.length > 0 ? explicitIdTokens : undefined,
+            customPrompt: bpPrompt || bp.mergeDirectives || '',
+            customDocx: bpDocx,
+            customImages: bpFiles.images,
+            extraFiles: bpFiles.otherFiles,
+            attachedFilesCount: bpFiles.fileNames.length
+          };
+        })
+      );
+
+      processedBatches.push(...resolvedBatches);
 
       // Dispatch to Batch Processor state with patient ID, audioBlobs, RTF docx, and handed-over files
       context.onApplyBatchReports(
@@ -907,6 +940,7 @@ export async function executeAutonomousPlan(
         name: b.name,
         findings: b.findings,
         templateUsed: b.templateUsed,
+        templateIds: b.templateIds,
         attachedFilesCount: b.attachedFilesCount,
       })),
       driveSaved: !!plan.globalDirectives.saveToDrive && isDriveConnected(),

@@ -1,19 +1,25 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { processAudio } from '../services/geminiService';
 import {
   findBuiltinTemplates,
   detectAndExtractTemplate,
   extractSpokenTemplateDirective,
-} from '../services/geminiService';
-import {
   normalizeTemplateTagId,
   extractTemplateTagIds,
   canonicalizeTemplateIdToken,
   mergeTemplateImages,
   buildCombinedTemplateBundle,
-} from '../services/upcomingTemplateService';
-import { findTemplateByIdOrNumber, getTemplateDisplayId } from '../services/templateStorage';
-import { getBuiltInTemplateNumber, resolveBuiltInTemplateByNumber } from '../services/builtInTemplates';
+  findTemplateByIdOrNumber,
+  getTemplateDisplayId,
+  getBuiltInTemplateNumber,
+  resolveBuiltInTemplateByNumber,
+  splitMultiPatientFindings,
+  joinMultiPatientFindings,
+} from '../services/templateHandling';
+import { findingsToRichHtml, generateRtfDocument, isReportTitle } from '../services/docxService';
+import { executeAutonomousPlan } from '../services/autonomousAgentService';
+import { resetApiKeyHealthState, setUserApiKeys } from '../services/apiKeyService';
 import { REPORT_TEMPLATES } from '../constants';
 
 test('normalizeTemplateTagId and extractTemplateTagIds handle built-in and custom IDs uniformly', () => {
@@ -254,4 +260,323 @@ test('all 300 built-in templates expose easy sequential IDs 1-300 (73-300 for su
   // Spoken directive extraction with simple sequential IDs
   const spoken200 = extractSpokenTemplateDirective(['add template id 1 and template id 200']);
   assert.deepEqual(spoken200.templateIds, ['1', '200']);
+});
+
+test('splitMultiPatientFindings, docxService multi-patient headers, and RTF output preserve every patient exam title', () => {
+  const combined = [
+    '{template id 1}',
+    'C.T.SCAN OF BRAIN (PLAIN)',
+    '*Clinical Profile: H/o RTA.*',
+    'BOLD::Right temporal contusion.',
+    'IMPRESSION:###Right temporal contusion.',
+    'BOLD::--- PATIENT 2: Jane Doe ---',
+    '{template id 200}',
+    'CHEST PA VIEW',
+    '*Clinical Profile: Cough.*',
+    'BOLD::Right lower zone consolidation.',
+    'IMPRESSION:###Right lower lobe pneumonia.',
+  ];
+
+  const segments = splitMultiPatientFindings(combined);
+  assert.equal(segments.length, 2);
+  assert.equal(segments[0].label, 'Patient 1');
+  assert.deepEqual(segments[0].templateIds, ['1']);
+  assert.equal(segments[0].findings[0], 'C.T.SCAN OF BRAIN (PLAIN)');
+  assert.equal(segments[1].patientName, 'Jane Doe');
+  assert.equal(segments[1].label, 'Patient 2: Jane Doe');
+  assert.deepEqual(segments[1].templateIds, ['200']);
+  assert.equal(segments[1].findings[0], 'CHEST PA VIEW');
+
+  const rejoined = joinMultiPatientFindings(segments);
+  const resplit = splitMultiPatientFindings(rejoined);
+  assert.equal(resplit.length, 2);
+  assert.equal(resplit[1].patientName, 'Jane Doe');
+  assert.equal(resplit[1].findings[0], 'CHEST PA VIEW');
+
+  // Verify docxService recognizes BOTH Patient 1 and Patient 2 exam titles as <h1>
+  const flatNoDirectives = rejoined;
+  assert.equal(isReportTitle(flatNoDirectives[0], 0, flatNoDirectives), true);
+  const p2HeaderIdx = flatNoDirectives.findIndex((l) => l.includes('PATIENT 2'));
+  assert.ok(p2HeaderIdx > 0);
+  assert.equal(isReportTitle(flatNoDirectives[p2HeaderIdx + 1], p2HeaderIdx + 1, flatNoDirectives), true);
+
+  const richHtml = findingsToRichHtml(flatNoDirectives);
+  const h1Matches = richHtml.match(/<h1\b/gi) || [];
+  assert.equal(h1Matches.length, 2);
+  assert.ok(richHtml.includes('C.T.SCAN OF BRAIN (PLAIN)'));
+  assert.ok(richHtml.includes('CHEST PA VIEW'));
+
+  const rtf = generateRtfDocument(richHtml, 'Multi Patient Report');
+  assert.ok(rtf.includes('C.T.SCAN OF BRAIN (PLAIN)'));
+  assert.ok(rtf.includes('CHEST PA VIEW'));
+});
+
+test('processAudio splits 2+ patients, resolves per-patient spoken template IDs independently, and supports 1 manual template across 2 patients', async () => {
+  const prevWindow = (globalThis as any).window;
+  const prevFetch = globalThis.fetch;
+  const localMap = new Map<string, string>();
+  (globalThis as any).window = {
+    localStorage: {
+      getItem: (k: string) => localMap.get(k) ?? null,
+      setItem: (k: string, v: string) => localMap.set(k, String(v)),
+      removeItem: (k: string) => localMap.delete(k),
+    },
+    sessionStorage: {
+      getItem: () => null,
+      setItem: () => {},
+      removeItem: () => {},
+    },
+    dispatchEvent: () => true,
+  };
+
+  try {
+    resetApiKeyHealthState();
+    setUserApiKeys(['AIzaSyMultiPatientTestKey01']);
+
+    const mergePromptsSeen: string[] = [];
+    let callIdx = 0;
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      if (!String(_url).includes('generativelanguage.googleapis.com')) {
+        return new Response('Not Found', { status: 404 });
+      }
+      callIdx++;
+      const body = JSON.parse(String(init?.body || '{}'));
+      const promptText = (body.contents?.[0]?.parts || []).map((p: any) => p.text || '').join('\n');
+
+      // Initial audio pass returns 2 patients with distinct spoken template IDs
+      if (callIdx === 1) {
+        return new Response(
+          JSON.stringify({
+            candidates: [
+              {
+                content: {
+                  parts: [
+                    {
+                      text: JSON.stringify({
+                        findings: [
+                          '{template id 1}',
+                          'BOLD::Small right frontal contusion.',
+                          'BOLD::--- PATIENT 2: Rahul ---',
+                          '{template id 200}',
+                          'BOLD::Bilateral maxillary sinusitis.',
+                        ],
+                      }),
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+          { status: 200 }
+        );
+      }
+
+      mergePromptsSeen.push(promptText);
+      const isPatient2 = promptText.includes('Bilateral maxillary sinusitis');
+      const mergedFindings = isPatient2
+        ? [
+            REPORT_TEMPLATES[199].lines?.[0] || REPORT_TEMPLATES[199].name,
+            '*Clinical Profile:*',
+            'BOLD::Bilateral maxillary sinusitis.',
+            'IMPRESSION:###Bilateral maxillary sinusitis.',
+          ]
+        : [
+            REPORT_TEMPLATES[0].lines?.[0] || REPORT_TEMPLATES[0].name,
+            '*Clinical Profile:*',
+            'BOLD::Small right frontal contusion.',
+            'IMPRESSION:###Right frontal contusion.',
+          ];
+
+      return new Response(
+        JSON.stringify({
+          candidates: [{ content: { parts: [{ text: JSON.stringify({ findings: mergedFindings }) }] } }],
+        }),
+        { status: 200 }
+      );
+    }) as any;
+
+    const audioBlob = new Blob([new Uint8Array([1, 2, 3, 4])], { type: 'audio/ogg' });
+    const result = await processAudio(audioBlob, 'gemini-4-hydrogen');
+
+    assert.equal(Array.isArray(result), true);
+    assert.equal(result.patientReports?.length, 2);
+    assert.deepEqual(result.patientReports?.[0].templateIds, ['1']);
+    assert.equal(result.patientReports?.[0].templateName, REPORT_TEMPLATES[0].name);
+    assert.deepEqual(result.patientReports?.[1].templateIds, ['200']);
+    assert.equal(result.patientReports?.[1].templateName, REPORT_TEMPLATES[199].name);
+    assert.equal(result.patientReports?.[1].patientName, 'Rahul');
+    assert.equal(result.some((l) => l.includes('{template id')), false);
+    assert.equal(mergePromptsSeen.length, 2);
+
+    // 2) Single manual template + 2 dictated patients merges each patient separately
+    callIdx = 0;
+    mergePromptsSeen.length = 0;
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      if (!String(_url).includes('generativelanguage.googleapis.com')) {
+        return new Response('Not Found', { status: 404 });
+      }
+      callIdx++;
+      const body = JSON.parse(String(init?.body || '{}'));
+      const promptText = (body.contents?.[0]?.parts || []).map((p: any) => p.text || '').join('\n');
+      if (callIdx === 1) {
+        return new Response(
+          JSON.stringify({
+            candidates: [
+              {
+                content: {
+                  parts: [
+                    {
+                      text: JSON.stringify({
+                        findings: [
+                          REPORT_TEMPLATES[0].name,
+                          'BOLD::Patient one normal brain.',
+                          'BOLD::--- PATIENT 2 REPORT ---',
+                          REPORT_TEMPLATES[0].name,
+                          'BOLD::Patient two lacunar infarct.',
+                        ],
+                      }),
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+          { status: 200 }
+        );
+      }
+      mergePromptsSeen.push(promptText);
+      const isP2 = promptText.includes('lacunar infarct');
+      return new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    text: JSON.stringify({
+                      findings: [
+                        REPORT_TEMPLATES[0].name,
+                        '*Clinical Profile:*',
+                        isP2 ? 'BOLD::Patient two lacunar infarct.' : 'Normal parenchyma.',
+                        isP2 ? 'IMPRESSION:###Lacunar infarct.' : 'IMPRESSION:###Normal study.',
+                      ],
+                    }),
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        { status: 200 }
+      );
+    }) as any;
+
+    const manualRes = await processAudio(
+      audioBlob,
+      'gemini-4-hydrogen',
+      `[TEMPLATE_ID: ${REPORT_TEMPLATES[0].id}] Use "${REPORT_TEMPLATES[0].name}"`
+    );
+    assert.equal(manualRes.patientReports?.length, 2);
+    assert.equal(mergePromptsSeen.length, 2);
+    assert.ok(manualRes.patientReports?.[0].findings.some((l) => l.includes('Normal study')));
+    assert.ok(manualRes.patientReports?.[1].findings.some((l) => l.includes('Lacunar infarct')));
+  } finally {
+    resetApiKeyHealthState();
+    (globalThis as any).window = prevWindow;
+    globalThis.fetch = prevFetch;
+  }
+});
+
+test('executeAutonomousPlan resolves and strips per-patient spoken and structured templateIds independently', async () => {
+  const prevWindow = (globalThis as any).window;
+  const prevFetch = globalThis.fetch;
+  const localMap = new Map<string, string>();
+  (globalThis as any).window = {
+    localStorage: {
+      getItem: (k: string) => localMap.get(k) ?? null,
+      setItem: (k: string, v: string) => localMap.set(k, String(v)),
+      removeItem: (k: string) => localMap.delete(k),
+    },
+    sessionStorage: {
+      getItem: () => null,
+      setItem: () => {},
+      removeItem: () => {},
+    },
+    dispatchEvent: () => true,
+  };
+
+  try {
+    resetApiKeyHealthState();
+    setUserApiKeys(['AIzaSyAutoPlanKey00001']);
+
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body || '{}'));
+      const promptText = (body.contents?.[0]?.parts || []).map((p: any) => p.text || '').join('\n');
+      const isSecond = promptText.includes('Hepatic steatosis');
+      return new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    text: JSON.stringify({
+                      findings: [
+                        isSecond ? REPORT_TEMPLATES[199].name : REPORT_TEMPLATES[0].name,
+                        '*Clinical Profile:*',
+                        isSecond ? 'BOLD::Hepatic steatosis.' : 'BOLD::Normal brain.',
+                        isSecond ? 'IMPRESSION:###Fatty liver.' : 'IMPRESSION:###Normal brain.',
+                      ],
+                    }),
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        { status: 200 }
+      );
+    }) as any;
+
+    let appliedBatches: any[] = [];
+    const execRes = await executeAutonomousPlan(
+      {
+        summary: '2 patients with per-patient template IDs',
+        totalPatientsDetected: 2,
+        globalDirectives: { saveToDrive: false, downloadHtml: false, syncToWorkstation: false },
+        patients: [
+          {
+            patientId: 'pt_1',
+            patientName: 'Patient 1',
+            targetMode: 'batch',
+            templateIds: ['1'],
+            findings: ['Normal brain.'],
+          },
+          {
+            patientId: 'pt_2',
+            patientName: 'Patient 2',
+            targetMode: 'batch',
+            findings: ['{template id 200}', 'Hepatic steatosis.'],
+          },
+        ],
+      },
+      {
+        selectedModel: 'gemini-4-hydrogen',
+        onApplyBatchReports: (batches) => {
+          appliedBatches = batches;
+        },
+      }
+    );
+
+    assert.equal(execRes.success, true);
+    assert.equal(execRes.batchPatients.length, 2);
+    assert.equal(execRes.batchPatients[0].templateUsed, REPORT_TEMPLATES[0].name);
+    assert.equal(execRes.batchPatients[1].templateUsed, REPORT_TEMPLATES[199].name);
+    assert.equal(appliedBatches.length, 2);
+    assert.equal(appliedBatches[1].findings.some((f: string) => f.includes('{template id')), false);
+  } finally {
+    resetApiKeyHealthState();
+    (globalThis as any).window = prevWindow;
+    globalThis.fetch = prevFetch;
+  }
 });

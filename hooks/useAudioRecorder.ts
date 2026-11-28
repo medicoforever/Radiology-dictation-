@@ -178,6 +178,7 @@ export const useAudioRecorder = (sessionScope = 'single'): AudioRecorderResult =
       unsavedSessionRef.current = nextUnsaved;
       setUnsavedSession(nextUnsaved);
     }
+    audioChunksRef.current = [];
 
     // 3. Clean up tracks and reset state
     streamRef.current?.getTracks().forEach(track => {
@@ -325,6 +326,7 @@ export const useAudioRecorder = (sessionScope = 'single'): AudioRecorderResult =
       }
 
       sessionStartTimeRef.current = Date.now();
+      audioChunksRef.current = [];
 
       let stream: MediaStream | null = null;
       try {
@@ -507,6 +509,7 @@ export const useAudioRecorder = (sessionScope = 'single'): AudioRecorderResult =
         
         recorder.addEventListener("stop", async () => {
           const newAudioBlob = new Blob(audioChunksRef.current, { type: mimeTypeRef.current });
+          audioChunksRef.current = [];
           await cleanupAndSetState();
           await saveCompletedRecording(newAudioBlob, mimeTypeRef.current);
           await clearActiveSession(sessionScope);
@@ -517,6 +520,7 @@ export const useAudioRecorder = (sessionScope = 'single'): AudioRecorderResult =
 
         recorder.addEventListener("error", async (event) => {
           console.error("MediaRecorder error:", event);
+          audioChunksRef.current = [];
           await cleanupAndSetState();
           reject(new Error("An error occurred during recording."));
         }, { once: true });
@@ -528,12 +532,14 @@ export const useAudioRecorder = (sessionScope = 'single'): AudioRecorderResult =
           cleanupAndSetState().then(() => {
             clearActiveSession(sessionScope).catch(() => {});
             const fallbackBlob = new Blob(audioChunksRef.current, { type: mimeTypeRef.current });
+            audioChunksRef.current = [];
             resolve(fallbackBlob);
           });
         }
       } else {
         clearActiveSession(sessionScope).catch(() => {});
         const fallbackBlob = new Blob(audioChunksRef.current, { type: mimeTypeRef.current });
+        audioChunksRef.current = [];
         setIsRecording(false);
         setIsPaused(false);
         resolve(fallbackBlob);

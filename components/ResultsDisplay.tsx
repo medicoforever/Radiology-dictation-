@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import ChatInterface from './ChatInterface';
 import { useAudioRecorder } from '../hooks/useAudioRecorder';
 import { continueAudioDictation, modifyFindingWithAudio, modifyReportWithAudio, runComplexImpressionGeneration, transcribeAudioForPrompt, detectAndExtractTemplate, mergeDictatedFindingsWithTemplate } from '../services/geminiService';
@@ -14,11 +14,13 @@ import ReorderIcon from './icons/ReorderIcon';
 import MergeIcon from './icons/MergeIcon';
 import CustomPromptInput from './ui/CustomPromptInput';
 import { IdentifiedError } from '../types';
-import { AVAILABLE_MODELS, REPORT_TEMPLATES, ReportTemplate } from '../constants';
+import { AIModelOption, AVAILABLE_MODELS, REPORT_TEMPLATES, ReportTemplate, getModelDisplayLabel } from '../constants';
+import { splitMultiPatientFindings, joinMultiPatientFindings, PatientReportSegment } from '../services/templateHandling';
 import WarningIcon from './icons/WarningIcon';
 import BrainIcon from './icons/BrainIcon';
 import MicIcon from './icons/MicIcon';
 import DownloadIcon from './icons/DownloadIcon';
+import CopyIcon from './icons/CopyIcon';
 import TrashIcon from './icons/TrashIcon';
 import PauseIcon from './icons/PauseIcon';
 import ResumeIcon from './icons/ResumeIcon';
@@ -29,7 +31,7 @@ import { getTemplateDocxBase64 } from '../services/builtInTemplates';
 import { buildCombinedTemplateBundle, mergeTemplateImages } from '../services/upcomingTemplateService';
 import ImageIcon from './icons/ImageIcon';
 import { mergeAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
-import {  generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText , isSummaryLeadIn, formatImpressionOutput, isReportTitle as isDocxReportTitle, isAnatomicalSubheading, isPureCorrelationOrRecommendation, sanitizeHtmlForClipboard, escapeHtml } from '../services/docxService';
+import { generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText, isSummaryLeadIn, formatImpressionOutput, isReportTitle as isDocxReportTitle, isAnatomicalSubheading, isPureCorrelationOrRecommendation, sanitizeHtmlForClipboard, escapeHtml, findingsToRichHtml, generateRtfDocument, findingsToStandardHtml } from '../services/docxService';
 import { stopRepeatingInterruptedAlert } from '../services/soundService';
 import RichTextReportEditor from './RichTextReportEditor';
 import type { DocxTemplateData } from './ui/CustomPromptInput';
@@ -92,7 +94,26 @@ interface ResultsDisplayProps {
   isExperimentalAudioFilterEnabled?: boolean;
   prefilterStats?: AudioPrefilterStats | null;
   compactedAudioBlob?: Blob | null;
+  patientReports?: PatientReportSegment[];
+  storageScopeKey?: string;
 }
+
+const formatLiveMessageForUser = (rawText: string): string => {
+  if (!rawText) return '';
+  let formatted = rawText.replace(/\bgemini-[a-z0-9.-]+/gi, (match) => getModelDisplayLabel(match));
+  formatted = formatted
+    .replace(/Auto-failover:\s*/gi, 'Switched backup model: ')
+    .replace(/\(503[^)]*\)/gi, '(temporarily busy)')
+    .replace(/\(429[^)]*\)/gi, '(quota limit reached)')
+    .replace(/\b503\b\s*(?:Service Unavailable|High Demand|overloaded)?/gi, 'temporarily busy')
+    .replace(/\b429\b\s*(?:Too Many Requests|Rate Limit|Resource Exhausted)?/gi, 'daily limit reached');
+  return formatted;
+};
+
+const sanitizeSegmentFileBase = (seg: PatientReportSegment, index: number): string => {
+  const raw = (seg.label || `patient-${index + 1}`).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+  return raw || `patient-${index + 1}`;
+};
 
 const formatAudioDuration = (totalSeconds: number): string => {
   const mins = Math.floor(totalSeconds / 60);
@@ -199,6 +220,21 @@ export const formatClinicalProfileText = (text: string): string => {
 
 declare const ClipboardItem: any;
 
+export const TieredModelOptgroups: React.FC<{
+  models?: AIModelOption[];
+  isPaidAvailable?: boolean;
+}> = ({ models = AVAILABLE_MODELS }) => {
+  return (
+    <>
+      {models.map(m => (
+        <option key={m.value} value={m.value}>
+          {m.label}
+        </option>
+      ))}
+    </>
+  );
+};
+
 const ResultsDisplay: React.FC<ResultsDisplayProps> = ({ 
   findings, 
   onReset, 
@@ -235,11 +271,100 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   isExperimentalAudioFilterEnabled = false,
   prefilterStats = null,
   compactedAudioBlob = null,
+  patientReports,
+  storageScopeKey,
 }) => {
   const [isAllCopied, setIsAllCopied] = useState<boolean>(false);
   const [selectedIndices, setSelectedIndices] = useState<Set<number>>(new Set<number>());
   const [copyNotification, setCopyNotification] = useState<{ text: string; visible: boolean }>({ text: '', visible: false });
   const [multiSelectMode, setMultiSelectMode] = useState<boolean>(false);
+  const [activePatientTabIndex, setActivePatientTabIndex] = useState<number | null>(null);
+  const [editingPatientIndex, setEditingPatientIndex] = useState<number | null>(null);
+  const [copiedPatientId, setCopiedPatientId] = useState<string | null>(null);
+
+  const patientSegments = useMemo<PatientReportSegment[]>(() => {
+    const liveSegments = splitMultiPatientFindings(findings);
+    if (!patientReports || patientReports.length === 0) return liveSegments;
+    if (liveSegments.length === patientReports.length) {
+      return liveSegments.map((seg, idx) => ({
+        ...seg,
+        templateName: patientReports[idx]?.templateName || seg.templateName,
+        templateIds: seg.templateIds?.length ? seg.templateIds : patientReports[idx]?.templateIds,
+      }));
+    }
+    return patientReports.length > 1 && liveSegments.length <= 1 ? patientReports : liveSegments;
+  }, [findings, patientReports]);
+
+  const hasMultiplePatients = patientSegments.length > 1;
+
+  useEffect(() => {
+    if (!hasMultiplePatients) {
+      setActivePatientTabIndex(null);
+      setEditingPatientIndex(null);
+    } else {
+      if (activePatientTabIndex !== null && activePatientTabIndex >= patientSegments.length) {
+        setActivePatientTabIndex(null);
+      }
+      if (editingPatientIndex !== null && editingPatientIndex >= patientSegments.length) {
+        setEditingPatientIndex(null);
+      }
+    }
+  }, [hasMultiplePatients, activePatientTabIndex, editingPatientIndex, patientSegments.length]);
+
+  const handleUpdatePatientFindings = useCallback((patientIdx: number, updatedPatientFindings: string[]) => {
+    const updatedSegments = patientSegments.map((seg, idx) =>
+      idx === patientIdx ? { ...seg, findings: updatedPatientFindings } : seg
+    );
+    onAllFindingsUpdate(joinMultiPatientFindings(updatedSegments));
+  }, [patientSegments, onAllFindingsUpdate]);
+
+  const handleCopyPatientReport = async (seg: PatientReportSegment) => {
+    try {
+      const { html, plainText } = findingsToStandardHtml(seg.findings);
+      const cleanHtml = sanitizeHtmlForClipboard(html);
+      if (typeof window !== 'undefined' && navigator.clipboard && window.ClipboardItem) {
+        await navigator.clipboard.write([
+          new ClipboardItem({
+            'text/plain': new Blob([plainText], { type: 'text/plain' }),
+            'text/html': new Blob([cleanHtml], { type: 'text/html' }),
+          }),
+        ]);
+      } else {
+        await navigator.clipboard.writeText(plainText);
+      }
+      setCopiedPatientId(seg.id);
+      setTimeout(() => setCopiedPatientId(prev => (prev === seg.id ? null : prev)), 2500);
+    } catch (err) {
+      console.error('Failed to copy patient report:', err);
+    }
+  };
+
+  const handleDownloadPatientHtml = (seg: PatientReportSegment, index: number) => {
+    const base = sanitizeSegmentFileBase(seg, index);
+    const htmlContent = generateSingleDictationHTML(seg.findings);
+    downloadFile(htmlContent, `${base}.html`, 'text/html;charset=utf-8');
+  };
+
+  const handleDownloadPatientRtf = (seg: PatientReportSegment, index: number) => {
+    const base = sanitizeSegmentFileBase(seg, index);
+    const richHtml = findingsToRichHtml(seg.findings);
+    const rtfDoc = generateRtfDocument(richHtml, seg.label || `Patient ${index + 1}`);
+    downloadFile(rtfDoc, `${base}.rtf`, 'application/rtf');
+  };
+
+  const handleDownloadAllPatientsHtml = () => {
+    if (patientSegments.length === 0) return;
+    patientSegments.forEach((seg, idx) => {
+      setTimeout(() => handleDownloadPatientHtml(seg, idx), idx * 180);
+    });
+  };
+
+  const handleDownloadAllPatientsRtf = () => {
+    if (patientSegments.length === 0) return;
+    patientSegments.forEach((seg, idx) => {
+      setTimeout(() => handleDownloadPatientRtf(seg, idx), idx * 180);
+    });
+  };
 
   // Detect if user is in "Merging with template" mode using comprehensive detector
   const detectedTemplate = detectAndExtractTemplate(customPrompt, customImages, customDocx);
@@ -369,11 +494,12 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   } = modificationRecorder;
   const [isRecoveringModify, setIsRecoveringModify] = useState(false);
 
-  // Stored and Retrieved Changes Audio
+  // Stored and Retrieved Changes Audio (scoped per active report/tab so old changes never leak)
+  const changesAudioScope = storageScopeKey || 'single';
   const [storedModificationBlob, setStoredModificationBlob] = useState<Blob | null>(null);
   const [storedModificationMeta, setStoredModificationMeta] = useState<{ timestamp: number; size: number; mimeType: string; name?: string } | null>(null);
   const [storedModificationAudioUrl, setStoredModificationAudioUrl] = useState<string | null>(null);
-  const [hasPersistedChangesAudio, setHasPersistedChangesAudio] = useState<boolean>(() => hasStoredDictateChangesAudio());
+  const [hasPersistedChangesAudio, setHasPersistedChangesAudio] = useState<boolean>(() => hasStoredDictateChangesAudio(changesAudioScope));
   const [isRetrievingChangesAudio, setIsRetrievingChangesAudio] = useState(false);
   const [isApplyingStoredChanges, setIsApplyingStoredChanges] = useState(false);
   const modificationFileInputRef = useRef<HTMLInputElement>(null);
@@ -382,6 +508,14 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   const [stagedModificationFiles, setStagedModificationFiles] = useState<File[]>([]);
   const [isModificationPasteModalOpen, setIsModificationPasteModalOpen] = useState(false);
   const [modificationClipboardPastedText, setModificationClipboardPastedText] = useState('');
+
+  const clearModificationPersistence = useCallback(async () => {
+    setStagedModificationFiles([]);
+    setStoredModificationBlob(null);
+    setStoredModificationMeta(null);
+    setHasPersistedChangesAudio(false);
+    await deleteDictateChangesAudio(changesAudioScope).catch(() => {});
+  }, [changesAudioScope]);
 
   // Synchronize object URL for stored changes audio preview and playback
   useEffect(() => {
@@ -394,9 +528,15 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     }
   }, [storedModificationBlob]);
 
-  // Check and retrieve any previously stored dictate changes audio on mount
+  // Check and retrieve any previously stored dictate changes audio for this scope on mount / scope change
   useEffect(() => {
-    getDictateChangesAudio().then((record) => {
+    let active = true;
+    setStoredModificationBlob(null);
+    setStoredModificationMeta(null);
+    setStagedModificationFiles([]);
+    setHasPersistedChangesAudio(hasStoredDictateChangesAudio(changesAudioScope));
+    getDictateChangesAudio(changesAudioScope).then((record) => {
+      if (!active) return;
       if (record && record.blob && record.blob.size > 0) {
         setHasPersistedChangesAudio(true);
         setStoredModificationBlob(record.blob);
@@ -407,7 +547,8 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     }).catch(err => {
       console.debug('Notice checking stored changes audio:', err);
     });
-  }, []);
+    return () => { active = false; };
+  }, [changesAudioScope]);
 
   // State for 'Complex Impression Generation' feature
   const [isComplexGeneratorVisible, setIsComplexGeneratorVisible] = useState(false);
@@ -1016,8 +1157,17 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   
   const handleRecordNew = useCallback(() => {
     setExpertNotes(null);
+    setStagedModificationFiles([]);
+    setStoredModificationBlob(null);
+    setStoredModificationMeta(null);
+    setHasPersistedChangesAudio(false);
+    setModificationError(null);
+    setModificationState('idle');
+    setContinuationError(null);
+    setExtraFiles([]);
+    deleteDictateChangesAudio(changesAudioScope).catch(() => {});
     onReset();
-  }, [onReset]);
+  }, [onReset, changesAudioScope]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -1348,8 +1498,8 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     try {
       const audioBlob = await stopGlobalModificationRecording();
       if (audioBlob && audioBlob.size > 0) {
-        // Automatically persist changes audio to IndexedDB
-        await saveDictateChangesAudio(audioBlob, 'Voice Changes Dictation');
+        // Persist temporarily under current scope in case network apply fails, then auto-clear on success
+        await saveDictateChangesAudio(audioBlob, 'Voice Changes Dictation', changesAudioScope);
         setStoredModificationBlob(audioBlob);
         setStoredModificationMeta({
           timestamp: Date.now(),
@@ -1359,16 +1509,14 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         });
         setHasPersistedChangesAudio(true);
 
-        // If audio dictate given then without using other file, we can apply it like how at the start.
-        // If there are also staged files, combine them; otherwise apply just audio only!
         const allItems: Blob[] = [audioBlob, ...stagedModificationFiles];
 
         setModificationState('processing');
         try {
           setUndoState(findings);
           await applyFilteredReportModification(allItems.length === 1 ? allItems[0] : allItems);
-          setStagedModificationFiles([]);
-          showNotification('Changes applied and voice dictation stored in browser!');
+          await clearModificationPersistence();
+          showNotification('Changes applied to report!');
         } catch (err) {
           const message = err instanceof Error ? err.message : 'An unknown error occurred.';
           setModificationError(message);
@@ -1389,7 +1537,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     setIsRetrievingChangesAudio(true);
     setModificationError(null);
     try {
-      const record = await getDictateChangesAudio();
+      const record = await getDictateChangesAudio(changesAudioScope);
       if (record && record.blob && record.blob.size > 0) {
         setStoredModificationBlob(record.blob);
         setStoredModificationMeta(record.meta);
@@ -1410,7 +1558,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
   const handleSaveCurrentChangesAudio = async () => {
     if (!storedModificationBlob) return;
     try {
-      await saveDictateChangesAudio(storedModificationBlob, storedModificationMeta?.name || 'Voice Changes Dictation');
+      await saveDictateChangesAudio(storedModificationBlob, storedModificationMeta?.name || 'Voice Changes Dictation', changesAudioScope);
       setHasPersistedChangesAudio(true);
       showNotification('Audio successfully stored in browser storage (IndexedDB)!');
     } catch (err) {
@@ -1421,10 +1569,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
 
   const handleDiscardStoredChangesAudio = async () => {
     try {
-      await deleteDictateChangesAudio();
-      setStoredModificationBlob(null);
-      setStoredModificationMeta(null);
-      setHasPersistedChangesAudio(false);
+      await clearModificationPersistence();
       showNotification('Stored changes audio deleted from browser.');
     } catch (err) {
       console.error('Failed to delete stored changes audio:', err);
@@ -1444,7 +1589,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     try {
       setUndoState(findings);
       await applyFilteredReportModification(allItems.length === 1 ? allItems[0] : allItems);
-      setStagedModificationFiles([]);
+      await clearModificationPersistence();
       showNotification('Changes applied using stored audio/files!');
     } catch (err) {
       const message = err instanceof Error ? err.message : 'An unknown error occurred.';
@@ -1463,30 +1608,14 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     const files: File[] = Array.from(e.target.files || []);
     if (files.length > 0) {
       setStagedModificationFiles(prev => [...prev, ...files]);
-      const audioFile: File | undefined = files.find((f: File) => f.type.startsWith('audio/'));
-      if (audioFile && !storedModificationBlob) {
-        saveDictateChangesAudio(audioFile, audioFile.name).then(() => {
-          setStoredModificationBlob(audioFile);
-          setStoredModificationMeta({
-            timestamp: Date.now(),
-            size: audioFile.size,
-            mimeType: audioFile.type || 'audio/webm',
-            name: audioFile.name
-          });
-          setHasPersistedChangesAudio(true);
-        }).catch(() => {});
-      }
       showNotification(`Added ${files.length} file(s) for report changes`);
     }
     if (e.target) e.target.value = '';
   };
 
   const handleApplyStagedModification = async () => {
-    const allItems: Blob[] = [];
-    if (storedModificationBlob) {
-      allItems.push(storedModificationBlob);
-    }
-    allItems.push(...stagedModificationFiles);
+    // Only apply staged files — never auto-prepend stale recorded voice changes audio
+    const allItems: Blob[] = [...stagedModificationFiles];
 
     if (allItems.length === 0) return;
 
@@ -1495,7 +1624,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     try {
       setUndoState(findings);
       await applyFilteredReportModification(allItems.length === 1 ? allItems[0] : allItems);
-      setStagedModificationFiles([]);
+      await clearModificationPersistence();
       showNotification('Changes applied to report!');
     } catch (err) {
       const message = err instanceof Error ? err.message : 'An unknown error occurred.';
@@ -1558,7 +1687,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
     try {
       const recoveredBlob = await recoverModifySession();
       if (recoveredBlob && recoveredBlob.size > 0) {
-        await saveDictateChangesAudio(recoveredBlob, 'Recovered Voice Changes');
+        await saveDictateChangesAudio(recoveredBlob, 'Recovered Voice Changes', changesAudioScope);
         setStoredModificationBlob(recoveredBlob);
         setStoredModificationMeta({
           timestamp: Date.now(),
@@ -1571,8 +1700,9 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
         setModificationState('processing');
         setUndoState(findings);
         await applyFilteredReportModification(recoveredBlob);
+        await clearModificationPersistence();
         setModificationState('idle');
-        showNotification('Restored and stored voice changes audio!');
+        showNotification('Restored and applied voice changes!');
       }
     } catch (err) {
       console.error('Failed to restore and apply modification:', err);
@@ -1985,7 +2115,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                         </span>
                     </div>
                     <p className="font-medium text-sm text-slate-200 mt-0.5">
-                        {liveError ? liveError : liveStatus || 'Listening for speech & medical voice commands...'}
+                        {liveError ? formatLiveMessageForUser(liveError) : liveStatus ? formatLiveMessageForUser(liveStatus) : 'Listening for speech & medical voice commands...'}
                     </p>
                 </div>
             </div>
@@ -2035,9 +2165,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                   className="bg-white border border-slate-300 text-slate-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block p-2 w-full sm:w-auto dark:bg-slate-700 dark:border-slate-600 dark:text-white"
                   aria-label="Select AI model for reprocessing"
               >
-                  {AVAILABLE_MODELS.map((model) => (
-                      <option key={model.value} value={model.value}>{model.label}</option>
-                  ))}
+                  <TieredModelOptgroups />
               </select>
             </div>
 
@@ -2227,6 +2355,159 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
           className="mb-6"
         />
 
+      {/* Multi-Patient Separate Reports & Downloads (HTML & RTF per patient) */}
+      {!isLive && hasMultiplePatients && (
+        <div className="mb-6 p-4 bg-gradient-to-br from-emerald-50/80 via-white to-blue-50/70 dark:from-slate-800/90 dark:via-slate-850 dark:to-slate-900 rounded-2xl border border-emerald-200/80 dark:border-emerald-800/60 shadow-sm space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2.5">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="px-2.5 py-0.5 rounded-full text-xs font-extrabold bg-emerald-600 text-white">
+                {patientSegments.length} Patients
+              </span>
+              <h3 className="text-sm sm:text-base font-bold text-slate-800 dark:text-slate-100">
+                Separate Patient Reports
+              </h3>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={handleDownloadAllPatientsHtml}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold shadow-xs cursor-pointer"
+              >
+                <DownloadIcon className="w-3.5 h-3.5" />
+                Download All Separate HTMLs
+              </button>
+              <button
+                type="button"
+                onClick={handleDownloadAllPatientsRtf}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-700 hover:bg-indigo-800 text-white text-xs font-bold shadow-xs cursor-pointer"
+              >
+                <DownloadIcon className="w-3.5 h-3.5" />
+                Download All Separate RTFs
+              </button>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => setActivePatientTabIndex(null)}
+              className={`px-3 py-1 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
+                activePatientTabIndex === null
+                  ? 'bg-slate-800 text-white dark:bg-blue-600'
+                  : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-700'
+              }`}
+            >
+              All Patients ({patientSegments.length})
+            </button>
+            {patientSegments.map((seg, idx) => (
+              <button
+                key={seg.id || `pt-tab-${idx}`}
+                type="button"
+                onClick={() => setActivePatientTabIndex(idx)}
+                className={`px-3 py-1 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
+                  activePatientTabIndex === idx
+                    ? 'bg-blue-600 text-white shadow-xs'
+                    : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-700 hover:bg-blue-50 dark:hover:bg-slate-700'
+                }`}
+              >
+                {seg.label}
+              </button>
+            ))}
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            {patientSegments.map((seg, idx) => {
+              if (activePatientTabIndex !== null && activePatientTabIndex !== idx) return null;
+              const isEditingThis = editingPatientIndex === idx;
+              const previewText = seg.findings
+                .filter(f => f && f.trim())
+                .slice(0, 2)
+                .map(f => f.replace(/^BOLD::/i, '').replace(/###/g, ' '))
+                .join(' • ');
+              return (
+                <div
+                  key={seg.id || `pt-card-${idx}`}
+                  className="p-3 rounded-xl bg-white dark:bg-slate-900/90 border border-slate-200 dark:border-slate-700 shadow-2xs flex flex-col justify-between gap-2.5"
+                >
+                  <div>
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <span className="text-xs sm:text-sm font-bold text-slate-800 dark:text-slate-100">
+                        {seg.label}
+                      </span>
+                      <div className="flex items-center gap-1.5">
+                        {seg.templateName && (
+                          <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 dark:bg-blue-950/60 dark:text-blue-300 border border-blue-200 dark:border-blue-800">
+                            {seg.templateName}
+                          </span>
+                        )}
+                        <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">
+                          {seg.findings.length} item{seg.findings.length === 1 ? '' : 's'}
+                        </span>
+                      </div>
+                    </div>
+                    {previewText && (
+                      <p className="text-xs text-slate-600 dark:text-slate-300 mt-1.5 line-clamp-2">
+                        {previewText}
+                      </p>
+                    )}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1.5 pt-1 border-t border-slate-100 dark:border-slate-800">
+                    <button
+                      type="button"
+                      onClick={() => handleCopyPatientReport(seg)}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white cursor-pointer"
+                    >
+                      <CopyIcon className="w-3.5 h-3.5" />
+                      {copiedPatientId === seg.id ? 'Copied!' : 'Copy'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleDownloadPatientHtml(seg, idx)}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 text-white cursor-pointer"
+                    >
+                      <DownloadIcon className="w-3.5 h-3.5" />
+                      Download HTML
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleDownloadPatientRtf(seg, idx)}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-semibold bg-indigo-700 hover:bg-indigo-800 text-white cursor-pointer"
+                    >
+                      <DownloadIcon className="w-3.5 h-3.5" />
+                      Download RTF
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setEditingPatientIndex(isEditingThis ? null : idx)}
+                      className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-semibold border cursor-pointer ${
+                        isEditingThis
+                          ? 'bg-amber-100 text-amber-900 border-amber-300 dark:bg-amber-900/50 dark:text-amber-200 dark:border-amber-700'
+                          : 'bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-slate-200 dark:border-slate-700'
+                      }`}
+                    >
+                      {isEditingThis ? 'Close Editor' : 'Edit in RTF'}
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {editingPatientIndex !== null && patientSegments[editingPatientIndex] && (
+            <div className="pt-2">
+              <RichTextReportEditor
+                findings={patientSegments[editingPatientIndex].findings}
+                templateName={patientSegments[editingPatientIndex].templateName || (isTemplateMergeMode ? activeTemplateName : null)}
+                patientLabel={patientSegments[editingPatientIndex].label}
+                disableInternalPatientTabs
+                onUpdateFindings={(updatedPatientFindings) => handleUpdatePatientFindings(editingPatientIndex, updatedPatientFindings)}
+                onOpenMacrosModal={onOpenMacrosModal}
+              />
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Embedded / Inline Rich Text Format (RTF) Editor - ONLY active when Template Merge Mode is selected */}
       {isTemplateMergeMode && (
         <>
@@ -2280,12 +2561,23 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                 </a>
               </div>
 
-              <RichTextReportEditor
-                findings={findings}
-                templateName={activeTemplateName}
-                onUpdateFindings={onAllFindingsUpdate}
-                onOpenMacrosModal={onOpenMacrosModal}
-              />
+              {hasMultiplePatients && activePatientTabIndex !== null && patientSegments[activePatientTabIndex] ? (
+                <RichTextReportEditor
+                  findings={patientSegments[activePatientTabIndex].findings}
+                  templateName={patientSegments[activePatientTabIndex].templateName || activeTemplateName}
+                  patientLabel={patientSegments[activePatientTabIndex].label}
+                  disableInternalPatientTabs
+                  onUpdateFindings={(updated) => handleUpdatePatientFindings(activePatientTabIndex, updated)}
+                  onOpenMacrosModal={onOpenMacrosModal}
+                />
+              ) : (
+                <RichTextReportEditor
+                  findings={findings}
+                  templateName={activeTemplateName}
+                  onUpdateFindings={onAllFindingsUpdate}
+                  onOpenMacrosModal={onOpenMacrosModal}
+                />
+              )}
             </div>
           )}
         </>
@@ -3203,7 +3495,7 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
                         {agenticProgressText || 'Running agentic analysis...'}
                     </p>
                     <p className="text-xs text-slate-500 dark:text-slate-400 mt-2">
-                        Default: gemini-3.8-flash (Search Grounded) • Automatic failover & retry
+                        Default: Gemini 3.8 Flash • Automatic backup & retry
                     </p>
                 </div>
             ) : (
@@ -3395,6 +3687,26 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({
               <DownloadIcon className="w-4 h-4" />
               Download HTML
             </button>
+            {hasMultiplePatients && (
+              <>
+                <button
+                  type="button"
+                  onClick={handleDownloadAllPatientsHtml}
+                  className="bg-teal-700 text-white font-bold py-2.5 px-5 rounded-xl hover:bg-teal-800 focus:outline-none focus:ring-2 focus:ring-teal-500 focus:ring-opacity-50 transition-all shadow-sm w-full lg:w-auto flex items-center justify-center gap-2 min-h-[44px]"
+                >
+                  <DownloadIcon className="w-4 h-4" />
+                  Download All Separate HTMLs ({patientSegments.length})
+                </button>
+                <button
+                  type="button"
+                  onClick={handleDownloadAllPatientsRtf}
+                  className="bg-indigo-700 text-white font-bold py-2.5 px-5 rounded-xl hover:bg-indigo-800 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-opacity-50 transition-all shadow-sm w-full lg:w-auto flex items-center justify-center gap-2 min-h-[44px]"
+                >
+                  <DownloadIcon className="w-4 h-4" />
+                  Download All Separate RTFs ({patientSegments.length})
+                </button>
+              </>
+            )}
           </div>
         ) : null}
         {continuationState.status === 'recording' && (

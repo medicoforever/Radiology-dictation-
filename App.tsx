@@ -3,13 +3,26 @@
 
 import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import AudioRecorder from './components/AudioRecorder';
-import ResultsDisplay from './components/ResultsDisplay';
+import ResultsDisplay, { TieredModelOptgroups } from './components/ResultsDisplay';
 import { AppStatus, IdentifiedError } from './types';
-import { processAudio, createChat, blobToBase64, base64ToBlob, createChatFromText, findBuiltinTemplates, runClinicalQaErrorCheck, ClinicalQaAssessment, SpokenTemplateResolution } from './services/geminiService';
+import {
+  processAudio,
+  createChat,
+  blobToBase64,
+  base64ToBlob,
+  createChatFromText,
+  findBuiltinTemplates,
+  runClinicalQaErrorCheck,
+  ClinicalQaAssessment,
+  SpokenTemplateResolution,
+  MODEL_FAILOVER_EVENT,
+  ModelFailoverEventDetail,
+  sendChatMessageWithFailover,
+} from './services/geminiService';
 import ClinicalQaPanel from './components/ui/ClinicalQaPanel';
 import Spinner from './components/ui/Spinner';
 import { Chat } from '@google/genai';
-import { saveAudioBlob, getAudioBlob, deleteAudioBlob, saveReportSession, getReportSession, deleteReportSession } from './services/audioStorage';
+import { saveAudioBlob, getAudioBlob, deleteAudioBlob, saveReportSession, getReportSession, deleteReportSession, deleteDictateChangesAudio } from './services/audioStorage';
 // FIX: Changed import to a named import based on the error message.
 import { BatchProcessor } from './components/BatchProcessor';
 import LiveDictation from './components/LiveDictation';
@@ -25,16 +38,34 @@ import WarningIcon from './components/icons/WarningIcon';
 import StopIcon from './components/icons/StopIcon';
 import CloseIcon from './components/icons/CloseIcon';
 import CustomPromptInput, { DocxTemplateData } from './components/ui/CustomPromptInput';
-import { AVAILABLE_MODELS, DEFAULT_SELECTED_MODEL } from './constants';
+import { AVAILABLE_MODELS, DEFAULT_SELECTED_MODEL, ModelFallbackPolicy, getModelDisplayLabel } from './constants';
 import { mergeAudioBlobs, triggerAudioDownload } from './services/audioMerger';
 import { autoSaveSingleDictation, autoSaveLiveDictation, autoSaveBatchDictations, SaveResult, syncPendingLocalDictationsToDrive, isDriveConnected, subscribeToAuth } from './services/googleDriveService';
 import { DriveStatusBadge } from './components/DriveStatusBadge';
 import { DriveAutoSaveToast } from './components/DriveAutoSaveToast';
 import { DriveReportsModal } from './components/DriveReportsModal';
-import { RotateCcw, X, ExternalLink, Power, Sparkles, Trash2, Download, ShieldCheck, BookOpen, Key } from 'lucide-react';
+import { RotateCcw, X, ExternalLink, Power, Sparkles, Trash2, Download, ShieldCheck, BookOpen, Key, AlertTriangle, RefreshCw } from 'lucide-react';
 import { OwnershipModal } from './components/ui/OwnershipModal';
 import { ApiKeyModal } from './components/ApiKeyModal';
-import { getUserApiKeys, API_KEYS_UPDATED_EVENT, isBuiltinKeysUnlocked, unlockBuiltinKeys, syncApiKeysWithGoogleDrive } from './services/apiKeyService';
+import {
+  getUserApiKeys,
+  API_KEYS_UPDATED_EVENT,
+  API_KEY_SETTINGS_UPDATED_EVENT,
+  MODEL_OVERLOAD_UPDATED_EVENT,
+  OverloadedModelInfo,
+  isBuiltinKeysUnlocked,
+  unlockBuiltinKeys,
+  syncApiKeysWithGoogleDrive,
+  getTotalActiveApiKeyCount,
+  getModelFallbackPolicy,
+  setModelFallbackPolicy,
+  isMediumProsePolishEnabled,
+  setMediumProsePolishEnabled,
+  isRetryTopTierAllKeysOn503Enabled,
+  setRetryTopTierAllKeysOn503Enabled,
+  getOverloadedModelStates,
+  clearModelTemporarilyUnavailable,
+} from './services/apiKeyService';
 import ThemeSelector from './components/ThemeSelector';
 import { getUpcomingTemplate, clearUpcomingTemplate, subscribeToUpcomingTemplate, UpcomingTemplateConfig, extractTemplateTagIds, mergeTemplateImages } from './services/upcomingTemplateService';
 import MacrosAndDictionaryModal from './components/MacrosAndDictionaryModal';
@@ -43,6 +74,7 @@ import { FloatingNewDictationButton } from './components/FloatingNewDictationBut
 import ErrorBoundary from './components/ErrorBoundary';
 import { safeLocalStorage, getTabId, markTabActive, isTabHeartbeatAlive, getSingleModeStorageKey, getSingleModeAudioKey, getSingleModeCompactedAudioKey, getBatchModeStorageKey } from './services/storageService';
 import {
+  classifyBlobForPrefilter,
   filterAudioInputsForModel,
   AudioPrefilterStats,
   EXPERIMENTAL_AUDIO_FILTER_KEY,
@@ -52,6 +84,7 @@ import {
   formatPrefilterDuration,
   mergePrefilterStats,
 } from './services/audioPrefilterService';
+import { PatientReportSegment, splitMultiPatientFindings } from './services/templateHandling';
 
 interface ChatMessage {
   author: 'You' | 'AI';
@@ -235,8 +268,10 @@ const App: React.FC = () => {
   const [isErrorCheckEnabled, setIsErrorCheckEnabled] = useState(() => {
     return safeLocalStorage.getItem<boolean>(ERROR_CHECK_ENABLED_KEY, false);
   });
-  const [isExperimentalAudioFilterEnabled, setIsExperimentalAudioFilterEnabled] = useState(() => {
-    return safeLocalStorage.getItem<boolean>(EXPERIMENTAL_AUDIO_FILTER_KEY, false);
+  const [isExperimentalAudioFilterEnabled, setIsExperimentalAudioFilterEnabled] = useState<boolean>(() => {
+    return safeLocalStorage.getRaw(EXPERIMENTAL_AUDIO_FILTER_KEY, '') !== ''
+      ? safeLocalStorage.getItem<boolean>(EXPERIMENTAL_AUDIO_FILTER_KEY, true)
+      : true;
   });
   const isExperimentalAudioFilterEnabledRef = useRef(isExperimentalAudioFilterEnabled);
   isExperimentalAudioFilterEnabledRef.current = isExperimentalAudioFilterEnabled;
@@ -255,9 +290,21 @@ const App: React.FC = () => {
   const [isApiKeyModalOpen, setIsApiKeyModalOpen] = useState<boolean>(false);
   const [activeMacrosCount, setActiveMacrosCount] = useState<number>(0);
   const [customKeysCount, setCustomKeysCount] = useState<number>(() => getUserApiKeys().length);
+  const [totalActiveKeysCount, setTotalActiveKeysCount] = useState<number>(() => getTotalActiveApiKeyCount());
   const [isSecretUnlocked, setIsSecretUnlocked] = useState<boolean>(() => isBuiltinKeysUnlocked());
+  const [fallbackPolicy, setFallbackPolicy] = useState<ModelFallbackPolicy>(() => getModelFallbackPolicy());
+  const [isProsePolishEnabled, setIsProsePolishEnabled] = useState<boolean>(() => isMediumProsePolishEnabled());
+  const [isRetryTopTierAllKeys, setIsRetryTopTierAllKeys] = useState<boolean>(() => isRetryTopTierAllKeysOn503Enabled());
+  const [patientReports, setPatientReports] = useState<PatientReportSegment[]>([]);
+  const [overloadedModels, setOverloadedModels] = useState<OverloadedModelInfo[]>(() => getOverloadedModelStates());
+  const [failoverToast, setFailoverToast] = useState<ModelFailoverEventDetail | null>(null);
+  const failoverToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [hasMultipleSingleDictations, setHasMultipleSingleDictations] = useState<boolean>(false);
   const [errorRecorderStatus, setErrorRecorderStatus] = useState<AppStatus>(AppStatus.Idle);
+
+  const openApiKeyModal = useCallback(() => {
+    setIsApiKeyModalOpen(true);
+  }, []);
 
   const handleHeaderTitleClick = useCallback(() => {
     const input = window.prompt("Enter secret key:");
@@ -265,6 +312,7 @@ const App: React.FC = () => {
       const res = unlockBuiltinKeys(input.trim());
       if (res.success) {
         setIsSecretUnlocked(true);
+        setTotalActiveKeysCount(getTotalActiveApiKeyCount());
         alert("Success: 9 Built-in API keys unlocked and activated!");
       } else {
         alert(res.message);
@@ -273,13 +321,52 @@ const App: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    const handleKeyUpdate = () => {
+    const syncSettingsAndKeys = () => {
       setCustomKeysCount(getUserApiKeys().length);
+      setTotalActiveKeysCount(getTotalActiveApiKeyCount());
       setIsSecretUnlocked(isBuiltinKeysUnlocked());
+      setFallbackPolicy(getModelFallbackPolicy());
+      setIsProsePolishEnabled(isMediumProsePolishEnabled());
+      setIsRetryTopTierAllKeys(isRetryTopTierAllKeysOn503Enabled());
     };
-    window.addEventListener(API_KEYS_UPDATED_EVENT, handleKeyUpdate);
-    return () => window.removeEventListener(API_KEYS_UPDATED_EVENT, handleKeyUpdate);
+    const handleOverloadUpdate = () => {
+      setOverloadedModels(getOverloadedModelStates());
+    };
+    const handleFailoverEvent = (e: Event) => {
+      const detail = (e as CustomEvent<ModelFailoverEventDetail>).detail;
+      if (!detail) return;
+      setFailoverToast(detail);
+      if (failoverToastTimerRef.current) {
+        clearTimeout(failoverToastTimerRef.current);
+      }
+      failoverToastTimerRef.current = setTimeout(() => {
+        setFailoverToast(null);
+      }, 7500);
+    };
+
+    window.addEventListener(API_KEYS_UPDATED_EVENT, syncSettingsAndKeys);
+    window.addEventListener(API_KEY_SETTINGS_UPDATED_EVENT, syncSettingsAndKeys);
+    window.addEventListener(MODEL_OVERLOAD_UPDATED_EVENT, handleOverloadUpdate);
+    window.addEventListener(MODEL_FAILOVER_EVENT, handleFailoverEvent);
+
+    return () => {
+      window.removeEventListener(API_KEYS_UPDATED_EVENT, syncSettingsAndKeys);
+      window.removeEventListener(API_KEY_SETTINGS_UPDATED_EVENT, syncSettingsAndKeys);
+      window.removeEventListener(MODEL_OVERLOAD_UPDATED_EVENT, handleOverloadUpdate);
+      window.removeEventListener(MODEL_FAILOVER_EVENT, handleFailoverEvent);
+      if (failoverToastTimerRef.current) {
+        clearTimeout(failoverToastTimerRef.current);
+      }
+    };
   }, []);
+
+  useEffect(() => {
+    if (overloadedModels.length === 0) return;
+    const timer = setInterval(() => {
+      setOverloadedModels(getOverloadedModelStates());
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [overloadedModels.length]);
 
   useEffect(() => {
     const unsubscribe = subscribeToMacroDictionary(store => {
@@ -303,6 +390,7 @@ const App: React.FC = () => {
   // Snapshot ref and snackbar state for "Undo Record New Dictation"
   const previousSingleSessionRef = useRef<{
     findings: string[];
+    patientReports?: PatientReportSegment[];
     audioBlob: Blob | Blob[] | null;
     chatHistory: ChatMessage[];
     customPrompt: string;
@@ -494,11 +582,17 @@ const App: React.FC = () => {
           const compactedKey = getSingleModeCompactedAudioKey(currentTabId);
           const loadedCompactedBlob = await getAudioBlob(compactedKey);
           setCompactedAudioBlob(loadedCompactedBlob || null);
-          setFindings(savedState.findings || []);
+          const restoredFindings = savedState.findings || [];
+          setFindings(restoredFindings);
+          setPatientReports(
+            Array.isArray(savedState.patientReports) && savedState.patientReports.length > 0
+              ? savedState.patientReports
+              : splitMultiPatientFindings(restoredFindings)
+          );
           setChatHistory(savedState.chatHistory || []);
           setStatus(AppStatus.Success);
           
-          const validModel = (savedState.selectedModel && savedState.selectedModel !== 'gemini-3.5-flash' && AVAILABLE_MODELS.some(m => m.value === savedState.selectedModel))
+          const validModel = (savedState.selectedModel && AVAILABLE_MODELS.some(m => m.value === savedState.selectedModel))
             ? savedState.selectedModel
             : DEFAULT_SELECTED_MODEL;
           setSelectedModel(validModel);
@@ -595,6 +689,7 @@ const App: React.FC = () => {
             driveSynced: isSynced,
             driveSyncedHash: driveSyncedHashRef.current,
             prefilterStats,
+            patientReports,
           };
           // Save full report state directly to IndexedDB isolated per tab (bypassing the 5MB localStorage limit completely!)
           await saveReportSession(singleKey, stateToSave);
@@ -603,8 +698,9 @@ const App: React.FC = () => {
           safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
           await deleteReportSession(SINGLE_MODE_STORAGE_KEY).catch(() => {});
 
-          if (audioBlob) {
-            await saveAudioBlob(audioKey, audioBlob);
+          const primaryAudioToSave = Array.isArray(audioBlob) ? audioBlob[0] : audioBlob;
+          if (primaryAudioToSave) {
+            await saveAudioBlob(audioKey, primaryAudioToSave);
           } else {
             await deleteAudioBlob(audioKey);
           }
@@ -628,7 +724,7 @@ const App: React.FC = () => {
       }
     };
     saveState();
-  }, [status, findings, audioBlob, compactedAudioBlob, chatHistory, selectedModel, customPrompt, customImages, isRestored, prefilterStats]);
+  }, [status, findings, patientReports, audioBlob, compactedAudioBlob, chatHistory, selectedModel, customPrompt, customImages, isRestored, prefilterStats]);
 
   // Listen for Google Drive auth reconnection to sync offline/pending dictations, custom API keys & macros dictionary
   useEffect(() => {
@@ -638,7 +734,9 @@ const App: React.FC = () => {
       syncApiKeysWithGoogleDrive()
         .then(() => {
           setCustomKeysCount(getUserApiKeys().length);
+          setTotalActiveKeysCount(getTotalActiveApiKeyCount());
           setIsSecretUnlocked(isBuiltinKeysUnlocked());
+          setIsRetryTopTierAllKeys(isRetryTopTierAllKeysOn503Enabled());
         })
         .catch(err => console.warn('Drive API key sync notice:', err));
     }
@@ -650,7 +748,9 @@ const App: React.FC = () => {
         syncApiKeysWithGoogleDrive()
           .then(() => {
             setCustomKeysCount(getUserApiKeys().length);
+            setTotalActiveKeysCount(getTotalActiveApiKeyCount());
             setIsSecretUnlocked(isBuiltinKeysUnlocked());
+            setIsRetryTopTierAllKeys(isRetryTopTierAllKeysOn503Enabled());
           })
           .catch(err => console.warn('Drive API key sync notice:', err));
         try {
@@ -1428,6 +1528,10 @@ const App: React.FC = () => {
         reqId,
       };
       setFindings(processedText);
+      const segments = (processedText as any).patientReports?.length
+        ? (processedText as any).patientReports
+        : splitMultiPatientFindings(processedText);
+      setPatientReports(segments);
 
       // Check if user has queued any concurrent audios, is opening mic/recording, or has an unresolved unsaved audio alarm
       const isConcurrentBusy =
@@ -1697,6 +1801,10 @@ const App: React.FC = () => {
         }
 
         setFindings(processedText);
+        const liveSegments = (processedText as any).patientReports?.length
+          ? (processedText as any).patientReports
+          : splitMultiPatientFindings(processedText);
+        setPatientReports(liveSegments);
         
         // Use the custom prompt from single mode for the follow-up chat
         try {
@@ -1743,53 +1851,102 @@ const App: React.FC = () => {
   }, [selectedModel, customPrompt, customImages]);
 
   const handleReprocess = useCallback(async (extraFiles?: File[]) => {
-    if (!audioBlob && (!extraFiles || extraFiles.length === 0)) {
+    if (!audioBlob && !compactedAudioBlob && (!extraFiles || extraFiles.length === 0)) {
       setError('No audio or input files available to reprocess.');
       setStatus(AppStatus.Error);
       return;
     }
 
+    // Abort any prior in-flight request cleanly (same pattern as handleRecordingComplete)
+    if (inFlightAbortControllerRef.current) {
+      try {
+        inFlightAbortControllerRef.current.abort();
+      } catch (_) {}
+    }
+    const currentAbortController = new AbortController();
+    inFlightAbortControllerRef.current = currentAbortController;
+
     const reqId = ++processingRequestIdRef.current;
     setStatus(AppStatus.Processing);
     setError(null);
-    setPrefilterStats(null);
-    setCompactedAudioBlob(null);
     setPrefilterStatusMsg(null);
     
     try {
       const currentBlobs = audioBlob 
         ? (Array.isArray(audioBlob) ? audioBlob : [audioBlob])
         : [];
-      const blobsToProcess = extraFiles && extraFiles.length > 0
-        ? [...currentBlobs, ...extraFiles]
-        : currentBlobs;
+      const hasValidCompacted = Boolean(compactedAudioBlob && compactedAudioBlob.size > 0);
+      let filteredInputs: Blob | Blob[];
+      let reprocessStats: AudioPrefilterStats | null = prefilterStats;
+      let reprocessCompactedAudio: Blob | null = compactedAudioBlob;
 
-      if (extraFiles && extraFiles.length > 0) {
-        setAudioBlob(blobsToProcess.length === 1 ? blobsToProcess[0] : blobsToProcess);
+      if (hasValidCompacted && compactedAudioBlob) {
+        // Reuse the compacted VAD Ogg/Opus blob as base input without mutating audioBlob or re-decoding multi-MB WAV
+        const nonAudioBase: Blob[] = [];
+        for (const b of currentBlobs) {
+          const cls = await classifyBlobForPrefilter(b);
+          if (!cls.isAudio) {
+            nonAudioBase.push(b);
+          }
+        }
+        const combinedParts: Blob[] = [compactedAudioBlob, ...nonAudioBase];
+        if (extraFiles && extraFiles.length > 0) {
+          const extraPrefilter = await runAudioPrefilterSafely(extraFiles, {
+            enabled: isExperimentalAudioFilterEnabledRef.current,
+            abortSignal: currentAbortController.signal,
+            onProgress: (m) => {
+              if (!currentAbortController.signal.aborted && processingRequestIdRef.current === reqId) {
+                setPrefilterStatusMsg(m);
+              }
+            },
+            onDone: () => {
+              if (processingRequestIdRef.current === reqId) {
+                setPrefilterStatusMsg(null);
+              }
+            },
+            contextLabel: 'Reprocess extras',
+          });
+          if (currentAbortController.signal.aborted || processingRequestIdRef.current !== reqId) return;
+          if (Array.isArray(extraPrefilter.modelInput)) {
+            combinedParts.push(...extraPrefilter.modelInput);
+          } else {
+            combinedParts.push(extraPrefilter.modelInput);
+          }
+        }
+        filteredInputs = combinedParts.length === 1 ? combinedParts[0] : combinedParts;
+      } else {
+        setPrefilterStats(null);
+        setCompactedAudioBlob(null);
+        const blobsToProcess = extraFiles && extraFiles.length > 0
+          ? [...currentBlobs, ...extraFiles]
+          : currentBlobs;
+        const prefilterRes = await runAudioPrefilterSafely(
+          blobsToProcess,
+          {
+            enabled: isExperimentalAudioFilterEnabledRef.current,
+            abortSignal: currentAbortController.signal,
+            onProgress: (m) => {
+              if (!currentAbortController.signal.aborted && processingRequestIdRef.current === reqId) {
+                setPrefilterStatusMsg(m);
+              }
+            },
+            onDone: () => {
+              if (processingRequestIdRef.current === reqId) {
+                setPrefilterStatusMsg(null);
+              }
+            },
+            contextLabel: 'Reprocess',
+          }
+        );
+        if (currentAbortController.signal.aborted || processingRequestIdRef.current !== reqId) return;
+        filteredInputs = prefilterRes.modelInput;
+        reprocessStats = prefilterRes.stats;
+        reprocessCompactedAudio = prefilterRes.compactedAudioBlob;
+        setPrefilterStats(reprocessStats);
+        setCompactedAudioBlob(reprocessCompactedAudio);
       }
 
-      const { modelInput: filteredInputs, stats: reprocessStats, compactedAudioBlob: reprocessCompactedAudio } = await runAudioPrefilterSafely(
-        blobsToProcess,
-        {
-          enabled: isExperimentalAudioFilterEnabledRef.current,
-          onProgress: (m) => {
-            if (processingRequestIdRef.current === reqId) {
-              setPrefilterStatusMsg(m);
-            }
-          },
-          onDone: () => {
-            if (processingRequestIdRef.current === reqId) {
-              setPrefilterStatusMsg(null);
-            }
-          },
-          contextLabel: 'Reprocess',
-        }
-      );
-      if (processingRequestIdRef.current !== reqId) return; // cancelled
-      setPrefilterStats(reprocessStats);
-      setCompactedAudioBlob(reprocessCompactedAudio);
-
-      // Reprocess clean from the original input audio/template/prompt without feeding in previous model output
+      // Reprocess clean from the input audio/template/prompt without feeding in previous model output
       let reprocessPrompt = customPrompt;
       let reprocessImages = customImages;
       const processedText = await processAudio(
@@ -1799,10 +1956,10 @@ const App: React.FC = () => {
         customImages,
         undefined,
         customDocx,
-        undefined,
+        currentAbortController.signal,
         {
           onSpokenTemplateResolved: (resolved: SpokenTemplateResolution) => {
-            if (processingRequestIdRef.current !== reqId) return;
+            if (currentAbortController.signal.aborted || processingRequestIdRef.current !== reqId) return;
             reprocessPrompt = resolved.promptText;
             reprocessImages = mergeTemplateImages(customImages, resolved.images);
             setCustomPrompt(resolved.promptText);
@@ -1811,12 +1968,16 @@ const App: React.FC = () => {
           },
         }
       );
-      if (processingRequestIdRef.current !== reqId) return; // cancelled
+      if (currentAbortController.signal.aborted || processingRequestIdRef.current !== reqId) return; // cancelled
       setFindings(processedText);
+      const segments = (processedText as any).patientReports?.length
+        ? (processedText as any).patientReports
+        : splitMultiPatientFindings(processedText);
+      setPatientReports(segments);
 
       // Recreate chat with the new findings
       const chatSession = await createChat(filteredInputs, processedText, reprocessPrompt, reprocessImages, selectedModel);
-      if (processingRequestIdRef.current !== reqId) return; // cancelled
+      if (currentAbortController.signal.aborted || processingRequestIdRef.current !== reqId) return; // cancelled
       setChat(chatSession);
       const aiGreeting = "I have re-processed the audio with your new instructions. How can I help you further?";
       setChatHistory([{ author: 'AI', text: `${processedText.join('\n\n')}\n\n${aiGreeting}` }]);
@@ -1831,13 +1992,13 @@ const App: React.FC = () => {
           setDriveSaveResult(result);
         }
       }).catch(err => console.warn('Drive reprocess auto-save notice:', err));
-    } catch (err) {
-      if (processingRequestIdRef.current !== reqId) return; // cancelled
+    } catch (err: any) {
+      if (err?.name === 'AbortError' || currentAbortController.signal.aborted || processingRequestIdRef.current !== reqId) return; // cancelled
       console.error(err);
       setError(err instanceof Error ? err.message : 'An unknown error occurred during re-processing.');
       setStatus(AppStatus.Error);
     }
-  }, [audioBlob, selectedModel, customPrompt, customImages, customDocx, findings]);
+  }, [audioBlob, compactedAudioBlob, prefilterStats, selectedModel, customPrompt, customImages, customDocx]);
 
   const driveEditDebounceTimerRef = useRef<NodeJS.Timeout | null>(null);
 
@@ -1874,12 +2035,16 @@ const App: React.FC = () => {
       updatedFindingsToSync = updatedFindings;
       return updatedFindings;
     });
+    if (updatedFindingsToSync.length > 0) {
+      setPatientReports(splitMultiPatientFindings(updatedFindingsToSync));
+    }
     debouncedDriveAutoSave(updatedFindingsToSync);
   };
 
   const handleAllFindingsUpdate = useCallback((newFindings: string[]) => {
     const expanded = expandMacrosInFindings(newFindings);
     setFindings(expanded);
+    setPatientReports(splitMultiPatientFindings(expanded));
     debouncedDriveAutoSave(expanded);
   }, []);
 
@@ -1931,6 +2096,9 @@ const App: React.FC = () => {
           const combinedCompacted = await combineAudioBlobsToCompact(combinedParts);
           setCompactedAudioBlob(combinedCompacted);
         }
+      } else if (compactedAudioBlob) {
+        // Clear stale compacted audio when continuing dictation without VAD filter
+        setCompactedAudioBlob(null);
       }
 
       let continuePrompt = customPrompt;
@@ -1989,6 +2157,7 @@ const App: React.FC = () => {
         ];
       }
       setFindings(updatedFindings);
+      setPatientReports(splitMultiPatientFindings(updatedFindings));
       
       const chatSession = await createChat(mergedBlob, updatedFindings, continuePrompt, continueImages, selectedModel);
       setChat(chatSession);
@@ -2025,9 +2194,9 @@ const App: React.FC = () => {
     setChatHistory(prev => [...prev, { author: 'You', text: userMessageText }]);
 
     try {
-      let response;
+      let messagePayload: string | any[];
       if (typeof message === 'string') {
-        response = await chat.sendMessage({ message });
+        messagePayload = message;
       } else { // It's a Blob
         const base64Audio = await blobToBase64(message);
         const audioPart = {
@@ -2036,13 +2205,14 @@ const App: React.FC = () => {
             data: base64Audio,
           },
         };
-        // Adding a text part to guide the model.
         const textPart = { text: "Please analyze this audio in the context of our conversation." };
-        // The `message` property can be an array of parts for multipart messages.
-        response = await chat.sendMessage({ message: [audioPart, textPart] });
+        messagePayload = [audioPart, textPart];
       }
-      const responseText = response.text;
-      setChatHistory(prev => [...prev, { author: 'AI', text: responseText }]);
+      const res = await sendChatMessageWithFailover(chat, messagePayload, selectedModel);
+      if (res.activeChat && res.activeChat !== chat) {
+        setChat(res.activeChat);
+      }
+      setChatHistory(prev => [...prev, { author: 'AI', text: res.text }]);
     } catch (err) {
       console.error("Chat error:", err);
       const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';
@@ -2057,6 +2227,7 @@ const App: React.FC = () => {
     if (findings.length > 0 || audioBlob !== null) {
       previousSingleSessionRef.current = {
         findings: [...findings],
+        patientReports: [...patientReports],
         audioBlob,
         chatHistory: [...chatHistory],
         customPrompt,
@@ -2113,6 +2284,12 @@ const App: React.FC = () => {
       deleteAudioBlob(`in_flight_recording_${curTabId}`).catch(() => {});
       safeLocalStorage.removeItem(`in_flight_recording_meta_${curTabId}`);
       safeLocalStorage.removeItem(`has_unsaved_session_${curTabId}`);
+      safeLocalStorage.removeItem(`has_unsaved_session_${curTabId}_results_modify`);
+      safeLocalStorage.removeItem(`has_unsaved_session_${curTabId}_results_continue`);
+      safeLocalStorage.removeItem(`has_unsaved_session_${curTabId}_results_complex`);
+      deleteDictateChangesAudio(`single_${curTabId}`).catch(() => {});
+      deleteDictateChangesAudio('single').catch(() => {});
+      deleteDictateChangesAudio().catch(() => {});
     } catch (e) {
       console.warn("Storage wipe on reset:", e);
     }
@@ -2151,6 +2328,7 @@ const App: React.FC = () => {
     setConcurrentRecordingStatus(AppStatus.Idle);
     setStatus(AppStatus.Idle);
     setFindings([]);
+    setPatientReports([]);
     setError(null);
     setAudioBlob(null);
     setChat(null);
@@ -2192,12 +2370,15 @@ const App: React.FC = () => {
 
     setStatus(AppStatus.Success);
     setFindings(prev.findings);
+    setPatientReports(
+      prev.patientReports?.length ? prev.patientReports : splitMultiPatientFindings(prev.findings)
+    );
     setAudioBlob(prev.audioBlob);
     setChatHistory(prev.chatHistory);
     setCustomPrompt(prev.customPrompt);
     setCustomImages(prev.customImages);
     setCustomDocx(prev.customDocx || null);
-    const restoredModel = (prev.selectedModel && prev.selectedModel !== 'gemini-3.5-flash' && AVAILABLE_MODELS.some(m => m.value === prev.selectedModel))
+    const restoredModel = (prev.selectedModel && AVAILABLE_MODELS.some(m => m.value === prev.selectedModel))
       ? prev.selectedModel
       : DEFAULT_SELECTED_MODEL;
     setSelectedModel(restoredModel);
@@ -2215,6 +2396,7 @@ const App: React.FC = () => {
     try {
       const stateToSave = {
         findings: prev.findings,
+        patientReports: prev.patientReports,
         chatHistory: prev.chatHistory,
         selectedModel: restoredModel,
         customPrompt: prev.customPrompt,
@@ -2233,8 +2415,9 @@ const App: React.FC = () => {
       await saveReportSession(singleKey, stateToSave);
       safeLocalStorage.removeItem(singleKey);
       safeLocalStorage.removeItem(SINGLE_MODE_STORAGE_KEY);
-      if (prev.audioBlob) {
-        await saveAudioBlob(audioKey, prev.audioBlob);
+      const primaryAudioToSave = Array.isArray(prev.audioBlob) ? prev.audioBlob[0] : prev.audioBlob;
+      if (primaryAudioToSave) {
+        await saveAudioBlob(audioKey, primaryAudioToSave);
       }
       if (prev.compactedAudioBlob) {
         await saveAudioBlob(compactedKey, prev.compactedAudioBlob);
@@ -2911,6 +3094,8 @@ const App: React.FC = () => {
             isExperimentalAudioFilterEnabled={isExperimentalAudioFilterEnabled}
             prefilterStats={prefilterStats}
             compactedAudioBlob={compactedAudioBlob}
+            patientReports={patientReports}
+            storageScopeKey={`single_${getTabId()}`}
             onOpenMacrosModal={() => setIsMacrosModalOpen(true)}
             />
           </ErrorBoundary>
@@ -2943,9 +3128,7 @@ const App: React.FC = () => {
                   onChange={(e) => setSelectedModel(e.target.value)}
                   className="bg-slate-50 border border-slate-300 text-slate-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block p-2 w-full sm:w-auto dark:bg-slate-700 dark:border-slate-600 dark:text-white"
                 >
-                  {AVAILABLE_MODELS.map((model) => (
-                    <option key={model.value} value={model.value}>{model.label}</option>
-                  ))}
+                  <TieredModelOptgroups />
                 </select>
               </div>
 
@@ -3191,6 +3374,7 @@ const App: React.FC = () => {
     templateUsed?: string
   ) => {
     setFindings(loadedFindings);
+    setPatientReports(splitMultiPatientFindings(loadedFindings));
     setPrefilterStats(null);
     setCompactedAudioBlob(null);
     setPrefilterStatusMsg(null);
@@ -3274,7 +3458,7 @@ const App: React.FC = () => {
                 </button>
                 <button
                   id="api-keys-header-btn-mobile"
-                  onClick={() => setIsApiKeyModalOpen(true)}
+                  onClick={() => openApiKeyModal()}
                   className={`p-1.5 rounded-lg border min-h-[34px] min-w-[34px] flex items-center justify-center relative cursor-pointer shadow-xs ${
                     customKeysCount > 0
                       ? 'text-emerald-700 bg-emerald-50 dark:bg-emerald-950/40 border-emerald-300 dark:border-emerald-700/60'
@@ -3285,10 +3469,10 @@ const App: React.FC = () => {
                   aria-label="Gemini API Keys"
                   title={
                     customKeysCount > 0
-                      ? `API Keys (${customKeysCount} active)`
+                      ? `Free Gemini API Keys (${customKeysCount} active)`
                       : isSecretUnlocked
                       ? 'API Keys (Secret Mode: 9 built-in keys active)'
-                      : 'No API Key — Click to add your free Gemini API key'
+                      : 'No API Key — Click to add your Free AI Studio Gemini API Key'
                   }
                 >
                   <Key className="w-4 h-4" />
@@ -3371,7 +3555,7 @@ const App: React.FC = () => {
               </button>
               <button
                 id="api-keys-header-btn"
-                onClick={() => setIsApiKeyModalOpen(true)}
+                onClick={() => openApiKeyModal()}
                 className={`p-2 sm:p-2.5 rounded-xl transition-colors shrink-0 shadow-sm border cursor-pointer min-h-[36px] min-w-[36px] flex items-center justify-center gap-1.5 relative ${
                   customKeysCount > 0
                     ? 'text-emerald-700 dark:text-emerald-300 bg-emerald-50 dark:bg-emerald-950/40 border-emerald-300 dark:border-emerald-700/60 hover:bg-emerald-100 dark:hover:bg-emerald-900/60'
@@ -3379,13 +3563,13 @@ const App: React.FC = () => {
                     ? 'text-purple-700 dark:text-purple-300 bg-purple-50 dark:bg-purple-950/40 border-purple-300 dark:border-purple-700/60 hover:bg-purple-100 dark:hover:bg-purple-900/60'
                     : 'text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/40 border-amber-300 dark:border-amber-700/60 hover:bg-amber-100 dark:hover:bg-amber-900/60'
                 }`}
-                aria-label="Gemini API Keys & Failover"
+                aria-label="Gemini API Keys & Backup Settings"
                 title={
                   customKeysCount > 0
-                    ? `API Keys (${customKeysCount} custom keys active)`
+                    ? `Free Gemini API Keys (${customKeysCount} active)`
                     : isSecretUnlocked
                     ? 'API Keys (Secret Mode: 9 rotating keys active)'
-                    : 'No API Key Configured — Click to Add Your Key'
+                    : 'No API Key Configured — Click to Add Free Gemini API Key'
                 }
               >
                 <Key className={`w-5 h-5 shrink-0 ${
@@ -3397,7 +3581,7 @@ const App: React.FC = () => {
                 }`} />
                 <span className="text-xs font-semibold hidden md:inline">
                   {customKeysCount > 0
-                    ? `Custom Keys (${customKeysCount})`
+                    ? `API Keys (${customKeysCount})`
                     : isSecretUnlocked
                     ? 'Secret Keys (9)'
                     : 'Add API Key (!)'}
@@ -3508,7 +3692,8 @@ const App: React.FC = () => {
           </div>
 
           {/* Settings Bar */}
-          <div className="mt-4 flex flex-col sm:flex-row sm:flex-wrap justify-center items-center gap-3 sm:gap-x-6 sm:gap-y-2.5 bg-slate-100/80 dark:bg-slate-800/60 p-2.5 sm:p-3 rounded-xl border border-slate-200/70 dark:border-slate-700/60 max-w-3xl mx-auto">
+          <div className="mt-4 flex flex-col gap-2.5 bg-slate-100/80 dark:bg-slate-800/60 p-2.5 sm:p-3 rounded-xl border border-slate-200/70 dark:border-slate-700/60 max-w-4xl mx-auto">
+            <div className="flex flex-col sm:flex-row sm:flex-wrap justify-center items-center gap-3 sm:gap-x-5 sm:gap-y-2.5">
               {(status === AppStatus.Idle || isContinuousSessionReady) && (mode === 'single' || mode === 'batch' || mode === 'autonomous') && (
                   <div className="flex items-center gap-2 w-full sm:w-auto justify-between sm:justify-start">
                       <label htmlFor="model-select" className="text-xs sm:text-sm font-semibold text-slate-700 dark:text-slate-300 whitespace-nowrap">AI Model:</label>
@@ -3518,12 +3703,29 @@ const App: React.FC = () => {
                           onChange={(e) => setSelectedModel(e.target.value)}
                           className="bg-white border border-slate-300 text-slate-900 text-xs sm:text-sm rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 block p-2 flex-grow sm:flex-grow-0 dark:bg-slate-700 dark:border-slate-600 dark:placeholder-slate-400 dark:text-white font-medium"
                       >
-                          {AVAILABLE_MODELS.map((model) => (
-                              <option key={model.value} value={model.value}>{model.label}</option>
-                          ))}
+                          <TieredModelOptgroups />
                       </select>
                   </div>
               )}
+              <div className="flex items-center gap-2 w-full sm:w-auto justify-between sm:justify-start">
+                  <label htmlFor="routing-policy-select" className="text-xs sm:text-sm font-semibold text-slate-700 dark:text-slate-300 whitespace-nowrap" title="Controls how backup models are selected automatically if a model is temporarily busy or reaches its daily quota">
+                      Routing Policy:
+                  </label>
+                  <select
+                      id="routing-policy-select"
+                      value={fallbackPolicy}
+                      onChange={(e) => {
+                          const next = e.target.value as ModelFallbackPolicy;
+                          setModelFallbackPolicy(next);
+                          setFallbackPolicy(next);
+                      }}
+                      className="bg-white border border-slate-300 text-slate-900 text-xs sm:text-sm rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 block p-2 flex-grow sm:flex-grow-0 dark:bg-slate-700 dark:border-slate-600 dark:text-white font-medium"
+                  >
+                      <option value="top_and_medium">Top + Medium Auto</option>
+                      <option value="top_only">Top Quality Only</option>
+                      <option value="selected_only">Selected Model Only</option>
+                  </select>
+              </div>
               <div className="flex items-center gap-2.5 w-full sm:w-auto justify-between sm:justify-start">
                   <label
                       htmlFor="error-check-toggle"
@@ -3555,11 +3757,11 @@ const App: React.FC = () => {
                   <label
                       htmlFor="experimental-audio-filter-toggle"
                       className="text-xs sm:text-sm font-semibold text-slate-700 dark:text-slate-300 cursor-pointer flex items-center gap-1.5"
-                      title="Strips empty no-speech pauses via client-side Web Audio VAD and encodes to 32 kbps Ogg/Opus before sending final audio to your selected AI model (0 Decision-1 API calls)."
+                      title="Strips empty no-speech pauses locally via Web Audio VAD and encodes to 32 kbps Ogg/Opus before sending audio to Gemini (0 API cost)."
                   >
-                      <span>Smart Audio Pre-Trim</span>
+                      <span>Silence Trim</span>
                       <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-md bg-amber-100 text-amber-800 dark:bg-amber-900/60 dark:text-amber-200 border border-amber-200/80 dark:border-amber-700/60">
-                        (VAD Ogg/Opus 32kbps)
+                        (VAD • 0 Cost)
                       </span>
                   </label>
                   <button
@@ -3571,7 +3773,7 @@ const App: React.FC = () => {
                       role="switch"
                       aria-checked={isExperimentalAudioFilterEnabled}
                       id="experimental-audio-filter-toggle"
-                      title="Strips empty no-speech pauses via client-side Web Audio VAD and encodes to 32 kbps Ogg/Opus before sending final audio to your selected AI model (0 Decision-1 API calls)."
+                      title="Strips empty no-speech pauses locally via Web Audio VAD and encodes to 32 kbps Ogg/Opus before sending audio to Gemini (0 API cost)."
                   >
                       <span
                       className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
@@ -3580,22 +3782,106 @@ const App: React.FC = () => {
                       />
                   </button>
               </div>
+              <div className="flex items-center gap-2.5 w-full sm:w-auto justify-between sm:justify-start">
+                  <label
+                      htmlFor="prose-polish-toggle"
+                      className="text-xs sm:text-sm font-semibold text-slate-700 dark:text-slate-300 cursor-pointer flex items-center gap-1.5"
+                      title="When a backup model (e.g. Robotics ER-2 or Gemini 3.6 Flash) wins automatically, runs a fast text-only pass to refine grammar and IMPRESSION bullets."
+                  >
+                      <span>Prose Polish (2-Pass)</span>
+                  </label>
+                  <button
+                      type="button"
+                      onClick={() => {
+                        const next = !isProsePolishEnabled;
+                        setMediumProsePolishEnabled(next);
+                        setIsProsePolishEnabled(next);
+                      }}
+                      className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-teal-500 focus:ring-offset-2 dark:focus:ring-offset-slate-900 ${
+                        isProsePolishEnabled ? 'bg-teal-600' : 'bg-gray-300 dark:bg-slate-600'
+                      }`}
+                      role="switch"
+                      aria-checked={isProsePolishEnabled}
+                      id="prose-polish-toggle"
+                  >
+                      <span
+                      className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                          isProsePolishEnabled ? 'translate-x-5' : 'translate-x-0'
+                      }`}
+                      />
+                  </button>
+              </div>
+              {totalActiveKeysCount >= 2 && (
+                <div className="flex items-center gap-2.5 w-full sm:w-auto justify-between sm:justify-start">
+                    <label
+                        htmlFor="retry-top-tier-all-keys-toggle"
+                        className="text-xs sm:text-sm font-semibold text-slate-700 dark:text-slate-300 cursor-pointer flex items-center gap-1.5"
+                        title="Users with 2 or more keys who only do a few dictations a day can keep trying Gemini 4 Hydrogen / Gemini 3.8 Flash across keys when busy, even though it uses extra daily quota."
+                    >
+                        <span>Try All Keys on Top Models When Busy</span>
+                        <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-md bg-amber-100 text-amber-800 dark:bg-amber-900/60 dark:text-amber-200 border border-amber-200/80 dark:border-amber-700/60">
+                          Uses Extra Quota
+                        </span>
+                    </label>
+                    <button
+                        type="button"
+                        onClick={() => {
+                          const next = !isRetryTopTierAllKeys;
+                          setRetryTopTierAllKeysOn503Enabled(next);
+                          setIsRetryTopTierAllKeys(next);
+                        }}
+                        className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 dark:focus:ring-offset-slate-900 ${
+                          isRetryTopTierAllKeys ? 'bg-blue-600' : 'bg-gray-300 dark:bg-slate-600'
+                        }`}
+                        role="switch"
+                        aria-checked={isRetryTopTierAllKeys}
+                        id="retry-top-tier-all-keys-toggle"
+                        title="Users with 2 or more keys who only do a few dictations a day can keep trying Gemini 4 Hydrogen / Gemini 3.8 Flash across keys when busy, even though it uses extra daily quota."
+                    >
+                        <span
+                        className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                            isRetryTopTierAllKeys ? 'translate-x-5' : 'translate-x-0'
+                        }`}
+                        />
+                    </button>
+                </div>
+              )}
+            </div>
+
+            {overloadedModels.length > 0 && (
+              <div className="flex flex-wrap items-center justify-center gap-2 pt-2 border-t border-slate-200/80 dark:border-slate-700/70">
+                {overloadedModels.map((item) => {
+                  const mins = Math.max(1, Math.ceil(item.remainingMs / 60000));
+                  return (
+                    <span
+                      key={item.model}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-amber-100/90 text-amber-900 border border-amber-300 dark:bg-amber-950/60 dark:text-amber-200 dark:border-amber-700/70"
+                    >
+                      <AlertTriangle className="w-3 h-3 text-amber-600 dark:text-amber-400 shrink-0" />
+                      <span className="font-semibold">{getModelDisplayLabel(item.model)}:</span>
+                      <span>Temporarily busy — paused ({mins}m)</span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          clearModelTemporarilyUnavailable(item.model);
+                          setOverloadedModels(getOverloadedModelStates());
+                        }}
+                        className="ml-1 px-1.5 py-0.5 rounded bg-amber-600 hover:bg-amber-700 text-white font-bold text-[10px] cursor-pointer transition-colors"
+                      >
+                        Try Again
+                      </button>
+                    </span>
+                  );
+                })}
+              </div>
+            )}
           </div>
         </header>
 
-        {/* Friendly Quick-Setup Callout when no Gemini API key is configured */}
+        {/* Friendly Quick-Setup Callout when no free Gemini API key is configured */}
         {customKeysCount === 0 && !isSecretUnlocked && (
           <div
-            onClick={() => setIsApiKeyModalOpen(true)}
-            role="button"
-            tabIndex={0}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' || e.key === ' ') {
-                e.preventDefault();
-                setIsApiKeyModalOpen(true);
-              }
-            }}
-            className="mb-4 max-w-2xl mx-auto p-3 sm:p-3.5 bg-gradient-to-r from-amber-50 to-orange-50 dark:from-amber-950/50 dark:to-orange-950/40 border border-amber-300 dark:border-amber-700/80 rounded-xl shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 cursor-pointer hover:border-amber-400 transition-all"
+            className="mb-4 max-w-3xl mx-auto p-3 sm:p-3.5 bg-gradient-to-r from-amber-50 to-orange-50 dark:from-amber-950/50 dark:to-orange-950/40 border border-amber-300 dark:border-amber-700/80 rounded-xl shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 transition-all"
           >
             <div className="flex items-center gap-2.5 min-w-0">
               <div className="p-2 rounded-lg bg-amber-100 dark:bg-amber-900/70 text-amber-700 dark:text-amber-300 shrink-0">
@@ -3603,16 +3889,22 @@ const App: React.FC = () => {
               </div>
               <div className="min-w-0">
                 <p className="text-xs sm:text-sm font-bold text-amber-950 dark:text-amber-100">
-                  Gemini API Key Required to Transcribe
+                  Free Gemini API Key Needed to Transcribe
                 </p>
                 <p className="text-[11px] sm:text-xs text-amber-800 dark:text-amber-300">
-                  Free 1-minute setup in Google AI Studio (Create Project first → Create API Key → Paste any key format like AQ... or AIzaSy...).
+                  Add one or more free Google AI Studio keys to start dictating right away. Adding 2+ keys boosts reliability when a model is busy.
                 </p>
               </div>
             </div>
-            <span className="inline-flex items-center justify-center px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs shadow-2xs shrink-0">
-              Add API Key →
-            </span>
+            <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                onClick={() => openApiKeyModal()}
+                className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs shadow-2xs cursor-pointer"
+              >
+                Add Free API Key
+              </button>
+            </div>
           </div>
         )}
 
@@ -4068,12 +4360,44 @@ const App: React.FC = () => {
           }}
         />
 
-        {/* Gemini API Keys & Failover Modal */}
+        {/* Gemini API Keys & Backup Settings Modal */}
         <ApiKeyModal
           isOpen={isApiKeyModalOpen}
           onClose={() => setIsApiKeyModalOpen(false)}
           selectedModel={selectedModel}
         />
+
+        {/* Non-blocking Bottom-Left Backup Model Notice */}
+        {failoverToast && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="fixed bottom-4 left-4 z-50 max-w-sm bg-slate-900/95 dark:bg-slate-800 text-white border border-amber-500/50 rounded-xl shadow-xl px-3.5 py-2.5 flex items-start gap-2.5 text-xs animate-in fade-in slide-in-from-bottom-2 duration-200"
+          >
+            <RefreshCw className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+            <div className="min-w-0 flex-1">
+              <p className="font-bold text-amber-200">
+                Switched to Backup Model ({failoverToast.reasonLabel || (failoverToast.reason === 'service_unavailable' ? 'High Demand' : failoverToast.reason === 'rate_limit' || failoverToast.reason === 'rpd_ledger' ? 'Quota Reached' : 'Connection Retry')})
+              </p>
+              <p className="text-slate-200 mt-0.5 break-words">
+                <span className="font-medium">{failoverToast.fromModelLabel || getModelDisplayLabel(failoverToast.fromModel)}</span> → <span className="font-bold text-emerald-300">{failoverToast.toModelLabel || getModelDisplayLabel(failoverToast.toModel)}</span>
+              </p>
+              {failoverToast.userMessage && (
+                <p className="text-[11px] text-slate-300 mt-0.5 break-words">
+                  {failoverToast.userMessage}
+                </p>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={() => setFailoverToast(null)}
+              className="p-1 text-slate-400 hover:text-white rounded cursor-pointer shrink-0"
+              aria-label="Dismiss backup model notice"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
 
         {/* Universal Floating "+ New Dictation" Button for Mobile & Desktop */}
         <FloatingNewDictationButton

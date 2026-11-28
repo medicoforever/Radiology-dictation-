@@ -28,9 +28,12 @@ import DownloadIcon from './icons/DownloadIcon';
 import UploadIcon from './icons/UploadIcon';
 import CopyIcon from './icons/CopyIcon';
 import PencilIcon from './icons/PencilIcon';
+import { getModelDisplayLabel } from '../constants';
 import { ALL_RADNITO_TEMPLATES } from '../services/builtInTemplates';
 import { getDynamicTemplateStats } from '../services/templateStorage';
 import { markTabActive, getTabId, getSingleModeStorageKey, getBatchModeStorageKey } from '../services/storageService';
+import { downloadFile, findingsToRichHtml, generateRtfDocument } from '../services/docxService';
+import { generateSingleDictationHTML } from '../services/htmlGenerator';
 
 interface AutonomousModeViewProps {
   selectedModel: string;
@@ -146,6 +149,45 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
       ...prev,
       [idx]: prev[idx] === undefined ? false : !prev[idx]
     }));
+  };
+
+  const sanitizeExportFileName = (name: string, idx: number): string => {
+    const cleaned = (name || `patient-${idx + 1}`)
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '');
+    return cleaned || `patient-${idx + 1}`;
+  };
+
+  const handleDownloadPatientHtml = (bp: { name: string; findings: string[] }, idx: number) => {
+    if (!bp.findings || bp.findings.length === 0) return;
+    const html = generateSingleDictationHTML(bp.findings);
+    const base = sanitizeExportFileName(bp.name, idx);
+    downloadFile(html, `${base}.html`, 'text/html;charset=utf-8');
+  };
+
+  const handleDownloadPatientRtf = (bp: { name: string; findings: string[] }, idx: number) => {
+    if (!bp.findings || bp.findings.length === 0) return;
+    const richHtml = findingsToRichHtml(bp.findings);
+    const rtf = generateRtfDocument(richHtml, bp.name || `Patient ${idx + 1}`);
+    const base = sanitizeExportFileName(bp.name, idx);
+    downloadFile(rtf, `${base}.rtf`, 'application/rtf');
+  };
+
+  const handleDownloadAllPatientsHtml = () => {
+    if (!executionResult?.batchPatients) return;
+    executionResult.batchPatients.forEach((bp, idx) => {
+      if (!bp.findings || bp.findings.length === 0) return;
+      setTimeout(() => handleDownloadPatientHtml(bp, idx), idx * 180);
+    });
+  };
+
+  const handleDownloadAllPatientsRtf = () => {
+    if (!executionResult?.batchPatients) return;
+    executionResult.batchPatients.forEach((bp, idx) => {
+      if (!bp.findings || bp.findings.length === 0) return;
+      setTimeout(() => handleDownloadPatientRtf(bp, idx), idx * 180);
+    });
   };
 
   const handleCopyReport = async (findings: string[], idx: number) => {
@@ -556,6 +598,10 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
     setRecordedBlob(null);
     setCompactedAudioBlob(null);
     setPrefilterStats(null);
+    setFeedbackRecordedBlob(null);
+    setFeedbackTextInput('');
+    setFeedbackError(null);
+    setFeedbackSuccessMessage(null);
     try {
       await startRecording();
     } catch (err: any) {
@@ -582,6 +628,10 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
       setPrefilterStats(null);
       setExecutionResult(null);
       setErrorMessage(null);
+      setFeedbackRecordedBlob(null);
+      setFeedbackTextInput('');
+      setFeedbackError(null);
+      setFeedbackSuccessMessage(null);
     }
     if (e.target) e.target.value = '';
   };
@@ -609,6 +659,10 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
     setExecutionResult(null);
     setCompactedAudioBlob(null);
     setPrefilterStats(null);
+    setFeedbackRecordedBlob(null);
+    setFeedbackTextInput('');
+    setFeedbackError(null);
+    setFeedbackSuccessMessage(null);
 
     markTabActive('processing');
     const heartbeatTimer = setInterval(() => {
@@ -618,10 +672,11 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
     try {
       let sessionCompactedBlob: Blob | null = null;
       let sessionPrefilterStats: AudioPrefilterStats | null = null;
+      const modelDisplayName = getModelDisplayLabel(selectedModel);
       setExecutionStep(
         isExperimentalAudioFilterEnabled
-          ? `Pre-trimming audio (VAD Ogg/Opus 32 kbps) & analyzing with ${selectedModel}...`
-          : `Analyzing spoken audio with ${selectedModel}...`
+          ? `Pre-trimming audio (VAD Ogg/Opus 32 kbps) & analyzing with ${modelDisplayName}...`
+          : `Analyzing spoken audio with ${modelDisplayName}...`
       );
       const plan: AutonomousExecutionPlan = await parseAutonomousAudioDictation(
         recordedBlob,
@@ -751,7 +806,7 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
     try {
       let nextCompactedBlob: Blob | null = compactedAudioBlob;
       let nextPrefilterStats: AudioPrefilterStats | null = prefilterStats;
-      setFeedbackStep(`Analyzing feedback dictation with ${selectedModel}...`);
+      setFeedbackStep(`Analyzing feedback dictation with ${getModelDisplayLabel(selectedModel)}...`);
       const updatedPlan = await parseAutonomousFeedbackDictation(
         lastPlan,
         executionResult,
@@ -1047,7 +1102,7 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
             <span className="text-slate-600">·</span>
             <span>Templates: <strong className="text-slate-200 font-semibold">{templateStats.totalCount}</strong>{templateStats.customCount > 0 ? <span className="text-emerald-400 font-normal ml-1">({templateStats.builtInCount} + {templateStats.customCount} custom)</span> : null}</span>
             <span className="text-slate-600">·</span>
-            <span>Model: <strong className="text-indigo-400 font-mono font-semibold">{selectedModel}</strong></span>
+            <span>Model: <strong className="text-indigo-400 font-semibold">{getModelDisplayLabel(selectedModel)}</strong></span>
           </div>
 
           <div className="flex items-center gap-2 text-xs shrink-0">
@@ -1114,7 +1169,7 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
                 <span>✓ Voice Audio Ready</span>
                 <span className="text-slate-400 font-mono">({(recordedBlob.size / 1024 / 1024).toFixed(2)} MB)</span>
               </span>
-              <span className="text-slate-400">Target Model: <strong className="text-indigo-300 font-mono">{selectedModel}</strong></span>
+              <span className="text-slate-400">Target Model: <strong className="text-indigo-300">{getModelDisplayLabel(selectedModel)}</strong></span>
             </div>
 
             {audioUrl && (
@@ -1181,7 +1236,7 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
               <span>{executionStep || 'Orchestrating autonomous actions...'}</span>
             </div>
             <p className="text-xs text-slate-400">
-              Using model <strong className="text-indigo-300 font-mono">{selectedModel}</strong> to transcribe, resolve patient addenda, and dispatch reports.
+              Using model <strong className="text-indigo-300">{getModelDisplayLabel(selectedModel)}</strong> to transcribe, resolve patient addenda, and dispatch reports.
             </p>
           </div>
         )}
@@ -1508,7 +1563,29 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
                       Saved in Batch Queue
                     </span>
                   </div>
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    {executionResult.batchPatients.length > 1 && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={handleDownloadAllPatientsHtml}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-semibold transition-colors cursor-pointer"
+                          title="Download separate HTML file for each patient"
+                        >
+                          <DownloadIcon className="w-3.5 h-3.5" />
+                          <span>All HTMLs</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleDownloadAllPatientsRtf}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-indigo-700 hover:bg-indigo-600 text-white text-xs font-semibold transition-colors cursor-pointer"
+                          title="Download separate RTF file for each patient"
+                        >
+                          <DownloadIcon className="w-3.5 h-3.5" />
+                          <span>All RTFs</span>
+                        </button>
+                      </>
+                    )}
                     <button
                       type="button"
                       onClick={() => {
@@ -1545,7 +1622,7 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
                         {/* Report Header */}
                         <div
                           onClick={() => toggleExpandReport(i)}
-                          className="flex items-center justify-between p-3 sm:p-4 bg-slate-800/60 hover:bg-slate-800/80 cursor-pointer select-none transition-colors border-b border-slate-700/40"
+                          className="flex flex-wrap items-center justify-between gap-2 p-3 sm:p-4 bg-slate-800/60 hover:bg-slate-800/80 cursor-pointer select-none transition-colors border-b border-slate-700/40"
                         >
                           <div className="flex items-center gap-2.5 min-w-0">
                             <span className="w-6 h-6 rounded-full bg-indigo-600/30 text-indigo-300 border border-indigo-500/40 flex items-center justify-center text-xs font-bold shrink-0">
@@ -1561,7 +1638,33 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
                             )}
                           </div>
 
-                          <div className="flex items-center gap-2 shrink-0">
+                          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0 flex-wrap">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleDownloadPatientHtml(bp, i);
+                              }}
+                              disabled={!bp.findings || bp.findings.length === 0}
+                              className="px-2.5 py-1 rounded-lg bg-emerald-700/80 hover:bg-emerald-600 disabled:opacity-40 text-white text-xs font-semibold transition-colors flex items-center gap-1 cursor-pointer"
+                              title={`Download separate HTML report for ${bp.name}`}
+                            >
+                              <DownloadIcon className="w-3.5 h-3.5" />
+                              <span>HTML</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleDownloadPatientRtf(bp, i);
+                              }}
+                              disabled={!bp.findings || bp.findings.length === 0}
+                              className="px-2.5 py-1 rounded-lg bg-indigo-700/80 hover:bg-indigo-600 disabled:opacity-40 text-white text-xs font-semibold transition-colors flex items-center gap-1 cursor-pointer"
+                              title={`Download separate RTF report for ${bp.name}`}
+                            >
+                              <DownloadIcon className="w-3.5 h-3.5" />
+                              <span>RTF</span>
+                            </button>
                             <button
                               type="button"
                               onClick={(e) => {
@@ -1723,16 +1826,22 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
                       <span>Start Dictating Changes</span>
                     </button>
 
-                    {feedbackAudioUrl && (
+                    {(feedbackRecordedBlob || feedbackAudioUrl) && (
                       <div className="flex items-center gap-2 w-full sm:w-auto">
-                        <audio controls src={feedbackAudioUrl} className="h-9 w-48 sm:w-56 rounded-lg" />
+                        {feedbackAudioUrl && (
+                          <audio controls src={feedbackAudioUrl} className="h-9 w-48 sm:w-56 rounded-lg" />
+                        )}
                         <button
                           type="button"
-                          onClick={() => setFeedbackRecordedBlob(null)}
-                          className="text-xs text-red-400 hover:text-red-300 p-2 rounded-lg hover:bg-red-950/40 transition-colors cursor-pointer"
-                          title="Discard feedback recording"
+                          onClick={() => {
+                            setFeedbackRecordedBlob(null);
+                            setFeedbackError(null);
+                          }}
+                          className="inline-flex items-center gap-1 text-xs font-semibold text-red-400 hover:text-red-300 px-2.5 py-1.5 rounded-lg bg-red-950/30 hover:bg-red-950/60 border border-red-800/40 transition-colors cursor-pointer"
+                          title="Clear feedback recording"
                         >
-                          ✕
+                          <span>✕</span>
+                          <span>Clear Audio</span>
                         </button>
                       </div>
                     )}
@@ -1867,7 +1976,22 @@ export const AutonomousModeView: React.FC<AutonomousModeViewProps> = ({
               )}
 
               {/* Apply Changes Action Button */}
-              <div className="flex justify-end pt-1">
+              <div className="flex items-center justify-end gap-2 pt-1">
+                {(feedbackRecordedBlob || feedbackTextInput.trim()) && (
+                  <button
+                    type="button"
+                    disabled={isProcessingFeedback}
+                    onClick={() => {
+                      setFeedbackRecordedBlob(null);
+                      setFeedbackTextInput('');
+                      setFeedbackError(null);
+                    }}
+                    className="py-2.5 px-3.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 hover:text-white font-semibold text-xs transition-colors cursor-pointer disabled:opacity-40"
+                    title="Clear staged feedback audio and written instructions"
+                  >
+                    Clear Changes
+                  </button>
+                )}
                 <button
                   type="button"
                   disabled={isProcessingFeedback || (!feedbackRecordedBlob && !feedbackTextInput.trim())}

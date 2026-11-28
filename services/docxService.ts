@@ -670,38 +670,57 @@ export function isAnatomicalSubheading(text: string): boolean {
   return false;
 }
 
+function isPatientHeaderLine(text: string): boolean {
+  if (!text) return false;
+  const clean = text.replace(/^BOLD::/i, '').trim();
+  return /^-{2,}\s*PATIENT\b/i.test(clean) || /^PATIENT\s+\d+\s*(?:REPORT\b|:)/i.test(clean);
+}
+
 /**
  * Robustly detects if a line is the primary examination title / study heading.
  * Handles all modality prefixes (CT, MRI, USG, X-Ray, etc.), contrast/plain variants,
- * uppercase/mixed-case formatting, and anatomical scan study titles.
+ * uppercase/mixed-case formatting, anatomical scan study titles, and per-patient headers
+ * inside multi-patient reports.
  */
 export function isReportTitle(text: string, index: number = 0, allFindings?: string[]): boolean {
   if (!text) return false;
   const clean = text.replace(/^BOLD::/i, '').replace(/[*_~`#]+/g, '').trim();
   if (!clean) return false;
 
-  // 1. Never match IMPRESSION, Technique, Clinical Profile, or bullet points
+  // 1. Never match patient separators, IMPRESSION, Technique, Clinical Profile, or bullet points
+  if (isPatientHeaderLine(text)) return false;
   if (/^(?:IMPRESSION|TECHNIQUE|CLINICAL\s*(?:PROFILE|HISTORY))/i.test(clean)) return false;
   if (/^[•\-\*]\s+/i.test(clean)) return false;
 
   // 2. Never match intro clauses, lead-in statements, or findings ending with colon or verbs (e.g. "shows:", "reveals:", "demonstrates:", "sections show:")
   if (/:$|\b(?:shows|reveals|demonstrates|noted|seen|evaluated|show):?$/i.test(clean)) return false;
 
-  // 3. Check if this is the first non-profile finding in the report (only index 0, or index 1 if index 0 was clinical profile/patient)
-  let isEarlyLine = index === 0;
-  if (!isEarlyLine && allFindings && index === 1) {
-    const firstClean = allFindings[0]?.replace(/^BOLD::/i, '').replace(/[*_~`#]+/g, '').trim() || '';
-    if (/^Clinical\s*(Profile|History):/i.test(firstClean) || /^--- PATIENT/i.test(firstClean)) {
+  // 3. Determine the start index of the current patient's section (supports multi-patient reports)
+  let sectionStart = 0;
+  if (allFindings && index > 0) {
+    for (let p = index - 1; p >= 0; p--) {
+      if (isPatientHeaderLine(allFindings[p] || '')) {
+        sectionStart = p + 1;
+        break;
+      }
+    }
+  }
+
+  // Check if this is the first non-profile finding in the current patient section
+  let isEarlyLine = index === sectionStart;
+  if (!isEarlyLine && allFindings && index === sectionStart + 1) {
+    const firstClean = allFindings[sectionStart]?.replace(/^BOLD::/i, '').replace(/[*_~`#]+/g, '').trim() || '';
+    if (/^Clinical\s*(Profile|History):/i.test(firstClean) || isPatientHeaderLine(allFindings[sectionStart] || '')) {
       isEarlyLine = true;
     }
   }
 
-  // 4. A single report can only have ONE primary exam title!
-  // If an earlier finding was already identified as a title, no subsequent line can be the report title.
-  if (allFindings && index > 0) {
-    for (let prev = 0; prev < index; prev++) {
+  // 4. Each patient report section can only have ONE primary exam title!
+  if (allFindings && index > sectionStart) {
+    for (let prev = sectionStart; prev < index; prev++) {
       const prevClean = allFindings[prev]?.replace(/^BOLD::/i, '').replace(/[*_~`#]+/g, '').trim() || '';
       if (!prevClean) continue;
+      if (isPatientHeaderLine(prevClean)) continue;
       if (/^(?:IMPRESSION|TECHNIQUE|CLINICAL\s*(?:PROFILE|HISTORY))/i.test(prevClean)) continue;
       if (isReportTitle(prevClean, prev)) {
         return false;
@@ -709,7 +728,7 @@ export function isReportTitle(text: string, index: number = 0, allFindings?: str
     }
   }
 
-  // A primary report title MUST be an early line (at the top of the report)
+  // A primary report title MUST be an early line in the report (or current patient section)
   if (!isEarlyLine) {
     return false;
   }
@@ -755,16 +774,26 @@ export function findingsToStandardHtml(findings: string[]): { html: string; plai
   const htmlParagraphs: string[] = [];
   const plainParagraphs: string[] = [];
   const pStyle = "font-family: 'Times New Roman', serif; font-size: 12pt; margin: 0; margin-top: 0; margin-bottom: 0; padding: 0; line-height: normal; mso-line-height-rule: exactly;";
+  let sectionStartIdx = 0;
 
   findings.forEach((raw, idx) => {
     if (!raw || typeof raw !== 'string') return;
     const trimmed = raw.trim();
     if (!trimmed) return;
 
-    // Check if line 0 has Clinical Profile glued to scan title
-    if (idx === 0) {
+    // 0. Patient separator
+    if (isPatientHeaderLine(trimmed)) {
+      const cleanHeader = trimmed.replace(/^BOLD::/i, '').trim();
+      plainParagraphs.push(cleanHeader);
+      htmlParagraphs.push(`<p style="font-family: 'Times New Roman', serif; font-size: 12pt; margin-top: 14pt; margin-bottom: 6pt; line-height: normal;"><strong><u>${escapeHtml(cleanHeader)}</u></strong></p>`);
+      sectionStartIdx = idx + 1;
+      return;
+    }
+
+    // Check if first line of report or patient section has Clinical Profile glued to scan title
+    if (idx === sectionStartIdx) {
       const matchGlued = trimmed.match(/^(.*?)(?:Clinical\s*profile:?|Clinical\s*history:?)\s*(.*)$/i);
-      if (matchGlued && matchGlued[1].trim().length > 0) {
+      if (matchGlued && matchGlued[1].trim().length > 0 && matchGlued[1].trim().length < 110 && !matchGlued[1].trim().endsWith('.')) {
         const titlePart = matchGlued[1].trim().replace(/^BOLD::/i, '').replace(/[*_]+$/g, '').trim();
         const profilePart = matchGlued[2].trim().replace(/^BOLD::/i, '').trim();
         const titleUpper = titlePart.toUpperCase();
@@ -1035,16 +1064,26 @@ export function findingsToRichHtml(findings: string[]): string {
 
   const htmlParts: string[] = [];
   let isFirst = true;
+  let sectionStartIdx = 0;
 
   for (let idx = 0; idx < findings.length; idx++) {
     const finding = findings[idx];
     const trimmed = finding.trim();
     if (!trimmed) continue;
 
-    // Check if line 0 or early line has "Clinical profile:" glued to the scan title
-    if (idx === 0 || isFirst) {
+    // 0. Patient separator (resets per-patient <h1> title tracking)
+    if (isPatientHeaderLine(trimmed)) {
+      const cleanTitle = trimmed.replace(/^BOLD::/i, '').trim();
+      htmlParts.push(`<h2 style="margin-top: 24px; margin-bottom: 12px; font-size: 14pt; font-weight: bold; border-bottom: 2px solid #3b82f6; padding-bottom: 4px; color: #1d4ed8; font-family: 'Times New Roman', serif;">${escapeHtml(cleanTitle)}</h2>`);
+      isFirst = true;
+      sectionStartIdx = idx + 1;
+      continue;
+    }
+
+    // Check if line 0 or section start has "Clinical profile:" glued to the scan title
+    if (idx === sectionStartIdx || isFirst) {
       const matchGlued = trimmed.match(/^(.*?)(?:Clinical\s*profile:?|Clinical\s*history:?)\s*(.*)$/i);
-      if (matchGlued && matchGlued[1].trim().length > 0) {
+      if (matchGlued && matchGlued[1].trim().length > 0 && matchGlued[1].trim().length < 110 && !matchGlued[1].trim().endsWith('.')) {
         const titleText = matchGlued[1].trim().replace(/^BOLD::/i, '').replace(/[*_]+$/g, '').trim();
         let profText = matchGlued[2].trim().replace(/^BOLD::/i, '').trim();
         profText = profText ? cleanClinicalProfileText(`Clinical Profile: ${profText}`) : '';
@@ -1108,16 +1147,17 @@ export function findingsToRichHtml(findings: string[]): string {
       continue;
     }
 
-    // 6. Patient separator
+    // 6. Patient separator fallback
     if (trimmed.startsWith('BOLD::--- PATIENT') || trimmed.startsWith('--- PATIENT')) {
       const cleanTitle = trimmed.replace('BOLD::', '').trim();
       htmlParts.push(`<h2 style="margin-top: 24px; margin-bottom: 12px; font-size: 14pt; font-weight: bold; border-bottom: 2px solid #3b82f6; padding-bottom: 4px; color: #1d4ed8; font-family: 'Times New Roman', serif;">${escapeHtml(cleanTitle)}</h2>`);
-      isFirst = false;
+      isFirst = true;
+      sectionStartIdx = idx + 1;
       continue;
     }
 
-    // 7. Report title (index 0 or all-caps header)
-    if (isFirst && (idx === 0 || (trimmed === trimmed.toUpperCase() && trimmed.length < 100 && !trimmed.startsWith('BOLD::')))) {
+    // 7. Report title (index 0, patient section start, or all-caps exam header)
+    if (isReportTitle(trimmed, idx, findings)) {
       const cleanTitle = trimmed
         .replace(/^BOLD::/i, '')
         .replace(/\s*clinical\s*(profile|history)\s*:?.*$/i, '')
@@ -1371,7 +1411,9 @@ export function generateRtfDocument(htmlOrText: string, title = 'Radiology Repor
     const lines = htmlOrText.replace(/<[^>]+>/g, '\n').split('\n').map(l => l.trim()).filter(Boolean);
     for (let idx = 0; idx < lines.length; idx++) {
       const line = lines[idx];
-      if (idx === 0) {
+      if (isPatientHeaderLine(line)) {
+        paragraphs.push(`\\pard\\sa60\\sb140\\sl276\\slmult1\\b\\fs24 ${escapeRtf(line)}\\b0\\par`);
+      } else if (idx === 0 || isReportTitle(line, idx, lines)) {
         const cleanH1 = line.replace(/\s*clinical\s*(profile|history)\s*:?.*$/i, '').trim();
         paragraphs.push(`\\pard\\qc\\sa180\\sb60\\b\\ul\\fs28 ${escapeRtf(cleanH1)}\\ul0\\b0\\par`);
       } else if (/^\*?\s*clinical\s*(profile|history):/i.test(line)) {
@@ -2061,8 +2103,8 @@ export async function generateDocxFromFindings(findings: string[], title = 'Radi
       }
     }
 
-    // Title line at index 0
-    if (idx === 0 && !hasEmittedTitle) {
+    // Title line at index 0 or per-patient section start
+    if (!hasEmittedTitle && isReportTitle(raw, idx, findings)) {
       const examName = raw
         .replace(/^BOLD::/i, '')
         .replace(/\s*clinical\s*(profile|history)\s*:?.*$/i, '')
@@ -2181,8 +2223,9 @@ export async function generateDocxFromFindings(findings: string[], title = 'Radi
     }
 
     // Patient separator
-    if (raw.startsWith('BOLD::--- PATIENT') || raw.startsWith('--- PATIENT')) {
-      const cleanPatient = raw.replace('BOLD::', '').trim();
+    if (isPatientHeaderLine(raw)) {
+      const cleanPatient = raw.replace(/^BOLD::/i, '').trim();
+      hasEmittedTitle = false;
       paragraphs.push(
         new Paragraph({
           heading: HeadingLevel.HEADING_2,

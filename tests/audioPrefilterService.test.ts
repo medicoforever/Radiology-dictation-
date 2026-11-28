@@ -23,7 +23,59 @@ import {
   type SpeechInterval,
 } from '../services/audioPrefilterService';
 import { safeLocalStorage } from '../services/storageService';
-import { AVAILABLE_MODELS, DEFAULT_SELECTED_MODEL } from '../constants';
+import {
+  AVAILABLE_MODELS,
+  DEFAULT_SELECTED_MODEL,
+  FREE_TIER_MEDIUM_MODELS,
+  GEMINI_FLASH_LITE_MODEL,
+  LIVE_DICTATION_MODELS,
+  ROBOTICS_QUALITY_DIRECTIVES,
+  getFreeTierModelFallbackChain,
+  getLiveModelFallbackChain,
+  getModelDisplayLabel,
+  getOptimalThinkingLevel,
+  resolveQuotaPoolModel,
+} from '../constants';
+import {
+  MODEL_FAILOVER_EVENT,
+  clearAllModelUnavailableCooldowns,
+  clearModelTemporarilyUnavailable,
+  executeWithApiKeyFailover,
+  getCandidateKeysForOperation,
+  getOverloadedModelStates,
+  getTotalActiveApiKeyCount,
+  isModelTemporarilyUnavailable,
+  isNetworkFetchError,
+  isRetryTopTierAllKeysOn503Enabled,
+  lockBuiltinKeys,
+  markModelTemporarilyUnavailable,
+  resetApiKeyHealthState,
+  setMediumProsePolishEnabled,
+  setModelFallbackPolicy,
+  setRetryTopTierAllKeysOn503Enabled,
+  setUserApiKeys,
+  unlockBuiltinKeys,
+} from '../services/apiKeyService';
+import {
+  deleteUploadedFile,
+  generateContentWithJsonFallback,
+  generateContentWithJsonFallbackMeta,
+  processAudio,
+  runClinicalQaErrorCheck,
+  uploadBlobViaFilesApi,
+  waitForUploadedFileActive,
+} from '../services/geminiService';
+import {
+  deleteDictateChangesAudio,
+  getDictateChangesAudio,
+  hasStoredDictateChangesAudio,
+  saveDictateChangesAudio,
+} from '../services/audioStorage';
+import {
+  LIVE_CHUNK_MAX_SEC,
+  LIVE_CHUNK_MIN_SPEECH_SEC,
+  LIVE_CHUNK_SILENCE_MS,
+} from '../hooks/useLiveSession';
 
 function makeSineBurst(sampleRate: number, durationSec: number, amplitude: number, freqHz = 320): Float32Array {
   const len = Math.round(sampleRate * durationSec);
@@ -691,23 +743,42 @@ test('filterAudioInputsForModel combines multi-audio inputs and downloads origin
   }
 });
 
-test('AVAILABLE_MODELS places Robotics ER-2 3rd and Gemini 3 Flash 4th while keeping other models untouched', () => {
+test('AVAILABLE_MODELS and LIVE_DICTATION_MODELS expose exact 8 free-tier selectable models in order', () => {
   assert.equal(DEFAULT_SELECTED_MODEL, 'gemini-4-hydrogen');
-  assert.deepEqual(
-    AVAILABLE_MODELS.map((m) => m.value),
-    [
-      'gemini-4-hydrogen',
-      'gemini-3.8-flash',
-      'gemini-robotics-er-2-preview',
-      'gemini-3-flash-preview',
-      'gemini-3.5-flash',
-      'gemini-3.6-flash',
-      'gemini-3.5-flash-lite',
-      'gemini-3.1-pro-preview',
-    ]
-  );
+  const expectedOrder = [
+    'gemini-4-hydrogen',
+    'gemini-3.8-flash',
+    'gemini-robotics-er-2-preview',
+    'gemini-3.6-flash',
+    'gemini-3-flash-preview',
+    'gemini-3.5-flash',
+    'gemini-3.5-flash-lite',
+    'gemini-3.1-pro-preview',
+  ];
+  assert.deepEqual(AVAILABLE_MODELS.map((m) => m.value), expectedOrder);
+  assert.deepEqual(LIVE_DICTATION_MODELS.map((m) => m.value), expectedOrder);
+  assert.deepEqual(FREE_TIER_MEDIUM_MODELS, [
+    'gemini-robotics-er-2-preview',
+    'gemini-3.6-flash',
+    'gemini-3-flash-preview',
+  ]);
+
+  assert.equal(AVAILABLE_MODELS[0].label, 'Gemini 4 Hydrogen');
+  assert.equal(AVAILABLE_MODELS[0].tier, 'top');
   assert.equal(AVAILABLE_MODELS[2].label, 'Gemini Robotics ER-2 Preview');
-  assert.equal(AVAILABLE_MODELS[3].label, 'Gemini 3 Flash');
+  assert.equal(AVAILABLE_MODELS[2].tier, 'medium');
+  assert.equal(AVAILABLE_MODELS[3].label, 'Gemini 3.6 Flash');
+  assert.equal(AVAILABLE_MODELS[3].quotaBucket, 'gemini-3.6-flash');
+  assert.equal(AVAILABLE_MODELS[4].label, 'Gemini 3 Flash Preview');
+  assert.equal(AVAILABLE_MODELS[5].quotaBucket, 'gemini-3.6-flash');
+  assert.equal(AVAILABLE_MODELS[6].tier, 'low');
+  assert.equal(AVAILABLE_MODELS[7].label, 'Gemini 3.1 Pro Preview');
+  assert.equal(AVAILABLE_MODELS[7].tier, 'top');
+  for (const m of AVAILABLE_MODELS) {
+    assert.equal('paidOnly' in m, false);
+  }
+  assert.equal(getModelDisplayLabel('gemini-3-flash-preview'), 'Gemini 3 Flash Preview');
+  assert.equal(getModelDisplayLabel('gemini-4-hydrogen'), 'Gemini 4 Hydrogen');
 });
 
 test('filterAudioInputsForModel uses VAD-Only Ogg/Opus 32 kbps with zero Decision-1 API calls on multi-window speech', async () => {
@@ -816,5 +887,695 @@ test('filterAudioInputsForModel uses VAD-Only Ogg/Opus 32 kbps with zero Decisio
     else (globalThis as any).AudioEncoder = prevAudioEncoder;
     if (prevAudioData === undefined) delete (globalThis as any).AudioData;
     else (globalThis as any).AudioData = prevAudioData;
+  }
+});
+
+function createMockBrowserEnv() {
+  const localMap = new Map<string, string>();
+  const sessionMap = new Map<string, string>();
+  const makeStorage = (map: Map<string, string>) => ({
+    get length() {
+      return map.size;
+    },
+    key(index: number) {
+      return Array.from(map.keys())[index] ?? null;
+    },
+    getItem(key: string) {
+      return map.has(key) ? map.get(key)! : null;
+    },
+    setItem(key: string, val: string) {
+      map.set(key, String(val));
+    },
+    removeItem(key: string) {
+      map.delete(key);
+    },
+    clear() {
+      map.clear();
+    },
+  });
+  return {
+    localMap,
+    sessionMap,
+    window: {
+      localStorage: makeStorage(localMap),
+      sessionStorage: makeStorage(sessionMap),
+      dispatchEvent: () => true,
+    },
+  };
+}
+
+test('adaptive 503 cooldown steps 5m -> 15m -> 30m -> 60m, persists to sessionStorage, and resets on 200', () => {
+  const prevWindow = (globalThis as any).window;
+  const mockEnv = createMockBrowserEnv();
+  (globalThis as any).window = mockEnv.window;
+
+  try {
+    resetApiKeyHealthState();
+    clearAllModelUnavailableCooldowns();
+
+    const t0 = 1_700_000_000_000;
+    const s1 = markModelTemporarilyUnavailable('gemini-4-hydrogen', t0)!;
+    assert.equal(s1.strikes, 1);
+    assert.equal(s1.remainingMs, 5 * 60_000);
+    assert.equal(isModelTemporarilyUnavailable('gemini-4-hydrogen', t0 + 4 * 60_000), true);
+    assert.equal(isModelTemporarilyUnavailable('gemini-4-hydrogen', t0 + 5 * 60_000 + 1), false);
+
+    // Strike 2 after 5m expiry escalates to 15m
+    const t1 = t0 + 5 * 60_000 + 1000;
+    const s2 = markModelTemporarilyUnavailable('gemini-4-hydrogen', t1)!;
+    assert.equal(s2.strikes, 2);
+    assert.equal(s2.remainingMs, 15 * 60_000);
+
+    // Strike 3 escalates to 30m, Strike 4+ caps at 60m
+    const t2 = t1 + 15 * 60_000 + 1000;
+    const s3 = markModelTemporarilyUnavailable('gemini-4-hydrogen', t2)!;
+    assert.equal(s3.strikes, 3);
+    assert.equal(s3.remainingMs, 30 * 60_000);
+
+    const t3 = t2 + 30 * 60_000 + 1000;
+    const s4 = markModelTemporarilyUnavailable('gemini-4-hydrogen', t3)!;
+    assert.equal(s4.strikes, 4);
+    assert.equal(s4.remainingMs, 60 * 60_000);
+
+    const s5 = markModelTemporarilyUnavailable('gemini-4-hydrogen', t3 + 60 * 60_000 + 1000)!;
+    assert.equal(s5.strikes, 5);
+    assert.equal(s5.remainingMs, 60 * 60_000);
+
+    // sessionStorage persisted + getOverloadedModelStates reports active cooldown
+    assert.ok(mockEnv.sessionMap.has('raddoc_overloaded_models_v1'));
+    const activeStates = getOverloadedModelStates(t3 + 60 * 60_000 + 2000);
+    assert.equal(activeStates.length, 1);
+    assert.equal(activeStates[0].model, 'gemini-4-hydrogen');
+
+    // Reset on 200 OK restores strike counter back to 1 (5m)
+    clearModelTemporarilyUnavailable('gemini-4-hydrogen');
+    assert.equal(isModelTemporarilyUnavailable('gemini-4-hydrogen', t3 + 60 * 60_000 + 2000), false);
+    const afterReset = markModelTemporarilyUnavailable('gemini-4-hydrogen', t3 + 70 * 60_000)!;
+    assert.equal(afterReset.strikes, 1);
+    assert.equal(afterReset.remainingMs, 5 * 60_000);
+  } finally {
+    clearAllModelUnavailableCooldowns();
+    (globalThis as any).window = prevWindow;
+  }
+});
+
+test('key-count-aware 503 caps: 1 try for <=2 keys, 2 tries for >=3 keys (failFast), and >=2-key Top-Tier willing retry option', async () => {
+  const prevWindow = (globalThis as any).window;
+  const prevFetch = globalThis.fetch;
+  const mockEnv = createMockBrowserEnv();
+  (globalThis as any).window = mockEnv.window;
+
+  try {
+    resetApiKeyHealthState();
+    setModelFallbackPolicy('top_and_medium');
+    setRetryTopTierAllKeysOn503Enabled(false);
+    lockBuiltinKeys();
+
+    // 1) <= 2 keys with failFastOnModelUnavailable: true -> caps 503 tries at 1
+    setUserApiKeys(['AIzaSyTestKeyOne0001', 'AIzaSyTestKeyTwo0002']);
+    assert.equal(getTotalActiveApiKeyCount(), 2);
+    let tries2 = 0;
+    await assert.rejects(
+      () =>
+        executeWithApiKeyFailover(
+          async () => {
+            tries2++;
+            const err: any = new Error('503 UNAVAILABLE high demand');
+            err.status = 503;
+            throw err;
+          },
+          { selectedModel: 'gemini-4-hydrogen', failFastOnModelUnavailable: true, delayMs: 0 }
+        ),
+      /503/
+    );
+    assert.equal(tries2, 1);
+
+    // 2) >= 3 keys (e.g. 9 keys unlocked) with failFastOnModelUnavailable: true -> caps 503 tries at 2, catches ~22% shedding
+    setUserApiKeys([]);
+    unlockBuiltinKeys('1198');
+    const { candidateKeys: unlockedPool } = getCandidateKeysForOperation('gemini-4-hydrogen');
+    assert.equal(unlockedPool.length, 9);
+    assert.equal(getTotalActiveApiKeyCount(), 9);
+
+    let tries9Systemic = 0;
+    await assert.rejects(
+      () =>
+        executeWithApiKeyFailover(
+          async () => {
+            tries9Systemic++;
+            const err: any = new Error('503 model overloaded');
+            err.status = 503;
+            throw err;
+          },
+          { selectedModel: 'gemini-3.8-flash', failFastOnModelUnavailable: true, delayMs: 0 }
+        ),
+      /503/
+    );
+    assert.equal(tries9Systemic, 2);
+
+    // Recovers on key #2 when key #1 experiences probabilistic 503 shedding
+    let tries9Probabilistic = 0;
+    const recoveredVal = await executeWithApiKeyFailover(
+      async () => {
+        tries9Probabilistic++;
+        if (tries9Probabilistic === 1) {
+          const err: any = new Error('503 transient shedding');
+          err.status = 503;
+          throw err;
+        }
+        return 'ok-on-2nd-key';
+      },
+      { selectedModel: 'gemini-4-hydrogen', failFastOnModelUnavailable: true, delayMs: 0 }
+    );
+    assert.equal(recoveredVal, 'ok-on-2nd-key');
+    assert.equal(tries9Probabilistic, 2);
+
+    // 3) failFastOnModelUnavailable: false (selected_only) caps 503 at min(N, 3), while allowFullPoolOn503 / 429 uses all 9
+    setModelFallbackPolicy('selected_only');
+    let triesSelectedOnly503 = 0;
+    await assert.rejects(
+      () =>
+        executeWithApiKeyFailover(
+          async () => {
+            triesSelectedOnly503++;
+            const err: any = new Error('503 unavailable');
+            err.status = 503;
+            throw err;
+          },
+          { selectedModel: 'gemini-4-hydrogen', failFastOnModelUnavailable: false, delayMs: 0 }
+        ),
+      /503/
+    );
+    assert.equal(triesSelectedOnly503, 3);
+
+    let triesFullPoolOn503 = 0;
+    await assert.rejects(
+      () =>
+        executeWithApiKeyFailover(
+          async () => {
+            triesFullPoolOn503++;
+            const err: any = new Error('503 unavailable');
+            err.status = 503;
+            throw err;
+          },
+          { selectedModel: 'gemini-4-hydrogen', failFastOnModelUnavailable: false, allowFullPoolOn503: true, delayMs: 0 }
+        ),
+      /503/
+    );
+    assert.equal(triesFullPoolOn503, 9);
+
+    let triesFullPoolOn429 = 0;
+    await assert.rejects(
+      () =>
+        executeWithApiKeyFailover(
+          async () => {
+            triesFullPoolOn429++;
+            const err: any = new Error('429 RESOURCE_EXHAUSTED');
+            err.status = 429;
+            throw err;
+          },
+          { selectedModel: 'gemini-4-hydrogen', failFastOnModelUnavailable: false, delayMs: 0 }
+        ),
+      /429/
+    );
+    assert.equal(triesFullPoolOn429, 9);
+
+    // 4) >= 2 active keys + isRetryTopTierAllKeysOn503Enabled() retries ALL active keys on Top-Tier before failing over
+    setModelFallbackPolicy('top_and_medium');
+    setRetryTopTierAllKeysOn503Enabled(true);
+    assert.equal(isRetryTopTierAllKeysOn503Enabled(), true);
+    resetApiKeyHealthState();
+
+    let topTierAttempts = 0;
+    globalThis.fetch = (async (url: string) => {
+      if (String(url).includes('gemini-4-hydrogen')) {
+        topTierAttempts++;
+        if (topTierAttempts < 9) {
+          return new Response(JSON.stringify({ error: { message: '503 busy' } }), { status: 503 });
+        }
+        return new Response(
+          JSON.stringify({ candidates: [{ content: { parts: [{ text: '{"findings":["BOLD::Recovered on 9th key."]}' }] } }] }),
+          { status: 200 }
+        );
+      }
+      throw new Error(`Should not fail over before trying all 9 keys: ${url}`);
+    }) as any;
+
+    const topRetryRes = await generateContentWithJsonFallbackMeta('gemini-4-hydrogen', [{ text: 'Transcribe' }]);
+    assert.equal(topRetryRes.winningModel, 'gemini-4-hydrogen');
+    assert.equal(topTierAttempts, 9);
+
+    // With < 2 keys (only 1 key), Top-Tier stays strictly at 1 try even if setting is true
+    lockBuiltinKeys();
+    setUserApiKeys(['AIzaSySingleKeyOnly0001']);
+    assert.equal(getTotalActiveApiKeyCount(), 1);
+    let singleKeyHydrogenTries = 0;
+    let fallback38Tries = 0;
+    globalThis.fetch = (async (url: string) => {
+      if (String(url).includes('gemini-4-hydrogen')) {
+        singleKeyHydrogenTries++;
+        return new Response(JSON.stringify({ error: { message: '503 busy' } }), { status: 503 });
+      }
+      if (String(url).includes('gemini-3.8-flash')) {
+        fallback38Tries++;
+        return new Response(
+          JSON.stringify({ candidates: [{ content: { parts: [{ text: '{"findings":["BOLD::Fallback 3.8 ok."]}' }] } }] }),
+          { status: 200 }
+        );
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    }) as any;
+
+    const singleKeyRes = await generateContentWithJsonFallbackMeta('gemini-4-hydrogen', [{ text: 'Transcribe' }]);
+    assert.equal(singleKeyHydrogenTries, 1);
+    assert.equal(fallback38Tries, 1);
+    assert.equal(singleKeyRes.winningModel, 'gemini-3.8-flash');
+
+    // Custom keys are strictly ordered before built-in 9 backup keys
+    unlockBuiltinKeys('1198');
+    setUserApiKeys(['AIzaSyCustomKeyPriority001']);
+    const { candidateKeys: combinedPool, isCustom, hasBuiltinBackup } = getCandidateKeysForOperation('gemini-4-hydrogen');
+    assert.equal(isCustom, true);
+    assert.equal(hasBuiltinBackup, true);
+    assert.equal(combinedPool[0], 'AIzaSyCustomKeyPriority001');
+    assert.equal(combinedPool.length, 10);
+    assert.equal(getTotalActiveApiKeyCount(), 10);
+  } finally {
+    setRetryTopTierAllKeysOn503Enabled(false);
+    resetApiKeyHealthState();
+    (globalThis as any).window = prevWindow;
+    globalThis.fetch = prevFetch;
+  }
+});
+
+test('tiered fallback chains dedup aliases, exclude flash-lite & 3.1-pro from auto-fallback, and respect policies', () => {
+  assert.equal(resolveQuotaPoolModel('gemini-3.5-flash'), 'gemini-3.6-flash');
+  assert.equal(resolveQuotaPoolModel('gemini-3.7-flash'), 'gemini-3.8-flash');
+
+  // top_and_medium includes Top + Medium (3.6-flash before 3-flash-preview), excludes 3.5-flash-lite & 3.1-pro-preview
+  const fullChain = getFreeTierModelFallbackChain('gemini-4-hydrogen', 'top_and_medium');
+  assert.deepEqual(fullChain, [
+    'gemini-4-hydrogen',
+    'gemini-3.8-flash',
+    'gemini-robotics-er-2-preview',
+    'gemini-3.6-flash',
+    'gemini-3-flash-preview',
+  ]);
+  assert.equal(fullChain.includes(GEMINI_FLASH_LITE_MODEL), false);
+  assert.equal(fullChain.includes('gemini-3.1-pro-preview'), false);
+
+  // Explicit 3.1-pro-preview puts it at index 0 with normal fallback chain behind it
+  const explicitPro = getFreeTierModelFallbackChain('gemini-3.1-pro-preview', 'top_and_medium');
+  assert.equal(explicitPro[0], 'gemini-3.1-pro-preview');
+  assert.equal(explicitPro[1], 'gemini-4-hydrogen');
+
+  // Alias deduplication: 3.5-flash removes 3.6-flash; 3.7-flash removes 3.8-flash
+  const alias35 = getFreeTierModelFallbackChain('gemini-3.5-flash', 'top_and_medium');
+  assert.equal(alias35[0], 'gemini-3.5-flash');
+  assert.equal(alias35.includes('gemini-3.6-flash'), false);
+
+  const alias37 = getFreeTierModelFallbackChain('gemini-3.7-flash', 'top_and_medium');
+  assert.equal(alias37[0], 'gemini-3.7-flash');
+  assert.equal(alias37.includes('gemini-3.8-flash'), false);
+
+  // top_only excludes Medium and Low models
+  assert.deepEqual(
+    getFreeTierModelFallbackChain('gemini-4-hydrogen', 'top_only'),
+    ['gemini-4-hydrogen', 'gemini-3.8-flash']
+  );
+
+  // selected_only returns strictly the selected model
+  assert.deepEqual(
+    getFreeTierModelFallbackChain('gemini-robotics-er-2-preview', 'selected_only'),
+    ['gemini-robotics-er-2-preview']
+  );
+
+  // Live fallback chain also excludes flash-lite unless explicitly selected
+  const liveDefault = getLiveModelFallbackChain('gemini-4-hydrogen', 'top_and_medium');
+  assert.equal(liveDefault.includes(GEMINI_FLASH_LITE_MODEL), false);
+  const liveExplicitLite = getLiveModelFallbackChain(GEMINI_FLASH_LITE_MODEL, 'top_and_medium');
+  assert.equal(liveExplicitLite[0], GEMINI_FLASH_LITE_MODEL);
+});
+
+test('getOptimalThinkingLevel calibrates Robotics high thinking, quality directives, and 2-pass Flash-Lite polish', async () => {
+  assert.equal(getOptimalThinkingLevel('gemini-4-hydrogen', 'transcription'), 'low');
+  assert.equal(getOptimalThinkingLevel('gemini-4-hydrogen', 'reasoning'), 'medium');
+  assert.equal(getOptimalThinkingLevel('gemini-3.8-flash', 'transcription'), 'medium');
+  assert.equal(getOptimalThinkingLevel('gemini-3.6-flash', 'reasoning'), 'medium');
+  assert.equal(getOptimalThinkingLevel('gemini-3.5-flash', 'live_chunk'), 'medium');
+  assert.equal(getOptimalThinkingLevel('gemini-robotics-er-2-preview', 'transcription'), 'high');
+  assert.equal(getOptimalThinkingLevel('gemini-robotics-er-2-preview', 'reasoning'), 'high');
+  assert.equal(getOptimalThinkingLevel('gemini-robotics-er-2-preview', 'live_chunk'), 'low');
+  assert.equal(getOptimalThinkingLevel('gemini-3-flash-preview', 'transcription'), 'low');
+  assert.equal(getOptimalThinkingLevel('gemini-3-flash-preview', 'live_chunk'), 'minimal');
+  assert.equal(getOptimalThinkingLevel('gemini-3.5-flash-lite', 'transcription'), 'minimal');
+  assert.equal(getOptimalThinkingLevel('gemini-3.5-flash-lite', 'reasoning'), 'high');
+
+  const prevWindow = (globalThis as any).window;
+  const prevFetch = globalThis.fetch;
+  const mockEnv = createMockBrowserEnv();
+  (globalThis as any).window = mockEnv.window;
+
+  try {
+    resetApiKeyHealthState();
+    setModelFallbackPolicy('top_and_medium');
+    setMediumProsePolishEnabled(true);
+    setUserApiKeys(['AIzaSyTestRoboticsKey0001']);
+
+    const capturedCalls: Array<{ url: string; body: any }> = [];
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      const parsedBody = JSON.parse(String(init?.body || '{}'));
+      capturedCalls.push({ url: String(url), body: parsedBody });
+
+      if (String(url).includes('gemini-robotics-er-2-preview')) {
+        return new Response(
+          JSON.stringify({
+            candidates: [
+              {
+                content: {
+                  parts: [
+                    { text: 'internal reasoning', thought: true },
+                    {
+                      text: JSON.stringify({
+                        findings: [
+                          'BOLD::Undisplaced occipital bone fracture with extra axial hematoma.',
+                          'IMPRESSION:###• Undisplaced occipital bone fracture.###• Extra axial hematoma.',
+                        ],
+                      }),
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+
+      // Stage-2 Flash-Lite polish call
+      return new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    text: JSON.stringify({
+                      findings: [
+                        'BOLD::Undisplaced occipital bone fracture with extra axial hematoma (polished).',
+                        'IMPRESSION:###• Undisplaced occipital bone fracture.###• Extra axial hematoma.',
+                      ],
+                    }),
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    }) as any;
+
+    const audioBlob = new Blob([encodePcmToWavBytes(makeSineBurst(16000, 0.3, 0.1), 16000)], { type: 'audio/wav' });
+    const out = await processAudio(audioBlob, 'gemini-robotics-er-2-preview');
+
+    assert.equal(capturedCalls.length, 2);
+    // Pass 1: Robotics ER-2 with thinkingLevel: 'high' and ROBOTICS_QUALITY_DIRECTIVES injected
+    assert.ok(capturedCalls[0].url.includes('gemini-robotics-er-2-preview:generateContent'));
+    assert.equal(capturedCalls[0].body.generationConfig.thinkingConfig.thinkingLevel, 'high');
+    const roboticsTextParts = capturedCalls[0].body.contents[0].parts
+      .map((p: any) => p.text || '')
+      .join('\n');
+    assert.ok(roboticsTextParts.includes('Undisplaced'));
+    assert.ok(roboticsTextParts.includes('extra axial'));
+    assert.ok(roboticsTextParts.includes(ROBOTICS_QUALITY_DIRECTIVES));
+
+    // Pass 2: Flash-Lite text polish with thinkingLevel: 'high'
+    assert.ok(capturedCalls[1].url.includes(`${GEMINI_FLASH_LITE_MODEL}:generateContent`));
+    assert.equal(capturedCalls[1].body.generationConfig.thinkingConfig.thinkingLevel, 'high');
+    assert.ok(out[0].includes('(polished)'));
+
+    // Verify Top-tier model skips ROBOTICS_QUALITY_DIRECTIVES and skips Flash-Lite Stage-2 polish
+    capturedCalls.length = 0;
+    await generateContentWithJsonFallback('gemini-4-hydrogen', [{ text: 'Transcribe' }]);
+    assert.equal(capturedCalls.length, 1);
+    assert.equal(capturedCalls[0].body.generationConfig.thinkingConfig.thinkingLevel, 'low');
+    assert.equal(
+      capturedCalls[0].body.contents[0].parts.some((p: any) => String(p.text || '').includes('CLINICAL PRECISION')),
+      false
+    );
+  } finally {
+    setMediumProsePolishEnabled(false);
+    resetApiKeyHealthState();
+    (globalThis as any).window = prevWindow;
+    globalThis.fetch = prevFetch;
+  }
+});
+
+test('direct fetch Files API avoids User-Agent/Content-Length, network fetch errors fail over cleanly, and plain-English notices emit', async () => {
+  const prevWindow = (globalThis as any).window;
+  const prevFetch = globalThis.fetch;
+  const mockEnv = createMockBrowserEnv();
+  const dispatchedEvents: any[] = [];
+  (mockEnv.window as any).dispatchEvent = (evt: any) => {
+    dispatchedEvents.push(evt);
+    return true;
+  };
+  (globalThis as any).window = mockEnv.window;
+
+  try {
+    resetApiKeyHealthState();
+    setModelFallbackPolicy('top_and_medium');
+    lockBuiltinKeys();
+    setUserApiKeys(['AIzaSyDirectFilesKey0001', 'AIzaSyDirectFilesKey0002']);
+
+    // 1) Pure fetch Files API omits forbidden User-Agent & Content-Length headers
+    const sentHeaderNames: string[][] = [];
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      const headers = (init?.headers || {}) as Record<string, string>;
+      sentHeaderNames.push(Object.keys(headers).map((h) => h.toLowerCase()));
+      const u = String(url);
+      if (u.includes('/upload/v1beta/files')) {
+        return new Response(null, {
+          status: 200,
+          headers: { 'X-Goog-Upload-URL': 'https://generativelanguage.googleapis.com/upload/session_123' },
+        });
+      }
+      if (u.includes('/upload/session_123')) {
+        return new Response(
+          JSON.stringify({
+            file: {
+              name: 'files/abc123',
+              uri: 'https://generativelanguage.googleapis.com/v1beta/files/abc123',
+              mimeType: 'audio/wav',
+              state: 'PROCESSING',
+            },
+          }),
+          { status: 200 }
+        );
+      }
+      if (u.endsWith('/v1beta/files/abc123') && init?.method === 'GET') {
+        return new Response(
+          JSON.stringify({
+            name: 'files/abc123',
+            uri: 'https://generativelanguage.googleapis.com/v1beta/files/abc123',
+            mimeType: 'audio/wav',
+            state: 'ACTIVE',
+          }),
+          { status: 200 }
+        );
+      }
+      if (u.endsWith('/v1beta/files/abc123') && init?.method === 'DELETE') {
+        return new Response(null, { status: 200 });
+      }
+      throw new Error(`Unexpected URL: ${u}`);
+    }) as any;
+
+    const uploaded = await uploadBlobViaFilesApi(new Blob(['abc'], { type: 'audio/wav' }), 'audio/wav', 'AIzaSyDirectFilesKey0001', 'clip.wav');
+    assert.equal(uploaded.name, 'files/abc123');
+    const active = await waitForUploadedFileActive(uploaded.name, 'AIzaSyDirectFilesKey0001');
+    assert.equal(active.state, 'ACTIVE');
+    await deleteUploadedFile(uploaded.name, 'AIzaSyDirectFilesKey0001');
+
+    for (const hdrList of sentHeaderNames) {
+      assert.equal(hdrList.includes('user-agent'), false);
+      assert.equal(hdrList.includes('content-length'), false);
+      assert.equal(hdrList.includes('x-goog-api-key'), true);
+    }
+
+    // 2) Repeated network fetch failures on gemini-3-flash-preview fail over to next model cleanly
+    assert.equal(isNetworkFetchError(new Error('exception TypeError: Failed to fetch sending request')), true);
+    dispatchedEvents.length = 0;
+
+    globalThis.fetch = (async (url: string) => {
+      const u = String(url);
+      if (u.includes('gemini-3-flash-preview')) {
+        throw new Error('exception TypeError: Failed to fetch sending request');
+      }
+      if (u.includes('gemini-4-hydrogen')) {
+        return new Response(
+          JSON.stringify({ candidates: [{ content: { parts: [{ text: '{"findings":["BOLD::Recovered after network drop."]}' }] } }] }),
+          { status: 200 }
+        );
+      }
+      throw new Error(`Unexpected URL: ${u}`);
+    }) as any;
+
+    const failoverRes = await generateContentWithJsonFallbackMeta('gemini-3-flash-preview', [{ text: 'Transcribe' }]);
+    assert.equal(failoverRes.winningModel, 'gemini-4-hydrogen');
+    assert.ok(failoverRes.text.includes('Recovered after network drop.'));
+    const failoverEvt = dispatchedEvents.find((e) => e?.type === MODEL_FAILOVER_EVENT);
+    assert.ok(failoverEvt);
+    assert.equal(failoverEvt.detail.fromModelLabel, 'Gemini 3 Flash Preview');
+    assert.equal(failoverEvt.detail.toModelLabel, 'Gemini 4 Hydrogen');
+    assert.equal(/503|429|Strike/i.test(failoverEvt.detail.userMessage), false);
+
+    // 3) Plain-English error message on strict model failure (no raw 503/429/Strike jargon)
+    setModelFallbackPolicy('selected_only');
+    globalThis.fetch = (async () => {
+      return new Response(JSON.stringify({ error: { message: 'overloaded' } }), { status: 503 });
+    }) as any;
+    await assert.rejects(
+      () => generateContentWithJsonFallbackMeta('gemini-4-hydrogen', [{ text: 'Transcribe' }]),
+      (err: any) => {
+        const msg = String(err?.message || '');
+        assert.ok(msg.includes('Gemini 4 Hydrogen'));
+        assert.equal(/\b(?:503|429|Strike)\b/i.test(msg), false);
+        return true;
+      }
+    );
+
+    // 4) Scoped dictate_changes audio metadata isolation & delete cleanup
+    await saveDictateChangesAudio(new Blob(['a'], { type: 'audio/webm' }), 'Edit A', 'scopeA');
+    await saveDictateChangesAudio(new Blob(['b'], { type: 'audio/webm' }), 'Edit B', 'scopeB');
+    assert.equal(hasStoredDictateChangesAudio('scopeA'), true);
+    assert.equal(hasStoredDictateChangesAudio('scopeB'), true);
+    assert.equal(hasStoredDictateChangesAudio('scopeC'), false);
+    await deleteDictateChangesAudio('scopeA');
+    assert.equal(hasStoredDictateChangesAudio('scopeA'), false);
+    assert.equal(hasStoredDictateChangesAudio('scopeB'), true);
+    await deleteDictateChangesAudio();
+    assert.equal(hasStoredDictateChangesAudio('scopeB'), false);
+    assert.equal(await getDictateChangesAudio('scopeB'), null);
+  } finally {
+    setModelFallbackPolicy('top_and_medium');
+    resetApiKeyHealthState();
+    (globalThis as any).window = prevWindow;
+    globalThis.fetch = prevFetch;
+  }
+});
+
+test('runClinicalQaErrorCheck isolates detailed error identification strictly onto Flash-Lite', async () => {
+  const prevWindow = (globalThis as any).window;
+  const prevFetch = globalThis.fetch;
+  const mockEnv = createMockBrowserEnv();
+  (globalThis as any).window = mockEnv.window;
+
+  try {
+    resetApiKeyHealthState();
+    setModelFallbackPolicy('top_and_medium');
+    setUserApiKeys(['AIzaSyQaIsolationKey0001']);
+
+    const calledModels: string[] = [];
+    globalThis.fetch = (async (url: string) => {
+      const u = String(url);
+      if (u.endsWith('/v1beta/decisions')) {
+        return new Response(
+          JSON.stringify({
+            answers: {
+              has_laterality_contradiction: { noul: 0.91, confidence: 0.95 },
+              has_normal_vs_abnormal_contradiction: { noul: 0.05, confidence: 0.95 },
+              impression_contradicts_or_omits_finding: { noul: 0.05, confidence: 0.95 },
+              impression_contains_numbers: { noul: 0.02, confidence: 0.95 },
+              critical_finding_urgency: { score: 1, probabilities: { '1': 0.9 } },
+              report_completeness: { score: 3, probabilities: { '3': 0.95 } },
+            },
+          }),
+          { status: 200 }
+        );
+      }
+      calledModels.push(u);
+      return new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    text: JSON.stringify({
+                      errors: [{ findingIndex: 0, errorDescription: 'Laterality conflict.', severity: 'WARNING' }],
+                    }),
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        { status: 200 }
+      );
+    }) as any;
+
+    const qaRes = await runClinicalQaErrorCheck(
+      ['Right kidney stone.', 'IMPRESSION:###Left nephrolithiasis.'],
+      'gemini-4-hydrogen'
+    );
+    assert.equal(qaRes.errors.length, 1);
+    assert.equal(calledModels.length, 1);
+    assert.ok(calledModels[0].includes(`${GEMINI_FLASH_LITE_MODEL}:generateContent`));
+    assert.equal(calledModels[0].includes('gemini-4-hydrogen'), false);
+
+    // Also when Decisions API fails, fallback still uses Flash-Lite exclusively (and never cascades to 4-hydrogen/3.8)
+    calledModels.length = 0;
+    globalThis.fetch = (async (url: string) => {
+      const u = String(url);
+      if (u.endsWith('/v1beta/decisions')) {
+        return new Response(JSON.stringify({ error: { message: 'Decisions unavailable' } }), { status: 503 });
+      }
+      calledModels.push(u);
+      return new Response(JSON.stringify({ error: { message: '429 quota' } }), { status: 429 });
+    }) as any;
+
+    const fallbackRes = await runClinicalQaErrorCheck(['Lungs clear.'], 'gemini-4-hydrogen');
+    assert.deepEqual(fallbackRes.errors, []);
+    assert.equal(calledModels.length, 1);
+    assert.ok(calledModels[0].includes(`${GEMINI_FLASH_LITE_MODEL}:generateContent`));
+  } finally {
+    resetApiKeyHealthState();
+    (globalThis as any).window = prevWindow;
+    globalThis.fetch = prevFetch;
+  }
+});
+
+test('useLiveSession 5-RPM cadence constants and storageService enum/JSON validation', () => {
+  assert.equal(LIVE_CHUNK_MIN_SPEECH_SEC, 3.0);
+  assert.equal(LIVE_CHUNK_SILENCE_MS, 900);
+  assert.equal(LIVE_CHUNK_MAX_SEC, 12.0);
+
+  const prevWindow = (globalThis as any).window;
+  const mockEnv = createMockBrowserEnv();
+  (globalThis as any).window = mockEnv.window;
+
+  try {
+    mockEnv.localMap.set('raddoc_retry_top_tier_all_keys_on_503', 'true');
+    mockEnv.localMap.set('raddoc_model_fallback_policy', 'top_only');
+    mockEnv.localMap.set('raddoc_medium_prose_polish', 'true');
+    safeLocalStorage.validateAndCleanStorage();
+
+    // Valid enum & JSON entries are preserved
+    assert.equal(mockEnv.localMap.get('raddoc_retry_top_tier_all_keys_on_503'), 'true');
+    assert.equal(mockEnv.localMap.get('raddoc_model_fallback_policy'), 'top_only');
+    assert.equal(mockEnv.localMap.get('raddoc_medium_prose_polish'), 'true');
+
+    // Invalid enum / corrupt JSON entries are purged
+    mockEnv.localMap.set('raddoc_model_fallback_policy', 'invalid_policy');
+    mockEnv.localMap.set('raddoc_retry_top_tier_all_keys_on_503', '{bad_json');
+    mockEnv.sessionMap.set('raddoc_overloaded_models_v1', '{bad_session');
+    safeLocalStorage.validateAndCleanStorage();
+
+    assert.equal(mockEnv.localMap.has('raddoc_model_fallback_policy'), false);
+    assert.equal(mockEnv.localMap.has('raddoc_retry_top_tier_all_keys_on_503'), false);
+    assert.equal(mockEnv.sessionMap.has('raddoc_overloaded_models_v1'), false);
+  } finally {
+    (globalThis as any).window = prevWindow;
   }
 });

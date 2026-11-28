@@ -1,5 +1,7 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import {  findingsToRichHtml, generateRtfDocument, generateWordHtmlDoc, generateDocxFromHtml, downloadFile , findingsToStandardHtml, sanitizeHtmlForClipboard } from '../services/docxService';
+import { generateSingleDictationHTML } from '../services/htmlGenerator';
+import { splitMultiPatientFindings, joinMultiPatientFindings, PatientReportSegment } from '../services/templateHandling';
 import CopyIcon from './icons/CopyIcon';
 import DownloadIcon from './icons/DownloadIcon';
 import SparklesIcon from './icons/SparklesIcon';
@@ -8,6 +10,8 @@ import QuickMacroInsertPopover from './QuickMacroInsertPopover';
 interface RichTextReportEditorProps {
   findings: string[];
   templateName?: string | null;
+  patientLabel?: string | null;
+  disableInternalPatientTabs?: boolean;
   onUpdateFindings?: (newFindings: string[]) => void;
   onOpenMacrosModal?: () => void;
 }
@@ -15,6 +19,8 @@ interface RichTextReportEditorProps {
 export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
   findings,
   templateName,
+  patientLabel = null,
+  disableInternalPatientTabs = false,
   onUpdateFindings,
   onOpenMacrosModal,
 }) => {
@@ -25,17 +31,45 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
   const [charCount, setCharCount] = useState<number>(0);
   const [isSynced, setIsSynced] = useState<boolean>(true);
   const lastInitialHtmlRef = useRef<string>('');
+  const [activePatientIndex, setActivePatientIndex] = useState<number | null>(null);
 
-  // Convert initial findings to rich HTML when findings change from outside
+  const patientSegments = useMemo<PatientReportSegment[]>(() => {
+    if (disableInternalPatientTabs) return [];
+    return splitMultiPatientFindings(findings);
+  }, [findings, disableInternalPatientTabs]);
+
+  const hasMultiPatients = !disableInternalPatientTabs && patientSegments.length > 1;
+
   useEffect(() => {
-    const richHtml = findingsToRichHtml(findings);
+    if (!hasMultiPatients) {
+      setActivePatientIndex(null);
+    } else if (activePatientIndex !== null && activePatientIndex >= patientSegments.length) {
+      setActivePatientIndex(0);
+    }
+  }, [hasMultiPatients, activePatientIndex, patientSegments.length]);
+
+  const activePatientSegment =
+    hasMultiPatients && activePatientIndex !== null
+      ? (patientSegments[activePatientIndex] || null)
+      : null;
+
+  const displayedFindings = useMemo(() => {
+    return activePatientSegment ? activePatientSegment.findings : findings;
+  }, [activePatientSegment, findings]);
+
+  const effectivePatientLabel = activePatientSegment?.label || patientLabel || null;
+
+  // Convert displayed findings to rich HTML when findings or active patient change from outside
+  useEffect(() => {
+    const richHtml = findingsToRichHtml(displayedFindings);
     setContentHtml(richHtml);
+    setIsSynced(true);
     lastInitialHtmlRef.current = richHtml;
     if (editorRef.current) {
       editorRef.current.innerHTML = richHtml;
       updateMetrics();
     }
-  }, [findings]);
+  }, [displayedFindings]);
 
   const updateMetrics = () => {
     if (!editorRef.current) return;
@@ -82,7 +116,7 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
       cleanHtml = sanitizeHtmlForClipboard(editorRef.current.innerHTML);
       plainText = editorRef.current.innerText || editorRef.current.textContent || '';
     } else {
-      const result = findingsToStandardHtml(findings);
+      const result = findingsToStandardHtml(displayedFindings);
       cleanHtml = sanitizeHtmlForClipboard(result.html);
       plainText = result.plainText || editorRef.current.innerText || editorRef.current.textContent || '';
     }
@@ -125,7 +159,7 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
     if (!isSynced && editorRef.current) {
       cleanHtml = sanitizeHtmlForClipboard(editorRef.current.innerHTML);
     } else {
-      cleanHtml = findingsToStandardHtml(findings).html;
+      cleanHtml = findingsToStandardHtml(displayedFindings).html;
     }
 
     try {
@@ -138,9 +172,15 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
     setTimeout(() => setCopyStatus(null), 3500);
   };
 
+  const getExportTitle = (labelOverride?: string | null) => {
+    const baseTitle = templateName ? `${templateName} Report` : 'Radiology Merged Report';
+    const label = labelOverride !== undefined ? labelOverride : effectivePatientLabel;
+    return label ? `${label} - ${baseTitle}` : baseTitle;
+  };
+
   const handleDownloadHtml = () => {
     if (!editorRef.current) return;
-    const title = templateName ? `${templateName} Report` : 'Radiology Merged Report';
+    const title = getExportTitle();
     const fullHtml = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -169,7 +209,7 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
   </div>
 </body>
 </html>`;
-    const fileName = `${title.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${new Date().toISOString().slice(0, 10)}.html`;
+    const fileName = `${title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')}-${new Date().toISOString().slice(0, 10)}.html`;
     downloadFile(fullHtml, fileName, 'text/html');
   };
 
@@ -177,17 +217,17 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
 
   const handleDownloadWordDoc = async () => {
     if (!editorRef.current) return;
-    const title = templateName ? `${templateName} Report` : 'Radiology Merged Report';
+    const title = getExportTitle();
     setIsExportingDocx(true);
     try {
       // Generate genuine binary .docx file using OpenXML Packer
       const docxBlob = await generateDocxFromHtml(editorRef.current.innerHTML, title);
-      const fileName = `${title.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${new Date().toISOString().slice(0, 10)}.docx`;
+      const fileName = `${title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')}-${new Date().toISOString().slice(0, 10)}.docx`;
       downloadFile(docxBlob, fileName, 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
     } catch (err) {
       console.error('Failed to export genuine docx, falling back to legacy doc format:', err);
       const htmlDoc = generateWordHtmlDoc(editorRef.current.innerHTML, title);
-      const fileName = `${title.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${new Date().toISOString().slice(0, 10)}.doc`;
+      const fileName = `${title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')}-${new Date().toISOString().slice(0, 10)}.doc`;
       downloadFile(htmlDoc, fileName, 'application/msword');
     } finally {
       setIsExportingDocx(false);
@@ -196,10 +236,35 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
 
   const handleDownloadRtf = () => {
     if (!editorRef.current) return;
-    const title = templateName ? `${templateName} Report` : 'Radiology Merged Report';
+    const title = getExportTitle();
     const rtfDoc = generateRtfDocument(editorRef.current.innerHTML, title);
-    const fileName = `${title.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${new Date().toISOString().slice(0, 10)}.rtf`;
+    const fileName = `${title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')}-${new Date().toISOString().slice(0, 10)}.rtf`;
     downloadFile(rtfDoc, fileName, 'application/rtf');
+  };
+
+  const handleDownloadAllSeparateHtmls = () => {
+    if (!hasMultiPatients) return;
+    const dateStamp = new Date().toISOString().slice(0, 10);
+    patientSegments.forEach((seg, idx) => {
+      const slug = `${seg.label.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')}-${dateStamp}`;
+      const htmlDoc = generateSingleDictationHTML(seg.findings);
+      setTimeout(() => {
+        downloadFile(htmlDoc, `${slug || `patient-${idx + 1}`}.html`, 'text/html;charset=utf-8');
+      }, idx * 180);
+    });
+  };
+
+  const handleDownloadAllSeparateRtfs = () => {
+    if (!hasMultiPatients) return;
+    const dateStamp = new Date().toISOString().slice(0, 10);
+    patientSegments.forEach((seg, idx) => {
+      const title = getExportTitle(seg.label);
+      const slug = `${title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')}-${dateStamp}`;
+      const rtfDoc = generateRtfDocument(findingsToRichHtml(seg.findings), title);
+      setTimeout(() => {
+        downloadFile(rtfDoc, `${slug || `patient-${idx + 1}`}.rtf`, 'application/rtf');
+      }, idx * 180);
+    });
   };
 
   const handlePrint = () => {
@@ -209,7 +274,7 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
       window.print();
       return;
     }
-    const title = templateName ? `${templateName} Report` : 'Radiology Merged Report';
+    const title = getExportTitle();
     printWindow.document.write(`
       <!DOCTYPE html>
       <html>
@@ -270,7 +335,14 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
         }
         return p;
       });
-      onUpdateFindings(sanitized);
+      if (hasMultiPatients && activePatientIndex !== null) {
+        const updatedSegments = patientSegments.map((seg, idx) =>
+          idx === activePatientIndex ? { ...seg, findings: sanitized } : seg
+        );
+        onUpdateFindings(joinMultiPatientFindings(updatedSegments));
+      } else {
+        onUpdateFindings(sanitized);
+      }
       setIsSynced(true);
     }
   };
@@ -280,9 +352,9 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
       {/* Header Banner */}
       <div className="bg-gradient-to-r from-blue-700 via-blue-600 to-indigo-700 text-white px-5 py-4 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
         <div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <span className="bg-white/20 text-white text-[11px] font-bold px-2.5 py-0.5 rounded-full uppercase tracking-wider">
-              Primary Editor
+              {effectivePatientLabel ? effectivePatientLabel : 'Primary Editor'}
             </span>
             <span className="text-xs text-blue-100 font-medium">
               {templateName ? `Template: ${templateName}` : 'Merged Report'}
@@ -298,6 +370,28 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
 
         {/* Top Header Actions */}
         <div className="flex flex-wrap items-center gap-1.5 self-stretch sm:self-auto justify-end">
+          {hasMultiPatients && (
+            <>
+              <button
+                type="button"
+                onClick={handleDownloadAllSeparateHtmls}
+                className="flex items-center gap-1 px-2.5 py-1.5 bg-emerald-800/90 hover:bg-emerald-900 text-white font-bold text-xs rounded-lg shadow-sm transition-all cursor-pointer"
+                title="Download a separate HTML file for each patient report"
+              >
+                <DownloadIcon className="w-3.5 h-3.5" />
+                All HTMLs ({patientSegments.length})
+              </button>
+              <button
+                type="button"
+                onClick={handleDownloadAllSeparateRtfs}
+                className="flex items-center gap-1 px-2.5 py-1.5 bg-indigo-900/90 hover:bg-indigo-950 text-white font-bold text-xs rounded-lg shadow-sm transition-all cursor-pointer"
+                title="Download a separate RTF file for each patient report"
+              >
+                <DownloadIcon className="w-3.5 h-3.5" />
+                All RTFs ({patientSegments.length})
+              </button>
+            </>
+          )}
           <button
             type="button"
             onClick={handleCopyRichText}
@@ -354,6 +448,37 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
           </button>
         </div>
       </div>
+
+      {hasMultiPatients && (
+        <div className="bg-blue-50/90 dark:bg-slate-800/95 border-b border-blue-200 dark:border-slate-700 px-4 py-2 flex flex-wrap items-center gap-1.5">
+          <span className="text-[11px] font-bold text-blue-900 dark:text-blue-200 mr-1">Patient View:</span>
+          <button
+            type="button"
+            onClick={() => setActivePatientIndex(null)}
+            className={`px-2.5 py-1 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
+              activePatientIndex === null
+                ? 'bg-blue-600 text-white shadow-2xs'
+                : 'bg-white dark:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-600 hover:bg-blue-100/60'
+            }`}
+          >
+            All Combined ({patientSegments.length})
+          </button>
+          {patientSegments.map((seg, idx) => (
+            <button
+              key={seg.id || `rtf-pt-${idx}`}
+              type="button"
+              onClick={() => setActivePatientIndex(idx)}
+              className={`px-2.5 py-1 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
+                activePatientIndex === idx
+                  ? 'bg-blue-600 text-white shadow-2xs'
+                  : 'bg-white dark:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-600 hover:bg-blue-100/60'
+              }`}
+            >
+              {seg.label}
+            </button>
+          ))}
+        </div>
+      )}
 
       {/* Formatting Toolbar */}
       <div className="bg-slate-50 dark:bg-slate-800/90 border-b border-slate-200 dark:border-slate-700 px-4 py-2.5 flex flex-wrap items-center gap-2 select-none">
@@ -470,7 +595,16 @@ export const RichTextReportEditor: React.FC<RichTextReportEditorProps> = ({
           onOpenManagerModal={onOpenMacrosModal}
           onInsertMacroFindings={(expandedLines) => {
             if (onUpdateFindings) {
-              onUpdateFindings([...findings, ...expandedLines]);
+              if (hasMultiPatients && activePatientIndex !== null) {
+                const updatedSegments = patientSegments.map((seg, idx) =>
+                  idx === activePatientIndex
+                    ? { ...seg, findings: [...seg.findings, ...expandedLines] }
+                    : seg
+                );
+                onUpdateFindings(joinMultiPatientFindings(updatedSegments));
+              } else {
+                onUpdateFindings([...findings, ...expandedLines]);
+              }
             } else if (editorRef.current) {
               const htmlSnippet = expandedLines
                 .map(line => `<p><strong>${line.replace(/^BOLD::/i, '')}</strong></p>`)

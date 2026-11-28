@@ -4,18 +4,36 @@ import WaveformIcon from './icons/WaveformIcon';
 import YinYangMicIcon from './icons/YinYangMicIcon';
 import WarningIcon from './icons/WarningIcon';
 import DownloadIcon from './icons/DownloadIcon';
-import ResultsDisplay from './ResultsDisplay';
+import ResultsDisplay, { TieredModelOptgroups } from './ResultsDisplay';
 import CustomPromptInput, { DocxTemplateData } from './ui/CustomPromptInput';
-import { DEFAULT_LIVE_MODEL, LIVE_DICTATION_MODELS, getLiveModelFallbackChain } from '../constants';
+import { DEFAULT_LIVE_MODEL, LIVE_DICTATION_MODELS, ModelFallbackPolicy, getLiveModelFallbackChain, getModelDisplayLabel } from '../constants';
+import { API_KEYS_UPDATED_EVENT, API_KEY_SETTINGS_UPDATED_EVENT, getModelFallbackPolicy } from '../services/apiKeyService';
 import { getIncompleteLiveAudioSessions, recoverLiveSessionAudioAsBlob, clearSessionAudioCache } from '../services/audioCacheService';
 import { triggerAudioDownload } from '../services/audioMerger';
+
+function formatLiveStatusForUser(raw: string): string {
+    if (!raw) return raw;
+    let formatted = raw
+        .replace(/Auto-failover:\s*/gi, 'Backup switch: ')
+        .replace(/\bfailed\s*\([^)]*503[^)]*\)\s*—\s*switching to subsequent model/gi, 'is busy right now — smoothly switching to')
+        .replace(/\bfailed\s*\([^)]*429[^)]*\)\s*—\s*switching to subsequent model/gi, 'reached its short-term limit — smoothly switching to')
+        .replace(/\bfailed\s*\(([^)]*)\)\s*—\s*switching to subsequent model/gi, 'was interrupted — smoothly switching to')
+        .replace(/\bHTTP\s*503\b|\b503\s*UNAVAILABLE\b|\b503\s*High\s*Demand\b/gi, 'temporarily busy')
+        .replace(/\bHTTP\s*429\b|\b429\s*Rate\s*Limit\b|\b429\b/gi, 'short-term limit reached');
+
+    formatted = formatted.replace(/\bmodels\/[a-z0-9.-]+\b|\bgemini-[a-z0-9.-]+\b/gi, (match) =>
+        getModelDisplayLabel(match)
+    );
+    return formatted;
+}
 
 interface LiveDictationProps {
     onComplete: (transcript: string, audioBlob: Blob | null) => void;
     onBack: () => void;
+    onOpenMacrosModal?: () => void;
 }
 
-const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack }) => {
+const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack, onOpenMacrosModal }) => {
     const [findings, setFindings] = useState<string[]>([]);
     const [customPrompt, setCustomPrompt] = useState('');
     const [customImages, setCustomImages] = useState<Array<{ data: string; mimeType: string }>>([]);
@@ -23,6 +41,21 @@ const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack }) => 
     const [selectedModel, setSelectedModel] = useState<string>(DEFAULT_LIVE_MODEL || 'gemini-4-hydrogen');
     const [interruptedSession, setInterruptedSession] = useState<{ sessionId: string; createdAt: number; totalChunks: number } | null>(null);
     const [isRecovering, setIsRecovering] = useState(false);
+    const [fallbackPolicy, setFallbackPolicy] = useState<ModelFallbackPolicy>(() => getModelFallbackPolicy());
+
+    useEffect(() => {
+        const syncConfig = () => {
+            setFallbackPolicy(getModelFallbackPolicy());
+        };
+        window.addEventListener(API_KEYS_UPDATED_EVENT, syncConfig);
+        window.addEventListener(API_KEY_SETTINGS_UPDATED_EVENT, syncConfig);
+        return () => {
+            window.removeEventListener(API_KEYS_UPDATED_EVENT, syncConfig);
+            window.removeEventListener(API_KEY_SETTINGS_UPDATED_EVENT, syncConfig);
+        };
+    }, []);
+
+    const liveFallbackChain = getLiveModelFallbackChain(selectedModel, fallbackPolicy);
 
     useEffect(() => {
         getIncompleteLiveAudioSessions().then(sessions => {
@@ -196,7 +229,7 @@ const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack }) => 
                     Live Dictation Mode
                 </h2>
                 <p className="text-slate-500 dark:text-slate-400 mb-6 text-center max-w-lg text-sm sm:text-base">
-                    Real-time speech recognition and continuous medical transcription powered by <strong className="text-emerald-700 dark:text-emerald-400">{selectedModel}</strong>. Features smart acoustic voice detection, custom instruction & template enforcement, and automatic 2-model failover protection against rate limits.
+                    Real-time speech recognition and continuous medical transcription powered by <strong className="text-emerald-700 dark:text-emerald-400">{getModelDisplayLabel(selectedModel)}</strong>. Features smart acoustic voice detection, custom instruction &amp; template enforcement, and {liveFallbackChain.length > 1 ? `automatic ${liveFallbackChain.length}-model backup protection when a model is busy` : 'strict selected-model-only routing'}.
                 </p>
 
                 {/* Model Selector Card */}
@@ -209,21 +242,23 @@ const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack }) => 
                             <select
                                 value={selectedModel}
                                 onChange={(e) => setSelectedModel(e.target.value)}
-                                className="bg-white dark:bg-slate-800 border border-emerald-300 dark:border-emerald-700 text-slate-800 dark:text-slate-100 font-mono text-sm font-semibold rounded-lg px-2.5 py-1 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                                className="bg-white dark:bg-slate-800 border border-emerald-300 dark:border-emerald-700 text-slate-800 dark:text-slate-100 text-sm font-semibold rounded-lg px-2.5 py-1 focus:outline-none focus:ring-2 focus:ring-emerald-500"
                             >
-                                {LIVE_DICTATION_MODELS.map(m => (
-                                    <option key={m.value} value={m.value}>
-                                        {m.label}
-                                    </option>
-                                ))}
+                                <TieredModelOptgroups models={LIVE_DICTATION_MODELS} />
                             </select>
                         </div>
                         <p className="text-[11px] text-emerald-700/80 dark:text-emerald-400/80 mt-1.5 leading-snug">
-                            Auto-failover chain: <span className="font-mono font-semibold">{getLiveModelFallbackChain(selectedModel).join(' → ')}</span>
+                            {fallbackPolicy === 'selected_only' || liveFallbackChain.length <= 1 ? (
+                                <>Routing: <span className="font-semibold">{getModelDisplayLabel(selectedModel)}</span> (selected model only)</>
+                            ) : (
+                                <>Automatic backup order: <span className="font-semibold">{liveFallbackChain.map(getModelDisplayLabel).join(' → ')}</span></>
+                            )}
                         </p>
                     </div>
                     <span className="inline-flex items-center self-start sm:self-center px-2.5 py-1 rounded-full text-xs font-medium bg-emerald-100 text-emerald-800 dark:bg-emerald-800/50 dark:text-emerald-200 whitespace-nowrap">
-                        🛡️ 2-Model Failover Safe
+                        {fallbackPolicy === 'selected_only' || liveFallbackChain.length <= 1
+                            ? '🎯 Selected Model Only'
+                            : `🛡️ ${liveFallbackChain.length}-Model Backup Safe`}
                     </span>
                 </div>
 
@@ -270,7 +305,7 @@ const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack }) => 
                 </div>
 
                 <div className="mt-2 text-center text-sm min-h-[20px]">
-                    {error ? <span className="text-red-500 font-medium">{error}</span> : <span className="text-slate-500 dark:text-slate-400">{status}</span>}
+                    {error ? <span className="text-red-500 font-medium">{formatLiveStatusForUser(error)}</span> : <span className="text-slate-500 dark:text-slate-400">{formatLiveStatusForUser(status)}</span>}
                 </div>
             </div>
         );
@@ -280,8 +315,8 @@ const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack }) => 
         <ResultsDisplay
             isLive={true}
             onStopLive={handleStop}
-            liveStatus={status}
-            liveError={error}
+            liveStatus={formatLiveStatusForUser(status)}
+            liveError={error ? formatLiveStatusForUser(error) : null}
             audioLevel={audioLevel}
             isPausedLive={isPaused}
             findings={findings}
@@ -296,6 +331,7 @@ const LiveDictation: React.FC<LiveDictationProps> = ({ onComplete, onBack }) => 
             customDocx={customDocx}
             onCustomDocxChange={setCustomDocx}
             onReset={handleSafeBack}
+            onOpenMacrosModal={onOpenMacrosModal}
             audioBlob={null}
             chatHistory={[]}
             isChatting={false}

@@ -1,27 +1,102 @@
 import { GoogleGenAI, Type, GenerateContentResponse, Chat } from "@google/genai";
-import { DEFAULT_LIVE_MODEL, DEFAULT_GEMINI_PROMPT, REPROCESS_GEMINI_PROMPT, TEMPLATE_GEMINI_PROMPT, REPORT_TEMPLATES, ERROR_IDENTIFIER_PROMPT, INITIAL_AGENT_PROMPT, REFINEMENT_AGENT_PROMPT, SYNTHESIZER_AGENT_PROMPT, VISUAL_TEMPLATE_GEMINI_PROMPT, getLiveModelFallbackChain, DEFAULT_SELECTED_MODEL, ReportTemplate } from '../constants';
+import {
+  DEFAULT_LIVE_MODEL,
+  DEFAULT_GEMINI_PROMPT,
+  REPROCESS_GEMINI_PROMPT,
+  TEMPLATE_GEMINI_PROMPT,
+  REPORT_TEMPLATES,
+  ERROR_IDENTIFIER_PROMPT,
+  INITIAL_AGENT_PROMPT,
+  REFINEMENT_AGENT_PROMPT,
+  SYNTHESIZER_AGENT_PROMPT,
+  VISUAL_TEMPLATE_GEMINI_PROMPT,
+  getLiveModelFallbackChain,
+  getFreeTierModelFallbackChain,
+  DEFAULT_SELECTED_MODEL,
+  GEMINI_FLASH_LITE_MODEL,
+  ROBOTICS_QUALITY_DIRECTIVES,
+  getModelDisplayLabel,
+  getModelQualityTier,
+  getOptimalThinkingLevel,
+  ModelTaskType,
+  ReportTemplate,
+} from '../constants';
 import { IdentifiedError } from "../types";
 import { isTableRowFinding } from "./docxService";
 import { expandMacrosInFindings, expandMacrosInSingleText, getMacroPromptContext } from "./macroDictionaryService";
-import { executeWithApiKeyFailover, getRandomAIClient, getClientForApiKey } from "./apiKeyService";
+import {
+  MODEL_FAILOVER_EVENT,
+  ModelFailoverEventDetail,
+  emitModelFailoverNotice,
+  clearModelTemporarilyUnavailable,
+  executeWithApiKeyFailover,
+  getCandidateKeysForOperation,
+  getClientForApiKey,
+  getModelFallbackPolicy,
+  getRandomAIClient,
+  getTotalActiveApiKeyCount,
+  isMediumProsePolishEnabled,
+  isModelLevelServiceUnavailableError,
+  isModelTemporarilyUnavailable,
+  isNetworkFetchError,
+  isRetryTopTierAllKeysOn503Enabled,
+  isStrictSelectedModelOnlyEnabled,
+  markModelTemporarilyUnavailable,
+} from "./apiKeyService";
 import { findTemplateByIdOrNumber } from "./templateStorage";
-import { buildCombinedTemplateBundle, canonicalizeTemplateIdToken, extractTemplateTagIds, mergeTemplateImages, DocxTemplateData as BundleDocxTemplateData } from "./upcomingTemplateService";
+import { buildCombinedTemplateBundle, extractTemplateTagIds, mergeTemplateImages, DocxTemplateData as BundleDocxTemplateData } from "./upcomingTemplateService";
+import {
+  CustomDocxInput,
+  DetectedTemplateInfo,
+  PatientReportSegment,
+  canonicalizeTemplateIdToken,
+  detectAndExtractTemplate,
+  extractSpokenTemplateDirective,
+  findBuiltinTemplate,
+  findBuiltinTemplates,
+  joinMultiPatientFindings,
+  splitMultiPatientFindings,
+} from "./templateHandling";
+
+export {
+  MODEL_FAILOVER_EVENT,
+  detectAndExtractTemplate,
+  emitModelFailoverNotice,
+  extractSpokenTemplateDirective,
+  findBuiltinTemplate,
+  findBuiltinTemplates,
+  joinMultiPatientFindings,
+  splitMultiPatientFindings,
+};
+export type { CustomDocxInput, DetectedTemplateInfo, ModelFailoverEventDetail, PatientReportSegment };
 
 export const getAI = (): GoogleGenAI => {
   return getRandomAIClient();
 };
 
-export const blobToBase64 = (blob: Blob): Promise<string> => {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      const base64data = reader.result as string;
-      // remove the "data:audio/ogg;base64," part
-      resolve(base64data.split(',')[1]);
-    };
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
+export const blobToBase64 = async (blob: Blob): Promise<string> => {
+  if (typeof FileReader !== 'undefined') {
+    return await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const base64data = reader.result as string;
+        // remove the "data:audio/ogg;base64," part
+        resolve(base64data.split(',')[1] || '');
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  }
+  const ab = await blob.arrayBuffer();
+  if (typeof Buffer !== 'undefined') {
+    return Buffer.from(ab).toString('base64');
+  }
+  const bytes = new Uint8Array(ab);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
 };
 
 export const base64ToBlob = (base64: string, mimeType: string): Blob => {
@@ -137,6 +212,10 @@ function isTransientOrKeyError(err: any): boolean {
     msg.includes('timeout') ||
     msg.includes('timed out') ||
     msg.includes('failed to fetch') ||
+    msg.includes('sending request') ||
+    msg.includes('fetch failed') ||
+    msg.includes('load failed') ||
+    msg.includes('networkerror') ||
     msg.includes('network')
   );
 }
@@ -395,197 +474,904 @@ export function extractErrorsFromResponse(rawText?: string | null): IdentifiedEr
   return [];
 }
 
+export const SAFE_INLINE_MEDIA_BYTES = Math.floor(14.5 * 1024 * 1024);
+const DEFAULT_GENERATE_CONTENT_TIMEOUT_MS = 60_000;
+
+export interface UploadedGeminiFileRef {
+  name: string;
+  uri: string;
+  mimeType: string;
+  apiKey: string;
+}
+
+export interface BlobContentPartDescriptor {
+  blob: Blob;
+  cleanMime: string;
+  headerText?: string;
+  textPartText?: string;
+  contextPartText?: string;
+  inlineBase64?: string;
+}
+
+function isQuotaOrRateLimitExceededError(err: any): boolean {
+  if (!err) return false;
+  if (getErrorStatusCode(err) === 429) return true;
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return (
+    msg.includes('resource_exhausted') ||
+    msg.includes('quota') ||
+    msg.includes('rate limit') ||
+    msg.includes('too many requests')
+  );
+}
+
+function findHealthyFailoverTarget(chain: string[], fromIndex: number): string | null {
+  if (fromIndex >= chain.length - 1) return null;
+  return chain.slice(fromIndex + 1).find((m) => !isModelTemporarilyUnavailable(m)) || null;
+}
+
+function withRoboticsDirectivesForModel(parts: any[], model: string, enabled = true): any[] {
+  if (!enabled || getModelQualityTier(model) !== 'medium') {
+    return parts;
+  }
+  return [...parts, { text: `\n\n${ROBOTICS_QUALITY_DIRECTIVES}` }];
+}
+
+function buildCombinedAbortController(
+  externalSignal?: AbortSignal,
+  timeoutMs: number = DEFAULT_GENERATE_CONTENT_TIMEOUT_MS
+): { controller: AbortController; didTimeout: () => boolean; cleanup: () => void } {
+  const controller = new AbortController();
+  let timedOut = false;
+
+  const onExternalAbort = () => controller.abort();
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      controller.abort();
+    } else {
+      externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+    }
+  }
+
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+
+  return {
+    controller,
+    didTimeout: () => timedOut && !externalSignal?.aborted,
+    cleanup: () => {
+      clearTimeout(timer);
+      externalSignal?.removeEventListener('abort', onExternalAbort);
+    },
+  };
+}
+
+function extractTextAndGroundingFromGenerateContent(data: any): { text: string; groundingChunks?: any[] } {
+  if (data?.promptFeedback?.blockReason) {
+    const blockedErr: any = new Error(`Gemini API blocked input: ${data.promptFeedback.blockReason}`);
+    blockedErr.isNonRetryable = true;
+    throw blockedErr;
+  }
+
+  const candidate = data?.candidates?.[0];
+  const candidateParts = candidate?.content?.parts;
+  const text = Array.isArray(candidateParts)
+    ? candidateParts
+        .filter((p: any) => !p?.thought && typeof p?.text === 'string')
+        .map((p: any) => p.text)
+        .join('')
+        .trim()
+    : '';
+  const groundingChunks = candidate?.groundingMetadata?.groundingChunks;
+  return { text, groundingChunks };
+}
+
 /**
- * Universal safe caller for Gemini models that gracefully handles JSON mode incompatibilities across all models.
+ * Invokes Gemini `generateContent` over direct REST `fetch()` with calibrated
+ * `thinkingConfig.thinkingLevel`, `thought: true` part filtering, 60s AbortController timeout,
+ * and automatic 400 retry without `thinkingConfig`.
  */
-export async function generateContentWithJsonFallback(
-  model: string,
-  parts: any[],
-  schema: any = responseSchema,
-  temperature: number = 0.1,
-  abortSignal?: AbortSignal
-): Promise<string> {
-  const resolvedModel = resolveApiTargetModel(model);
+export async function callGenerateContentRawWithOptimalThinking(params: {
+  client?: GoogleGenAI;
+  apiKey?: string;
+  model: string;
+  parts: any[];
+  contents?: any[];
+  systemInstruction?: string;
+  tools?: any[];
+  temperature?: number;
+  responseMimeType?: string;
+  responseSchema?: any;
+  abortSignal?: AbortSignal;
+  taskType?: ModelTaskType;
+  timeoutMs?: number;
+}): Promise<{ text: string; groundingChunks?: any[] }> {
+  const {
+    client,
+    apiKey,
+    model,
+    parts,
+    contents,
+    systemInstruction,
+    tools,
+    temperature = 0.1,
+    responseMimeType,
+    responseSchema: schema,
+    abortSignal,
+    taskType = 'transcription',
+    timeoutMs = DEFAULT_GENERATE_CONTENT_TIMEOUT_MS,
+  } = params;
 
-  return await executeWithApiKeyFailover(
-    async (client) => {
-      // Strategy 1: Primary attempt with structured JSON schema on the selected model
-      try {
-        const response: GenerateContentResponse = await client.models.generateContent({
-          model: resolvedModel,
-          contents: { parts },
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: schema,
-            temperature,
-          }
-        });
+  if (abortSignal?.aborted) {
+    throw new DOMException('Aborted by user', 'AbortError');
+  }
 
-        const text = response.text?.trim() || '';
-        if (text) return text;
-      } catch (err: any) {
-        if (err?.name === 'AbortError' || abortSignal?.aborted) {
-          throw err;
-        }
-        if (isNonRetryableMediaError(err)) {
-          (err as any).isNonRetryable = true;
-          throw err;
-        }
-        // Strategy 2: If JSON mode unsupported or schema error, retry prompt-only on the SAME selected model
-        if (isJsonModeUnsupportedError(err) || (err?.message && err.message.toLowerCase().includes('schema'))) {
-          console.warn(`[Gemini API] Primary JSON mode call failed on model ${resolvedModel} (${err?.message || err}). Attempting prompt-only fallback without schema config on SAME model...`);
-          try {
-            const partsWithJsonInstruction = [
-              ...parts,
-              { text: '\n\nCRITICAL OUTPUT REQUIREMENT: Output ONLY a valid JSON object in the exact format: {"findings": ["finding 1", "finding 2", ...]}. Do NOT output any markdown wrappers or conversational text.' }
-            ];
+  const thinkingLevel = getOptimalThinkingLevel(model, taskType);
 
-            const retryResponse: GenerateContentResponse = await client.models.generateContent({
-              model: resolvedModel,
-              contents: { parts: partsWithJsonInstruction },
-              config: {
-                temperature,
-              }
-            });
+  if (typeof fetch !== 'function' || !apiKey) {
+    if (!client) {
+      throw new Error('Gemini API client or API key is missing.');
+    }
+    const config: Record<string, any> = { temperature };
+    if (responseMimeType) config.responseMimeType = responseMimeType;
+    if (schema) config.responseSchema = schema;
+    if (systemInstruction) config.systemInstruction = systemInstruction;
+    if (tools && tools.length > 0) config.tools = tools;
+    const response: GenerateContentResponse = await client.models.generateContent({
+      model,
+      contents: contents || { parts },
+      config,
+    });
+    return {
+      text: response.text?.trim() || '',
+      groundingChunks: response.candidates?.[0]?.groundingMetadata?.groundingChunks,
+    };
+  }
 
-            const retryText = retryResponse.text?.trim() || '';
-            if (retryText) return retryText;
-          } catch (retryErr: any) {
-            console.warn(`[Gemini API] Prompt-only retry on ${resolvedModel} failed:`, retryErr);
-            const retryMsg = (retryErr instanceof Error ? retryErr.message : String(retryErr)).toLowerCase();
-            if (
-              isNonRetryableMediaError(retryErr) ||
-              (!isTransientOrKeyError(retryErr) && (getErrorStatusCode(retryErr) === 400 || retryMsg.includes('invalid argument')))
-            ) {
-              (retryErr as any).isNonRetryable = true;
-              throw retryErr;
-            }
-          }
-        }
+  const sendRest = async (includeThinking: boolean): Promise<{ text: string; groundingChunks?: any[] }> => {
+    const generationConfig: Record<string, any> = { temperature };
+    if (responseMimeType) generationConfig.responseMimeType = responseMimeType;
+    if (schema) generationConfig.responseSchema = schema;
+    if (includeThinking && thinkingLevel) {
+      generationConfig.thinkingConfig = { thinkingLevel };
+    }
 
-        // Re-throw so executeWithApiKeyFailover immediately retries with another random API key
-        // strictly preserving the selected model!
+    const body: Record<string, any> = {
+      contents: contents || [{ role: 'user', parts }],
+      generationConfig,
+    };
+    if (systemInstruction) {
+      body.systemInstruction = { parts: [{ text: systemInstruction }] };
+    }
+    if (tools && tools.length > 0) {
+      body.tools = tools;
+    }
+
+    const { controller, didTimeout, cleanup } = buildCombinedAbortController(abortSignal, timeoutMs);
+    try {
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'x-goog-api-key': apiKey,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        const msg = errBody?.error?.message || `Gemini API HTTP ${res.status}: ${res.statusText}`;
+        const err: any = new Error(msg);
+        err.status = res.status;
         throw err;
       }
 
-      return '';
+      const data = await res.json();
+      return extractTextAndGroundingFromGenerateContent(data);
+    } catch (err: any) {
+      if (didTimeout()) {
+        const timeoutErr: any = new Error(`Gemini request timed out after ${Math.round(timeoutMs / 1000)}s`);
+        timeoutErr.status = 504;
+        throw timeoutErr;
+      }
+      throw err;
+    } finally {
+      cleanup();
+    }
+  };
+
+  try {
+    return await sendRest(Boolean(thinkingLevel));
+  } catch (err: any) {
+    if (err?.name === 'AbortError' || abortSignal?.aborted) throw err;
+    const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+    if (
+      thinkingLevel &&
+      getErrorStatusCode(err) === 400 &&
+      (msg.includes('thinking') || msg.includes('thinkinglevel'))
+    ) {
+      console.warn(`[Gemini API] Model ${model} rejected thinkingLevel="${thinkingLevel}"; retrying without thinkingConfig...`);
+      return await sendRest(false);
+    }
+    throw err;
+  }
+}
+
+export async function callGenerateContentWithOptimalThinking(params: {
+  client?: GoogleGenAI;
+  apiKey?: string;
+  model: string;
+  parts: any[];
+  contents?: any[];
+  systemInstruction?: string;
+  tools?: any[];
+  temperature?: number;
+  responseMimeType?: string;
+  responseSchema?: any;
+  abortSignal?: AbortSignal;
+  taskType?: ModelTaskType;
+  timeoutMs?: number;
+}): Promise<string> {
+  const res = await callGenerateContentRawWithOptimalThinking(params);
+  return res.text;
+}
+
+/**
+ * Prepares per-blob descriptors once (detecting audio MIME headers, extracting text,
+ * and pre-encoding base64 only when within the safe 14.5MB inline limit).
+ */
+export async function prepareBlobPartDescriptors(
+  blobs: Blob[],
+  options: { includeContextLabels?: boolean } = {}
+): Promise<BlobContentPartDescriptor[]> {
+  const descriptors: BlobContentPartDescriptor[] = [];
+  const includeLabels = options.includeContextLabels !== false;
+
+  for (let i = 0; i < blobs.length; i++) {
+    const blob = blobs[i];
+    let cleanMime = getCleanMimeType(blob);
+    if (!blob.type || blob.type === 'application/octet-stream' || cleanMime === 'audio/ogg' || cleanMime === 'audio/webm') {
+      const detectedAudioMime = await detectAudioMimeFromHeader(blob);
+      if (detectedAudioMime) {
+        cleanMime = detectedAudioMime;
+      }
+    }
+
+    const isAudio = cleanMime.startsWith('audio/');
+    const isVideo = cleanMime.startsWith('video/');
+    const isPdf = cleanMime === 'application/pdf';
+    const isImage = cleanMime.startsWith('image/');
+    const isText = cleanMime.startsWith('text/');
+    const fileName = (blob as any).name ? `"${(blob as any).name}"` : `Segment #${i + 1}`;
+
+    let headerText: string | undefined;
+    let contextPartText: string | undefined;
+    if (includeLabels) {
+      if (blobs.length > 1) {
+        headerText = `--- Dictation / Input File #${i + 1}: ${fileName} (${cleanMime}) ---`;
+      } else if (!isAudio) {
+        contextPartText = `Context & Input File: The user has provided an input file (${isPdf ? 'PDF document' : isImage ? 'Medical scan / image' : isVideo ? 'Video recording' : isText ? 'Text / Document' : 'Document'}). Analyze, transcribe, extract, and interpret all radiological findings, clinical indications, observations, measurements, impressions, and technique thoroughly into the structured findings array following all medical and radiology transcription rules.`;
+      }
+    }
+
+    let textPartText: string | undefined;
+    if (isText) {
+      try {
+        const textContent = await blob.text();
+        textPartText = `[Dictated / Pasted Clinical Text Content for ${fileName}]:\n"""\n${textContent}\n"""\nInstruction: This is dictated / clinical text provided by the clinician. Transcribe, analyze, correct, format, and structure this text into formal radiology findings according to all radiology report and transcription rules.`;
+      } catch (e) {
+        console.warn('Could not read blob as text:', e);
+      }
+    }
+
+    const inlineBase64 = blob.size <= SAFE_INLINE_MEDIA_BYTES ? await blobToBase64(blob) : undefined;
+    descriptors.push({
+      blob,
+      cleanMime,
+      headerText,
+      contextPartText,
+      textPartText,
+      inlineBase64,
+    });
+  }
+
+  return descriptors;
+}
+
+export async function uploadBlobViaFilesApi(
+  blob: Blob,
+  mimeType: string,
+  apiKey: string,
+  displayName?: string,
+  abortSignal?: AbortSignal
+): Promise<{ name: string; uri: string; mimeType: string; state?: string }> {
+  if (!apiKey) {
+    throw new Error('Gemini API key is required for Files API upload.');
+  }
+
+  const startRes = await fetch('https://generativelanguage.googleapis.com/upload/v1beta/files', {
+    method: 'POST',
+    headers: {
+      'x-goog-api-key': apiKey,
+      'X-Goog-Upload-Protocol': 'resumable',
+      'X-Goog-Upload-Command': 'start',
+      'X-Goog-Upload-Header-Content-Length': String(blob.size),
+      'X-Goog-Upload-Header-Content-Type': mimeType,
+      'Content-Type': 'application/json',
     },
-    { selectedModel: resolvedModel, abortSignal }
-  );
-}
+    body: JSON.stringify({ file: { display_name: displayName || 'raddoc_media' } }),
+    signal: abortSignal,
+  });
 
-export interface DetectedTemplateInfo {
-  isTemplateMode: boolean;
-  templateType: 'docx' | 'image' | 'builtin' | 'custom_text' | 'none';
-  templateName?: string;
-  templateContent?: string;
-  templateHtml?: string;
-  userInstructions?: string;
-  templateContextPrompt: string;
-}
-
-export function findBuiltinTemplates(promptOrId?: string): (typeof REPORT_TEMPLATES)[number][] {
-  if (!promptOrId || !promptOrId.trim()) return [];
-
-  const raw = promptOrId.trim();
-  const matched: (typeof REPORT_TEMPLATES)[number][] = [];
-
-  // 1. Direct ID match (e.g. single "tpl_001", "tpl_add_128", "add_128", or "1")
-  const directCanon = canonicalizeTemplateIdToken(raw).toLowerCase();
-  const directId = REPORT_TEMPLATES.find(
-    t => t.id && (t.id.toLowerCase() === raw.toLowerCase() || t.id.toLowerCase() === directCanon)
-  );
-  if (directId) {
-    return [directId];
+  if (!startRes.ok) {
+    const errBody = await startRes.json().catch(() => ({}));
+    const err: any = new Error(errBody?.error?.message || `Files API upload start HTTP ${startRes.status}`);
+    err.status = startRes.status;
+    throw err;
   }
 
-  // 2. Explicit ID tags in prompt: [TEMPLATE_ID: tpl_001, tpl_add_128] or [TEMPLATE_ID: 1, add_128]
-  const idTagMatches = [...raw.matchAll(/\[(?:TEMPLATE_ID|TEMPLATE_IDS|TEMPLATES|TEMPLATE|ID):\s*([^\]]+)\]/gi)];
-  for (const match of idTagMatches) {
-    const idsStr = match[1].replace(/\b((?:builtin_)?(?:tpl[\s_-]*)?add)[\s_-]+(\d+)\b/gi, '$1_$2');
-    const parts = idsStr.split(/[,;\s]+/).map(p => p.trim()).filter(Boolean);
-    for (const part of parts) {
-      const cleanPart = canonicalizeTemplateIdToken(part).toLowerCase();
-      const byId = REPORT_TEMPLATES.find(t => t.id && t.id.toLowerCase() === cleanPart);
-      if (byId && !matched.some(m => m.id === byId.id)) {
-        matched.push(byId);
+  const uploadUrl =
+    startRes.headers.get('x-goog-upload-url') ||
+    startRes.headers.get('X-Goog-Upload-URL');
+  if (!uploadUrl) {
+    throw new Error('Files API did not return a resumable upload URL.');
+  }
+
+  const uploadRes = await fetch(uploadUrl, {
+    method: 'POST',
+    headers: {
+      'x-goog-api-key': apiKey,
+      'X-Goog-Upload-Offset': '0',
+      'X-Goog-Upload-Command': 'upload, finalize',
+      'Content-Type': mimeType,
+    },
+    body: blob,
+    signal: abortSignal,
+  });
+
+  if (!uploadRes.ok) {
+    const errBody = await uploadRes.json().catch(() => ({}));
+    const err: any = new Error(errBody?.error?.message || `Files API upload transfer HTTP ${uploadRes.status}`);
+    err.status = uploadRes.status;
+    throw err;
+  }
+
+  const payload = await uploadRes.json();
+  const fileObj = payload?.file || payload;
+  return {
+    name: fileObj?.name || '',
+    uri: fileObj?.uri || '',
+    mimeType: fileObj?.mimeType || mimeType,
+    state: fileObj?.state,
+  };
+}
+
+export async function waitForUploadedFileActive(
+  fileName: string,
+  apiKey: string,
+  abortSignal?: AbortSignal
+): Promise<{ name: string; uri: string; mimeType: string; state?: string }> {
+  const cleanName = fileName.replace(/^\/+/, '');
+  const resourcePath = cleanName.startsWith('files/') ? cleanName : `files/${cleanName}`;
+
+  let current: any = { name: resourcePath, uri: '', mimeType: '', state: 'PROCESSING' };
+  for (let pollCount = 0; pollCount < 15; pollCount++) {
+    if (abortSignal?.aborted) {
+      throw new DOMException('Aborted by user', 'AbortError');
+    }
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/${resourcePath}`, {
+      method: 'GET',
+      headers: {
+        'x-goog-api-key': apiKey,
+      },
+      signal: abortSignal,
+    });
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      const err: any = new Error(errBody?.error?.message || `Files API status HTTP ${res.status}`);
+      err.status = res.status;
+      throw err;
+    }
+    const payload = await res.json();
+    current = payload?.file || payload;
+    if (current?.state === 'FAILED') {
+      throw new Error('Gemini Files API processing failed for uploaded file.');
+    }
+    if (current?.state !== 'PROCESSING') {
+      return {
+        name: current?.name || resourcePath,
+        uri: current?.uri || '',
+        mimeType: current?.mimeType || '',
+        state: current?.state,
+      };
+    }
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(resolve, 1000);
+      abortSignal?.addEventListener(
+        'abort',
+        () => {
+          clearTimeout(timer);
+          reject(new DOMException('Aborted by user', 'AbortError'));
+        },
+        { once: true }
+      );
+    });
+  }
+
+  return {
+    name: current?.name || resourcePath,
+    uri: current?.uri || '',
+    mimeType: current?.mimeType || '',
+    state: current?.state,
+  };
+}
+
+export async function deleteUploadedFile(fileName: string, apiKey: string): Promise<void> {
+  if (!fileName || !apiKey) return;
+  const cleanName = fileName.replace(/^\/+/, '');
+  const resourcePath = cleanName.startsWith('files/') ? cleanName : `files/${cleanName}`;
+  await fetch(`https://generativelanguage.googleapis.com/v1beta/${resourcePath}`, {
+    method: 'DELETE',
+    headers: {
+      'x-goog-api-key': apiKey,
+    },
+  });
+}
+
+/**
+ * Resolves descriptors into Gemini `inlineData` (fast path <=14.5MB) or pure direct `fetch()`
+ * Files API `fileData` (>14.5MB), scoped to the active API key and tracked for best-effort cleanup.
+ */
+export async function resolveBlobDescriptorPartsForAttempt(params: {
+  descriptors: BlobContentPartDescriptor[];
+  client?: GoogleGenAI;
+  apiKey: string;
+  uploadedByKey: Map<string, Map<number, UploadedGeminiFileRef>>;
+  abortSignal?: AbortSignal;
+}): Promise<any[]> {
+  const { descriptors, apiKey, uploadedByKey, abortSignal } = params;
+  const resolved: any[] = [];
+
+  for (let i = 0; i < descriptors.length; i++) {
+    if (abortSignal?.aborted) throw new DOMException('Aborted by user', 'AbortError');
+    const desc = descriptors[i];
+    if (desc.headerText) resolved.push({ text: desc.headerText });
+    if (desc.contextPartText) resolved.push({ text: desc.contextPartText });
+    if (desc.textPartText) resolved.push({ text: desc.textPartText });
+
+    if (desc.inlineBase64 !== undefined) {
+      resolved.push({
+        inlineData: {
+          mimeType: desc.cleanMime,
+          data: desc.inlineBase64,
+        },
+      });
+      continue;
+    }
+
+    let keyUploads = uploadedByKey.get(apiKey);
+    if (!keyUploads) {
+      keyUploads = new Map();
+      uploadedByKey.set(apiKey, keyUploads);
+    }
+
+    let ref = keyUploads.get(i);
+    if (!ref) {
+      const displayName = (desc.blob as any).name || `raddoc_media_${i + 1}`;
+      let readyFile = await uploadBlobViaFilesApi(
+        desc.blob,
+        desc.cleanMime,
+        apiKey,
+        displayName,
+        abortSignal
+      );
+      if ((readyFile.state === 'PROCESSING' || !readyFile.uri) && readyFile.name) {
+        readyFile = await waitForUploadedFileActive(readyFile.name, apiKey, abortSignal);
+      }
+      if (!readyFile.uri) {
+        throw new Error('Gemini Files API upload completed without a valid file URI.');
+      }
+      ref = {
+        name: readyFile.name || '',
+        uri: readyFile.uri,
+        mimeType: readyFile.mimeType || desc.cleanMime,
+        apiKey,
+      };
+      keyUploads.set(i, ref);
+    }
+
+    resolved.push({
+      fileData: {
+        fileUri: ref.uri,
+        mimeType: ref.mimeType,
+      },
+    });
+  }
+
+  return resolved;
+}
+
+export async function cleanupUploadedGeminiFiles(
+  uploadedByKey: Map<string, Map<number, UploadedGeminiFileRef>>
+): Promise<void> {
+  const deletions: Promise<any>[] = [];
+  for (const keyMap of uploadedByKey.values()) {
+    for (const ref of keyMap.values()) {
+      if (ref.name && ref.apiKey) {
+        deletions.push(deleteUploadedFile(ref.name, ref.apiKey).catch(() => {}));
       }
     }
   }
+  await Promise.all(deletions);
+}
 
-  // 3. Exact quoted or bracketed template names in prompt
-  // e.g. Use combined report templates: "MRI SCAN OF BRAIN (PLAIN)" and "MRI CERVICAL SPINE"
-  const quoteMatches = [...raw.matchAll(/["'“]([^"'“”\n]+?)["'”]/gi)];
-  for (const q of quoteMatches) {
-    const rawExtracted = q[1].trim().toLowerCase();
-    const exactNameMatch = REPORT_TEMPLATES.find(t => t.name.toLowerCase() === rawExtracted);
-    if (exactNameMatch && !matched.some(m => m.id === exactNameMatch.id)) {
-      matched.push(exactNameMatch);
+/**
+ * Executes an operation across the configured quality-tiered model fallback chain,
+ * bypassing models experiencing temporary busy pauses and resetting cooldowns on 200 OK.
+ */
+export async function executeWithFreeTierModelFallbackMeta<T>(
+  selectedModel: string,
+  runForModel: (targetModelName: string, hasMoreFallbackModels?: boolean) => Promise<T>,
+  options?: { abortSignal?: AbortSignal; skipCrossModelFallback?: boolean }
+): Promise<{ result: T; winningModel: string }> {
+  const resolvedPrimary = resolveApiTargetModel(selectedModel);
+  const policy = getModelFallbackPolicy();
+  const userStrictOnly = !options?.skipCrossModelFallback && (policy === 'selected_only' || isStrictSelectedModelOnlyEnabled());
+  const strictOnly = Boolean(options?.skipCrossModelFallback || userStrictOnly);
+  const chain = strictOnly
+    ? [resolvedPrimary]
+    : getFreeTierModelFallbackChain(resolvedPrimary, policy);
+
+  let lastErr: any = null;
+  let notifiedPreSkip = false;
+
+  for (let i = 0; i < chain.length; i++) {
+    const modelName = chain[i];
+    if (options?.abortSignal?.aborted) {
+      throw new DOMException('Aborted by user', 'AbortError');
     }
-  }
 
-  if (matched.length > 0) {
-    return matched;
-  }
-
-  // 4. Single template fallback search
-  const extractedMatch = raw.match(/(?:normal|use|template)\s+["'“]([^"'“”\n]+?)["'”]\s+(?:report\s+)?template/i) ||
-                         raw.match(/normal\s+(.+?)\s+report\s+template/i);
-  if (extractedMatch) {
-    const rawExtracted = extractedMatch[1].trim().toLowerCase();
-    const exactNameMatch = REPORT_TEMPLATES.find(t => t.name.toLowerCase() === rawExtracted);
-    if (exactNameMatch) return [exactNameMatch];
-  }
-
-  const lower = raw.toLowerCase();
-  const cleanPrompt = ' ' + lower.replace(/[^a-z0-9]/g, ' ').replace(/\s+/g, ' ') + ' ';
-
-  const promptHasMRI = /\bmri\b|\bmagnetic\b/.test(lower);
-  const promptHasCT = /\bct\b|\bc\s*t\b|\bcomputed\b/.test(lower);
-
-  const sortedTemplates = [...REPORT_TEMPLATES].sort((a, b) => b.name.length - a.name.length);
-
-  for (const t of sortedTemplates) {
-    if (promptHasMRI && !promptHasCT && (t.modality || t.category || '').toUpperCase().includes('CT')) continue;
-    if (promptHasCT && !promptHasMRI && (t.modality || t.category || '').toUpperCase().includes('MRI')) continue;
-
-    const cleanT = t.name.toLowerCase().replace(/[^a-z0-9]/g, ' ').replace(/\s+/g, ' ').trim();
-    if (cleanT && cleanPrompt.includes(' ' + cleanT + ' ')) {
-      return [t];
-    }
-  }
-
-  if (extractedMatch) {
-    const extractedClean = extractedMatch[1].toLowerCase().replace(/[^a-z0-9]/g, ' ').replace(/\s+/g, ' ').trim();
-    if (extractedClean) {
-      for (const t of sortedTemplates) {
-        if (promptHasMRI && !promptHasCT && (t.modality || t.category || '').toUpperCase().includes('CT')) continue;
-        if (promptHasCT && !promptHasMRI && (t.modality || t.category || '').toUpperCase().includes('MRI')) continue;
-        const cleanT = t.name.toLowerCase().replace(/[^a-z0-9]/g, ' ').replace(/\s+/g, ' ').trim();
-        if (cleanT === extractedClean) {
-          return [t];
+    const hasMoreFallbackModels = i < chain.length - 1;
+    if (!strictOnly && hasMoreFallbackModels && isModelTemporarilyUnavailable(modelName)) {
+      const healthyTarget = findHealthyFailoverTarget(chain, i);
+      if (healthyTarget) {
+        if (!notifiedPreSkip) {
+          notifiedPreSkip = true;
+          emitModelFailoverNotice({
+            fromModel: resolvedPrimary,
+            toModel: healthyTarget,
+            reason: 'service_unavailable',
+          });
         }
+        continue;
       }
+    }
+
+    try {
+      const result = await runForModel(modelName, hasMoreFallbackModels);
+      clearModelTemporarilyUnavailable(modelName);
+      return { result, winningModel: modelName };
+    } catch (err: any) {
+      if (err?.name === 'AbortError' || options?.abortSignal?.aborted) {
+        throw err;
+      }
+      lastErr = err;
+      const isQuotaErr = isQuotaOrRateLimitExceededError(err);
+      const isUnavailableErr = isModelLevelServiceUnavailableError(err);
+      const isNetworkErr = isNetworkFetchError(err);
+      if (isUnavailableErr && !isModelTemporarilyUnavailable(modelName)) {
+        markModelTemporarilyUnavailable(modelName);
+      }
+      const isFailoverTrigger = isQuotaErr || isUnavailableErr || isNetworkErr;
+
+      if (hasMoreFallbackModels && isFailoverTrigger) {
+        const nextModel = chain[i + 1];
+        const reason: ModelFailoverEventDetail['reason'] = isQuotaErr
+          ? 'rate_limit'
+          : isNetworkErr
+          ? 'network_error'
+          : 'service_unavailable';
+        console.warn(
+          `[Gemini API] ${getModelDisplayLabel(modelName)} ${isQuotaErr ? 'reached usage limit' : isNetworkErr ? 'hit a connection issue' : 'is busy'}; switching to ${getModelDisplayLabel(nextModel)}...`
+        );
+        emitModelFailoverNotice({
+          fromModel: modelName,
+          toModel: nextModel,
+          reason,
+        });
+        continue;
+      }
+      if (userStrictOnly && isFailoverTrigger) {
+        const triedCount = typeof err?.triedKeysCount === 'number' && err.triedKeysCount > 0 ? err.triedKeysCount : 1;
+        const primaryLabel = getModelDisplayLabel(resolvedPrimary);
+        const strictErr: any = new Error(
+          isQuotaErr
+            ? `${primaryLabel} reached its daily/minute usage limit across ${triedCount} API key(s) while "Selected Model Only" is enabled. Switch Backup Model Routing to "Auto (Top + Backup)" to let a backup model finish.`
+            : isNetworkErr
+            ? `${primaryLabel} could not reach Google servers across ${triedCount} API key(s) while "Selected Model Only" is enabled. Please check your connection or switch Backup Model Routing to "Auto (Top + Backup)".`
+            : `${primaryLabel} is currently busy across ${triedCount} API key(s) while "Selected Model Only" is enabled. Switch Backup Model Routing to "Auto (Top + Backup)" or try again shortly.`
+        );
+        strictErr.status = getErrorStatusCode(err) ?? (isQuotaErr ? 429 : 503);
+        throw strictErr;
+      }
+      if (!strictOnly && isFailoverTrigger) {
+        const chainLabels = chain.map(getModelDisplayLabel).join(' → ');
+        const exhaustedErr: any = new Error(
+          isQuotaErr
+            ? `All available models (${chainLabels}) reached their usage limits across your active API key(s). Please wait a minute and try again, or add another API key.`
+            : isNetworkErr
+            ? `Could not connect to Google AI across available models (${chainLabels}). Please check your internet connection and try again.`
+            : `All available models (${chainLabels}) are currently busy right now. Please try again in a moment.`
+        );
+        exhaustedErr.status = getErrorStatusCode(err) ?? (isQuotaErr ? 429 : 503);
+        throw exhaustedErr;
+      }
+      throw err;
     }
   }
 
-  return [];
+  throw lastErr;
 }
 
-export function findBuiltinTemplate(promptOrId?: string): (typeof REPORT_TEMPLATES)[number] | undefined {
-  const matches = findBuiltinTemplates(promptOrId);
-  return matches.length > 0 ? matches[0] : undefined;
+export async function executeWithFreeTierModelFallback<T>(
+  selectedModel: string,
+  runForModel: (targetModelName: string, hasMoreFallbackModels?: boolean) => Promise<T>,
+  options?: { abortSignal?: AbortSignal; skipCrossModelFallback?: boolean }
+): Promise<T> {
+  const { result } = await executeWithFreeTierModelFallbackMeta(selectedModel, runForModel, options);
+  return result;
 }
 
-export type CustomDocxInput = { 
-  name: string; 
-  text?: string; 
-  extractedText?: string; 
-  html?: string; 
-  extractedHtml?: string;
-  data?: string;
-  size?: number;
-} | null;
+/**
+ * Optional Stage-2 prose polishing pass using `gemini-3.5-flash-lite` (`thinkingLevel: 'high'`)
+ * when Medium-tier prose polish is enabled and the winning model is Medium tier.
+ */
+export async function polishMediumProseWithFlashLite(
+  findings: string[],
+  abortSignal?: AbortSignal
+): Promise<string[]> {
+  if (!findings || findings.length === 0) return findings;
+
+  const polishPrompt = `You are a senior radiology report copy-editor polishing a structured radiology findings JSON array transcribed by an intermediate model.
+
+STRICT EDITING RULES:
+1. Preserve 100% of clinical facts, measurements, laterality (Right/Left/Bilateral), and pathology polarity ("Undisplaced" vs "Displaced") verbatim. Do NOT add, invent, or remove any clinical finding.
+2. Remove repetitive phrasing (e.g., repeated "is noted") and conversational spoken filler (e.g., "there also", "also there") while keeping sentences crisp and natural.
+3. Keep anatomical compound descriptors cleanly spaced: "extra axial" (NOT "extraaxial" or "extra-axial") and "intra axial" (NOT "intraaxial" or "intra-axial"). Do NOT insert unnecessary hyphens. Verify exact temporal bone / skull-base terms ("petrous part", "tympanic part", "tegmen tympani" — never substitute "cribriform plate" or "squamous part" unless spoken).
+4. Preserve all structural markers exactly: \`BOLD::\`, \`UNDERLINE::\`, \`UNITALIC::\`, \`[STYLE:...]\`, \`*Clinical Profile: ...*\`, and table \`###\` delimiters.
+5. Ensure the \`IMPRESSION:...\` entry is clinically complete (never lazy "as detailed", "as described", or "as noted"), verb-free, measurement-free, and uses Smart Bullet Formatting ("IMPRESSION:###• Point 1###• Point 2" for 2+ discrete points, or flush single line without bullet for a single/normal summary).
+
+INPUT REPORT:
+${JSON.stringify({ findings })}
+
+Return ONLY a JSON object with the "findings" array of polished strings.`;
+
+  try {
+    const raw = await generateContentWithJsonFallback(
+      GEMINI_FLASH_LITE_MODEL,
+      [{ text: polishPrompt }],
+      responseSchema,
+      0.1,
+      abortSignal,
+      'reasoning',
+      { skipCrossModelFallback: true, injectRoboticsDirectives: false }
+    );
+    const polished = extractFindingsFromResponse(raw);
+    if (polished && polished.length >= Math.max(1, Math.floor(findings.length * 0.5))) {
+      return polished;
+    }
+  } catch (err: any) {
+    if (err?.name === 'AbortError' || abortSignal?.aborted) throw err;
+    console.warn('[Medium Prose Polish] Stage-2 Flash-Lite polish failed; returning Stage-1 findings:', err);
+  }
+  return findings;
+}
+
+async function maybePolishMediumFindings(
+  findings: string[],
+  winningModel: string,
+  abortSignal?: AbortSignal
+): Promise<string[]> {
+  if (
+    findings &&
+    findings.length > 0 &&
+    isMediumProsePolishEnabled() &&
+    getModelQualityTier(winningModel) === 'medium'
+  ) {
+    return await polishMediumProseWithFlashLite(findings, abortSignal);
+  }
+  return findings;
+}
+
+/**
+ * Computes key-rotation options for `executeWithApiKeyFailover`:
+ * when 2+ active keys exist and the user enabled Top-Tier multi-key retry,
+ * allows Top-Tier models (`gemini-4-hydrogen`, `gemini-3.8-flash`, `gemini-3.1-pro-preview`)
+ * to try all active keys before failing over down a tier.
+ */
+export function getFailoverKeyOptionsForModel(
+  targetModelName: string,
+  hasMoreFallbackModels?: boolean,
+  explicitFailFast?: boolean
+): { failFastOnModelUnavailable: boolean; allowFullPoolOn503: boolean } {
+  const activeKeyCount = getTotalActiveApiKeyCount();
+  const isTopTier = getModelQualityTier(targetModelName) === 'top';
+  const retryTopAllKeys =
+    isTopTier && activeKeyCount >= 2 && isRetryTopTierAllKeysOn503Enabled();
+  return {
+    failFastOnModelUnavailable: retryTopAllKeys
+      ? false
+      : Boolean(explicitFailFast ?? hasMoreFallbackModels),
+    allowFullPoolOn503: retryTopAllKeys,
+  };
+}
+
+export async function generateContentWithJsonFallbackMeta(
+  model: string,
+  partsOrResolver: any[] | ((client: GoogleGenAI, apiKey: string, activeModel: string) => Promise<any[]>),
+  schema: any = responseSchema,
+  temperature: number = 0.1,
+  abortSignal?: AbortSignal,
+  taskType: ModelTaskType = 'transcription',
+  options?: {
+    skipCrossModelFallback?: boolean;
+    failFastOnModelUnavailable?: boolean;
+    injectRoboticsDirectives?: boolean;
+    timeoutMs?: number;
+  }
+): Promise<{ text: string; winningModel: string }> {
+  const resolvedModel = resolveApiTargetModel(model);
+  const shouldInjectRobotics = options?.injectRoboticsDirectives !== false;
+
+  const invokeModelCall = async (params: {
+    client: GoogleGenAI;
+    apiKey: string;
+    targetModelName: string;
+    parts: any[];
+    useSchema: boolean;
+  }): Promise<string> => {
+    const { client, apiKey, targetModelName, parts, useSchema } = params;
+    return await callGenerateContentWithOptimalThinking({
+      client,
+      apiKey,
+      model: targetModelName,
+      parts,
+      temperature,
+      responseMimeType: useSchema ? 'application/json' : undefined,
+      responseSchema: useSchema ? schema : undefined,
+      abortSignal,
+      taskType,
+      timeoutMs: options?.timeoutMs,
+    });
+  };
+
+  const runOnModelAcrossKeys = async (
+    targetModelName: string,
+    hasMoreFallbackModels?: boolean
+  ): Promise<string> => {
+    const { failFastOnModelUnavailable, allowFullPoolOn503 } = getFailoverKeyOptionsForModel(
+      targetModelName,
+      hasMoreFallbackModels,
+      options?.failFastOnModelUnavailable
+    );
+
+    return await executeWithApiKeyFailover(
+      async (client, apiKey) => {
+        const baseParts =
+          typeof partsOrResolver === 'function'
+            ? await partsOrResolver(client, apiKey, targetModelName)
+            : partsOrResolver;
+        const parts = withRoboticsDirectivesForModel(
+          baseParts,
+          targetModelName,
+          shouldInjectRobotics
+        );
+
+        // Strategy 1: Structured JSON schema + optimal thinkingLevel
+        try {
+          const text = await invokeModelCall({
+            client,
+            apiKey,
+            targetModelName,
+            parts,
+            useSchema: true,
+          });
+          if (text) return text;
+        } catch (err: any) {
+          if (err?.name === 'AbortError' || abortSignal?.aborted) {
+            throw err;
+          }
+          if (isNonRetryableMediaError(err) || err?.isNonRetryable === true) {
+            (err as any).isNonRetryable = true;
+            throw err;
+          }
+          // Strategy 2: Prompt-only fallback without schema config on SAME model
+          if (isJsonModeUnsupportedError(err) || (err?.message && err.message.toLowerCase().includes('schema'))) {
+            console.warn(`[Gemini API] Primary JSON mode call failed on model ${targetModelName} (${err?.message || err}). Attempting prompt-only fallback without schema config on SAME model...`);
+            try {
+              const partsWithJsonInstruction = [
+                ...parts,
+                { text: '\n\nCRITICAL OUTPUT REQUIREMENT: Output ONLY a valid JSON object in the exact format: {"findings": ["finding 1", "finding 2", ...]}. Do NOT output any markdown wrappers or conversational text.' }
+              ];
+              const retryText = await invokeModelCall({
+                client,
+                apiKey,
+                targetModelName,
+                parts: partsWithJsonInstruction,
+                useSchema: false,
+              });
+              if (retryText) return retryText;
+            } catch (retryErr: any) {
+              console.warn(`[Gemini API] Prompt-only retry on ${targetModelName} failed:`, retryErr);
+              const retryMsg = (retryErr instanceof Error ? retryErr.message : String(retryErr)).toLowerCase();
+              if (
+                isNonRetryableMediaError(retryErr) ||
+                (!isTransientOrKeyError(retryErr) && (getErrorStatusCode(retryErr) === 400 || retryMsg.includes('invalid argument')))
+              ) {
+                (retryErr as any).isNonRetryable = true;
+                throw retryErr;
+              }
+              if (isTransientOrKeyError(retryErr) || isModelLevelServiceUnavailableError(retryErr)) {
+                throw retryErr;
+              }
+            }
+          }
+
+          throw err;
+        }
+
+        return '';
+      },
+      {
+        selectedModel: targetModelName,
+        abortSignal,
+        failFastOnModelUnavailable,
+        allowFullPoolOn503,
+      }
+    );
+  };
+
+  const { result, winningModel } = await executeWithFreeTierModelFallbackMeta(
+    resolvedModel,
+    runOnModelAcrossKeys,
+    { abortSignal, skipCrossModelFallback: options?.skipCrossModelFallback }
+  );
+  return { text: result, winningModel };
+}
+
+/**
+ * Universal safe caller for Gemini models with optimal thinkingLevel,
+ * Robotics quality directives, Files API large media handling, and full tiered failover.
+ */
+export async function generateContentWithJsonFallback(
+  model: string,
+  partsOrResolver: any[] | ((client: GoogleGenAI, apiKey: string, activeModel: string) => Promise<any[]>),
+  schema: any = responseSchema,
+  temperature: number = 0.1,
+  abortSignal?: AbortSignal,
+  taskType: ModelTaskType = 'transcription',
+  options?: {
+    skipCrossModelFallback?: boolean;
+    failFastOnModelUnavailable?: boolean;
+    injectRoboticsDirectives?: boolean;
+    timeoutMs?: number;
+  }
+): Promise<string> {
+  const { text } = await generateContentWithJsonFallbackMeta(
+    model,
+    partsOrResolver,
+    schema,
+    temperature,
+    abortSignal,
+    taskType,
+    options
+  );
+  return text;
+}
 
 export interface SpokenTemplateResolution {
   templateIds: string[];
@@ -595,521 +1381,14 @@ export interface SpokenTemplateResolution {
   images: Array<{ data: string; mimeType: string }>;
 }
 
+export type ProcessAudioResult = string[] & {
+  patientReports?: PatientReportSegment[];
+};
+
 export interface ProcessAudioOptions {
   onSpokenTemplateResolved?: (resolved: SpokenTemplateResolution) => void;
+  onPatientReportsResolved?: (reports: PatientReportSegment[]) => void;
   mergeBaseFindings?: string[];
-}
-
-function parseCombinedNamesFromPrompt(customPrompt?: string): string[] {
-  if (!customPrompt) return [];
-  const match = customPrompt.match(/Use combined report templates:\s*([^\n.]+)/i);
-  if (!match) return [];
-  const quoted = [...match[1].matchAll(/"([^"]+)"/g)].map(m => m[1].trim()).filter(Boolean);
-  if (quoted.length > 0) return quoted;
-  return match[1].split(/\s+(?:and|\+)\s+|,/i).map(s => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
-}
-
-function parseSingleTemplateNameFromPrompt(customPrompt?: string): string | null {
-  if (!customPrompt) return null;
-  const m = customPrompt.match(/Merged with template:\s*([^\n.]+?)(?:\.|\n|$)/i);
-  return m && m[1] ? m[1].trim() : null;
-}
-
-export function detectAndExtractTemplate(
-  customPrompt?: string,
-  customImages?: Array<{ data: string; mimeType: string }> | null,
-  customDocx?: CustomDocxInput
-): DetectedTemplateInfo {
-  const docxText = ((customDocx?.text || customDocx?.extractedText || '')).trim();
-  const docxHtml = customDocx?.html || customDocx?.extractedHtml;
-
-  // Check if built-in templates or explicit template IDs are specified via prompt or multi-section docxText
-  const matchedBuiltins = findBuiltinTemplates(customPrompt);
-  const explicitTagIds = extractTemplateTagIds(customPrompt);
-  const parsedDocxSections = docxText
-    ? docxText
-        .split(/(?=^===\s*TEMPLATE:)/m)
-        .map(s => s.trim())
-        .filter(s => /^===\s*TEMPLATE:/i.test(s))
-        .map(block => {
-          const headerMatch = block.match(/^===\s*TEMPLATE:\s*(.+?)\s*===/i);
-          const name = headerMatch ? headerMatch[1].trim() : 'Template Section';
-          const body = block.replace(/^===\s*TEMPLATE:[^\n]*\n?/i, '').trim();
-          const builtinMatch = matchedBuiltins.find(b => b.name.toLowerCase() === name.toLowerCase());
-          return {
-            name,
-            content: body || (builtinMatch?.lines?.join('\n') || builtinMatch?.content || ''),
-            skillPrompt: builtinMatch?.skillPrompt || '',
-          };
-        })
-    : [];
-
-  const isExplicitCombined =
-    matchedBuiltins.length > 1 ||
-    explicitTagIds.length > 1 ||
-    parsedDocxSections.length > 1 ||
-    /Use combined report templates:/i.test(customPrompt || '');
-
-  if (isExplicitCombined) {
-    let combinedSections: Array<{ name: string; content: string; skillPrompt?: string }> = [];
-    if (parsedDocxSections.length > 1) {
-      combinedSections = parsedDocxSections;
-    } else if (matchedBuiltins.length > 1 && explicitTagIds.length <= matchedBuiltins.length) {
-      combinedSections = matchedBuiltins.map(t => ({
-        name: t.name,
-        content: t.lines && t.lines.length > 0 ? t.lines.join('\n') : (t.content || ''),
-        skillPrompt: t.skillPrompt || '',
-      }));
-    } else {
-      const promptNames = parseCombinedNamesFromPrompt(customPrompt);
-      const count = Math.max(promptNames.length, matchedBuiltins.length, explicitTagIds.length);
-      for (let idx = 0; idx < count; idx++) {
-        const name = promptNames[idx] || matchedBuiltins[idx]?.name || explicitTagIds[idx] || `Template ${idx + 1}`;
-        const builtinMatch =
-          matchedBuiltins.find(b => b.name.toLowerCase() === name.toLowerCase()) ||
-          matchedBuiltins[idx];
-        combinedSections.push({
-          name,
-          content:
-            (builtinMatch?.lines && builtinMatch.lines.length > 0
-              ? builtinMatch.lines.join('\n')
-              : builtinMatch?.content) || '',
-          skillPrompt: builtinMatch?.skillPrompt || '',
-        });
-      }
-    }
-
-    const templateNames = combinedSections.map(s => s.name).join(' + ');
-    const templateContent = (docxText.length > 0)
-      ? docxText
-      : combinedSections.map((t, idx) => {
-          return `================================================================================\nTEMPLATE ${idx + 1}: "${t.name}"\n--------------------------------------------------------------------------------\n${t.content}\n${t.skillPrompt ? `CLINICAL SKILL DIRECTIVES FOR THIS SECTION:\n${t.skillPrompt}\n` : ''}`;
-        }).join('\n\n');
-
-    const templateContextPrompt = `
-================================================================================
-ACTIVE COMBINED RADIOLOGY REPORT TEMPLATES (${combinedSections.length} TEMPLATES COMBINED):
-${combinedSections.map((t, idx) => {
-  return `--------------------------------------------------------------------------------
-TEMPLATE ${idx + 1}: "${t.name}"
-BASELINE TEMPLATE CONTENT:
-"""
-${t.content}
-"""
-${t.skillPrompt ? `AUTHORITATIVE CLINICAL SKILL & PHRASING DIRECTIVES:\n${t.skillPrompt}` : ''}
-`;
-}).join('\n')}
-================================================================================
-CRITICAL MULTI-TEMPLATE COMBINATION & MERGE DIRECTIVES:
-1. UNIFIED COHESIVE REPORT: Combine these ${combinedSections.length} templates into a single, comprehensive, seamlessly integrated multi-study report.
-   - Maintain the logical clinical order of anatomical regions (e.g. Brain sections followed by Cervical Spine sections; Chest followed by Abdomen and Pelvis).
-   - Combine the study title/header into a unified examination title (e.g. "CT SCAN OF BRAIN AND CERVICAL SPINE (PLAIN)").
-   - Group Technique / Protocol lines under the Technique section.
-2. ACCURATE FINDINGS PLACEMENT: When the doctor dictates findings, accurately place each dictated finding into its corresponding anatomical section across the combined templates (e.g., intracranial/cerebral findings in the brain sections, vertebral/disc findings in the spine sections, pulmonary findings in the lung sections, hepatic findings in the liver section).
-   - Prefix only dictated/abnormal or modified lines with 'BOLD::'.
-3. NORMAL FINDINGS PRESERVATION: For any anatomical regions from either template where no abnormalities were dictated or where the dictation indicated normal/unremarkable, preserve the complete normal baseline findings verbatim WITHOUT the 'BOLD::' prefix.
-4. COMBINED CLINICAL IMPRESSION: Synthesize ONE unified, comprehensive, prioritized IMPRESSION covering all examined regions (format: 'IMPRESSION:###point 1###point 2...'). Prioritize significant acute abnormalities first, followed by incidental findings or normal summaries for the respective regions.
-   - Smart Bullet Formatting in Impression:
-     * Single-Line / Lead-In Summaries: Statements such as "findings are s/o...", narrative summary paragraphs, or single normal summary sentences now start flush with the beginning of the line without any bullet point (e.g. "IMPRESSION:###Normal study without acute abnormality.").
-     * Discrete / Multi-Point Findings: When the impression consists of 2 or more discrete clinical findings, each individual finding is cleanly formatted with bullet points (• Point 1, • Point 2) starting from the left margin (e.g. "IMPRESSION:###• Point 1###• Point 2").
-5. PRESERVE TABULAR DATA: When any template contains measurement tables or comparative grids, preserve them intact with rows joined by '###'.
-================================================================================
-`;
-    return {
-      isTemplateMode: true,
-      templateType: customDocx ? 'docx' : 'builtin',
-      templateName: templateNames,
-      templateContent,
-      templateHtml: docxHtml,
-      userInstructions: customPrompt?.trim() || '',
-      templateContextPrompt,
-    };
-  }
-
-  const matchedBuiltin = matchedBuiltins[0];
-
-  if (matchedBuiltin) {
-    const templateName = matchedBuiltin.name;
-    const templateContent = (docxText.length > 0)
-      ? docxText
-      : matchedBuiltin.content;
-    const templateHtml = docxHtml;
-    const templateContextPrompt = `
-================================================================================
-ACTIVE RADIOLOGY NORMAL REPORT TEMPLATE: "${templateName}"
-BASELINE TEMPLATE CONTENT:
-"""
-${templateContent}
-"""
-${matchedBuiltin.skillPrompt ? `
-AUTHORITATIVE CLINICAL SKILL & PHRASING DIRECTIVES:
-${matchedBuiltin.skillPrompt}
-` : ''}
-CRITICAL TEMPLATE MERGE DIRECTIVES:
-1. BASELINE STRUCTURE: Use the full structure, headings, normal findings, and layout from this "${templateName}" template as the baseline skeleton.
-2. NORMAL FINDINGS PRESERVATION: If the doctor's audio dictation states "normal", "all normal", "scan is normal", "unremarkable", or does not mention changes for any anatomical section, PRESERVE and output the complete normal findings for that section verbatim WITHOUT the 'BOLD::' prefix.
-3. ABNORMAL / DICTATED FINDINGS MERGING: When the doctor dictates specific abnormal findings, observations, or modifications, merge them into the corresponding template sections and prefix only those dictated/abnormal lines with 'BOLD::'.
-4. NEW FINDINGS: Any new findings dictated that are not covered in the template should be inserted in the appropriate clinical location with 'BOLD::'.
-5. IMPRESSION: Synthesize an accurate, comprehensive IMPRESSION based on all findings (normal and abnormal) in the format 'IMPRESSION:###point 1###point 2...'.
-   - Smart Bullet Formatting in Impression:
-     * Single-Line / Lead-In Summaries: Statements such as "findings are s/o...", narrative summary paragraphs, or single normal summary sentences now start flush with the beginning of the line without any bullet point (e.g. "IMPRESSION:###Normal study without acute abnormality.").
-     * Discrete / Multi-Point Findings: When the impression consists of 2 or more discrete clinical findings, each individual finding is cleanly formatted with bullet points (• Point 1, • Point 2) starting from the left margin (e.g. "IMPRESSION:###• Point 1###• Point 2").
-6. MEASUREMENT / COMPARATIVE TABLES: When the template or report contains measurement grids or comparative anatomical tables (e.g., bilateral kidney comparisons, TAVI measurements, pulmonary artery dimensions, cardiac ventricular volumes), preserve the table rows joined by '###' (e.g. 'Col1 | Col2###Val1 | Val2') so the full tabular grid is preserved as a cohesive unit.
-================================================================================
-`;
-    return {
-      isTemplateMode: true,
-      templateType: customDocx ? 'docx' : 'builtin',
-      templateName,
-      templateContent,
-      templateHtml,
-      userInstructions: customPrompt?.trim() || '',
-      templateContextPrompt,
-    };
-  }
-
-  // 1. DOCX Template
-  if (customDocx && docxText.length > 0) {
-    const templateContent = docxText;
-    const promptTemplateName = parseSingleTemplateNameFromPrompt(customPrompt);
-    const templateName = promptTemplateName || (customDocx.name ? customDocx.name.replace(/\.[^/.]+$/, '').replace(/^\d+[-_ ]*/, '') : 'Uploaded DOCX Template');
-    const templateContextPrompt = `
-================================================================================
-ACTIVE DOCX REPORT TEMPLATE: "${templateName}"
-BASELINE TEMPLATE CONTENT:
-"""
-${templateContent}
-"""
-
-CRITICAL TEMPLATE MERGE DIRECTIVES:
-1. BASELINE STRUCTURE: Use the full structure, headings, normal findings, and layout from this template as the baseline skeleton.
-2. NORMAL FINDINGS PRESERVATION: If the doctor dictates "normal", "all normal", "scan is normal", "unremarkable", or does not mention changes for any section/organ, PRESERVE and output the complete normal findings for that section verbatim WITHOUT the 'BOLD::' prefix.
-3. ABNORMAL / DICTATED FINDINGS MERGING: When the doctor dictates specific abnormal findings or modifications, merge them into the corresponding template sections and prefix only those dictated/abnormal lines with 'BOLD::'.
-4. NEW FINDINGS: Dictated findings not covered in the template should be inserted in the appropriate anatomical section with 'BOLD::'.
-5. IMPRESSION: Synthesize an accurate, comprehensive IMPRESSION based on all findings (normal and abnormal) in the standard format 'IMPRESSION:###point 1###point 2...'.
-6. MEASUREMENT / COMPARATIVE TABLES: When this template contains tables or measurement grids (delimited with '| Col 1 | Col 2 |' pipe syntax), PRESERVE the table structure. Output table rows joined by '###' (e.g. '| Col 1 | Col 2 |###| Val 1 | Val 2 |') and prefix modified or abnormal measurements with 'BOLD::' so the tabular grid is maintained intact.
-================================================================================
-`;
-    return {
-      isTemplateMode: true,
-      templateType: 'docx',
-      templateName,
-      templateContent,
-      templateHtml: docxHtml,
-      userInstructions: customPrompt?.trim() || '',
-      templateContextPrompt,
-    };
-  }
-
-  // 2. Visual Template (Images)
-  if (customImages && customImages.length > 0) {
-    const explicitPromptName = parseSingleTemplateNameFromPrompt(customPrompt);
-    const promptTextTrimmed = customPrompt?.trim() || '';
-    return {
-      isTemplateMode: true,
-      templateType: 'image',
-      templateName: explicitPromptName || 'Visual Image Template',
-      templateContent: promptTextTrimmed || undefined,
-      userInstructions: promptTextTrimmed,
-      templateContextPrompt: `
-================================================================================
-ACTIVE VISUAL TEMPLATE: The user has provided ${customImages.length} image(s) of a report template${explicitPromptName ? ` ("${explicitPromptName}")` : ''}.
-Use them as a strict visual guide for the layout, sections, and formatting of the final report.
-${promptTextTrimmed ? `ADDITIONAL TEMPLATE CONTEXT:\n${promptTextTrimmed}\n` : ''}
-Populate the template with findings from the dictation. Normal sections without abnormal dictations should be populated with standard normal template findings without BOLD::.
-Prefix dictated/abnormal lines with 'BOLD::'.
-================================================================================
-`,
-    };
-  }
-
-  // 3. Text Prompt Analysis (Built-in template or Custom text template)
-  if (customPrompt && customPrompt.trim().length > 0) {
-    const trimmed = customPrompt.trim();
-
-    // Check for custom text template indicators:
-    // a) Keywords indicating template merge mode or explicit [TEMPLATE_ID: ...] tag
-    const hasTemplateIdTag = explicitTagIds.length > 0;
-    const hasTemplateKeyword = hasTemplateIdTag || /(template|report template|normal report|standard report|merge with|integrate into template|normal template|use template|format as template|merge dictation)/i.test(trimmed);
-    
-    // b) Structural radiology template indicators
-    const lines = trimmed.split('\n').map(l => l.trim()).filter(Boolean);
-    const hasRadiologyHeaders = /(TECHNIQUE|FINDINGS|IMPRESSION|CLINICAL PROFILE|CLINICAL HISTORY|INDICATION|COMPARISON|PROTOCOL|OBSERVATIONS):/i.test(trimmed);
-    const hasMultipleOrganSections = (trimmed.match(/([A-Z][a-zA-Z\s]{2,25}):\s+[A-Z]/g) || []).length >= 2;
-    const isMultiLineTemplate = lines.length >= 3 && (hasRadiologyHeaders || hasMultipleOrganSections || hasTemplateKeyword || trimmed.length > 80);
-
-    if (hasTemplateKeyword || hasRadiologyHeaders || isMultiLineTemplate) {
-      const templateContent = trimmed;
-      const explicitName = parseSingleTemplateNameFromPrompt(trimmed);
-      const templateName = explicitName || (lines[0] && lines[0].length < 60 ? lines[0].replace(/^#+\s*/, '') : 'Custom Text Template');
-      const templateContextPrompt = `
-================================================================================
-ACTIVE CUSTOM TEXT REPORT TEMPLATE: "${templateName}"
-BASELINE TEMPLATE CONTENT:
-"""
-${templateContent}
-"""
-
-CRITICAL TEMPLATE MERGE DIRECTIVES:
-1. BASELINE STRUCTURE: Use the full structure, headings, normal findings, and layout from this custom text template as the baseline skeleton of the report.
-2. NORMAL FINDINGS PRESERVATION: If the doctor's audio dictation states "normal", "all normal", "scan is normal", "unremarkable", or does not mention changes for any anatomical section, PRESERVE and output the complete normal findings for that section verbatim WITHOUT the 'BOLD::' prefix.
-3. ABNORMAL / DICTATED FINDINGS MERGING: When the doctor dictates specific abnormal findings, observations, or modifications, merge them into the corresponding template sections and prefix only those dictated/abnormal lines with 'BOLD::'.
-4. NEW FINDINGS: Any new findings dictated that are not covered in the template should be inserted in the appropriate clinical location with 'BOLD::'.
-5. IMPRESSION: Synthesize an accurate, comprehensive IMPRESSION combining template baseline and all abnormal findings in the format 'IMPRESSION:###point 1###point 2...'.
-================================================================================
-`;
-      return {
-        isTemplateMode: true,
-        templateType: 'custom_text',
-        templateName,
-        templateContent,
-        userInstructions: trimmed,
-        templateContextPrompt,
-      };
-    }
-  }
-
-  return {
-    isTemplateMode: false,
-    templateType: 'none',
-    userInstructions: customPrompt?.trim() || '',
-    templateContextPrompt: '',
-  };
-}
-
-const UNIT_OR_TEEN_PATTERN = `(?:zero|oh|o|one|won|two|to|too|three|four|for|five|six|seven|eight|ate|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen)`;
-const TENS_WORD_PATTERN = `(?:twenty|thirty|forty|fourty|fifty|sixty|seventy|eighty|ninety)`;
-const SPOKEN_NUM_PHRASE = `(?:(?:one|two|three)\\s+hundred(?:\\s+and)?(?:\\s+${TENS_WORD_PATTERN})?(?:[\\s-]+${UNIT_OR_TEEN_PATTERN})?|(?:one|two|three)[\\s-]+(?:${TENS_WORD_PATTERN}(?:[\\s-]+${UNIT_OR_TEEN_PATTERN})?|${UNIT_OR_TEEN_PATTERN}(?:[\\s-]+${UNIT_OR_TEEN_PATTERN})?)|${TENS_WORD_PATTERN}(?:[\\s-]+${UNIT_OR_TEEN_PATTERN})?|${UNIT_OR_TEEN_PATTERN}|\\d+)`;
-const SPOKEN_JOINER = `(?:[\\s_-]*(?:underscore|under\\s+score|dash|hyphen)[\\s_-]*|[\\s_-]+)`;
-const ADD_ID_ATOM_PATTERN = `(?:(?:builtin_)?(?:tpl[\\s_-]*)?add${SPOKEN_JOINER}${SPOKEN_NUM_PHRASE})`;
-const CUSTOM_ID_ATOM_PATTERN = `(?:(?:see|sea|custom|c)(?:[\\s_-]*\\d+|${SPOKEN_JOINER}(?:${TENS_WORD_PATTERN}(?:[\\s-]+${UNIT_OR_TEEN_PATTERN})?|${UNIT_OR_TEEN_PATTERN})))`;
-const ID_ATOM_PATTERN = `(?:${ADD_ID_ATOM_PATTERN}|(?:builtin_)?(?:tpl_|cust_|template_)\\d+|${CUSTOM_ID_ATOM_PATTERN}|${SPOKEN_NUM_PHRASE})`;
-
-const SPOKEN_UNIT_WORDS: Record<string, string> = {
-  zero: '0', oh: '0', o: '0', one: '1', won: '1', two: '2', to: '2', too: '2', three: '3', four: '4', for: '4',
-  five: '5', six: '6', seven: '7', eight: '8', ate: '8', nine: '9', ten: '10',
-  eleven: '11', twelve: '12', thirteen: '13', fourteen: '14', fifteen: '15',
-  sixteen: '16', seventeen: '17', eighteen: '18', nineteen: '19',
-};
-
-const SPOKEN_TENS_WORDS: Record<string, number> = {
-  twenty: 20, thirty: 30, forty: 40, fourty: 40, fifty: 50, sixty: 60, seventy: 70, eighty: 80, ninety: 90,
-};
-
-function parseSpokenDigitsOrNumber(phrase: string): string | null {
-  const clean = phrase.trim().toLowerCase().replace(/[-\s]+/g, ' ');
-  if (!clean) return null;
-  if (/^\d+$/.test(clean)) return String(parseInt(clean, 10));
-  const tokens = clean.split(' ').filter(t => t && t !== 'and');
-  if (tokens.length === 0) return null;
-
-  if (!tokens.includes('hundred')) {
-    const first = SPOKEN_UNIT_WORDS[tokens[0]] !== undefined ? parseInt(SPOKEN_UNIT_WORDS[tokens[0]], 10) : NaN;
-    if (tokens.length === 3 && !isNaN(first) && first >= 0 && first <= 9) {
-      const sTen = SPOKEN_TENS_WORDS[tokens[1]];
-      const sOne = SPOKEN_UNIT_WORDS[tokens[1]] !== undefined ? parseInt(SPOKEN_UNIT_WORDS[tokens[1]], 10) : NaN;
-      const tOne = SPOKEN_UNIT_WORDS[tokens[2]] !== undefined ? parseInt(SPOKEN_UNIT_WORDS[tokens[2]], 10) : NaN;
-      if (first >= 1 && sTen !== undefined && !isNaN(tOne) && tOne >= 1 && tOne <= 9) {
-        return String(first * 100 + sTen + tOne);
-      }
-      if (!isNaN(sOne) && sOne >= 0 && sOne <= 9 && !isNaN(tOne) && tOne >= 0 && tOne <= 9) {
-        return String(first * 100 + sOne * 10 + tOne);
-      }
-    }
-    if (tokens.length === 2 && !isNaN(first) && first >= 1 && first <= 9) {
-      const sTen = SPOKEN_TENS_WORDS[tokens[1]];
-      const sTeen = SPOKEN_UNIT_WORDS[tokens[1]] !== undefined ? parseInt(SPOKEN_UNIT_WORDS[tokens[1]], 10) : NaN;
-      if (sTen !== undefined) return String(first * 100 + sTen);
-      if (!isNaN(sTeen) && sTeen >= 10 && sTeen <= 19) return String(first * 100 + sTeen);
-    }
-  }
-
-  let total = 0;
-  let current = 0;
-  for (const tok of tokens) {
-    if (SPOKEN_UNIT_WORDS[tok] !== undefined) {
-      current += parseInt(SPOKEN_UNIT_WORDS[tok], 10);
-    } else if (SPOKEN_TENS_WORDS[tok] !== undefined) {
-      current += SPOKEN_TENS_WORDS[tok];
-    } else if (tok === 'hundred') {
-      current = (current === 0 ? 1 : current) * 100;
-    } else if (/^\d+$/.test(tok)) {
-      current += parseInt(tok, 10);
-    } else {
-      return null;
-    }
-  }
-  total += current;
-  return total > 0 ? String(total) : null;
-}
-
-function splitSpokenIdList(rawSegment: string): string[] {
-  if (!rawSegment) return [];
-  // Protect "hundred and <X>" from being split at "and"
-  const protectedText = rawSegment
-    .replace(/\bhundred\s+and\b/gi, 'hundred__and')
-    .replace(/\b(?:template\s+(?:ids?|numbers?|no\.?)|templates?)\s*[:#-]*/gi, ',')
-    .replace(/\b(?:and|also|plus|with|&|\+)\b/gi, ',');
-  const rawTokens = protectedText
-    .split(/[,;]+/)
-    .map(t => t.replace(/hundred__and/g, 'hundred and').trim())
-    .filter(Boolean);
-
-  const ids: string[] = [];
-  for (const tok of rawTokens) {
-    // Extract atomic matches inside runs like "add_128" or "5 15"
-    const subMatches = [...tok.matchAll(new RegExp(ID_ATOM_PATTERN, 'gi'))].map(m => m[0].trim()).filter(Boolean);
-    const candidates = subMatches.length > 0 ? subMatches : [tok];
-    for (let candidate of candidates) {
-      const addPrefixed = candidate.match(/^(?:builtin_)?(?:tpl[\s_-]*)?add(?:[\s_-]*(?:underscore|under\s+score|dash|hyphen)[\s_-]*|[\s_-]+)(.+)$/i);
-      if (addPrefixed) {
-        const tail = addPrefixed[1].trim();
-        const numParsed = parseSpokenDigitsOrNumber(tail);
-        candidate = numParsed ? `add_${numParsed.padStart(3, '0')}` : `add_${tail.replace(/\s+/g, '_')}`;
-      } else {
-        // Normalize phonetic "see 1" / "sea two" / "c two" / "custom 2" -> "C2" or "C <rest>"
-        const customPrefixed = candidate.match(/^(?:see|sea|custom|c)[\s-]+(.+)$/i);
-        if (customPrefixed) {
-          const tail = customPrefixed[1].trim().toLowerCase();
-          candidate = /^\d+$/.test(tail)
-            ? `C${tail}`
-            : SPOKEN_UNIT_WORDS[tail]
-              ? `C${SPOKEN_UNIT_WORDS[tail]}`
-              : `C ${tail}`;
-        }
-      }
-      if (candidate && !ids.some(x => x.toLowerCase() === candidate.toLowerCase())) {
-        ids.push(candidate);
-      }
-    }
-  }
-  return ids;
-}
-
-/**
- * Detects and extracts spoken template ID directive token(s): {template id [ID]} or spoken "template id X and Y"
- * Supports numeric IDs, supplemental "add_XXX" / "add XXX" IDs, custom C-IDs, and multiple combined IDs.
- */
-export function extractSpokenTemplateDirective(findings: string[]): {
-  templateId: string | null;
-  templateIds: string[];
-  mode: 'add' | 'replace';
-  cleanedFindings: string[];
-} {
-  if (!findings || findings.length === 0) {
-    return { templateId: null, templateIds: [], mode: 'add', cleanedFindings: [] };
-  }
-
-  const detectedIds: string[] = [];
-  let mode: 'add' | 'replace' = 'add';
-  const cleaned: string[] = [];
-
-  const listTailPattern = `(` +
-    ID_ATOM_PATTERN +
-    `(?:\\s*(?:,|;|&|\\+|\\band\\b|\\balso\\b|\\bwith\\b)\\s*(?:(?:template\\s+(?:ids?|numbers?|no\\.?)\\s*[:\\s#-]*))?` +
-    ID_ATOM_PATTERN +
-    `)*)`;
-
-  const bracedTemplateRegex = /\{\s*((?:add|use|apply|insert|combine|switch(?:\s+to)?|change(?:\s+to)?|replace(?:\s+with)?|merge(?:\s+with)?)\s+)?template(?:s|\s+ids?|\s+numbers?|\s+no\.?)?\s*[:\s#-]*([a-zA-Z0-9_,\-&\+\s]+?)\s*\}\.?/gi;
-  const bracedPrefixedIdRegex = /\{\s*((?:use|apply|add|merge(?:\s+with)?)?\s*)?((?:(?:builtin_)?(?:tpl[\s_-]*)?add[\s_-]*\d+|tpl_\d+|c\d+)(?:\s*(?:,|;|&|\+|\band\b)\s*[a-zA-Z0-9_\s-]+)*)\s*\}\.?/gi;
-
-  // Matches "template id 5", "template id add_128", "add template id add 128", or omitted-"id" explicit prefix ("template add_128", "template add 128", "template C1")
-  const unbracedRegex = new RegExp(
-    `(?:^|\\b)((?:add|use|apply|insert|combine|also\\s+(?:add|use)|switch(?:\\s+to)?|change(?:\\s+to)?|replace(?:\\s+with)?|merge(?:\\s+with)?)\\s+)?(?:template(?:s)?\\s+(?:ids?|numbers?|no\\.?)|combined\\s+templates?)\\s*[:\\s#-]*` +
-      listTailPattern +
-      `\\b\\.?`,
-    'gi'
-  );
-  const explicitPrefixedTagRegex = new RegExp(
-    `(?:^|\\b)((?:add|use|apply|insert|combine|also\\s+(?:add|use)|switch(?:\\s+to)?|change(?:\\s+to)?|replace(?:\\s+with)?|merge(?:\\s+with)?)\\s+)?(?:template\\s+(?:` +
-      ADD_ID_ATOM_PATTERN +
-      `|` +
-      CUSTOM_ID_ATOM_PATTERN +
-      `|(?:builtin_)?(?:tpl_|cust_)\\d+)|(?:tpl_add_\\d+|add_\\d+|add_(?:${UNIT_OR_TEEN_PATTERN}|${TENS_WORD_PATTERN})))(?:\\s*(?:,|;|&|\\+|\\band\\b|\\balso\\b|\\bwith\\b)\\s*(?:template(?:\\s+(?:ids?|numbers?|no\\.?))?\\s*[:\\s#-]*)?` +
-      ID_ATOM_PATTERN +
-      `)*\\b\\.?`,
-    'gi'
-  );
-
-  const candidateRegexes: Array<{ regex: RegExp; rawTokenGroupIndex: number }> = [
-    { regex: bracedTemplateRegex, rawTokenGroupIndex: 2 },
-    { regex: bracedPrefixedIdRegex, rawTokenGroupIndex: 2 },
-    { regex: unbracedRegex, rawTokenGroupIndex: 2 },
-    { regex: explicitPrefixedTagRegex, rawTokenGroupIndex: 99 },
-  ];
-
-  for (const rawFinding of findings) {
-    if (!rawFinding) continue;
-    const isBold = /^BOLD::/i.test(rawFinding);
-    let working = rawFinding.replace(/^BOLD::/i, '').trim();
-
-    const rawMatches: Array<{ start: number; end: number; verb: string; idSegment: string }> = [];
-    for (const { regex, rawTokenGroupIndex } of candidateRegexes) {
-      regex.lastIndex = 0;
-      for (const m of working.matchAll(regex)) {
-        if (m.index === undefined) continue;
-        const full = m[0];
-        const idSegment = (m[rawTokenGroupIndex] !== undefined
-          ? m[rawTokenGroupIndex]
-          : full
-              .replace(/^[\{\s]+/, '')
-              .replace(/[\}\s]+$/, '')
-              .replace(/^(?:add|use|apply|insert|combine|also\s+(?:add|use)|switch(?:\s+to)?|change(?:\s+to)?|replace(?:\s+with)?|merge(?:\s+with)?)\s+/i, '')
-              .replace(/^(?:template(?:s)?\s+(?:ids?|numbers?|no\.?)?\s*[:\s#-]*)/i, '')) || '';
-        rawMatches.push({
-          start: m.index,
-          end: m.index + full.length,
-          verb: (m[1] || '').toLowerCase(),
-          idSegment,
-        });
-      }
-    }
-
-    if (rawMatches.length > 0) {
-      rawMatches.sort((a, b) => (a.start - b.start) || ((b.end - b.start) - (a.end - a.start)));
-      const accepted: typeof rawMatches = [];
-      for (const item of rawMatches) {
-        const prev = accepted[accepted.length - 1];
-        if (prev && item.start < prev.end) continue;
-        accepted.push(item);
-      }
-
-      for (const item of accepted) {
-        if (/(?:switch|change|replace)/i.test(item.verb)) {
-          mode = 'replace';
-        }
-        const ids = splitSpokenIdList(item.idSegment);
-        for (const id of ids) {
-          if (!detectedIds.some(existing => existing.toLowerCase() === id.toLowerCase())) {
-            detectedIds.push(id);
-          }
-        }
-      }
-
-      for (let idx = accepted.length - 1; idx >= 0; idx--) {
-        const span = accepted[idx];
-        working = `${working.slice(0, span.start)} ${working.slice(span.end)}`;
-      }
-
-      const stripped = working
-        .replace(/\s+/g, ' ')
-        .replace(/^[:\s\-.,;]+/, '')
-        .replace(/[:\s\-.,;]+$/, '')
-        .trim();
-      if (stripped.length > 0 && !/^(?:please|and|also|instead)$/i.test(stripped)) {
-        cleaned.push(isBold ? `BOLD::${stripped}` : stripped);
-      }
-    } else {
-      cleaned.push(rawFinding);
-    }
-  }
-
-  return {
-    templateId: detectedIds[0] || null,
-    templateIds: detectedIds,
-    mode,
-    cleanedFindings: cleaned,
-  };
 }
 
 async function resolveAndApplySpokenTemplates(
@@ -1221,22 +1500,19 @@ async function resolveAndApplySpokenTemplates(
   return findingsToMerge;
 }
 
-export const processAudio = async (
-  audioBlob: Blob | Blob[], 
-  model: string, 
-  customPrompt?: string,
-  customImages?: Array<{ data: string; mimeType: string }> | null,
-  existingFindings?: string[],
-  customDocx?: CustomDocxInput,
-  abortSignal?: AbortSignal,
-  options?: ProcessAudioOptions
-): Promise<string[]> => {
-  const audioBlobs = Array.isArray(audioBlob) ? audioBlob : [audioBlob];
-  if (audioBlobs.length === 0) {
-    throw new Error("No audio or input files provided for processing.");
-  }
-
-  const isReprocessing = existingFindings && existingFindings.length > 0;
+function buildProcessAudioStaticParts(params: {
+  audioBlobsCount: number;
+  customPrompt?: string;
+  customImages?: Array<{ data: string; mimeType: string }> | null;
+  existingFindings?: string[];
+  customDocx?: CustomDocxInput;
+}): {
+  parts: any[];
+  templateInfo: DetectedTemplateInfo;
+  audioTaskType: ModelTaskType;
+} {
+  const { audioBlobsCount, customPrompt, customImages, existingFindings, customDocx } = params;
+  const isReprocessing = Boolean(existingFindings && existingFindings.length > 0);
   const templateInfo = detectAndExtractTemplate(customPrompt, customImages, customDocx);
 
   let basePrompt: string;
@@ -1251,133 +1527,297 @@ export const processAudio = async (
   } else {
     basePrompt = DEFAULT_GEMINI_PROMPT;
   }
-  
+
   const macroContext = getMacroPromptContext();
   const spokenTemplateReminder = templateInfo.isTemplateMode
-    ? `SPOKEN TEMPLATE ID ADDITION/SWITCH: If the radiologist explicitly speaks another Template ID in the audio (e.g., "add template id 15", "template id 200", "combine with template id C1", "switch to template id 42"), emit "{add template id [ID]}" (e.g. "{add template id 200}" or "{template id 1, 200}") at the very beginning of the "findings" array. Do NOT emit unless explicit numeric (1-300), add_XXX, or C-code IDs were spoken.`
+    ? `SPOKEN TEMPLATE ID ADDITION/SWITCH: If the radiologist explicitly speaks another Template ID in the audio (e.g., "add template id 15", "template id 200", "combine with template id C1", "switch to template id 42"), emit "{add template id [ID]}" (e.g. "{add template id 200}" or "{template id 1, 200}") at the very beginning of that patient's block (if 2+ patients, keep each patient's token strictly inside their own "--- PATIENT N REPORT ---" block). Do NOT emit unless explicit numeric (1-300), add_XXX, or C-code IDs were spoken.`
     : '';
   const prompt = [
-    customPrompt 
-      ? `${basePrompt}\n\nCustom Instructions (Reminder):\n${customPrompt}` 
+    customPrompt
+      ? `${basePrompt}\n\nCustom Instructions (Reminder):\n${customPrompt}`
       : basePrompt,
     macroContext,
-    spokenTemplateReminder
+    spokenTemplateReminder,
   ].filter(Boolean).join('\n\n');
 
   const parts: any[] = [];
 
-  // If template is detected, inject the explicit template merge directives
   if (templateInfo.isTemplateMode && templateInfo.templateContextPrompt) {
-    parts.push({
-      text: templateInfo.templateContextPrompt
-    });
+    parts.push({ text: templateInfo.templateContextPrompt });
   }
 
   if (customImages && customImages.length > 0) {
     for (const customImage of customImages) {
-        parts.push({
-            inlineData: {
-                mimeType: customImage.mimeType,
-                data: customImage.data,
-            },
-        });
+      parts.push({
+        inlineData: {
+          mimeType: customImage.mimeType,
+          data: customImage.data,
+        },
+      });
     }
     parts.push({
-      text: `The user has provided ${customImages.length > 1 ? 'images' : 'an image'}. Use ${customImages.length > 1 ? 'them' : 'it'} as a strict visual guide for the structure, layout, and formatting of the final report. The following instructions and audio dictation should be used to populate this template.`
+      text: `The user has provided ${customImages.length > 1 ? 'images' : 'an image'}. Use ${customImages.length > 1 ? 'them' : 'it'} as a strict visual guide for the structure, layout, and formatting of the final report. The following instructions and audio dictation should be used to populate this template.`,
     });
   }
-  
+
   if (isReprocessing) {
     parts.push({ text: `Here is the existing transcript to start from:\n\n${JSON.stringify({ findings: existingFindings })}` });
   }
 
   parts.push({ text: prompt });
 
-  if (audioBlobs.length > 1) {
+  if (audioBlobsCount > 1) {
     parts.push({
-      text: `The user has uploaded ${audioBlobs.length} dictation/input files for this study. Transcribe, analyze, and combine all findings, observations, and impressions from all provided files into a single, comprehensive radiology report.`
+      text: `The user has uploaded ${audioBlobsCount} dictation/input files for this study. Transcribe, analyze, and combine all findings, observations, and impressions from all provided files into a single, comprehensive radiology report.`,
     });
   }
 
-  for (let i = 0; i < audioBlobs.length; i++) {
-    const blob = audioBlobs[i];
-    const base64Audio = await blobToBase64(blob);
-    let cleanMime = getCleanMimeType(blob);
-    if (!blob.type || blob.type === 'application/octet-stream' || cleanMime === 'audio/ogg' || cleanMime === 'audio/webm') {
-      const detectedAudioMime = await detectAudioMimeFromHeader(blob);
-      if (detectedAudioMime) {
-        cleanMime = detectedAudioMime;
-      }
-    }
-    const isAudio = cleanMime.startsWith('audio/');
-    const isVideo = cleanMime.startsWith('video/');
-    const isPdf = cleanMime === 'application/pdf';
-    const isImage = cleanMime.startsWith('image/');
-    const isText = cleanMime.startsWith('text/');
+  const audioTaskType: ModelTaskType =
+    isReprocessing ||
+    templateInfo.isTemplateMode ||
+    Boolean(customPrompt?.trim()) ||
+    Boolean(customImages && customImages.length > 0) ||
+    Boolean(customDocx)
+      ? 'reasoning'
+      : 'transcription';
 
-    const fileName = (blob as any).name ? `"${(blob as any).name}"` : `Segment #${i + 1}`;
+  return { parts, templateInfo, audioTaskType };
+}
 
-    if (audioBlobs.length > 1) {
-      parts.push({
-        text: `--- Dictation / Input File #${i + 1}: ${fileName} (${cleanMime}) ---`
-      });
-    } else if (!isAudio) {
-      parts.push({
-        text: `Context & Input File: The user has provided an input file (${isPdf ? 'PDF document' : isImage ? 'Medical scan / image' : isVideo ? 'Video recording' : isText ? 'Text / Document' : 'Document'}). Analyze, transcribe, extract, and interpret all radiological findings, clinical indications, observations, measurements, impressions, and technique thoroughly into the structured findings array following all medical and radiology transcription rules.`
-      });
-    }
-
-    if (isText) {
-      try {
-        const textContent = await blob.text();
-        parts.push({
-          text: `[Dictated / Pasted Clinical Text Content for ${fileName}]:\n"""\n${textContent}\n"""\nInstruction: This is dictated / clinical text provided by the clinician. Transcribe, analyze, correct, format, and structure this text into formal radiology findings according to all radiology report and transcription rules.`
-        });
-      } catch (e) {
-        console.warn('Could not read blob as text:', e);
-      }
-    }
-
-    parts.push({
-      inlineData: {
-        mimeType: cleanMime,
-        data: base64Audio,
-      },
-    });
-  }
-  
-  // For merge mode alone or non-audio inputs: transcribe-only models do not support non-audio formats or template reasoning.
-  // Route to multimodal reasoning models (defaulting to gemini-3.8-flash).
-  const hasNonAudio = audioBlobs.some(b => {
-    const mime = getCleanMimeType(b);
-    return !mime.startsWith('audio/');
+function attachPatientReports(
+  findings: string[],
+  patientReports: PatientReportSegment[]
+): ProcessAudioResult {
+  const result = [...findings] as ProcessAudioResult;
+  Object.defineProperty(result, 'patientReports', {
+    value: patientReports,
+    enumerable: false,
+    configurable: true,
+    writable: true,
   });
+  return result;
+}
+
+export const processAudio = async (
+  audioBlob: Blob | Blob[],
+  model: string,
+  customPrompt?: string,
+  customImages?: Array<{ data: string; mimeType: string }> | null,
+  existingFindings?: string[],
+  customDocx?: CustomDocxInput,
+  abortSignal?: AbortSignal,
+  options?: ProcessAudioOptions
+): Promise<ProcessAudioResult> => {
+  const audioBlobs = Array.isArray(audioBlob) ? audioBlob : [audioBlob];
+  if (audioBlobs.length === 0) {
+    throw new Error("No audio or input files provided for processing.");
+  }
+
+  const { parts, templateInfo, audioTaskType } = buildProcessAudioStaticParts({
+    audioBlobsCount: audioBlobs.length,
+    customPrompt,
+    customImages,
+    existingFindings,
+    customDocx,
+  });
+
+  const totalMediaBytes = audioBlobs.reduce((sum, b) => sum + (b?.size || 0), 0);
+  const processTimeoutMs = totalMediaBytes > 10 * 1024 * 1024 ? 120_000 : undefined;
+
+  const blobDescriptors = await prepareBlobPartDescriptors(audioBlobs, { includeContextLabels: true });
+  const uploadedByKey = new Map<string, Map<number, UploadedGeminiFileRef>>();
+
+  const resolveRequestParts = async (client: GoogleGenAI, apiKey: string): Promise<any[]> => {
+    const mediaParts = await resolveBlobDescriptorPartsForAttempt({
+      descriptors: blobDescriptors,
+      client,
+      apiKey,
+      uploadedByKey,
+      abortSignal,
+    });
+    return [...parts, ...mediaParts];
+  };
 
   const targetModel = resolveApiTargetModel(model);
 
-  try {
-    const rawResponseText = await generateContentWithJsonFallback(targetModel, parts, responseSchema, 0.1, abortSignal);
-    const findings = extractFindingsFromResponse(rawResponseText);
+  const finalizeProcessAudioFindings = async (
+    rawFindings: string[],
+    winningModel: string
+  ): Promise<ProcessAudioResult> => {
+    const segments = splitMultiPatientFindings(rawFindings);
 
-    if (findings && findings.length > 0) {
+    // Multi-patient path (2+ patients detected): resolve each patient's own spoken template IDs
+    // or fallback manual template independently and run merges in parallel.
+    if (segments.length >= 2) {
+      const manualBuiltins = templateInfo.isTemplateMode ? findBuiltinTemplates(customPrompt) : [];
+      const manualTemplateFallback =
+        manualBuiltins.length > 0
+          ? manualBuiltins
+          : templateInfo.isTemplateMode && (templateInfo.templateContent || customDocx || (customImages && customImages.length > 0))
+          ? [
+              {
+                name: templateInfo.templateName || 'Selected Template',
+                content: templateInfo.templateContent || '',
+                lines: (templateInfo.templateContent || '').split('\n').filter(Boolean),
+              },
+            ]
+          : [];
+
+      let firstSpokenResolution: SpokenTemplateResolution | null = null;
+
+      const resolvedSegments = await Promise.all(
+        segments.map(async (seg): Promise<PatientReportSegment> => {
+          const segBaseFindings =
+            options?.mergeBaseFindings && options.mergeBaseFindings.length > 0
+              ? [...options.mergeBaseFindings, ...seg.findings]
+              : seg.findings;
+
+          if (seg.templateIds && seg.templateIds.length > 0) {
+            try {
+              const foundTemplates = (
+                await Promise.all(seg.templateIds.map((id) => findTemplateByIdOrNumber(id)))
+              ).filter((tpl): tpl is NonNullable<typeof tpl> => Boolean(tpl));
+
+              if (foundTemplates.length > 0) {
+                const bundle = await buildCombinedTemplateBundle(foundTemplates);
+                const mergedImages = mergeTemplateImages(customImages, bundle.images);
+                if (!firstSpokenResolution) {
+                  firstSpokenResolution = {
+                    templateIds: seg.templateIds,
+                    templateName: bundle.name,
+                    promptText: bundle.promptText,
+                    docxData: bundle.docxData,
+                    images: mergedImages,
+                  };
+                }
+                const merged = await mergeDictatedFindingsWithTemplate(
+                  segBaseFindings,
+                  foundTemplates.length === 1 ? foundTemplates[0] : foundTemplates,
+                  winningModel,
+                  undefined,
+                  bundle.promptText,
+                  bundle.docxData,
+                  abortSignal,
+                  mergedImages
+                );
+                const strippedMerged = extractSpokenTemplateDirective(merged).cleanedFindings;
+                return {
+                  ...seg,
+                  templateName: bundle.name,
+                  findings: strippedMerged.length > 0 ? strippedMerged : merged,
+                };
+              }
+            } catch (segErr: any) {
+              if (segErr?.name === 'AbortError' || abortSignal?.aborted) throw segErr;
+              console.warn(`Per-patient spoken template merge failed for ${seg.label}:`, segErr);
+            }
+          }
+
+          if (manualTemplateFallback.length > 0) {
+            try {
+              const merged = await mergeDictatedFindingsWithTemplate(
+                segBaseFindings,
+                manualTemplateFallback.length === 1 ? manualTemplateFallback[0] : manualTemplateFallback,
+                winningModel,
+                undefined,
+                customPrompt,
+                customDocx,
+                abortSignal,
+                customImages
+              );
+              const strippedMerged = extractSpokenTemplateDirective(merged).cleanedFindings;
+              return {
+                ...seg,
+                templateName: templateInfo.templateName,
+                findings: strippedMerged.length > 0 ? strippedMerged : merged,
+              };
+            } catch (manualErr: any) {
+              if (manualErr?.name === 'AbortError' || abortSignal?.aborted) throw manualErr;
+              console.warn(`Per-patient manual template merge failed for ${seg.label}:`, manualErr);
+            }
+          }
+
+          const polished = await maybePolishMediumFindings(seg.findings, winningModel, abortSignal);
+          return {
+            ...seg,
+            findings: polished,
+          };
+        })
+      );
+
+      if (firstSpokenResolution) {
+        try {
+          options?.onSpokenTemplateResolved?.(firstSpokenResolution);
+        } catch (cbErr) {
+          console.warn('onSpokenTemplateResolved callback notice:', cbErr);
+        }
+      }
+
+      const combined = joinMultiPatientFindings(resolvedSegments);
+      options?.onPatientReportsResolved?.(resolvedSegments);
+      return attachPatientReports(combined, resolvedSegments);
+    }
+
+    // Single-patient path
+    let resolvedTemplateName = templateInfo.templateName;
+    const { templateIds } = extractSpokenTemplateDirective(rawFindings);
+    let finalFindings: string[];
+    if (templateIds.length > 0) {
       try {
-        return await resolveAndApplySpokenTemplates(findings, {
+        finalFindings = await resolveAndApplySpokenTemplates(rawFindings, {
           templateInfo,
-          model: targetModel,
+          model: winningModel,
           audioBlobs,
           customPrompt,
           customImages,
           customDocx,
           abortSignal,
-          onSpokenTemplateResolved: options?.onSpokenTemplateResolved,
+          onSpokenTemplateResolved: (resolved) => {
+            resolvedTemplateName = resolved.templateName;
+            options?.onSpokenTemplateResolved?.(resolved);
+          },
           mergeBaseFindings: options?.mergeBaseFindings,
         });
       } catch (mergeErr: any) {
         if (mergeErr?.name === 'AbortError' || abortSignal?.aborted) throw mergeErr;
         console.warn("Spoken template merge error, falling back to cleaned findings:", mergeErr);
-        const { cleanedFindings } = extractSpokenTemplateDirective(findings);
-        return cleanedFindings.length > 0 ? cleanedFindings : findings;
+        const { cleanedFindings } = extractSpokenTemplateDirective(rawFindings);
+        const fallbackFindings = cleanedFindings.length > 0 ? cleanedFindings : rawFindings;
+        finalFindings = await maybePolishMediumFindings(fallbackFindings, winningModel, abortSignal);
       }
+    } else {
+      finalFindings = await maybePolishMediumFindings(rawFindings, winningModel, abortSignal);
+    }
+
+    const strippedSingle = extractSpokenTemplateDirective(finalFindings).cleanedFindings;
+    const cleanFinal = strippedSingle.length > 0 ? strippedSingle : finalFindings;
+    const singleSeg: PatientReportSegment = {
+      id: segments[0]?.id || 'patient_1',
+      label: segments[0]?.label || 'Patient 1',
+      ...(segments[0]?.patientName ? { patientName: segments[0].patientName } : {}),
+      ...(templateIds.length > 0 ? { templateIds } : {}),
+      ...(resolvedTemplateName ? { templateName: resolvedTemplateName } : {}),
+      findings: cleanFinal,
+    };
+    const patientReports = [singleSeg];
+    options?.onPatientReportsResolved?.(patientReports);
+    return attachPatientReports(cleanFinal, patientReports);
+  };
+
+  try {
+    const { text: rawResponseText, winningModel } = await generateContentWithJsonFallbackMeta(
+      targetModel,
+      resolveRequestParts,
+      responseSchema,
+      0.1,
+      abortSignal,
+      audioTaskType,
+      { timeoutMs: processTimeoutMs }
+    );
+    const findings = extractFindingsFromResponse(rawResponseText);
+
+    if (findings && findings.length > 0) {
+      return await finalizeProcessAudioFindings(findings, winningModel);
     } else {
       throw new Error("Invalid data structure in API response. Expected a 'findings' array.");
     }
@@ -1387,7 +1827,6 @@ export const processAudio = async (
     }
     console.warn("Gemini API call returned error, evaluating fallback:", error);
 
-    // In MERGE MODE ALONE: If error is JSON mode unsupported or schema failure, retry cleanly with target model & raw JSON prompt
     const isMediaOrNonRetryable = Boolean((error as any)?.isNonRetryable) || isNonRetryableMediaError(error);
     const isSchemaOrParseError =
       !isMediaOrNonRetryable &&
@@ -1395,10 +1834,18 @@ export const processAudio = async (
         (error instanceof Error && error.message.includes("Expected a 'findings' array")));
     if (templateInfo.isTemplateMode && isSchemaOrParseError) {
       try {
-        const retryText = await generateContentWithJsonFallback(targetModel, parts, responseSchema, 0.1, abortSignal);
+        const { text: retryText, winningModel } = await generateContentWithJsonFallbackMeta(
+          targetModel,
+          resolveRequestParts,
+          responseSchema,
+          0.1,
+          abortSignal,
+          audioTaskType,
+          { timeoutMs: processTimeoutMs }
+        );
         const parsedFindings = extractFindingsFromResponse(retryText);
         if (parsedFindings && parsedFindings.length > 0) {
-          return parsedFindings;
+          return await finalizeProcessAudioFindings(parsedFindings, winningModel);
         }
       } catch (retryErr: any) {
         if (retryErr?.name === 'AbortError' || abortSignal?.aborted) {
@@ -1409,20 +1856,22 @@ export const processAudio = async (
     }
 
     if (existingFindings && existingFindings.length > 0) {
-      return existingFindings;
+      return attachPatientReports(existingFindings, splitMultiPatientFindings(existingFindings));
     }
 
     if (error instanceof Error && !error.message.includes('API_KEY')) {
-        throw new Error(`Failed to process audio: ${error.message}`);
+      throw new Error(`Failed to process audio: ${error.message}`);
     }
-    
-    // Default structured radiology findings if no API key is configured
-    return [
+
+    const fallbackReport = [
       "BOLD::Serial axial CT sections of the brain were performed without contrast.",
       "BOLD::No acute intracranial hemorrhage, territorial infarction, or mass effect.",
       "BOLD::Ventricles, basal cisterns, and cortical sulci are normal for patient age.",
       "IMPRESSION:###NORMAL CT BRAIN STUDY WITHOUT ACUTE INTRACRANIAL ABNORMALITY."
     ];
+    return attachPatientReports(fallbackReport, splitMultiPatientFindings(fallbackReport));
+  } finally {
+    cleanupUploadedGeminiFiles(uploadedByKey).catch(() => {});
   }
 };
 
@@ -1564,6 +2013,22 @@ export function applySpokenHeadingModifications(findings: string[], directives?:
   });
 }
 
+export type TemplateMergeInput =
+  | ReportTemplate
+  | {
+      name: string;
+      content?: string;
+      lines?: string[];
+      skillPrompt?: string;
+      id?: string;
+      fileName?: string;
+      docxBase64?: string;
+      category?: string;
+      modality?: string;
+      templateId?: string;
+      description?: string;
+    };
+
 /**
  * Merges pre-existing dictated findings with a selected template after dictation.
  * Surgically gathers prompt texts from TEMPLATE_GEMINI_PROMPT and CRITICAL TEMPLATE MERGE DIRECTIVES
@@ -1571,7 +2036,7 @@ export function applySpokenHeadingModifications(findings: string[], directives?:
  */
 export const mergeDictatedFindingsWithTemplate = async (
   dictatedFindings: string[],
-  template: ReportTemplate | ReportTemplate[] | { name: string; content?: string; lines?: string[]; skillPrompt?: string; id?: string; fileName?: string; docxBase64?: string },
+  template: TemplateMergeInput | TemplateMergeInput[],
   model: string = DEFAULT_SELECTED_MODEL,
   audioBlob?: Blob | Blob[] | null,
   customPrompt?: string,
@@ -1584,7 +2049,7 @@ export const mergeDictatedFindingsWithTemplate = async (
   }
 
   const isMulti = Array.isArray(template) && template.length > 1;
-  const templates: Array<{ name: string; content?: string; lines?: string[]; skillPrompt?: string; id?: string; fileName?: string; docxBase64?: string }> = Array.isArray(template) ? template : [template];
+  const templates: TemplateMergeInput[] = Array.isArray(template) ? template : [template];
   const templateName = templates.map(t => t.name).join(' + ');
 
   const docxText = ((customDocx?.text || customDocx?.extractedText || '')).trim();
@@ -1776,11 +2241,19 @@ Carefully integrate these dictated findings into the "${templateName}" baseline 
   const targetModel = resolveApiTargetModel(model);
 
   try {
-    const rawResponseText = await generateContentWithJsonFallback(targetModel, parts, responseSchema, 0.1, abortSignal);
+    const { text: rawResponseText, winningModel } = await generateContentWithJsonFallbackMeta(
+      targetModel,
+      parts,
+      responseSchema,
+      0.1,
+      abortSignal,
+      'reasoning'
+    );
     const mergedFindings = extractFindingsFromResponse(rawResponseText);
 
     if (mergedFindings && mergedFindings.length > 0) {
-      return applySpokenHeadingModifications(mergedFindings, customPrompt);
+      const modified = applySpokenHeadingModifications(mergedFindings, customPrompt);
+      return await maybePolishMediumFindings(modified, winningModel, abortSignal);
     }
     throw new Error("Invalid response format received while merging template.");
   } catch (error) {
@@ -1788,25 +2261,42 @@ Carefully integrate these dictated findings into the "${templateName}" baseline 
 
     // Direct JSON prompt fallback using text-only parts to guarantee payload fits
     try {
-      const textOnlyParts = parts.filter(p => !p.inlineData);
-      const retryResponse = await executeWithApiKeyFailover(
-        async (client) => {
-          return await client.models.generateContent({
-            model: targetModel,
-            contents: {
-              parts: [
-                ...textOnlyParts,
-                { text: "\n\nCRITICAL OUTPUT REQUIREMENT: Output ONLY a valid JSON object in the exact format: {\"findings\": [\"finding 1\", \"finding 2\", ...]}" }
-              ]
+      const textOnlyParts = parts.filter(p => !p.inlineData && !p.fileData);
+      const { result: retryText, winningModel } = await executeWithFreeTierModelFallbackMeta(
+        targetModel,
+        (activeModel, hasMoreFallbackModels) =>
+          executeWithApiKeyFailover(
+            async (client, apiKey) => {
+              const effectiveParts = withRoboticsDirectivesForModel(
+                [
+                  ...textOnlyParts,
+                  { text: "\n\nCRITICAL OUTPUT REQUIREMENT: Output ONLY a valid JSON object in the exact format: {\"findings\": [\"finding 1\", \"finding 2\", ...]}" }
+                ],
+                activeModel,
+                true
+              );
+              return await callGenerateContentWithOptimalThinking({
+                client,
+                apiKey,
+                model: activeModel,
+                parts: effectiveParts,
+                temperature: 0.1,
+                abortSignal,
+                taskType: 'reasoning',
+              });
+            },
+            {
+              selectedModel: activeModel,
+              abortSignal,
+              ...getFailoverKeyOptionsForModel(activeModel, hasMoreFallbackModels),
             }
-          });
-        },
-        { selectedModel: targetModel }
+          ),
+        { abortSignal }
       );
-      const retryText = retryResponse.text?.trim() || '';
       const parsed = extractFindingsFromResponse(retryText);
       if (parsed && parsed.length > 0) {
-        return applySpokenHeadingModifications(parsed, customPrompt);
+        const modified = applySpokenHeadingModifications(parsed, customPrompt);
+        return await maybePolishMediumFindings(modified, winningModel, abortSignal);
       }
     } catch (retryErr) {
       console.warn("mergeDictatedFindingsWithTemplate fallback failed:", retryErr);
@@ -1843,19 +2333,12 @@ Carefully integrate these dictated findings into the "${templateName}" baseline 
 };
 
 export const continueAudioDictation = async (existingText: string, audioBlob: Blob, customPrompt?: string, model?: string): Promise<string> => {
-  let audioPart: any;
-  if (audioBlob.type && (audioBlob.type.startsWith('text/') || audioBlob.type === 'application/json')) {
-    const textContent = await audioBlob.text();
-    audioPart = { text: `New dictated/pasted text to append:\n"""\n${textContent}\n"""` };
-  } else {
-    const base64Audio = await blobToBase64(audioBlob);
-    audioPart = {
-      inlineData: {
-        mimeType: getCleanMimeType(audioBlob),
-        data: base64Audio,
-      },
-    };
-  }
+  const isTextInput = Boolean(audioBlob.type && (audioBlob.type.startsWith('text/') || audioBlob.type === 'application/json'));
+  const descriptors = isTextInput ? [] : await prepareBlobPartDescriptors([audioBlob], { includeContextLabels: false });
+  const textInputPart = isTextInput
+    ? { text: `New dictated/pasted text to append:\n"""\n${await audioBlob.text()}\n"""` }
+    : null;
+  const uploadedByKey = new Map<string, Map<number, UploadedGeminiFileRef>>();
 
   let prompt = `You are an expert medical transcriptionist specializing in radiology. A user is adding to their dictation.
 The existing text is: "${existingText}".
@@ -1890,43 +2373,54 @@ Follow these strict instructions to produce a clean and accurate continuation:
 
   try {
     const targetModel = resolveApiTargetModel(model || DEFAULT_SELECTED_MODEL);
-    return await executeWithApiKeyFailover(
-      async (client) => {
-        const response: GenerateContentResponse = await client.models.generateContent({
-          model: targetModel,
-          contents: { parts: [textPart, audioPart] },
-        });
-        const resultText = response.text?.trim();
-        if (!resultText) {
-          throw new Error("API returned an empty response for audio continuation.");
-        }
-        return expandMacrosInSingleText(resultText);
-      },
-      { selectedModel: targetModel }
+    return await executeWithFreeTierModelFallback(
+      targetModel,
+      (activeModel, hasMoreFallbackModels) =>
+        executeWithApiKeyFailover(
+          async (client, apiKey) => {
+            const mediaParts = textInputPart
+              ? [textInputPart]
+              : await resolveBlobDescriptorPartsForAttempt({
+                  descriptors,
+                  client,
+                  apiKey,
+                  uploadedByKey,
+                });
+            const reqParts = withRoboticsDirectivesForModel([textPart, ...mediaParts], activeModel, true);
+            const resultText = await callGenerateContentWithOptimalThinking({
+              client,
+              apiKey,
+              model: activeModel,
+              parts: reqParts,
+              temperature: 0.1,
+              taskType: 'transcription',
+            });
+            if (!resultText) {
+              throw new Error("API returned an empty response for audio continuation.");
+            }
+            return expandMacrosInSingleText(resultText);
+          },
+          { selectedModel: activeModel, ...getFailoverKeyOptionsForModel(activeModel, hasMoreFallbackModels) }
+        )
     );
   } catch (error) {
     console.error("Error calling Gemini API for audio continuation:", error);
     if (error instanceof Error) {
-        throw new Error(`Failed to process audio continuation: ${error.message}`);
+      throw new Error(`Failed to process audio continuation: ${error.message}`);
     }
     throw new Error("An unknown error occurred while communicating with the API for audio continuation.");
+  } finally {
+    cleanupUploadedGeminiFiles(uploadedByKey).catch(() => {});
   }
 };
 
 export const modifyFindingWithAudio = async (originalText: string, audioBlob: Blob, customPrompt?: string, model?: string): Promise<string> => {
-  let audioPart: any;
-  if (audioBlob.type && (audioBlob.type.startsWith('text/') || audioBlob.type === 'application/json')) {
-    const textContent = await audioBlob.text();
-    audioPart = { text: `New modification instructions/text:\n"""\n${textContent}\n"""` };
-  } else {
-    const base64Audio = await blobToBase64(audioBlob);
-    audioPart = {
-      inlineData: {
-        mimeType: getCleanMimeType(audioBlob),
-        data: base64Audio,
-      },
-    };
-  }
+  const isTextInput = Boolean(audioBlob.type && (audioBlob.type.startsWith('text/') || audioBlob.type === 'application/json'));
+  const descriptors = isTextInput ? [] : await prepareBlobPartDescriptors([audioBlob], { includeContextLabels: false });
+  const textInputPart = isTextInput
+    ? { text: `New modification instructions/text:\n"""\n${await audioBlob.text()}\n"""` }
+    : null;
+  const uploadedByKey = new Map<string, Map<number, UploadedGeminiFileRef>>();
 
   let prompt = `You are an expert medical transcriptionist assistant. You will be given an existing medical finding text and an audio recording. The audio contains instructions and/or additional dictation to modify the original finding.
 
@@ -1961,26 +2455,44 @@ Now, listen to the audio and provide the single, updated finding text.`;
 
   try {
     const targetModel = resolveApiTargetModel(model || DEFAULT_SELECTED_MODEL);
-    return await executeWithApiKeyFailover(
-      async (client) => {
-        const response: GenerateContentResponse = await client.models.generateContent({
-          model: targetModel,
-          contents: { parts: [textPart, audioPart] },
-        });
-        const resultText = response.text?.trim();
-        if (!resultText) {
-          throw new Error("API returned an empty response for finding modification.");
-        }
-        return expandMacrosInSingleText(resultText);
-      },
-      { selectedModel: targetModel }
+    return await executeWithFreeTierModelFallback(
+      targetModel,
+      (activeModel, hasMoreFallbackModels) =>
+        executeWithApiKeyFailover(
+          async (client, apiKey) => {
+            const mediaParts = textInputPart
+              ? [textInputPart]
+              : await resolveBlobDescriptorPartsForAttempt({
+                  descriptors,
+                  client,
+                  apiKey,
+                  uploadedByKey,
+                });
+            const reqParts = withRoboticsDirectivesForModel([textPart, ...mediaParts], activeModel, true);
+            const resultText = await callGenerateContentWithOptimalThinking({
+              client,
+              apiKey,
+              model: activeModel,
+              parts: reqParts,
+              temperature: 0.1,
+              taskType: 'reasoning',
+            });
+            if (!resultText) {
+              throw new Error("API returned an empty response for finding modification.");
+            }
+            return expandMacrosInSingleText(resultText);
+          },
+          { selectedModel: activeModel, ...getFailoverKeyOptionsForModel(activeModel, hasMoreFallbackModels) }
+        )
     );
   } catch (error) {
     console.error("Error calling Gemini API for finding modification:", error);
     if (error instanceof Error) {
-        throw new Error(`Failed to process finding modification: ${error.message}`);
+      throw new Error(`Failed to process finding modification: ${error.message}`);
     }
     throw new Error("An unknown error occurred while communicating with the API for finding modification.");
+  } finally {
+    cleanupUploadedGeminiFiles(uploadedByKey).catch(() => {});
   }
 };
 
@@ -1994,33 +2506,6 @@ export const modifyReportWithAudio = async (
   options?: ProcessAudioOptions
 ): Promise<string[]> => {
   const blobs: Blob[] = Array.isArray(audioBlob) ? audioBlob : [audioBlob];
-  const inputParts: any[] = [];
-
-  for (let i = 0; i < blobs.length; i++) {
-    const b = blobs[i];
-    const cleanMime = getCleanMimeType(b);
-    const fileName = (b as any).name ? `"${(b as any).name}"` : `Input #${i + 1}`;
-
-    if (cleanMime.startsWith('text/') || cleanMime === 'application/json' || b.type?.startsWith('text/')) {
-      try {
-        const textContent = await b.text();
-        inputParts.push({ text: `New clinical text / instructions to modify or update the report from ${fileName}:\n"""\n${textContent}\n"""` });
-      } catch (e) {
-        console.warn('Could not read blob as text:', e);
-      }
-    } else {
-      const base64Data = await blobToBase64(b);
-      inputParts.push({
-        inlineData: {
-          mimeType: cleanMime,
-          data: base64Data,
-        },
-      });
-      if (!cleanMime.startsWith('audio/')) {
-        inputParts.push({ text: `[Attached Input Document/File ${fileName} (${cleanMime})]: Analyze and incorporate all clinical instructions, findings, and modifications from this file.` });
-      }
-    }
-  }
 
   let prompt = `You are an expert medical transcriptionist assistant. You are given an existing medical report in JSON format and an audio recording or input file(s)/text containing instructions to modify it. Your task is to intelligently interpret the audio instructions and any attached text/files and return a single, updated report in the exact same JSON format.
 
@@ -2111,48 +2596,95 @@ ${JSON.stringify({ findings: currentFindings })}
 
   prompt += `\n\nSPOKEN TEMPLATE ID DIRECTIVE (STRICT): If the audio/instruction explicitly speaks one or more Template IDs (e.g. "template id 1", "template id 200", "template id C1", "add template id 15", "combine templates 5 and 200"), output "{template id [ID]}" or "{add template id [ID]}" or "{template id [ID1, ID2]}" at the start of the "findings" array. Do NOT trigger on vague requests like "add ct brain" without an explicit ID.`;
 
-  const parts: any[] = [];
-  
+  const staticParts: any[] = [];
+
   if (customImages && customImages.length > 0) {
     for (const customImage of customImages) {
-        parts.push({
-          inlineData: {
-            mimeType: customImage.mimeType,
-            data: customImage.data
-          }
-        });
+      staticParts.push({
+        inlineData: {
+          mimeType: customImage.mimeType,
+          data: customImage.data
+        }
+      });
     }
-    parts.push({ text: `The user has provided ${customImages.length > 1 ? 'images' : 'an image'} of a report template. If the audio instruction is to reformat the report, use ${customImages.length > 1 ? 'these images' : 'this image'} as a strict visual guide.` });
+    staticParts.push({ text: `The user has provided ${customImages.length > 1 ? 'images' : 'an image'} of a report template. If the audio instruction is to reformat the report, use ${customImages.length > 1 ? 'these images' : 'this image'} as a strict visual guide.` });
   }
 
-  parts.push({ text: prompt });
-  parts.push(...inputParts);
-  
+  staticParts.push({ text: prompt });
+
+  const nonTextBlobs: Blob[] = [];
+  const inlineTextParts: any[] = [];
+  for (let i = 0; i < blobs.length; i++) {
+    const b = blobs[i];
+    const cleanMime = getCleanMimeType(b);
+    const fileName = (b as any).name ? `"${(b as any).name}"` : `Input #${i + 1}`;
+    if (cleanMime.startsWith('text/') || cleanMime === 'application/json' || b.type?.startsWith('text/')) {
+      try {
+        const textContent = await b.text();
+        inlineTextParts.push({ text: `New clinical text / instructions to modify or update the report from ${fileName}:\n"""\n${textContent}\n"""` });
+      } catch (e) {
+        console.warn('Could not read blob as text:', e);
+      }
+    } else {
+      nonTextBlobs.push(b);
+    }
+  }
+
+  const blobDescriptors = nonTextBlobs.length > 0
+    ? await prepareBlobPartDescriptors(nonTextBlobs, { includeContextLabels: true })
+    : [];
+  const uploadedByKey = new Map<string, Map<number, UploadedGeminiFileRef>>();
+
+  const resolveModifyParts = async (client: GoogleGenAI, apiKey: string): Promise<any[]> => {
+    const mediaParts = blobDescriptors.length > 0
+      ? await resolveBlobDescriptorPartsForAttempt({
+          descriptors: blobDescriptors,
+          client,
+          apiKey,
+          uploadedByKey,
+        })
+      : [];
+    return [...staticParts, ...inlineTextParts, ...mediaParts];
+  };
+
   const targetModel = resolveApiTargetModel(model);
 
   try {
-    const rawResponseText = await generateContentWithJsonFallback(targetModel, parts, responseSchema, 0.1);
+    const { text: rawResponseText, winningModel } = await generateContentWithJsonFallbackMeta(
+      targetModel,
+      resolveModifyParts,
+      responseSchema,
+      0.1,
+      undefined,
+      'reasoning'
+    );
     const findings = extractFindingsFromResponse(rawResponseText);
 
     if (findings && findings.length > 0) {
-      return await resolveAndApplySpokenTemplates(findings, {
-        templateInfo,
-        model: targetModel,
-        audioBlobs: blobs,
-        customPrompt,
-        customImages,
-        customDocx,
-        onSpokenTemplateResolved: options?.onSpokenTemplateResolved,
-      });
+      const { templateIds } = extractSpokenTemplateDirective(findings);
+      if (templateIds.length > 0) {
+        return await resolveAndApplySpokenTemplates(findings, {
+          templateInfo,
+          model: winningModel,
+          audioBlobs: blobs,
+          customPrompt,
+          customImages,
+          customDocx,
+          onSpokenTemplateResolved: options?.onSpokenTemplateResolved,
+        });
+      }
+      return await maybePolishMediumFindings(findings, winningModel);
     } else {
       throw new Error("Invalid data structure in API response. Expected a 'findings' array.");
     }
   } catch (error) {
     console.error("Error calling Gemini API for report modification:", error);
     if (error instanceof Error) {
-        throw new Error(`Failed to modify report: ${error.message}`);
+      throw new Error(`Failed to modify report: ${error.message}`);
     }
     throw new Error("An unknown error occurred while communicating with the API for report modification.");
+  } finally {
+    cleanupUploadedGeminiFiles(uploadedByKey).catch(() => {});
   }
 };
 
@@ -2160,33 +2692,37 @@ export const transcribeAudioForPrompt = async (
   audioBlob: Blob,
   model?: string
 ): Promise<string> => {
-  const base64Audio = await blobToBase64(audioBlob);
-
+  const descriptors = await prepareBlobPartDescriptors([audioBlob], { includeContextLabels: false });
+  const uploadedByKey = new Map<string, Map<number, UploadedGeminiFileRef>>();
   const prompt = "Transcribe the following audio accurately. Provide only the transcribed text without any additional commentary or introduction.";
-
   const textPart = { text: prompt };
-  const audioPart = {
-    inlineData: {
-      mimeType: getCleanMimeType(audioBlob),
-      data: base64Audio,
-    },
-  };
 
-  // Primary model respects the user's selected model from main interface
   const primaryModel = resolveApiTargetModel(model || DEFAULT_SELECTED_MODEL);
 
   try {
-    return await executeWithApiKeyFailover(
-      async (client) => {
-        const response: GenerateContentResponse = await client.models.generateContent({
-          model: primaryModel,
-          contents: { parts: [textPart, audioPart] },
-        });
-
-        const resultText = response.text?.trim();
-        return resultText || "";
-      },
-      { selectedModel: primaryModel }
+    return await executeWithFreeTierModelFallback(
+      primaryModel,
+      (activeModel, hasMoreFallbackModels) =>
+        executeWithApiKeyFailover(
+          async (client, apiKey) => {
+            const mediaParts = await resolveBlobDescriptorPartsForAttempt({
+              descriptors,
+              client,
+              apiKey,
+              uploadedByKey,
+            });
+            const resultText = await callGenerateContentWithOptimalThinking({
+              client,
+              apiKey,
+              model: activeModel,
+              parts: [textPart, ...mediaParts],
+              temperature: 0.1,
+              taskType: 'live_chunk',
+            });
+            return resultText || "";
+          },
+          { selectedModel: activeModel, ...getFailoverKeyOptionsForModel(activeModel, hasMoreFallbackModels) }
+        )
     );
   } catch (lastError: any) {
     console.error("Transcription failed across API keys for model:", primaryModel, lastError);
@@ -2194,8 +2730,158 @@ export const transcribeAudioForPrompt = async (
       throw new Error(`Failed to transcribe audio: ${lastError.message}`);
     }
     throw new Error("An unknown error occurred while communicating with the API for transcription.");
+  } finally {
+    cleanupUploadedGeminiFiles(uploadedByKey).catch(() => {});
   }
 };
+
+interface ChatFailoverContext {
+  model: string;
+  systemInstruction: string;
+  history: Array<{ role: 'user' | 'model'; parts: any[] }>;
+}
+
+const chatFailoverContextMap = new WeakMap<Chat, ChatFailoverContext>();
+
+function createManagedChatSession(ctx: ChatFailoverContext): Chat {
+  const normalizedCtx: ChatFailoverContext = {
+    model: ctx.model || DEFAULT_SELECTED_MODEL,
+    systemInstruction: ctx.systemInstruction,
+    history: ctx.history.map((turn) => ({ role: turn.role, parts: [...turn.parts] })),
+  };
+
+  const { candidateKeys } = getCandidateKeysForOperation(normalizedCtx.model);
+  if (candidateKeys.length > 0) {
+    const client = getClientForApiKey(candidateKeys[0]);
+    const chat = client.chats.create({
+      model: normalizedCtx.model,
+      config: {
+        systemInstruction: normalizedCtx.systemInstruction,
+      },
+      history: normalizedCtx.history,
+    });
+    chatFailoverContextMap.set(chat, normalizedCtx);
+    return chat;
+  }
+
+  // Deferred resilient chat handle if no keys exist yet (will evaluate keys when sendMessage runs)
+  const deferredChat = {
+    sendMessage: async (payload: { message: string | any[] }) => {
+      const res = await sendChatMessageWithFailover(deferredChat as unknown as Chat, payload.message, normalizedCtx.model);
+      return { text: res.text };
+    },
+  } as unknown as Chat;
+  chatFailoverContextMap.set(deferredChat, normalizedCtx);
+  return deferredChat;
+}
+
+/**
+ * Sends a follow-up Q&A message through a Chat session, automatically failing over
+ * across active API keys and permitted backup models on usage-limit, connection, or busy errors.
+ */
+export async function sendChatMessageWithFailover(
+  chat: Chat | null | undefined,
+  message: string | any[] | Blob | { message: string | any[] | Blob },
+  modelOrSignal?: string | AbortSignal,
+  maybeAbortSignal?: AbortSignal
+): Promise<{ text: string; activeChat: Chat; activeModel: string }> {
+  const overrideModel = typeof modelOrSignal === 'string' && modelOrSignal.trim() ? modelOrSignal.trim() : undefined;
+  const abortSignal = typeof modelOrSignal === 'object' && modelOrSignal !== null ? modelOrSignal : maybeAbortSignal;
+
+  const unwrapped =
+    message &&
+    typeof message === 'object' &&
+    !(typeof Blob !== 'undefined' && message instanceof Blob) &&
+    !Array.isArray(message) &&
+    'message' in message
+      ? (message as { message: string | any[] | Blob }).message
+      : message;
+
+  let messageParts: any[];
+  if (typeof unwrapped === 'string') {
+    messageParts = [{ text: unwrapped }];
+  } else if (typeof Blob !== 'undefined' && unwrapped instanceof Blob) {
+    const base64Audio = await blobToBase64(unwrapped);
+    messageParts = [
+      {
+        inlineData: {
+          mimeType: getCleanMimeType(unwrapped),
+          data: base64Audio,
+        },
+      },
+      { text: "Please analyze this audio in the context of our conversation." },
+    ];
+  } else if (Array.isArray(unwrapped)) {
+    messageParts = unwrapped;
+  } else {
+    messageParts = [{ text: String(unwrapped ?? '') }];
+  }
+
+  const ctx = chat ? chatFailoverContextMap.get(chat) : undefined;
+  const targetModel = resolveApiTargetModel(overrideModel || ctx?.model || DEFAULT_SELECTED_MODEL);
+  const systemInstruction =
+    ctx?.systemInstruction ||
+    'You are a helpful AI assistant for a radiologist. Answer follow-up questions based on the radiology dictation and report.';
+  const baseHistory = ctx?.history || [];
+  const contents = [
+    ...baseHistory.map((t) => ({ role: t.role, parts: [...t.parts] })),
+    { role: 'user', parts: messageParts },
+  ];
+
+  const { result } = await executeWithFreeTierModelFallbackMeta(
+    targetModel,
+    (candidateModel, hasMoreFallbackModels) =>
+      executeWithApiKeyFailover(
+        async (client, apiKey) => {
+          const text = await callGenerateContentWithOptimalThinking({
+            client,
+            apiKey,
+            model: candidateModel,
+            parts: messageParts,
+            contents,
+            systemInstruction,
+            temperature: 0.2,
+            abortSignal,
+            taskType: 'reasoning',
+          });
+          return { text, activeModel: candidateModel };
+        },
+        {
+          selectedModel: candidateModel,
+          abortSignal,
+          ...getFailoverKeyOptionsForModel(candidateModel, hasMoreFallbackModels),
+        }
+      ),
+    { abortSignal }
+  );
+
+  const updatedHistory: Array<{ role: 'user' | 'model'; parts: any[] }> = [
+    ...baseHistory.map((t) => ({ role: t.role, parts: [...t.parts] })),
+    { role: 'user', parts: [...messageParts] },
+    { role: 'model', parts: [{ text: result.text }] },
+  ];
+
+  if (ctx) {
+    ctx.model = result.activeModel;
+    ctx.history = updatedHistory;
+  }
+
+  const activeChat = chat || createManagedChatSession({
+    model: result.activeModel,
+    systemInstruction,
+    history: updatedHistory,
+  });
+
+  if (!chatFailoverContextMap.has(activeChat)) {
+    chatFailoverContextMap.set(activeChat, {
+      model: result.activeModel,
+      systemInstruction,
+      history: updatedHistory,
+    });
+  }
+
+  return { text: result.text, activeChat, activeModel: result.activeModel };
+}
 
 
 export const createChat = async (
@@ -2271,17 +2957,14 @@ export const createChat = async (
       systemInstruction += `\n\nAdditionally, follow these custom instructions from the user:\n${customPrompt}`;
   }
 
-  const chat = getAI().chats.create({
-    model: model || DEFAULT_SELECTED_MODEL,
-    config: {
-      systemInstruction: systemInstruction,
-    },
+  return createManagedChatSession({
+    model: resolveApiTargetModel(model || DEFAULT_SELECTED_MODEL),
+    systemInstruction,
     history: [
       { role: 'user', parts: userMessageParts },
       { role: 'model', parts: [modelResponsePart] },
     ],
   });
-  return chat;
 };
 
 export const createChatFromText = async (
@@ -2313,17 +2996,14 @@ export const createChatFromText = async (
       systemInstruction += `\n\nAdditionally, follow these custom instructions from the user:\n${customPrompt}`;
   }
 
-  const chat = getAI().chats.create({
-    model: model || DEFAULT_SELECTED_MODEL,
-    config: {
-      systemInstruction: systemInstruction,
-    },
+  return createManagedChatSession({
+    model: resolveApiTargetModel(model || DEFAULT_SELECTED_MODEL),
+    systemInstruction,
     history: [
       { role: 'user', parts: userMessageParts },
       { role: 'model', parts: [modelResponsePart] },
     ],
   });
-  return chat;
 };
 
 const errorSchema = {
@@ -2359,6 +3039,7 @@ export const identifyPotentialErrors = async (
   options?: {
     triggeredRules?: ClinicalQaRuleResult[];
     abortSignal?: AbortSignal;
+    skipCrossModelFallback?: boolean;
   }
 ): Promise<IdentifiedError[]> => {
     const triggeredHint = options?.triggeredRules && options.triggeredRules.length > 0
@@ -2378,7 +3059,12 @@ export const identifyPotentialErrors = async (
           [textPart],
           errorSchema,
           0.1,
-          options?.abortSignal
+          options?.abortSignal,
+          'reasoning',
+          {
+            skipCrossModelFallback: options?.skipCrossModelFallback,
+            injectRoboticsDirectives: false,
+          }
         );
         return extractErrorsFromResponse(rawResponseText);
     } catch (error: any) {
@@ -2759,10 +3445,13 @@ export const runClinicalQaErrorCheck = async (
       };
     }
 
+    // Background QA explanation strictly runs on Flash-Lite (500 RPD/key) isolated from dictation models
+    const backgroundQaModel = GEMINI_FLASH_LITE_MODEL;
     assessment.invokedDetailedGenerator = true;
-    const errors = await identifyPotentialErrors(findings, model, {
+    const errors = await identifyPotentialErrors(findings, backgroundQaModel, {
       triggeredRules: assessment.triggeredRules,
       abortSignal,
+      skipCrossModelFallback: true,
     });
 
     if (errors.length === 0) {
@@ -2796,8 +3485,11 @@ export const runClinicalQaErrorCheck = async (
     if (err?.name === 'AbortError' || abortSignal?.aborted) {
       throw err;
     }
-    console.warn('[Clinical QA] gemini-decision-1 check failed, falling back to identifyPotentialErrors:', err);
-    const fallbackErrors = await identifyPotentialErrors(findings, model, { abortSignal });
+    console.warn('[Clinical QA] gemini-decision-1 check failed, falling back to identifyPotentialErrors on Flash-Lite:', err);
+    const fallbackErrors = await identifyPotentialErrors(findings, GEMINI_FLASH_LITE_MODEL, {
+      abortSignal,
+      skipCrossModelFallback: true,
+    });
     return {
       errors: fallbackErrors,
       qaAssessment: null,
@@ -2806,7 +3498,7 @@ export const runClinicalQaErrorCheck = async (
 };
 
 // --- Complex Impression Generation Constants & Pipeline ---
-const COMPLEX_IMPRESSION_DEFAULT_MODEL = 'gemini-3.5-flash';
+const COMPLEX_IMPRESSION_DEFAULT_MODEL = 'gemini-3.8-flash';
 
 /**
  * Detects if an API error is a rate-limit (429 / resource exhausted / quota) error.
@@ -2833,54 +3525,57 @@ interface StepExecutionResult {
 }
 
 /**
- * Executes a single task in the complex impression workflow with:
- * 1. gemini-3.8-flash with Google search grounding alone as default.
- * 2. When rate limit error occurs, counts down live in the app ("retrying in x seconds...") and retries with gemini-3.8-flash.
- * 3. Only the errored item is retried; once an item succeeds, its result is preserved.
+ * Executes a single task in the complex impression workflow via `executeWithFreeTierModelFallback`,
+ * defaulting to `gemini-3.8-flash` with Google Search grounding disabled on Free Tier.
  */
 async function executeAgentStepWithFallbackAndRetry(
     taskName: string,
     prompt: string,
     onProgress?: (status: string) => void,
-    maxRetryCycles: number = 8
+    maxRetryCycles: number = 4
 ): Promise<StepExecutionResult> {
     let cycle = 0;
+
     while (cycle < maxRetryCycles) {
         cycle++;
-
-        // Try default model: gemini-3.8-flash with Google search grounding alone
         try {
-            onProgress?.(`${taskName}: Analyzing with ${COMPLEX_IMPRESSION_DEFAULT_MODEL} (Google Search grounded)...`);
-            const response = await executeWithApiKeyFailover(
-                async (client) => {
-                    return await client.models.generateContent({
-                        model: COMPLEX_IMPRESSION_DEFAULT_MODEL,
-                        contents: prompt,
-                        config: {
-                            tools: [{ googleSearch: {} }]
-                        }
-                    });
-                },
-                { selectedModel: COMPLEX_IMPRESSION_DEFAULT_MODEL }
+            onProgress?.(
+              `${taskName}: Analyzing with ${getModelDisplayLabel(COMPLEX_IMPRESSION_DEFAULT_MODEL)}...`
             );
-            const text = response.text || '';
-            const groundingChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks;
-            return { text, groundingChunks };
+            return await executeWithFreeTierModelFallback(
+              COMPLEX_IMPRESSION_DEFAULT_MODEL,
+              (activeModel, hasMoreFallbackModels) =>
+                executeWithApiKeyFailover(
+                  async (client, apiKey) => {
+                    return await callGenerateContentRawWithOptimalThinking({
+                      client,
+                      apiKey,
+                      model: activeModel,
+                      parts: [{ text: prompt }],
+                      temperature: 0.1,
+                      taskType: 'reasoning',
+                    });
+                  },
+                  {
+                    selectedModel: activeModel,
+                    ...getFailoverKeyOptionsForModel(activeModel, hasMoreFallbackModels),
+                  }
+                )
+            );
         } catch (primaryErr: any) {
             if (!isRateLimitError(primaryErr)) {
-                console.error(`${taskName}: Fatal error on ${COMPLEX_IMPRESSION_DEFAULT_MODEL}:`, primaryErr);
+                console.error(`${taskName}: Error in complex impression step:`, primaryErr);
                 throw primaryErr;
             }
 
-            // Rate limit hit: Wait with live countdown and retry gemini-3.8-flash
-            const waitSeconds = Math.min(15, 5 + (cycle - 1) * 2); // 5s, 7s, 9s, 11s, 13s, 15s
-            console.warn(`${taskName}: Rate limit on ${COMPLEX_IMPRESSION_DEFAULT_MODEL}. Retrying in ${waitSeconds}s...`);
+            const waitSeconds = Math.min(15, 5 + (cycle - 1) * 2);
+            console.warn(`${taskName}: Rate limit across fallback models. Retrying in ${waitSeconds}s...`);
 
             for (let sec = waitSeconds; sec > 0; sec--) {
-                onProgress?.(`${taskName}: Rate limit reached on ${COMPLEX_IMPRESSION_DEFAULT_MODEL}. Retrying in ${sec} second${sec > 1 ? 's' : ''}...`);
+                onProgress?.(`${taskName}: Rate limit reached. Retrying in ${sec} second${sec > 1 ? 's' : ''}...`);
                 await new Promise(res => setTimeout(res, 1000));
             }
-            onProgress?.(`${taskName}: Retrying with ${COMPLEX_IMPRESSION_DEFAULT_MODEL}...`);
+            onProgress?.(`${taskName}: Retrying...`);
         }
     }
     throw new Error(`${taskName}: Rate limit persisted after ${maxRetryCycles} retry cycles.`);
@@ -3295,13 +3990,35 @@ INSTRUCTIONS FOR THIS AUDIO SEGMENT:
 - Return the COMPLETE, FINAL, UPDATED array of findings for the whole report in JSON format.
 `;
 
-  // Multi-model fallback chain: selected model + subsequent next model
-  const fallbackChain = getLiveModelFallbackChain(model || DEFAULT_LIVE_MODEL || 'gemini-4-hydrogen');
+  // Multi-model fallback chain respecting policy and temporary busy pauses
+  const primaryLiveModel = resolveApiTargetModel(model || DEFAULT_LIVE_MODEL || 'gemini-4-hydrogen');
+  const policy = getModelFallbackPolicy();
+  const strictOnly = policy === 'selected_only' || isStrictSelectedModelOnlyEnabled();
+  const fallbackChain = strictOnly
+    ? [primaryLiveModel]
+    : getLiveModelFallbackChain(primaryLiveModel, policy);
   let lastError: any = null;
   const failedModels: string[] = [];
 
   for (let attempt = 0; attempt < fallbackChain.length; attempt++) {
     const currentModel = fallbackChain[attempt];
+    if (!strictOnly && attempt < fallbackChain.length - 1 && isModelTemporarilyUnavailable(currentModel)) {
+      const healthyTarget = findHealthyFailoverTarget(fallbackChain, attempt);
+      if (healthyTarget) {
+        emitModelFailoverNotice({
+          fromModel: currentModel,
+          toModel: healthyTarget,
+          reason: 'service_unavailable',
+        });
+        onFailover?.(
+          currentModel,
+          healthyTarget,
+          `${getModelDisplayLabel(currentModel)} is temporarily paused while busy`
+        );
+        continue;
+      }
+    }
+
     try {
       const liveChunkPrompt = buildPromptForModel(currentModel);
       const parts: any[] = [
@@ -3314,7 +4031,16 @@ INSTRUCTIONS FOR THIS AUDIO SEGMENT:
         }
       ];
 
-      const rawResponseText = await generateContentWithJsonFallback(currentModel, parts, responseSchema, 0.1);
+      const rawResponseText = await generateContentWithJsonFallback(
+        currentModel,
+        parts,
+        responseSchema,
+        0.1,
+        undefined,
+        'live_chunk',
+        { skipCrossModelFallback: true, failFastOnModelUnavailable: attempt < fallbackChain.length - 1 }
+      );
+      clearModelTemporarilyUnavailable(currentModel);
       const parsedFindings = extractFindingsFromResponse(rawResponseText);
 
       if (parsedFindings && parsedFindings.length > 0) {
@@ -3338,19 +4064,30 @@ INSTRUCTIONS FOR THIS AUDIO SEGMENT:
       lastError = error;
       failedModels.push(currentModel);
 
-      const isRateLimit =
-        error?.status === 429 ||
-        error?.message?.includes('429') ||
-        error?.message?.toLowerCase().includes('quota') ||
-        error?.message?.toLowerCase().includes('resource_exhausted') ||
-        error?.message?.toLowerCase().includes('rate');
+      const isRateLimit = isQuotaOrRateLimitExceededError(error);
+      const isUnavailable = isModelLevelServiceUnavailableError(error);
+      const isNetworkErr = isNetworkFetchError(error);
+      if (isUnavailable && !isModelTemporarilyUnavailable(currentModel)) {
+        markModelTemporarilyUnavailable(currentModel);
+      }
 
-      const reason = isRateLimit ? 'Rate limit exceeded' : (error?.message || 'Model service error');
-      console.warn(`[Live Dictation] Chunk #${chunkIndex + 1} attempt ${attempt + 1}/${fallbackChain.length} with ${currentModel} failed (${reason})`);
+      const reason = isRateLimit
+        ? 'Usage limit reached — trying backup model'
+        : isNetworkErr
+        ? 'Temporary connection issue — trying backup model'
+        : isUnavailable
+        ? 'Model is temporarily busy — trying backup model'
+        : (error?.message || 'Switching to backup model');
+      console.warn(`[Live Dictation] Chunk #${chunkIndex + 1} attempt ${attempt + 1}/${fallbackChain.length} with ${getModelDisplayLabel(currentModel)} failed (${reason})`);
 
       if (attempt < fallbackChain.length - 1) {
         const nextModel = fallbackChain[attempt + 1];
-        console.info(`[Live Dictation] Auto-failing over to subsequent model: ${nextModel}`);
+        console.info(`[Live Dictation] Auto-failing over to subsequent model: ${getModelDisplayLabel(nextModel)}`);
+        emitModelFailoverNotice({
+          fromModel: currentModel,
+          toModel: nextModel,
+          reason: isRateLimit ? 'rate_limit' : isNetworkErr ? 'network_error' : 'service_unavailable',
+        });
         if (onFailover) {
           onFailover(currentModel, nextModel, reason);
         }
@@ -3358,14 +4095,15 @@ INSTRUCTIONS FOR THIS AUDIO SEGMENT:
     }
   }
 
-  console.error(`[Live Dictation] All ${fallbackChain.length} candidate models failed (${fallbackChain.join(' -> ')}). Returning previous findings.`);
+  const chainLabels = fallbackChain.map(getModelDisplayLabel).join(' → ');
+  console.error(`[Live Dictation] All ${fallbackChain.length} candidate models failed (${chainLabels}). Returning previous findings.`);
   return {
     findings: previousFindings,
     activeModel: model,
     attempts: fallbackChain.length,
     failoverOccurred: true,
     failedModels,
-    error: `Rate limit or service error across all 2 models (${fallbackChain.join(', ')}).`,
+    error: lastError?.message || `Models are temporarily busy or reached limits (${chainLabels}).`,
   };
 };
 
@@ -3373,7 +4111,7 @@ INSTRUCTIONS FOR THIS AUDIO SEGMENT:
  * Performs a global, holistic clinical review and unification pass over accumulated live findings.
  * Removes cross-chunk duplications, standardizes terminology, validates anatomical consistency,
  * integrates template structure and user custom instructions, and synthesizes/aligns the IMPRESSION section.
- * Automatically tries subsequent next 2 models if primary model fails.
+ * Automatically routes across permitted fallback models and applies optional Stage-2 polish if Medium tier wins.
  */
 export const synthesizeLiveReport = async (
   rawFindings: string[],
@@ -3422,26 +4160,24 @@ Perform a comprehensive, holistic review pass over the draft to generate the fin
 
 Output MUST be a JSON object with a single "findings" array of strings.`;
 
-  const fallbackChain = getLiveModelFallbackChain(model || DEFAULT_LIVE_MODEL || 'gemini-4-hydrogen');
-
-  for (let attempt = 0; attempt < fallbackChain.length; attempt++) {
-    const currentModel = fallbackChain[attempt];
-    try {
-      const rawResponseText = await generateContentWithJsonFallback(currentModel, [{ text: prompt }], responseSchema, 0.1);
-      const parsedFindings = extractFindingsFromResponse(rawResponseText);
-      if (parsedFindings && parsedFindings.length > 0) {
-        return parsedFindings;
-      }
-      return rawFindings;
-    } catch (err) {
-      console.warn(`[Synthesize Report] Attempt ${attempt + 1}/${fallbackChain.length} with ${currentModel} notice:`, err);
-      if (attempt < fallbackChain.length - 1) {
-        console.info(`[Synthesize Report] Auto-failing over to subsequent model: ${fallbackChain[attempt + 1]}`);
-      }
+  try {
+    const { text: rawResponseText, winningModel } = await generateContentWithJsonFallbackMeta(
+      model || DEFAULT_LIVE_MODEL || 'gemini-4-hydrogen',
+      [{ text: prompt }],
+      responseSchema,
+      0.1,
+      undefined,
+      'reasoning'
+    );
+    const parsedFindings = extractFindingsFromResponse(rawResponseText);
+    if (parsedFindings && parsedFindings.length > 0) {
+      return await maybePolishMediumFindings(parsedFindings, winningModel);
     }
+    return rawFindings;
+  } catch (err) {
+    console.warn(`[Synthesize Report] Synthesis failed across fallback chain:`, err);
+    return rawFindings;
   }
-
-  return rawFindings;
 };
 
 

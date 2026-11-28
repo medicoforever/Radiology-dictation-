@@ -1,12 +1,14 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useAudioRecorder } from '../hooks/useAudioRecorder';
-import { processAudio, createChat, blobToBase64, continueAudioDictation, base64ToBlob, modifyFindingWithAudio, modifyReportWithAudio, runComplexImpressionGeneration, transcribeAudioForPrompt, detectAndExtractTemplate, mergeDictatedFindingsWithTemplate, runClinicalQaErrorCheck, ClinicalQaAssessment, SpokenTemplateResolution } from '../services/geminiService';
+import { processAudio, createChat, blobToBase64, continueAudioDictation, base64ToBlob, modifyFindingWithAudio, modifyReportWithAudio, runComplexImpressionGeneration, transcribeAudioForPrompt, detectAndExtractTemplate, mergeDictatedFindingsWithTemplate, runClinicalQaErrorCheck, ClinicalQaAssessment, SpokenTemplateResolution, sendChatMessageWithFailover } from '../services/geminiService';
 import ClinicalQaPanel, { getUrgencyBadgeMeta } from './ui/ClinicalQaPanel';
-import { saveAudioBlob, getAudioBlob, clearUnusedAudioBlobs, saveReportSession, getReportSession, deleteReportSession } from '../services/audioStorage';
+import { saveAudioBlob, getAudioBlob, clearUnusedAudioBlobs, saveReportSession, getReportSession, deleteReportSession, deleteDictateChangesAudio } from '../services/audioStorage';
 import { mergeMultipleAudioBlobs, triggerAudioDownload } from '../services/audioMerger';
 import {
+    classifyBlobForPrefilter,
     filterAudioInputsForModel,
     AudioPrefilterStats,
+    EXPERIMENTAL_AUDIO_FILTER_KEY,
     combineAudioBlobsToCompact,
     downloadOriginalAudioInput,
     downloadCompactedAudioBlob,
@@ -50,7 +52,8 @@ import WarningIcon from './icons/WarningIcon';
 import BrainIcon from './icons/BrainIcon';
 import { autoSaveBatchDictations, SaveResult, BatchFolderInfo, isDriveConnected, subscribeToAuth } from '../services/googleDriveService';
 import { generateDocxFromMarkdown, downloadFile, isTableRowFinding, parseTableRow, parseMarkdownTable, tableToPlainText, formatImpressionOutput, findingsToStandardHtml, isPureCorrelationOrRecommendation, isReportTitle, isAnatomicalSubheading, sanitizeHtmlForClipboard, escapeHtml } from '../services/docxService';
-import { isClinicalProfileFinding, formatClinicalProfileText } from './ResultsDisplay';
+import { isClinicalProfileFinding, formatClinicalProfileText, TieredModelOptgroups } from './ResultsDisplay';
+import { getCandidateKeysForOperation } from '../services/apiKeyService';
 
 const BATCH_DRIVE_FOLDER_KEY = 'radiologyDictationBatchDriveFolder';
 const BATCH_SESSION_TIMESTAMP_KEY = 'radiologyDictationBatchSessionTimestamp';
@@ -197,12 +200,19 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     onBack, 
     selectedModel, 
     isErrorCheckEnabled, 
-    isExperimentalAudioFilterEnabled = false,
+    isExperimentalAudioFilterEnabled: isExperimentalAudioFilterProp,
     initialFiles, 
     onClearInitialFiles,
     onSaveToDrive
 }) => {
+    const useExperimentalAudioFilter = isExperimentalAudioFilterProp !== undefined
+        ? Boolean(isExperimentalAudioFilterProp)
+        : (safeLocalStorage.getRaw(EXPERIMENTAL_AUDIO_FILTER_KEY, '') !== ''
+            ? safeLocalStorage.getItem<boolean>(EXPERIMENTAL_AUDIO_FILTER_KEY, true)
+            : true);
     const [batches, setBatches] = useState<Batch[]>([]);
+    const batchesRef = useRef<Batch[]>([]);
+    batchesRef.current = batches;
     const [activeBatchId, setActiveBatchId] = useState<string | null>(null);
     const {
         isRecording: isMainRecording,
@@ -1112,6 +1122,8 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         safeLocalStorage.removeItem(BATCH_MODE_STORAGE_KEY);
         await deleteReportSession(curKey).catch(() => {});
         await deleteReportSession(BATCH_MODE_STORAGE_KEY).catch(() => {});
+        await deleteDictateChangesAudio(`batch_${currentTabId}`).catch(() => {});
+        await deleteDictateChangesAudio('batch').catch(() => {});
         clearUnusedAudioBlobs([]).catch(() => {});
     };
 
@@ -1254,14 +1266,19 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
     const [isUploadReplace, setIsUploadReplace] = useState(false);
     const generalDragCounter = useRef(0);
     const batchProcessingIdRef = useRef<Record<string, number>>({});
+    const batchAbortControllersRef = useRef<Record<string, AbortController>>({});
 
     const handleCancelBatchProcessing = (batchId: string) => {
         batchProcessingIdRef.current[batchId] = (batchProcessingIdRef.current[batchId] || 0) + 1;
+        if (batchAbortControllersRef.current[batchId]) {
+            try { batchAbortControllersRef.current[batchId].abort(); } catch {}
+            delete batchAbortControllersRef.current[batchId];
+        }
         setBatches(prev => prev.map(b => {
             if (b.id === batchId && b.status === 'processing') {
                 return {
                     ...b,
-                    status: b.findings ? 'complete' : 'idle'
+                    status: b.findings ? 'complete' : 'idle',
                 };
             }
             return b;
@@ -1438,7 +1455,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         blob: Blob
     ): Promise<{ blob: Blob; stats: AudioPrefilterStats | null; compactedAudioBlob: Blob | null }> => {
         const { filteredInput, stats, compactedAudioBlob } = await filterAudioInputsForModel(blob, {
-            enabled: Boolean(isExperimentalAudioFilterEnabled),
+            enabled: Boolean(useExperimentalAudioFilter),
         });
         return {
             blob: Array.isArray(filteredInput) ? filteredInput[0] : filteredInput,
@@ -1456,12 +1473,81 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         blobs: Blob[],
         mergeWhenDisabled: boolean
     ): Promise<{ modelInput: Blob | Blob[]; prefilterStats: AudioPrefilterStats | null; compactedAudioBlob: Blob | null }> => {
-        if (isExperimentalAudioFilterEnabled) {
+        if (useExperimentalAudioFilter) {
             const { filteredInput, stats, compactedAudioBlob } = await filterAudioInputsForModel(blobs, { enabled: true });
             return { modelInput: filteredInput, prefilterStats: stats, compactedAudioBlob };
         }
         const modelInput = mergeWhenDisabled ? await mergeMultipleAudioBlobs(blobs) : blobs;
         return { modelInput, prefilterStats: null, compactedAudioBlob: null };
+    };
+
+    const processSingleBatchWorker = async (batch: Batch) => {
+        if (batch.audioBlobs.length === 0) return;
+        const currentReqId = batchProcessingIdRef.current[batch.id];
+        if (batchAbortControllersRef.current[batch.id]) {
+            try { batchAbortControllersRef.current[batch.id].abort(); } catch {}
+        }
+        const abortController = new AbortController();
+        batchAbortControllersRef.current[batch.id] = abortController;
+        try {
+            const { modelInput, prefilterStats, compactedAudioBlob } = await prepareModelInputsForBatch(batch.audioBlobs, true);
+            if (abortController.signal.aborted || batchProcessingIdRef.current[batch.id] !== currentReqId) return;
+
+            setBatches(prev => prev.map(b => b.id === batch.id ? { ...b, prefilterStats, compactedAudioBlob } : b));
+
+            const currentUpcoming = getUpcomingTemplate();
+            const effectivePrompt = batch.customPrompt || (currentUpcoming ? currentUpcoming.promptText : globalCustomPrompt);
+            const effectiveDocx = batch.customDocx || (currentUpcoming ? (currentUpcoming.docxData || null) : globalCustomDocx);
+            let spokenPrompt = effectivePrompt;
+            let spokenDocx = effectiveDocx;
+            let spokenImages = batch.customImages;
+            let hadSpokenTemplate = false;
+            const makeSpokenHandler = () => (resolved: SpokenTemplateResolution) => {
+                hadSpokenTemplate = true;
+                spokenPrompt = resolved.promptText;
+                spokenDocx = resolved.docxData;
+                spokenImages = mergeTemplateImages(batch.customImages, resolved.images);
+                setBatchRtfViewIds(prev => ({ ...prev, [batch.id]: true }));
+            };
+            const findings = await processAudio(
+                modelInput,
+                batch.selectedModel,
+                effectivePrompt,
+                batch.customImages,
+                undefined,
+                effectiveDocx,
+                abortController.signal,
+                { onSpokenTemplateResolved: makeSpokenHandler() }
+            );
+
+            if (abortController.signal.aborted || batchProcessingIdRef.current[batch.id] !== currentReqId) return;
+
+            const chatSession = await createChat(modelInput, findings, spokenPrompt, spokenImages, batch.selectedModel);
+            const aiGreeting = "I have reviewed the audio and transcript for this dictation. How can I help you further?";
+            const initialChatHistory = [{ author: 'AI' as const, text: `${findings.join('\n\n')}\n\n${aiGreeting}` }];
+
+            if (abortController.signal.aborted || batchProcessingIdRef.current[batch.id] !== currentReqId) return;
+
+            setBatches(prev => prev.map(b => b.id === batch.id ? {
+                ...b,
+                status: 'complete',
+                findings,
+                chat: chatSession,
+                chatHistory: initialChatHistory,
+                isChatting: false,
+                prefilterStats,
+                compactedAudioBlob,
+                ...(hadSpokenTemplate ? { customPrompt: spokenPrompt, customDocx: spokenDocx, customImages: spokenImages } : {}),
+            } : b));
+        } catch (err: any) {
+            if (err?.name === 'AbortError' || abortController.signal.aborted || batchProcessingIdRef.current[batch.id] !== currentReqId) return;
+            const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';
+            setBatches(prev => prev.map(b => b.id === batch.id ? { ...b, status: 'error', error: errorMessage } : b));
+        } finally {
+            if (batchAbortControllersRef.current[batch.id] === abortController) {
+                delete batchAbortControllersRef.current[batch.id];
+            }
+        }
     };
 
     const handleProcessAll = async () => {
@@ -1480,66 +1566,18 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         setBatches(prev => prev.map(b => batchesToProcess.find(p => p.id === b.id) ? {...b, status: 'processing', compactedAudioBlob: null, prefilterStats: null} : b));
 
         try {
-            await Promise.all(batchesToProcess.map(async (batch) => {
-                if (batch.audioBlobs.length === 0) return;
-                const currentReqId = batchProcessingIdRef.current[batch.id];
-                try {
-                    const { modelInput, prefilterStats, compactedAudioBlob } = await prepareModelInputsForBatch(batch.audioBlobs, true);
-                    if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
+            const candidateKeyCount = getCandidateKeysForOperation(batchesToProcess[0]?.selectedModel || selectedModel).candidateKeys.length;
+            const maxWorkers = Math.min(batchesToProcess.length, Math.max(1, Math.min(6, candidateKeyCount)));
 
-                    // Expose compacted audio & pre-trim stats immediately once filtering/combination finishes
-                    setBatches(prev => prev.map(b => b.id === batch.id ? { ...b, prefilterStats, compactedAudioBlob } : b));
-
-                    const currentUpcoming = getUpcomingTemplate();
-                    const effectivePrompt = batch.customPrompt || (currentUpcoming ? currentUpcoming.promptText : globalCustomPrompt);
-                    const effectiveDocx = batch.customDocx || (currentUpcoming ? (currentUpcoming.docxData || null) : globalCustomDocx);
-                    let spokenPrompt = effectivePrompt;
-                    let spokenDocx = effectiveDocx;
-                    let spokenImages = batch.customImages;
-                    let hadSpokenTemplate = false;
-                    const makeSpokenHandler = () => (resolved: SpokenTemplateResolution) => {
-                        hadSpokenTemplate = true;
-                        spokenPrompt = resolved.promptText;
-                        spokenDocx = resolved.docxData;
-                        spokenImages = mergeTemplateImages(batch.customImages, resolved.images);
-                        setBatchRtfViewIds(prev => ({ ...prev, [batch.id]: true }));
-                    };
-                    const findings = await processAudio(
-                        modelInput,
-                        batch.selectedModel,
-                        effectivePrompt,
-                        batch.customImages,
-                        undefined,
-                        effectiveDocx,
-                        undefined,
-                        { onSpokenTemplateResolved: makeSpokenHandler() }
-                    );
-                    
-                    if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
-
-                    const chatSession = await createChat(modelInput, findings, spokenPrompt, spokenImages, batch.selectedModel);
-                    const aiGreeting = "I have reviewed the audio and transcript for this dictation. How can I help you further?";
-                    const initialChatHistory = [{ author: 'AI' as const, text: `${findings.join('\n\n')}\n\n${aiGreeting}` }];
-
-                    if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
-
-                    setBatches(prev => prev.map(b => b.id === batch.id ? {
-                        ...b,
-                        status: 'complete',
-                        findings,
-                        chat: chatSession,
-                        chatHistory: initialChatHistory,
-                        isChatting: false,
-                        prefilterStats,
-                        compactedAudioBlob,
-                        ...(hadSpokenTemplate ? { customPrompt: spokenPrompt, customDocx: spokenDocx, customImages: spokenImages } : {}),
-                    } : b));
-                } catch (err) {
-                    if (batchProcessingIdRef.current[batch.id] !== currentReqId) return;
-                    const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';
-                    setBatches(prev => prev.map(b => b.id === batch.id ? { ...b, status: 'error', error: errorMessage } : b));
-                }
-            }));
+            let nextIndex = 0;
+            await Promise.all(
+                Array.from({ length: maxWorkers }, async () => {
+                    while (nextIndex < batchesToProcess.length) {
+                        const batch = batchesToProcess[nextIndex++];
+                        await processSingleBatchWorker(batch);
+                    }
+                })
+            );
         } finally {
             clearInterval(processingHeartbeatTimer);
             markTabActive('idle');
@@ -1553,34 +1591,75 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
             });
         }, 100);
     };
-    
+
     const handleReprocessBatch = async (batchId: string) => {
         const batch = batches.find(b => b.id === batchId);
-        let allBlobs = [...(batch?.audioBlobs || []), ...(batch?.extraFiles || [])];
-        if (!allBlobs.length && batch) {
+        let baseBlobs = [...(batch?.audioBlobs || [])];
+        if (!baseBlobs.length && batch) {
             const currentTabId = getTabId();
             const storedBlob = (await getAudioBlob(`batch_audio_${currentTabId}_${batch.id}_0`)) ||
                                (await getAudioBlob(`batch_audio_${batch.id}_0`));
             if (storedBlob) {
-                allBlobs = [storedBlob];
+                baseBlobs = [storedBlob];
             }
         }
-        if (!batch || allBlobs.length === 0) return;
+        const extraFiles = [...(batch?.extraFiles || [])];
+        if (!batch || (baseBlobs.length === 0 && extraFiles.length === 0)) return;
 
-        if (batch && batch.findings) {
+        if (batch.findings) {
             setUndoStates(prev => ({ ...prev, [batchId]: [...batch.findings!] }));
         }
 
         const currentReqId = (batchProcessingIdRef.current[batchId] || 0) + 1;
         batchProcessingIdRef.current[batchId] = currentReqId;
 
-        setBatches(prev => prev.map(b => b.id === batchId ? {...b, status: 'processing', error: undefined, compactedAudioBlob: null, prefilterStats: null } : b));
+        if (batchAbortControllersRef.current[batchId]) {
+            try { batchAbortControllersRef.current[batchId].abort(); } catch {}
+        }
+        const abortController = new AbortController();
+        batchAbortControllersRef.current[batchId] = abortController;
+
+        const hasExistingCompacted = Boolean(batch.compactedAudioBlob && batch.compactedAudioBlob.size > 0);
+        setBatches(prev => prev.map(b => b.id === batchId ? { ...b, status: 'processing', error: undefined } : b));
 
         try {
-            const { modelInput, prefilterStats, compactedAudioBlob } = await prepareModelInputsForBatch(allBlobs, false);
-            if (batchProcessingIdRef.current[batchId] !== currentReqId) return;
+            let modelInput: Blob | Blob[];
+            let nextPrefilterStats: AudioPrefilterStats | null = batch.prefilterStats ?? null;
+            let nextCompactedAudioBlob: Blob | null = batch.compactedAudioBlob ?? null;
 
-            setBatches(prev => prev.map(b => b.id === batchId ? { ...b, prefilterStats, compactedAudioBlob } : b));
+            if (hasExistingCompacted && batch.compactedAudioBlob) {
+                // Reuse the VAD-compacted Ogg/Opus audio as base input instead of re-decoding/uploading multi-MB WAV
+                const nonAudioBase: Blob[] = [];
+                for (const b of baseBlobs) {
+                    const cls = await classifyBlobForPrefilter(b);
+                    if (!cls.isAudio) {
+                        nonAudioBase.push(b);
+                    }
+                }
+                const combinedParts: Blob[] = [batch.compactedAudioBlob, ...nonAudioBase];
+                if (extraFiles.length > 0) {
+                    const { modelInput: extraInput } = await prepareModelInputsForBatch(extraFiles, false);
+                    if (abortController.signal.aborted || batchProcessingIdRef.current[batchId] !== currentReqId) return;
+                    if (Array.isArray(extraInput)) {
+                        combinedParts.push(...extraInput);
+                    } else {
+                        combinedParts.push(extraInput);
+                    }
+                }
+                modelInput = combinedParts.length === 1 ? combinedParts[0] : combinedParts;
+            } else {
+                const allBlobs = [...baseBlobs, ...extraFiles];
+                const prepared = await prepareModelInputsForBatch(allBlobs, false);
+                if (abortController.signal.aborted || batchProcessingIdRef.current[batchId] !== currentReqId) return;
+                modelInput = prepared.modelInput;
+                nextPrefilterStats = prepared.prefilterStats;
+                nextCompactedAudioBlob = prepared.compactedAudioBlob;
+                setBatches(prev => prev.map(b => b.id === batchId ? {
+                    ...b,
+                    prefilterStats: nextPrefilterStats,
+                    compactedAudioBlob: nextCompactedAudioBlob,
+                } : b));
+            }
 
             let spokenPrompt = batch.customPrompt;
             let spokenDocx = batch.customDocx;
@@ -1593,9 +1672,10 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                 batch.customImages,
                 undefined,
                 batch.customDocx,
-                undefined,
+                abortController.signal,
                 {
                     onSpokenTemplateResolved: (resolved: SpokenTemplateResolution) => {
+                        if (abortController.signal.aborted || batchProcessingIdRef.current[batchId] !== currentReqId) return;
                         hadSpokenTemplate = true;
                         spokenPrompt = resolved.promptText;
                         spokenDocx = resolved.docxData;
@@ -1605,35 +1685,37 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                 }
             );
             
-            if (batchProcessingIdRef.current[batchId] !== currentReqId) return;
+            if (abortController.signal.aborted || batchProcessingIdRef.current[batchId] !== currentReqId) return;
 
             const chatSession = await createChat(modelInput, findings, spokenPrompt, spokenImages, batch.selectedModel);
             const aiGreeting = "I have reviewed the audio and transcript for this dictation. How can I help you further?";
             const initialChatHistory = [{ author: 'AI' as const, text: `${findings.join('\n\n')}\n\n${aiGreeting}` }];
 
-            if (batchProcessingIdRef.current[batchId] !== currentReqId) return;
+            if (abortController.signal.aborted || batchProcessingIdRef.current[batchId] !== currentReqId) return;
 
             setBatches(prev => {
                 const updated = prev.map(b => b.id === batchId ? {
                     ...b,
-                    audioBlobs: allBlobs,
-                    extraFiles: [],
-                    status: 'complete',
+                    status: 'complete' as BatchStatus,
                     findings,
                     chat: chatSession,
                     chatHistory: initialChatHistory,
                     isChatting: false,
-                    prefilterStats,
-                    compactedAudioBlob,
+                    prefilterStats: nextPrefilterStats,
+                    compactedAudioBlob: nextCompactedAudioBlob,
                     ...(hadSpokenTemplate ? { customPrompt: spokenPrompt, customDocx: spokenDocx, customImages: spokenImages } : {}),
                 } : b);
                 saveBatchesToDrive(updated);
                 return updated;
             });
-        } catch (err) {
-            if (batchProcessingIdRef.current[batchId] !== currentReqId) return;
+        } catch (err: any) {
+            if (err?.name === 'AbortError' || abortController.signal.aborted || batchProcessingIdRef.current[batchId] !== currentReqId) return;
             const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';
             setBatches(prev => prev.map(b => b.id === batchId ? { ...b, status: 'error', error: errorMessage, findings: null } : b));
+        } finally {
+            if (batchAbortControllersRef.current[batchId] === abortController) {
+                delete batchAbortControllersRef.current[batchId];
+            }
         }
     };
 
@@ -1650,19 +1732,23 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
         setBatches(prev => prev.map(b => b.id === batchId ? { ...b, isChatting: true, chatHistory: updatedHistory } : b));
 
         try {
-            let response;
+            let messagePayload: string | any[];
             if (typeof message === 'string') {
-                response = await batch.chat.sendMessage({ message });
+                messagePayload = message;
             } else {
                 const base64Audio = await blobToBase64(message);
                 const audioPart = {
                     inlineData: { mimeType: getCleanMimeType(message), data: base64Audio },
                 };
                 const textPart = { text: "Please analyze this audio in the context of our conversation." };
-                response = await batch.chat.sendMessage({ message: [audioPart, textPart] });
+                messagePayload = [audioPart, textPart];
             }
-            const responseText = response.text;
-            setBatches(prev => prev.map(b => b.id === batchId ? {...b, chatHistory: [...updatedHistory, { author: 'AI' as const, text: responseText }]} : b));
+            const res = await sendChatMessageWithFailover(batch.chat, messagePayload, batch.selectedModel || selectedModel);
+            setBatches(prev => prev.map(b => b.id === batchId ? {
+                ...b,
+                chat: res.activeChat || b.chat,
+                chatHistory: [...updatedHistory, { author: 'AI' as const, text: res.text }],
+            } : b));
         } catch (err) {
             console.error("Chat error:", err);
             const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';
@@ -2239,8 +2325,8 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                 const { blob: filteredNewAudio, stats: continueStats, compactedAudioBlob: continueCompacted } = await prefilterSingleAudioBlob(newAudioBlob);
                 const updatedAudioBlobs = [...batch.audioBlobs, newAudioBlob];
                 let chatAudioInput: Blob | Blob[];
-                let updatedCompactedBlob: Blob | null = batch.compactedAudioBlob ?? null;
-                if (isExperimentalAudioFilterEnabled) {
+                let updatedCompactedBlob: Blob | null = useExperimentalAudioFilter ? (batch.compactedAudioBlob ?? null) : null;
+                if (useExperimentalAudioFilter) {
                     if (batch.audioBlobs.length > 0) {
                         if (batch.compactedAudioBlob || continueStats?.applied) {
                             const prevBase = batch.compactedAudioBlob || batch.audioBlobs;
@@ -2297,7 +2383,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                         compactedAudioBlob: updatedCompactedBlob,
                         chat: chatSession,
                         chatHistory: updatedChatHistory,
-                        prefilterStats: isExperimentalAudioFilterEnabled
+                        prefilterStats: useExperimentalAudioFilter
                             ? mergePrefilterStats(b.prefilterStats, continueStats)
                             : b.prefilterStats,
                         ...(hadSpokenTemplate ? { customPrompt: spokenPrompt, customDocx: spokenDocx, customImages: spokenImages } : {}),
@@ -3610,9 +3696,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                                 className="bg-white border border-slate-300 text-slate-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block p-2 w-full sm:w-auto dark:bg-slate-700 dark:border-slate-600 dark:text-white"
                                                                 aria-label="Select AI model for reprocessing"
                                                             >
-                                                                {AVAILABLE_MODELS.map((model) => (
-                                                                    <option key={model.value} value={model.value}>{model.label}</option>
-                                                                ))}
+                                                                <TieredModelOptgroups />
                                                             </select>
                                                         </div>
 
@@ -4414,7 +4498,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                                     {agenticProgressTexts[batch.id] || 'Running agentic analysis...'}
                                                                 </p>
                                                                 <p className="text-xs text-slate-500 dark:text-slate-400 mt-2">
-                                                                    Default: gemini-3.8-flash (Search Grounded) • Automatic failover & retry
+                                                                    Default: Gemini 3.8 Flash • Automatic backup & retry
                                                                 </p>
                                                             </div>
                                                         ) : (
@@ -4574,9 +4658,7 @@ const BatchProcessor: React.FC<BatchProcessorProps> = ({
                                                         onChange={(e) => updateBatchModel(batch.id, e.target.value)}
                                                         className="bg-slate-50 border border-slate-300 text-slate-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block p-2 w-full sm:w-auto dark:bg-slate-700 dark:border-slate-600 dark:text-white"
                                                     >
-                                                        {AVAILABLE_MODELS.map((model) => (
-                                                            <option key={model.value} value={model.value}>{model.label}</option>
-                                                        ))}
+                                                        <TieredModelOptgroups />
                                                     </select>
                                                 </div>
 

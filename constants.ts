@@ -4,57 +4,211 @@ export const LIVE_DICTATION_MODEL = 'gemini-4-hydrogen';
 export const GEMINI_FLASH_LITE_MODEL = 'gemini-3.5-flash-lite';
 export const DEFAULT_SELECTED_MODEL = 'gemini-4-hydrogen';
 
+export const STRICT_SELECTED_MODEL_ONLY_KEY = 'raddoc_strict_selected_model_only';
+
+export type ModelQualityTier = 'top' | 'medium' | 'low';
+export type ModelFallbackPolicy = 'top_and_medium' | 'top_only' | 'selected_only';
+export type ModelTaskType = 'transcription' | 'reasoning' | 'live_chunk';
+export type ThinkingLevel = 'minimal' | 'low' | 'medium' | 'high';
+
+export type GeminiThinkingTask = ModelTaskType;
+export type GeminiThinkingLevel = ThinkingLevel;
+
 export interface AIModelOption {
   value: string;
   label: string;
+  tier: ModelQualityTier;
+  quotaBucket?: string;
 }
 
-export const LIVE_DICTATION_MODELS: AIModelOption[] = [
-  { value: 'gemini-4-hydrogen', label: 'gemini-4-hydrogen (Default)' },
-  { value: 'gemini-3.5-flash', label: 'gemini-3.5-flash' },
-  { value: 'gemini-3.8-flash', label: 'gemini-3.8-flash' },
-  { value: 'gemini-3.5-flash-lite', label: 'gemini-3.5-flash-lite' },
-];
-
-export const LIVE_DICTATION_CYCLE_ORDER = [
+export const FREE_TIER_TOP_MODELS: string[] = [
   'gemini-4-hydrogen',
-  'gemini-3.5-flash',
   'gemini-3.8-flash',
-  'gemini-3.5-flash-lite',
 ];
 
-/**
- * Returns the candidate model chain: the selected primary model plus subsequent fallback model,
- * cycling across permitted live dictation models:
- * 1. gemini-4-hydrogen (Default)
- * 2. gemini-3.5-flash
- * 3. gemini-3.8-flash
- * 4. gemini-3.5-flash-lite
- */
-export function getLiveModelFallbackChain(selectedModel: string): string[] {
-  const modelOrder = LIVE_DICTATION_CYCLE_ORDER;
-  const idx = modelOrder.indexOf(selectedModel);
+export const FREE_TIER_MEDIUM_MODELS: string[] = [
+  'gemini-robotics-er-2-preview',
+  'gemini-3.6-flash',
+  'gemini-3-flash-preview',
+];
 
-  if (idx !== -1) {
-    return [
-      modelOrder[idx],
-      ...modelOrder.filter((_, i) => i !== idx),
-    ];
-  }
+export const FREE_TIER_QUOTA_FALLBACK_ORDER: string[] = [
+  ...FREE_TIER_TOP_MODELS,
+  ...FREE_TIER_MEDIUM_MODELS,
+];
 
-  return [...modelOrder];
-}
+export const LIVE_DICTATION_CYCLE_ORDER = [...FREE_TIER_QUOTA_FALLBACK_ORDER];
 
 export const AVAILABLE_MODELS: AIModelOption[] = [
-  { value: 'gemini-4-hydrogen', label: 'Gemini 4 Hydrogen (Default)' },
-  { value: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash' },
-  { value: 'gemini-robotics-er-2-preview', label: 'Gemini Robotics ER-2 Preview' },
-  { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash' },
-  { value: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
-  { value: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash' },
-  { value: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash Lite' },
-  { value: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro' },
+  { value: 'gemini-4-hydrogen', label: 'Gemini 4 Hydrogen', tier: 'top' },
+  { value: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash', tier: 'top' },
+  { value: 'gemini-robotics-er-2-preview', label: 'Gemini Robotics ER-2 Preview', tier: 'medium' },
+  { value: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash', tier: 'medium', quotaBucket: 'gemini-3.6-flash' },
+  { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash Preview', tier: 'medium' },
+  { value: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash', tier: 'medium', quotaBucket: 'gemini-3.6-flash' },
+  { value: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash Lite', tier: 'low' },
+  { value: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro Preview', tier: 'top' },
 ];
+
+export const LIVE_DICTATION_MODELS: AIModelOption[] = [
+  { value: 'gemini-4-hydrogen', label: 'Gemini 4 Hydrogen', tier: 'top' },
+  { value: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash', tier: 'top' },
+  { value: 'gemini-robotics-er-2-preview', label: 'Gemini Robotics ER-2 Preview', tier: 'medium' },
+  { value: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash', tier: 'medium', quotaBucket: 'gemini-3.6-flash' },
+  { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash Preview', tier: 'medium' },
+  { value: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash', tier: 'medium', quotaBucket: 'gemini-3.6-flash' },
+  { value: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash Lite', tier: 'low' },
+  { value: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro Preview', tier: 'top' },
+];
+
+export function getModelDisplayLabel(modelId: string): string {
+  const clean = (modelId || '').replace(/^models\//, '').trim();
+  if (!clean) return 'Selected Model';
+  const match = AVAILABLE_MODELS.find((m) => m.value === clean);
+  if (match) return match.label;
+  if (clean === 'gemini-3.7-flash') return 'Gemini 3.7 Flash';
+  if (clean === 'gemini-3.5-transcribe' || clean === 'gemini-3.5-transcribe-live') {
+    return 'Gemini 4 Hydrogen';
+  }
+  if (clean === 'gemini-decision-1') return 'Clinical Quality Check';
+  return clean;
+}
+
+/**
+ * Normalizes model IDs and maps routed aliases (`3.7-flash -> 3.8-flash`, `3.5-flash -> 3.6-flash`)
+ * onto their shared quota pool bucket for deduplication and cooldown tracking.
+ */
+export function resolveQuotaPoolModel(model?: string): string {
+  if (!model) return 'default';
+  const clean = model.replace(/^models\//, '').trim();
+  if (clean === 'gemini-3.7-flash') return 'gemini-3.8-flash';
+  if (clean === 'gemini-3.5-flash') return 'gemini-3.6-flash';
+  if (clean === 'gemini-embedding-2-preview') return 'gemini-embedding-2';
+  return clean || 'default';
+}
+
+export function getModelQualityTier(model?: string): ModelQualityTier {
+  if (!model) return 'top';
+  const clean = model.replace(/^models\//, '').trim();
+  const bucket = resolveQuotaPoolModel(clean);
+  const found = AVAILABLE_MODELS.find(m => m.value === clean || m.value === bucket);
+  if (found) return found.tier;
+  if (clean.includes('flash-lite')) return 'low';
+  if (clean.includes('robotics') || clean.includes('3-flash') || clean.includes('3.6-flash') || clean.includes('3.5-flash')) {
+    return 'medium';
+  }
+  return 'top';
+}
+
+/**
+ * Builds the model fallback chain starting from `selectedModel`, deduplicating routed aliases
+ * (`3.5-flash`/`3.6-flash`, `3.7-flash`/`3.8-flash`), respecting `policy`, and excluding
+ * `gemini-3.5-flash-lite` and `gemini-3.1-pro-preview` from automatic fallback unless explicitly selected.
+ */
+export function getFreeTierModelFallbackChain(
+  selectedModel: string,
+  policy: ModelFallbackPolicy = 'top_and_medium'
+): string[] {
+  const cleanSelected = (selectedModel || DEFAULT_SELECTED_MODEL).replace(/^models\//, '').trim() || DEFAULT_SELECTED_MODEL;
+
+  if (policy === 'selected_only') {
+    return [cleanSelected];
+  }
+
+  const chain: string[] = [];
+  const seenBuckets = new Set<string>();
+
+  const pushUnique = (candidate: string) => {
+    const bucket = resolveQuotaPoolModel(candidate);
+    if (!seenBuckets.has(bucket)) {
+      seenBuckets.add(bucket);
+      chain.push(candidate);
+    }
+  };
+
+  pushUnique(cleanSelected);
+
+  for (const m of FREE_TIER_TOP_MODELS) {
+    if (m !== GEMINI_FLASH_LITE_MODEL) {
+      pushUnique(m);
+    }
+  }
+
+  if (policy === 'top_and_medium') {
+    for (const m of FREE_TIER_MEDIUM_MODELS) {
+      if (m !== GEMINI_FLASH_LITE_MODEL) {
+        pushUnique(m);
+      }
+    }
+  }
+
+  return chain;
+}
+
+/**
+ * Returns the candidate live dictation fallback chain starting with `selectedModel`,
+ * respecting `policy` and excluding `gemini-3.5-flash-lite` from automatic fallback unless explicitly selected.
+ */
+export function getLiveModelFallbackChain(
+  selectedModel: string,
+  policy: ModelFallbackPolicy = 'top_and_medium'
+): string[] {
+  return getFreeTierModelFallbackChain(
+    selectedModel || DEFAULT_LIVE_MODEL || 'gemini-4-hydrogen',
+    policy
+  );
+}
+
+/**
+ * Returns the empirically calibrated thinkingLevel per model and task type:
+ * - gemini-4-hydrogen: 'low' (transcription/live_chunk), 'medium' (reasoning)
+ * - gemini-3.8-flash / 3.7-flash / 3.6-flash / 3.5-flash: 'medium'
+ * - gemini-robotics-er-2-preview: 'high' (transcription/reasoning), 'low' (live_chunk)
+ * - gemini-3-flash-preview: 'low' (transcription/reasoning), 'minimal' (live_chunk)
+ * - gemini-3.5-flash-lite / 3.1-flash-lite: 'minimal' (transcription/live_chunk), 'high' (reasoning)
+ */
+export function getOptimalThinkingLevel(
+  model: string,
+  taskType: ModelTaskType = 'transcription'
+): ThinkingLevel {
+  const clean = (model || '').replace(/^models\//, '').trim();
+
+  if (clean === 'gemini-4-hydrogen') {
+    return taskType === 'reasoning' ? 'medium' : 'low';
+  }
+  if (
+    clean === 'gemini-3.8-flash' ||
+    clean === 'gemini-3.7-flash' ||
+    clean === 'gemini-3.6-flash' ||
+    clean === 'gemini-3.5-flash'
+  ) {
+    return 'medium';
+  }
+  if (clean === 'gemini-robotics-er-2-preview') {
+    return taskType === 'live_chunk' ? 'low' : 'high';
+  }
+  if (clean === 'gemini-3-flash-preview') {
+    return taskType === 'live_chunk' ? 'minimal' : 'low';
+  }
+  if (clean === 'gemini-3.5-flash-lite' || clean === 'gemini-3.1-flash-lite') {
+    return taskType === 'reasoning' ? 'high' : 'minimal';
+  }
+  if (clean === 'gemini-3.1-pro-preview') {
+    return taskType === 'reasoning' ? 'medium' : 'low';
+  }
+
+  return taskType === 'live_chunk' ? 'low' : 'medium';
+}
+
+/**
+ * Clinical precision & formatting directives verified in robotics_high_refined_v2
+ * to elevate Medium-tier models to Gold Standard consistency.
+ */
+export const ROBOTICS_QUALITY_DIRECTIVES = `CLINICAL PRECISION & PROSE REFINEMENT DIRECTIVES:
+1. Fracture & Pathology Polarity Fidelity: Strictly preserve the exact dictated status ("Undisplaced" vs "Displaced", "Right" vs "Left", "Bilateral", "Acute" vs "Chronic"). Never invert or omit "Undisplaced" or "Displaced" qualifiers.
+2. Clean Radiology Prose & Skull-Base Precision: Avoid conversational filler or trailing artifacts such as "there also" or "also there". Write concise, formal radiology sentences, and carefully verify exact skull-base / temporal bone anatomy ("petrous part", "tympanic part", "tegmen tympani" — never substitute "cribriform plate" or "squamous part" unless spoken).
+3. Anatomical Term Spacing: Keep multi-word anatomical terms cleanly spaced — write "extra axial" (NOT "extraaxial" or "extra-axial") and "intra axial" (NOT "intraaxial" or "intra-axial").
+4. Complete Synthesized IMPRESSION: Never emit lazy or truncated impressions such as "as detailed", "as detailed above", "as described", or "as noted". Synthesize all abnormal findings into a full, verb-free, measurement-free IMPRESSION using Smart Bullet Formatting ("IMPRESSION:###• Point 1###• Point 2" for multi-point findings, or flush single sentence for a single/normal summary).`;
 
 export const RADIOLOGY_CUSTOM_VOCABULARY = [
   'Radiology', 'CT', 'MRI', 'X-ray', 'Ultrasound', 'USG', 'Mammography', 'PET-CT', 'Fluoroscopy',
@@ -142,13 +296,14 @@ Follow these strict instructions to produce a clean and accurate report:
     - Structure each patient's report completely with its own study title, Clinical Profile (if dictated), findings, and IMPRESSION.
     - Clearly separate the report for each patient in the "findings" array by inserting a distinct header line, e.g., "BOLD::--- PATIENT 2 REPORT ---" (or "BOLD::--- PATIENT 2: [Name/ID if dictated] ---").
     - Apply logical reasoning and contextual medical understanding so that findings, clinical histories, and impressions are accurately assigned to the correct patient without cross-contamination.
-11. **Spoken Template ID Directives**:
+11. **Spoken Template ID Directives (Per-Patient Isolation)**:
     - The radiologist may dictate a command to merge their findings into a specific report template — or combine MULTIPLE templates — by Template ID:
       * Built-in numeric IDs: clean numbers 1 through 300 (e.g., "template id 1", "template id 42", "template id 200", "template id two hundred").
       * Custom template IDs: e.g., "template id C1", "see one" -> "{template id C1}".
       * Legacy supplemental aliases if explicitly spoken: "add_128" / "add underscore 128" -> keep "add_" prefix ("{template id add_128}").
     - Always convert spoken number words inside the ID to digits/ID codes (e.g., "template id one" -> "{template id 1}", "template id two hundred" -> "{template id 200}", "template id forty two" -> "{template id 42}", "template id C one" / "see one" -> "{template id C1}", "template id 5 and 200" -> "{template id 5, 200}").
-    - If they ask to ADD/COMBINE another template ID (e.g. "add template id 15" or "add template id 200"), output "{add template id 15}" or "{add template id 200}" (or "{template id 5, 200}" for multiple) as a standalone directive token at the beginning of the "findings" array.
+    - Single-patient dictation: output "{template id [ID]}" or "{add template id [ID]}" (or "{template id 5, 200}" for multiple) as a standalone directive token at the beginning of the "findings" array.
+    - Multi-patient dictation (2+ patients with per-patient template IDs): NEVER combine different patients' template IDs at the top! Keep EACH patient's spoken "{template id [ID]}" / "{add template id [ID]}" strictly inside THAT patient's own block (at the beginning of Patient 1's block, and immediately after "BOLD::--- PATIENT N REPORT ---" inside Patient 2's, Patient 3's, etc. own block).
     - VAGUE TEMPLATE COMMANDS FORBIDDEN (DO NOT GUESS): If the doctor dictates vague phrases like "add ct brain", "use ct brain template", "add normal template", "normal report", or mentions a body region without a specific Template ID number/code, DO NOT output any {template id ...} token! Only output {template id [ID]} when explicit Template ID numbers or C codes were dictated.
 12. Your final output must be ONLY the corrected text, with no additional commentary, introductions, or explanations. Do not use any markdown formatting (like for bolding), with the single exception of using asterisks for the clinical profile as described above.
 
@@ -173,8 +328,8 @@ Follow these strict instructions:
 1.  **Use Existing Transcript as Primary Reference**: The provided transcript is your starting point. It may have been manually corrected by the user. Preserve its structure and content unless it directly contradicts the audio or the new custom instructions.
 2.  **Apply New Custom Instructions**: Strictly apply the new "Custom Instructions" provided. This is the main reason for the re-processing. These new instructions override any previous ones.
 3.  **Verify with Audio**: Listen to the audio again to ensure the final output is accurate. If the existing transcript has an error that was missed before, correct it now.
-4.  **Follow Core Transcription Rules**: Adhere to all the core transcription rules regarding medical terminology, abbreviations (S/p, C/o, H/o), formatting (dimensions, comparatives), and handling of impressions and clinical profiles as laid out in the original transcription task. The same rules for 'BOLD::', 'IMPRESSION:###', and '*Clinical Profile:*' apply. Also preserve or normalize any explicit spoken '{template id [ID]}' directives and expand any dictated macros.
-5.  **Multi-Patient Dictation & Report Splitting**: If the dictation covers multiple patients in one recording, apply logical reasoning and contextual clues to cleanly split and separate the report for each patient, inserting clear separator headers (e.g., "BOLD::--- PATIENT 2 REPORT ---").
+4.  **Follow Core Transcription Rules**: Adhere to all the core transcription rules regarding medical terminology, abbreviations (S/p, C/o, H/o), formatting (dimensions, comparatives), and handling of impressions and clinical profiles as laid out in the original transcription task. The same rules for 'BOLD::', 'IMPRESSION:###', and '*Clinical Profile:*' apply. Preserve or normalize any explicit spoken '{template id [ID]}' directives strictly inside EACH respective patient's own report block and expand any dictated macros.
+5.  **Multi-Patient Dictation & Report Splitting**: If the dictation covers multiple patients in one recording, apply logical reasoning and contextual clues to cleanly split and separate the report for each patient, inserting clear separator headers (e.g., "BOLD::--- PATIENT 2 REPORT ---"). If a single template is selected across multiple patients, apply that same template layout separately and completely to EACH patient's report block (each with its own exam title, Clinical Profile, findings, and IMPRESSION).
 6.  **Final Output Format**: Your entire response must be a single JSON object with a key named "findings". The value of "findings" must be an array of strings representing the final, re-processed report.
 `;
 
@@ -242,9 +397,10 @@ STRICT INSTRUCTIONS:
     c. The entire impression MUST be a single string formatted with a title and points separated by '###'. It must start with "IMPRESSION:". For example: "IMPRESSION:###• Hepatomegaly.###• Splenomegaly."
 
 12. **Multi-Patient Dictation & Report Splitting**:
-    - If the user dictates findings for more than one patient in a single audio recording (explicitly via "next patient", "patient 2", etc., or implicitly via logical reasoning and context shifts like new patient names/IDs or different study procedures), you MUST generate separate report structures for each patient.
-    - Separate each patient's report using a clear separator header line in the "findings" array, e.g., "BOLD::--- PATIENT 2 REPORT ---".
-    - Ensure each patient receives their own complete report with appropriate integrated template/findings and synthesized IMPRESSION based on their specific dictated findings.
+    - If the user dictates findings for more than one patient in a single audio recording (explicitly via "next patient", "patient 2", etc., or implicitly via logical reasoning and context shifts like new patient names/IDs or different study procedures), you MUST generate separate, complete report structures for each patient.
+    - Apply the SAME provided template layout separately and completely to EACH patient (Patient 1, Patient 2, etc.) so every patient receives their own standalone exam title, Clinical Profile, normal + dictated findings ('BOLD::' on dictated/abnormal lines), and independent synthesized IMPRESSION.
+    - Separate each patient's report using a clear separator header line in the "findings" array, e.g., "BOLD::--- PATIENT 2 REPORT ---" (or "BOLD::--- PATIENT 2: [Name/ID if dictated] ---"), followed immediately by that patient's own exam title.
+    - If a patient also dictates a specific spoken Template ID override/addition ('1-300', 'add_XXX', or 'C1+'), keep '{template id [ID]}' strictly inside THAT patient's own block right after their '--- PATIENT N REPORT ---' header (or at the start of Patient 1's block).
 13. **Final Output Format**: Your entire response must be a single JSON object with a key named "findings". The value of "findings" must be an array of strings, where each string is a part of the assembled report in the correct order specified in rule #5.
 14. **Spoken Structural & Heading/Title Modifications**:
     - The radiologist may dictate modifications to the template structure, title, or section headings in the same breath as clinical findings (e.g., "change the CT extremity heading in that template to CT right arm", "change title to CT SCAN OF RIGHT FOREARM", "rename pelvis heading to lower abdomen", "omit bladder section").
@@ -416,8 +572,10 @@ Your primary task is to:
    - Abbreviate "history of" to "H/o".
    - **Hyphenation Rule**: Do NOT add hyphens to compound modifiers or adjectives commonly written without hyphens in radiology reports. Write them as separate words with a space (e.g., write "age related" NOT "age-related", "age related neuro parenchymal atrophy", "well defined" NOT "well-defined", "ill defined" NOT "ill-defined", "ring enhancing" NOT "ring-enhancing", "contrast enhancing" NOT "contrast-enhancing", "non enhancing" NOT "non-enhancing", "soft tissue" NOT "soft-tissue", "flow void" NOT "flow-void", "fluid fluid level" NOT "fluid-fluid level", "fat fluid level" NOT "fat-fluid level"). Never insert unnecessary hyphens between adjacent words or between sentences. Only retain hyphens if strictly standard in medical nomenclature (such as "X-ray", "follow-up", "CT-guided", "T1-weighted", "T2-weighted"). When in doubt, prefer NO hyphen.
 8. **Multi-Patient Dictation & Report Splitting**:
-   - If the audio dictation covers more than one patient in a single recording (e.g., indicated by "next patient", "patient 2", or logical contextual shifts in patient details/studies), use logical reasoning to separate the dictation into distinct patient reports.
-   - Separate each patient's report with a clear header marker in the "findings" array, e.g., "BOLD::--- PATIENT 2 REPORT ---". Each report should follow the extracted template layout for that patient's findings.
+   - If the audio dictation covers more than one patient in a single recording (e.g., indicated by "next patient", "patient 2", or logical contextual shifts in patient details/studies), use logical reasoning to separate the dictation into distinct, complete patient reports.
+   - Apply the SAME extracted visual template layout separately and completely to EACH patient (Patient 1, Patient 2, etc.) so each patient has their own standalone exam title, Clinical Profile, integrated findings, and independent IMPRESSION.
+   - Separate each patient's report with a clear header marker in the "findings" array, e.g., "BOLD::--- PATIENT 2 REPORT ---" (or "BOLD::--- PATIENT 2: [Name/ID if dictated] ---"), followed immediately by that patient's own exam title.
+   - If a patient speaks a specific Template ID override/addition ('1-300', 'add_XXX', 'C1+'), keep '{template id [ID]}' strictly inside THAT patient's own block.
 
 Format your entire response as a single JSON object with a key named "findings". The value of "findings" must be an array of strings representing the final, assembled, formatted report.
 
